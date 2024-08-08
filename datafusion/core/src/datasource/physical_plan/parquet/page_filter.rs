@@ -28,7 +28,7 @@ use datafusion_physical_expr::{split_conjunction, PhysicalExpr};
 use log::{debug, trace};
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::file::metadata::{ParquetColumnIndex, ParquetOffsetIndex};
-use parquet::format::PageLocation;
+use parquet::file::page_index::offset_index::OffsetIndexMetaData;
 use parquet::schema::types::SchemaDescriptor;
 use parquet::{
     arrow::arrow_reader::{RowSelection, RowSelector},
@@ -362,7 +362,7 @@ struct PagesPruningStatistics<'a> {
     converter: StatisticsConverter<'a>,
     column_index: &'a ParquetColumnIndex,
     offset_index: &'a ParquetOffsetIndex,
-    page_offsets: &'a Vec<PageLocation>,
+    page_offsets: &'a OffsetIndexMetaData,
 }
 
 impl<'a> PagesPruningStatistics<'a> {
@@ -421,13 +421,16 @@ impl<'a> PagesPruningStatistics<'a> {
         let num_rows_in_row_group = row_group_metadata.num_rows() as usize;
 
         let page_offsets = self.page_offsets;
-        let mut vec = Vec::with_capacity(page_offsets.len());
-        page_offsets.windows(2).for_each(|x| {
+        let mut vec = Vec::with_capacity(page_offsets.page_locations.len());
+        page_offsets.page_locations.windows(2).for_each(|x| {
             let start = x[0].first_row_index as usize;
             let end = x[1].first_row_index as usize;
             vec.push(end - start);
         });
-        vec.push(num_rows_in_row_group - page_offsets.last()?.first_row_index as usize);
+        vec.push(
+            num_rows_in_row_group
+                - page_offsets.page_locations.last()?.first_row_index as usize,
+        );
         Some(vec)
     }
 }
@@ -461,7 +464,7 @@ impl<'a> PruningStatistics for PagesPruningStatistics<'a> {
     }
 
     fn num_containers(&self) -> usize {
-        self.page_offsets.len()
+        self.page_offsets.page_locations.len()
     }
 
     fn null_counts(&self, _column: &datafusion_common::Column) -> Option<ArrayRef> {
