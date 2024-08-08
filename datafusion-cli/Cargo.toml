@@ -30,7 +30,7 @@ rust-version = "1.76"
 readme = "README.md"
 
 [dependencies]
-arrow = { version = "52.2.0" }
+arrow = { git = "https://github.com/apache/arrow-rs.git", rev = "2795b94" }
 async-trait = "0.1.73"
 aws-config = "0.55"
 aws-credential-types = "0.55"
@@ -49,9 +49,9 @@ dirs = "4.0.0"
 env_logger = "0.9"
 futures = "0.3"
 mimalloc = { version = "0.1", default-features = false }
-object_store = { version = "0.10.1", features = ["aws", "gcp", "http"] }
+object_store = { version = "0.11", features = ["aws", "gcp", "http"] }
 parking_lot = { version = "0.12" }
-parquet = { version = "52.2.0", default-features = false }
+parquet = { git = "https://github.com/apache/arrow-rs.git", rev = "2795b94", default-features = false }
 regex = "1.8"
 rustyline = "11.0"
 tokio = { version = "1.24", features = ["macros", "rt", "rt-multi-thread", "sync", "parking_lot", "signal"] }
@@ -62,3 +62,14 @@ assert_cmd = "2.0"
 ctor = "0.2.0"
 predicates = "3.0"
 rstest = "0.17"
+
+[patch.crates-io]
+arrow = { git = "https://github.com/apache/arrow-rs.git", rev = "2795b94" }
+arrow-array = { git = "https://github.com/apache/arrow-rs.git", rev = "2795b94" }
+arrow-buffer = { git = "https://github.com/apache/arrow-rs.git", rev = "2795b94" }
+arrow-data = { git = "https://github.com/apache/arrow-rs.git", rev = "2795b94" }
+arrow-ipc = { git = "https://github.com/apache/arrow-rs.git", rev = "2795b94" }
+arrow-ord = { git = "https://github.com/apache/arrow-rs.git", rev = "2795b94" }
+arrow-schema = { git = "https://github.com/apache/arrow-rs.git", rev = "2795b94" }
+arrow-select = { git = "https://github.com/apache/arrow-rs.git", rev = "2795b94" }
+arrow-string = { git = "https://github.com/apache/arrow-rs.git", rev = "2795b94" }
