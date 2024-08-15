@@ -465,7 +465,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             }
             SQLDataType::Bytea => Ok(DataType::Binary),
             SQLDataType::Interval => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
-            SQLDataType::Struct(fields, _) => {
+            SQLDataType::Struct(fields) => {
                 let fields = fields
                     .iter()
                     .enumerate()
