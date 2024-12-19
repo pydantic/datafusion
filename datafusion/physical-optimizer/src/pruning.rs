@@ -802,6 +802,19 @@ impl RequiredColumns {
         self.columns.iter()
     }
 
+    // Return the names of all of the columns in this RequiredColumns
+    pub fn column_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.columns.iter().map(|(c, stat_type, _)| {
+            let suffix = match stat_type {
+                StatisticsType::Min => "min",
+                StatisticsType::Max => "max",
+                StatisticsType::NullCount => "null_count",
+                StatisticsType::RowCount => "row_count",
+            };
+            format!("{}_{}", c.name(), suffix)
+        })
+    }
+
     fn find_stat_column(
         &self,
         column: &phys_expr::Column,
