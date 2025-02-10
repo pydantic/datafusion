@@ -146,7 +146,7 @@ impl<'a> BinaryTypeCoercer<'a> {
         }
         And | Or => if matches!((self.lhs, self.rhs), (Boolean | Null, Boolean | Null)) {
             // Logical binary boolean operators can only be evaluated for
-            // boolean or null arguments.                   
+            // boolean or null arguments.
             Ok(Signature::uniform(Boolean))
         } else {
             plan_err!(
@@ -499,6 +499,14 @@ pub fn type_union_resolution(data_types: &[DataType]) -> Option<DataType> {
             }
         } else {
             candidate_type = Some(data_type.clone());
+        }
+    }
+
+    // HACK: DataType::Utf8View is not a meaningful dictionary value type, so
+    // just pull this out if we dict-encoded it
+    if let Some(DataType::Dictionary(_, value_type)) = &candidate_type {
+        if value_type.as_ref() == &DataType::Utf8View {
+            candidate_type = Some(DataType::Utf8View);
         }
     }
 
