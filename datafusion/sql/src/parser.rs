@@ -291,6 +291,13 @@ impl<'a> DFParser<'a> {
         })
     }
 
+    /// Specify the maximum recursion limit while parsing.
+    pub fn with_recursion_limit(mut self, recursion_limit: usize) -> Self {
+        self.parser = self.parser.with_recursion_limit(recursion_limit);
+        self
+    }
+
+
     /// Parse a sql string into one or [`Statement`]s using the
     /// [`GenericDialect`].
     pub fn parse_sql(sql: &str) -> Result<VecDeque<Statement>, ParserError> {
