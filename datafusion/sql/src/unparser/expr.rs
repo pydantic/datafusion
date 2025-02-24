@@ -1624,9 +1624,7 @@ impl Unparser<'_> {
             DataType::Union(_, _) => {
                 not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
             }
-            DataType::Dictionary(_, _) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
-            }
+            DataType::Dictionary(_, val) => self.arrow_dtype_to_ast_dtype(val),
             DataType::Decimal128(precision, scale)
             | DataType::Decimal256(precision, scale) => {
                 let mut new_precision = *precision as u64;
