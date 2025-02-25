@@ -522,7 +522,10 @@ impl SessionState {
             )
         })?;
 
-        let expr = DFParser::parse_sql_into_expr_with_dialect(sql, dialect.as_ref())?;
+        let mut parser = DFParser::new_with_dialect(sql, dialect.as_ref())?
+            .with_recursion_limit(self.config.options().sql_parser.recursion_limit);
+
+        let expr = parser.parse_expr()?;
 
         Ok(expr)
     }
