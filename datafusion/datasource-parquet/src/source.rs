@@ -591,4 +591,17 @@ impl FileSource for ParquetSource {
             }
         }
     }
+
+    fn supports_dynamic_filter_pushdown(&self) -> bool {
+        true
+    }
+
+    fn push_down_dynamic_filter(
+            &self,
+            _dynamic_filter: Arc<dyn DynamicFilterSource>,
+        ) -> datafusion_common::Result<Option<Arc<dyn FileSource>>> {
+        let mut conf = self.clone();
+        conf.dynamic_filters.push(_dynamic_filter);
+        Ok(Some(Arc::new(conf)))
+    }
 }
