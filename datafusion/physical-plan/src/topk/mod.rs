@@ -232,9 +232,11 @@ impl TopK {
 
         // break into record batches as needed
         let mut batches = vec![];
-        let mut heap = heap
-            .write()
-            .map_err(|_| DataFusionError::Internal("Failed to acquire write lock on TopK heap".to_string()))?;
+        let mut heap = heap.write().map_err(|_| {
+            DataFusionError::Internal(
+                "Failed to acquire write lock on TopK heap".to_string(),
+            )
+        })?;
         if let Some(mut batch) = heap.emit()? {
             metrics.baseline.output_rows().add(batch.num_rows());
 
