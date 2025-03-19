@@ -729,16 +729,14 @@ impl ExecutionPlan for RepartitionExec {
     }
 
     fn push_down_dynamic_filter(
-            &self,
-            dynamic_filter: Arc<dyn crate::DynamicFilterSource>,
-        ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        &self,
+        dynamic_filter: Arc<dyn crate::DynamicFilterSource>,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if let Some(input) = self.input.push_down_dynamic_filter(dynamic_filter)? {
-            return Ok(Some(Arc::new(
-                Self {
-                    input,
-                    ..self.clone()
-                }
-            )));
+            return Ok(Some(Arc::new(Self {
+                input,
+                ..self.clone()
+            })));
         }
         Ok(None)
     }
