@@ -41,10 +41,7 @@ use datafusion_physical_expr::{
     PhysicalSortExpr,
 };
 use datafusion_physical_plan::{
-    display::{display_orderings, ProjectSchemaDisplay},
-    metrics::ExecutionPlanMetricsSet,
-    projection::{all_alias_free_columns, new_projections_for_columns, ProjectionExec},
-    DisplayAs, DisplayFormatType, ExecutionPlan,
+    display::{display_orderings, ProjectSchemaDisplay}, dynamic_filters::DynamicFilterSource, metrics::ExecutionPlanMetricsSet, projection::{all_alias_free_columns, new_projections_for_columns, ProjectionExec}, DisplayAs, DisplayFormatType, ExecutionPlan
 };
 use log::{debug, warn};
 
@@ -316,9 +313,9 @@ impl DataSource for FileScanConfig {
 
     fn with_dynamic_filter(
         &self,
-        dynamic_filters: Vec<Arc<dyn datafusion_physical_expr::PhysicalExpr>>,
+        dynamic_filter: Arc<dyn DynamicFilterSource>,
     ) -> Arc<dyn DataSource> {
-        file_source = self.file_source.with_dynamic_filter(dynamic_filters);
+        let file_source = self.file_source.with_dynamic_filter(dynamic_filter);
         Arc::new(Self {
             file_source,
             ..self.clone()
