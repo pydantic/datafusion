@@ -191,7 +191,7 @@ impl FileOpener for ParquetOpener {
                 let filter_schema = filter_schema_builder.build();
 
                 pruning_predicate = build_pruning_predicate(
-                    predicate.clone(),
+                    Arc::clone(predicate),
                     &filter_schema,
                     &predicate_creation_errors,
                 );
@@ -357,7 +357,7 @@ pub(crate) fn build_pruning_predicate(
     file_schema: &SchemaRef,
     predicate_creation_errors: &Count,
 ) -> Option<Arc<PruningPredicate>> {
-    match PruningPredicate::try_new(predicate.clone(), Arc::clone(file_schema)) {
+    match PruningPredicate::try_new(predicate, Arc::clone(file_schema)) {
         Ok(pruning_predicate) => {
             if !pruning_predicate.always_true() {
                 return Some(Arc::new(pruning_predicate));
