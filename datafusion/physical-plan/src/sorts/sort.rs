@@ -1100,10 +1100,9 @@ impl ExecutionPlan for SortExec {
                     context.runtime_env(),
                     &self.metrics_set,
                 )?;
-                let dynamic_filter_source = topk.dynamic_filter_source();
                 let input_exec = if input_exec.supports_dynamic_filter_pushdown() {
                     input_exec
-                        .push_down_dynamic_filter(dynamic_filter_source.clone())?
+                        .push_down_dynamic_filter(topk.dynamic_filter_source())?
                         .unwrap_or(input_exec)
                 } else {
                     input_exec
