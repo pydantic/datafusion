@@ -40,6 +40,7 @@ use datafusion_physical_optimizer::pruning::PruningPredicate;
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
 use datafusion_physical_plan::DisplayFormatType;
 
+use datafusion_physical_plan::DynamicFilterSource;
 use itertools::Itertools;
 use log::debug;
 use object_store::ObjectStore;
@@ -259,6 +260,8 @@ pub struct ParquetSource {
     pub(crate) metrics: ExecutionPlanMetricsSet,
     /// Optional predicate for row filtering during parquet scan
     pub(crate) predicate: Option<Arc<dyn PhysicalExpr>>,
+    /// Dynamic filters for row filtering during parquet scan
+    pub(crate) dynamic_filters: Vec<Arc<dyn DynamicFilterSource>>,
     /// Optional predicate for pruning row groups (derived from `predicate`)
     pub(crate) pruning_predicate: Option<Arc<PruningPredicate>>,
     /// Optional predicate for pruning pages (derived from `predicate`)
@@ -489,6 +492,7 @@ impl FileSource for ParquetSource {
                 .expect("Batch size must set before creating ParquetOpener"),
             limit: base_config.limit,
             predicate: self.predicate.clone(),
+            dynamic_filters: self.dynamic_filters.clone(),
             pruning_predicate: self.pruning_predicate.clone(),
             page_pruning_predicate: self.page_pruning_predicate.clone(),
             table_schema: Arc::clone(&base_config.file_schema),
@@ -525,6 +529,15 @@ impl FileSource for ParquetSource {
 
     fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
         Arc::new(Self { ..self.clone() })
+    }
+
+    fn with_dynamic_filter(
+        &self,
+        dynamic_filters: Arc<dyn DynamicFilterSource>,
+    ) -> Arc<dyn FileSource> {
+        let mut conf = self.clone();
+        conf.dynamic_filters.push(dynamic_filters);
+        Arc::new(conf)
     }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
