@@ -22,6 +22,7 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use datafusion_physical_plan::dynamic_filters::DynamicFilterSource;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion_physical_plan::projection::ProjectionExec;
@@ -80,7 +81,7 @@ pub trait DataSource: Send + Sync + Debug {
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>>;
     fn with_dynamic_filter(
         &self,
-        _dynamic_filters: Vec<Arc<dyn datafusion_physical_expr::PhysicalExpr>>,
+        _dynamic_filter: Arc<dyn DynamicFilterSource>,
     ) -> Arc<dyn DataSource>;
 }
 
@@ -228,9 +229,9 @@ impl DataSourceExec {
 
     pub fn with_dynamic_filters(
         mut self,
-        dynamic_filters: Vec<Arc<dyn datafusion_physical_expr::PhysicalExpr>>,
+        dynamic_filter: Arc<dyn DynamicFilterSource>,
     ) -> Self {
-        self.data_source = self.data_source.with_dynamic_filters(dynamic_filters);
+        self.data_source = self.data_source.with_dynamic_filter(dynamic_filter);
         self
     }
 
