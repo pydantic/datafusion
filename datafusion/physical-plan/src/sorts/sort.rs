@@ -1072,7 +1072,7 @@ impl ExecutionPlan for SortExec {
             .equivalence_properties()
             .ordering_satisfy_requirement(&LexRequirement::from(self.expr.clone()));
 
-        let input_exec = self.input.clone();
+        let input_exec = Arc::clone(&self.input);
 
         let execution_options = &context.session_config().options().execution;
 
