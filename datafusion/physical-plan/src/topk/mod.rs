@@ -17,31 +17,33 @@
 
 //! TopK: Combination of Sort / LIMIT
 
+use std::mem::size_of;
+use std::sync::{Arc as StdArc, RwLock};
+use std::{cmp::Ordering, collections::BinaryHeap, sync::Arc};
+
+use arrow::array::{Array, ArrayRef, RecordBatch};
+use arrow::datatypes::SchemaRef;
 use arrow::{
     compute::interleave,
     row::{RowConverter, Rows, SortField},
 };
-use datafusion_expr::ColumnarValue;
-use std::mem::size_of;
-use std::{cmp::Ordering, collections::BinaryHeap, sync::Arc};
-
-use datafusion_expr::Operator;
-
-use super::metrics::{BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder};
-use crate::dynamic_filters::DynamicFilterSource;
-use crate::spill::get_record_batch_memory_size;
-use crate::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
-use arrow::array::{Array, ArrayRef, RecordBatch};
-use arrow::datatypes::SchemaRef;
+use arrow_schema::SortOptions;
 use datafusion_common::Result;
 use datafusion_common::{internal_err, DataFusionError, HashMap};
 use datafusion_execution::{
     memory_pool::{MemoryConsumer, MemoryReservation},
     runtime_env::RuntimeEnv,
 };
+use datafusion_expr::ColumnarValue;
+use datafusion_expr::Operator;
+use datafusion_physical_expr::expressions::{lit, BinaryExpr};
 use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
-use std::sync::{Arc as StdArc, RwLock};
+
+use super::metrics::{BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder};
+use crate::dynamic_filters::DynamicFilterSource;
+use crate::spill::get_record_batch_memory_size;
+use crate::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
 
 /// Global TopK
 ///
@@ -155,15 +157,11 @@ impl TopK {
         })
     }
 
-    pub fn dynamic_filter_source(
-        &self,
-    ) -> Arc<dyn DynamicFilterSource> {
-        Arc::new(
-            TopKDynamicFilterSource {
-                heap: StdArc::clone(&self.heap),
-                expr: Arc::clone(&self.expr),
-            }
-        )
+    pub fn dynamic_filter_source(&self) -> Arc<dyn DynamicFilterSource> {
+        Arc::new(TopKDynamicFilterSource {
+            heap: StdArc::clone(&self.heap),
+            expr: Arc::clone(&self.expr),
+        })
     }
 
     /// Insert `batch`, remembering if any of its values are among
@@ -339,10 +337,8 @@ struct ColumnThreshold {
     pub expr: Arc<dyn PhysicalExpr>,
     /// The threshold value
     pub value: datafusion_common::ScalarValue,
-    /// Whether the sort order is descending
-    pub is_descending: bool,
-    /// Whether nulls should be sorted first
-    pub nulls_first: bool,
+    /// Sort options
+    pub sort_options: SortOptions,
 }
 
 impl TopKHeap {
@@ -405,15 +401,10 @@ impl TopKHeap {
                 }
             };
 
-            // Get sort options
-            let is_descending = sort_expr.options.descending;
-            let nulls_first = sort_expr.options.nulls_first;
-
             thresholds.push(ColumnThreshold {
                 expr,
                 value: scalar,
-                is_descending,
-                nulls_first,
+                sort_options: sort_expr.options,
             });
         }
 
@@ -821,7 +812,7 @@ impl DynamicFilterSource for TopKDynamicFilterSource {
             }
 
             // Create the appropriate operator based on sort order
-            let op = if threshold.is_descending {
+            let op = if threshold.sort_options.descending {
                 // For descending sort, we want col > threshold (exclude smaller values)
                 Operator::Gt
             } else {
@@ -829,44 +820,14 @@ impl DynamicFilterSource for TopKDynamicFilterSource {
                 Operator::Lt
             };
 
-            // Special handling for NULLs - if nulls_first is opposite of the sort direction,
-            // we need to add IS NOT NULL to ensure we don't include nulls
-            let include_nulls = threshold.nulls_first == threshold.is_descending;
-
-            // Create a comparison expression using the Column and the threshold value
-            use datafusion_physical_expr::expressions::{binary, is_not_null, lit};
-
-            // We need the schema to create binary expressions
-            // For testing purposes, create a minimal schema with just the column we need
-            use arrow::datatypes::{DataType, Field, Schema};
-            let schema = &Schema::new(vec![Field::new(
-                "value",
-                match &threshold.value {
-                    datafusion_common::ScalarValue::Float64(_) => DataType::Float64,
-                    datafusion_common::ScalarValue::Int32(_) => DataType::Int32,
-                    _ => DataType::Utf8, // Default to string type for other values
-                },
-                true,
-            )]);
-
-            let comparison = binary(
+            let comparison = Arc::new(BinaryExpr::new(
                 threshold.expr.clone(),
                 op,
                 lit(threshold.value.clone()),
-                schema,
-            )?;
+            ));
 
-            // If nulls would be captured by the filter but shouldn't be, add IS NOT NULL
-            if !include_nulls {
-                let not_null = is_not_null(threshold.expr.clone())?;
-
-                // Combine with AND
-                let combined = binary(comparison, Operator::And, not_null, schema)?;
-
-                filters.push(combined);
-            } else {
-                filters.push(comparison);
-            }
+            // TODO: handle nulls first/last?
+            filters.push(comparison);
         }
 
         Ok(filters)

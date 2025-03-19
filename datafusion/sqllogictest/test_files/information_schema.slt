@@ -241,6 +241,7 @@ datafusion.explain.show_statistics false
 datafusion.optimizer.allow_symmetric_joins_without_pruning true
 datafusion.optimizer.default_filter_selectivity 20
 datafusion.optimizer.enable_distinct_aggregation_soft_limit true
+datafusion.optimizer.enable_dynamic_filter_pushdown true
 datafusion.optimizer.enable_round_robin_repartition true
 datafusion.optimizer.enable_topk_aggregation true
 datafusion.optimizer.expand_views_at_output false
