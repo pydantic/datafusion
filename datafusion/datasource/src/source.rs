@@ -80,10 +80,6 @@ pub trait DataSource: Send + Sync + Debug {
         &self,
         _projection: &ProjectionExec,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>>;
-    fn with_dynamic_filter(
-        &self,
-        _dynamic_filter: Arc<dyn DynamicFilterSource>,
-    ) -> Arc<dyn DataSource>;
 }
 
 /// [`ExecutionPlan`] handles different file formats like JSON, CSV, AVRO, ARROW, PARQUET
@@ -225,14 +221,6 @@ impl DataSourceExec {
     /// Assign output partitioning
     pub fn with_partitioning(mut self, partitioning: Partitioning) -> Self {
         self.cache = self.cache.with_partitioning(partitioning);
-        self
-    }
-
-    pub fn with_dynamic_filters(
-        mut self,
-        dynamic_filter: Arc<dyn DynamicFilterSource>,
-    ) -> Self {
-        self.data_source = self.data_source.with_dynamic_filter(dynamic_filter);
         self
     }
 

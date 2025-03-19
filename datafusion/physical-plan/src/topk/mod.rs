@@ -28,7 +28,7 @@ use std::{cmp::Ordering, collections::BinaryHeap, sync::Arc};
 use datafusion_expr::Operator;
 
 use super::metrics::{BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder};
-use crate::dynamic_filter::DynamicFilterSource;
+use crate::dynamic_filters::DynamicFilterSource;
 use crate::spill::get_record_batch_memory_size;
 use crate::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
 use arrow::array::{Array, ArrayRef, RecordBatch};

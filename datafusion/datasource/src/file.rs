@@ -52,11 +52,6 @@ pub trait FileSource: Send + Sync {
     fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource>;
     /// Initialize new instance with projection information
     fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource>;
-    /// Add dynamic filters to the file source
-    fn with_dynamic_filter(
-        &self,
-        dynamic_filter: Arc<dyn DynamicFilterSource>,
-    ) -> Arc<dyn FileSource>;
     /// Initialize new instance with projected statistics
     fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource>;
     /// Return execution plan metrics
