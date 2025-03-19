@@ -20,6 +20,8 @@ use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
+use crate::opener::build_page_pruning_predicate;
+use crate::opener::build_pruning_predicate;
 use crate::opener::ParquetOpener;
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::DefaultParquetFileReaderFactory;
@@ -42,7 +44,6 @@ use datafusion_physical_plan::DisplayFormatType;
 
 use datafusion_physical_plan::DynamicFilterSource;
 use itertools::Itertools;
-use log::debug;
 use object_store::ObjectStore;
 
 /// Execution plan for reading one or more Parquet files.
@@ -320,24 +321,10 @@ impl ParquetSource {
         conf.with_metrics(metrics);
         conf.predicate = Some(Arc::clone(&predicate));
 
-        match PruningPredicate::try_new(Arc::clone(&predicate), Arc::clone(&file_schema))
-        {
-            Ok(pruning_predicate) => {
-                if !pruning_predicate.always_true() {
-                    conf.pruning_predicate = Some(Arc::new(pruning_predicate));
-                }
-            }
-            Err(e) => {
-                debug!("Could not create pruning predicate for: {e}");
-                predicate_creation_errors.add(1);
-            }
-        };
-
-        let page_pruning_predicate = Arc::new(PagePruningAccessPlanFilter::new(
-            &predicate,
-            Arc::clone(&file_schema),
-        ));
-        conf.page_pruning_predicate = Some(page_pruning_predicate);
+        conf.page_pruning_predicate =
+            Some(build_page_pruning_predicate(&predicate, &file_schema));
+        conf.pruning_predicate =
+            build_pruning_predicate(predicate, &file_schema, &predicate_creation_errors);
 
         conf
     }
