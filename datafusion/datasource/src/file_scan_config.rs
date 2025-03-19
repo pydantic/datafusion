@@ -41,7 +41,10 @@ use datafusion_physical_expr::{
     PhysicalSortExpr,
 };
 use datafusion_physical_plan::{
-    display::{display_orderings, ProjectSchemaDisplay}, metrics::ExecutionPlanMetricsSet, projection::{all_alias_free_columns, new_projections_for_columns, ProjectionExec}, DisplayAs, DisplayFormatType, DynamicFilterSource, ExecutionPlan
+    display::{display_orderings, ProjectSchemaDisplay},
+    metrics::ExecutionPlanMetricsSet,
+    projection::{all_alias_free_columns, new_projections_for_columns, ProjectionExec},
+    DisplayAs, DisplayFormatType, DynamicFilterSource, ExecutionPlan,
 };
 use log::{debug, warn};
 
