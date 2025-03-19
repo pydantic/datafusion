@@ -234,7 +234,7 @@ impl TopK {
         let mut batches = vec![];
 
         // Try to get the heap data, using one of two approaches
-        let maybe_heap = match StdArc::try_unwrap(heap.clone()) {
+        let maybe_heap = match StdArc::try_unwrap(Arc::clone(&heap)) {
             Ok(lock) => {
                 // We got exclusive ownership of the heap
                 match lock.into_inner() {
@@ -821,7 +821,7 @@ impl DynamicFilterSource for TopKDynamicFilterSource {
             };
 
             let comparison = Arc::new(BinaryExpr::new(
-                threshold.expr.clone(),
+                Arc::clone(&threshold.expr),
                 op,
                 lit(threshold.value.clone()),
             ));
