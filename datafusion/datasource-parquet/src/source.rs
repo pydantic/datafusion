@@ -533,10 +533,10 @@ impl FileSource for ParquetSource {
 
     fn with_dynamic_filter(
         &self,
-        dynamic_filters: Arc<dyn DynamicFilterSource>,
+        dynamic_filter: Arc<dyn DynamicFilterSource>,
     ) -> Arc<dyn FileSource> {
         let mut conf = self.clone();
-        conf.dynamic_filters.push(dynamic_filters);
+        conf.dynamic_filters.push(dynamic_filter);
         Arc::new(conf)
     }
 
