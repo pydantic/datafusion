@@ -109,15 +109,9 @@ impl FileOpener for ParquetOpener {
         let dynamic_filters = self
             .dynamic_filters
             .iter()
-            .filter_map(|f| {
-                f.current_filters().ok().and_then(|filters| {
-                    if filters.is_empty() {
-                        None
-                    } else {
-                        Some(filters)
-                    }
-                })
-            })
+            .map(|f| f.current_filters())
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
             .flatten()
             .collect::<Vec<_>>();
         // Collect dynamic_filters into a single predicate by reducing with AND

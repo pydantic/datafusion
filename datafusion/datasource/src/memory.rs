@@ -491,14 +491,6 @@ impl DataSource for MemorySourceConfig {
             })
             .transpose()
     }
-
-    fn with_dynamic_filter(
-        &self,
-        _dynamic_filter: Arc<dyn datafusion_physical_plan::DynamicFilterSource>,
-    ) -> Arc<dyn DataSource> {
-        // MemorySourceConfig does not support dynamic filters
-        Arc::new(self.clone())
-    }
 }
 
 impl MemorySourceConfig {

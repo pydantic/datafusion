@@ -531,15 +531,6 @@ impl FileSource for ParquetSource {
         Arc::new(Self { ..self.clone() })
     }
 
-    fn with_dynamic_filter(
-        &self,
-        dynamic_filter: Arc<dyn DynamicFilterSource>,
-    ) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.dynamic_filters.push(dynamic_filter);
-        Arc::new(conf)
-    }
-
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
         &self.metrics
     }

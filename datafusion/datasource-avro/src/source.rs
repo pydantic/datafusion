@@ -220,13 +220,6 @@ impl FileSource for AvroSource {
         Arc::new(conf)
     }
 
-    fn with_dynamic_filter(
-        &self,
-        _dynamic_filter: Arc<dyn datafusion_physical_plan::DynamicFilterSource>,
-    ) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
-    }
-
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
         &self.metrics
     }

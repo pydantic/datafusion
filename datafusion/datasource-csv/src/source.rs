@@ -605,14 +605,6 @@ impl FileSource for CsvSource {
         Arc::new(conf)
     }
 
-    fn with_dynamic_filter(
-        &self,
-        _dynamic_filter: Arc<dyn datafusion_physical_plan::DynamicFilterSource>,
-    ) -> Arc<dyn FileSource> {
-        // AvroSource does not support dynamic filters, so we just return self
-        Arc::new(self.clone())
-    }
-
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
         &self.metrics
     }
