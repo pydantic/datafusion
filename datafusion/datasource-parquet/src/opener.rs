@@ -35,9 +35,9 @@ use datafusion_common::{exec_err, Result};
 use datafusion_physical_expr::expressions::BinaryExpr;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_optimizer::pruning::PruningPredicate;
+use datafusion_physical_plan::dynamic_filters::DynamicFilterSource;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 
-use datafusion_physical_plan::DynamicFilterSource;
 use futures::{StreamExt, TryStreamExt};
 use log::debug;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
