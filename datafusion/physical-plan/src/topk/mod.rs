@@ -155,6 +155,17 @@ impl TopK {
         })
     }
 
+    pub fn dynamic_filter_source(
+        &self,
+    ) -> Arc<dyn DynamicFilterSource> {
+        Arc::new(
+            TopKDynamicFilterSource {
+                heap: StdArc::clone(&self.heap),
+                expr: Arc::clone(&self.expr),
+            }
+        )
+    }
+
     /// Insert `batch`, remembering if any of its values are among
     /// the top k seen so far.
     pub fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
@@ -771,7 +782,22 @@ impl RecordBatchStore {
     }
 }
 
-impl DynamicFilterSource for TopK {
+struct TopKDynamicFilterSource {
+    /// The TopK heap that provides the current filters
+    heap: StdArc<RwLock<TopKHeap>>,
+    /// The sort expressions used to create the TopK
+    expr: Arc<[PhysicalSortExpr]>,
+}
+
+impl std::fmt::Debug for TopKDynamicFilterSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TopKDynamicFilterSource")
+            .field("expr", &self.expr)
+            .finish()
+    }
+}
+
+impl DynamicFilterSource for TopKDynamicFilterSource {
     fn current_filters(&self) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
         let heap_guard = self.heap.read().map_err(|_| {
             DataFusionError::Internal(
@@ -919,7 +945,7 @@ mod tests {
         .unwrap();
 
         // Initially there should be no filters (empty heap)
-        let filters = <TopK as DynamicFilterSource>::current_filters(&topk).unwrap();
+        let filters = topk.dynamic_filter_source().current_filters().unwrap();
         assert_eq!(filters.len(), 0);
 
         // Insert some data to fill the heap
@@ -936,7 +962,7 @@ mod tests {
         topk.insert_batch(batch).unwrap();
 
         // Now there should be a filter
-        let filters = <TopK as DynamicFilterSource>::current_filters(&topk).unwrap();
+        let filters = topk.dynamic_filter_source().current_filters().unwrap();
 
         // We expect a filter for col2 > 6.0 (since we're doing descending sort and have 5 values)
         assert_eq!(filters.len(), 1);

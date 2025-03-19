@@ -22,12 +22,11 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use datafusion_physical_plan::dynamic_filters::DynamicFilterSource;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+    DisplayAs, DisplayFormatType, DynamicFilterSource, ExecutionPlan, PlanProperties
 };
 
 use datafusion_common::config::ConfigOptions;
@@ -79,6 +78,17 @@ pub trait DataSource: Send + Sync + Debug {
         &self,
         _projection: &ProjectionExec,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>>;
+
+    fn supports_dynamic_filter_pushdown(&self) -> bool {
+        false
+    }
+
+    fn push_down_dynamic_filter(
+        &self,
+        _dynamic_filter: Arc<dyn DynamicFilterSource>,
+    ) -> datafusion_common::Result<Option<Arc<dyn DataSource>>> {
+        Ok(None)
+    }
 }
 
 /// [`ExecutionPlan`] handles different file formats like JSON, CSV, AVRO, ARROW, PARQUET
@@ -191,6 +201,22 @@ impl ExecutionPlan for DataSourceExec {
         projection: &ProjectionExec,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         self.data_source.try_swapping_with_projection(projection)
+    }
+
+    fn supports_dynamic_filter_pushdown(&self) -> bool {
+        self.data_source.supports_dynamic_filter_pushdown()
+    }
+
+    fn push_down_dynamic_filter(
+            &self,
+            dynamic_filter: Arc<dyn DynamicFilterSource>,
+        ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
+        if let Some(data_source) = self.data_source.push_down_dynamic_filter(dynamic_filter)? {
+            return Ok(Some(Arc::new(
+                Self { data_source, ..self.clone() }
+            )));
+        }
+        Ok(None)
     }
 }
 
