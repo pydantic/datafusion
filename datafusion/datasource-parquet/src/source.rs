@@ -597,9 +597,9 @@ impl FileSource for ParquetSource {
     }
 
     fn push_down_dynamic_filter(
-            &self,
-            _dynamic_filter: Arc<dyn DynamicFilterSource>,
-        ) -> datafusion_common::Result<Option<Arc<dyn FileSource>>> {
+        &self,
+        _dynamic_filter: Arc<dyn DynamicFilterSource>,
+    ) -> datafusion_common::Result<Option<Arc<dyn FileSource>>> {
         let mut conf = self.clone();
         conf.dynamic_filters.push(_dynamic_filter);
         Ok(Some(Arc::new(conf)))

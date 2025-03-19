@@ -26,7 +26,7 @@ use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, DynamicFilterSource, ExecutionPlan, PlanProperties
+    DisplayAs, DisplayFormatType, DynamicFilterSource, ExecutionPlan, PlanProperties,
 };
 
 use crate::file_scan_config::FileScanConfig;
@@ -209,13 +209,16 @@ impl ExecutionPlan for DataSourceExec {
     }
 
     fn push_down_dynamic_filter(
-            &self,
-            dynamic_filter: Arc<dyn DynamicFilterSource>,
-        ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
-        if let Some(data_source) = self.data_source.push_down_dynamic_filter(dynamic_filter)? {
-            return Ok(Some(Arc::new(
-                Self { data_source, ..self.clone() }
-            )));
+        &self,
+        dynamic_filter: Arc<dyn DynamicFilterSource>,
+    ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
+        if let Some(data_source) =
+            self.data_source.push_down_dynamic_filter(dynamic_filter)?
+        {
+            return Ok(Some(Arc::new(Self {
+                data_source,
+                ..self.clone()
+            })));
         }
         Ok(None)
     }
