@@ -29,7 +29,7 @@ use arrow::datatypes::SchemaRef;
 use datafusion_common::Statistics;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
-use datafusion_physical_plan::DisplayFormatType;
+use datafusion_physical_plan::{DisplayFormatType, DynamicFilterSource};
 
 use object_store::ObjectStore;
 
@@ -52,6 +52,11 @@ pub trait FileSource: Send + Sync {
     fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource>;
     /// Initialize new instance with projection information
     fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource>;
+    /// Add dynamic filters to the file source
+    fn with_dynamic_filter(
+        &self,
+        dynamic_filters: Arc<dyn DynamicFilterSource>,
+    ) -> Arc<dyn FileSource>;
     /// Initialize new instance with projected statistics
     fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource>;
     /// Return execution plan metrics

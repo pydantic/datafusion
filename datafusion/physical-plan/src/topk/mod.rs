@@ -21,22 +21,27 @@ use arrow::{
     compute::interleave,
     row::{RowConverter, Rows, SortField},
 };
+use datafusion_expr::ColumnarValue;
 use std::mem::size_of;
 use std::{cmp::Ordering, collections::BinaryHeap, sync::Arc};
 
+use datafusion_expr::Operator;
+
 use super::metrics::{BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder};
+use crate::dynamic_filters::DynamicFilterSource;
 use crate::spill::get_record_batch_memory_size;
 use crate::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::SchemaRef;
-use datafusion_common::HashMap;
 use datafusion_common::Result;
+use datafusion_common::{internal_err, DataFusionError, HashMap};
 use datafusion_execution::{
     memory_pool::{MemoryConsumer, MemoryReservation},
     runtime_env::RuntimeEnv,
 };
-use datafusion_physical_expr::PhysicalSortExpr;
+use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
+use std::sync::{Arc as StdArc, RwLock};
 
 /// Global TopK
 ///
@@ -89,7 +94,17 @@ pub struct TopK {
     /// scratch space for converting rows
     scratch_rows: Rows,
     /// stores the top k values and their sort key values, in order
-    heap: TopKHeap,
+    heap: StdArc<RwLock<TopKHeap>>,
+}
+
+impl std::fmt::Debug for TopK {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TopK")
+            .field("schema", &self.schema)
+            .field("batch_size", &self.batch_size)
+            .field("expr", &self.expr)
+            .finish()
+    }
 }
 
 impl TopK {
@@ -136,7 +151,7 @@ impl TopK {
             expr,
             row_converter,
             scratch_rows,
-            heap: TopKHeap::new(k, batch_size, schema),
+            heap: StdArc::new(RwLock::new(TopKHeap::new(k, batch_size, schema))),
         })
     }
 
@@ -163,26 +178,32 @@ impl TopK {
         // TODO make this algorithmically better?:
         // Idea: filter out rows >= self.heap.max() early (before passing to `RowConverter`)
         //       this avoids some work and also might be better vectorizable.
-        let mut batch_entry = self.heap.register_batch(batch);
+        let mut heap = self.heap.try_write().map_err(|_| {
+            DataFusionError::Internal(
+                "Failed to acquire write lock on TopK heap".to_string(),
+            )
+        })?;
+        let mut batch_entry = heap.register_batch(batch);
         for (index, row) in rows.iter().enumerate() {
-            match self.heap.max() {
+            match heap.max() {
                 // heap has k items, and the new row is greater than the
                 // current max in the heap ==> it is not a new topk
                 Some(max_row) if row.as_ref() >= max_row.row() => {}
                 // don't yet have k items or new item is lower than the currently k low values
                 None | Some(_) => {
-                    self.heap.add(&mut batch_entry, row, index);
+                    heap.add(&mut batch_entry, row, index);
                     self.metrics.row_replacements.add(1);
                 }
             }
         }
-        self.heap.insert_batch_entry(batch_entry);
+        heap.insert_batch_entry(batch_entry);
 
         // conserve memory
-        self.heap.maybe_compact()?;
+        heap.maybe_compact()?;
 
         // update memory reservation
-        self.reservation.try_resize(self.size())?;
+        let heap_size = heap.size();
+        self.reservation.try_resize(self.size(heap_size))?;
         Ok(())
     }
 
@@ -196,26 +217,57 @@ impl TopK {
             expr: _,
             row_converter: _,
             scratch_rows: _,
-            mut heap,
+            heap,
         } = self;
         let _timer = metrics.baseline.elapsed_compute().timer(); // time updated on drop
 
         // break into record batches as needed
         let mut batches = vec![];
-        if let Some(mut batch) = heap.emit()? {
-            metrics.baseline.output_rows().add(batch.num_rows());
 
-            loop {
-                if batch.num_rows() <= batch_size {
-                    batches.push(Ok(batch));
-                    break;
-                } else {
-                    batches.push(Ok(batch.slice(0, batch_size)));
-                    let remaining_length = batch.num_rows() - batch_size;
-                    batch = batch.slice(batch_size, remaining_length);
+        // Try to get the heap data, using one of two approaches
+        let maybe_heap = match StdArc::try_unwrap(heap.clone()) {
+            Ok(lock) => {
+                // We got exclusive ownership of the heap
+                match lock.into_inner() {
+                    Ok(heap) => Some(heap),
+                    Err(_) => None, // Poisoned lock
                 }
             }
+            Err(_) => {
+                // If we couldn't get ownership, try a write lock and swap
+                let result = heap.write().ok().map(|mut guard| {
+                    // Create a new empty heap and swap it with the current one
+                    let mut empty_heap = TopKHeap::new(
+                        guard.k(),
+                        guard.batch_size(),
+                        Arc::clone(guard.store.schema()),
+                    );
+                    std::mem::swap(&mut *guard, &mut empty_heap);
+                    // Return the heap we swapped out
+                    empty_heap
+                });
+                result
+            }
         };
+
+        // Process the heap if we obtained it successfully
+        if let Some(mut heap) = maybe_heap {
+            if let Some(mut batch) = heap.emit()? {
+                metrics.baseline.output_rows().add(batch.num_rows());
+
+                loop {
+                    if batch.num_rows() <= batch_size {
+                        batches.push(Ok(batch));
+                        break;
+                    } else {
+                        batches.push(Ok(batch.slice(0, batch_size)));
+                        let remaining_length = batch.num_rows() - batch_size;
+                        batch = batch.slice(batch_size, remaining_length);
+                    }
+                }
+            }
+        }
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
             futures::stream::iter(batches),
@@ -223,11 +275,11 @@ impl TopK {
     }
 
     /// return the size of memory used by this operator, in bytes
-    fn size(&self) -> usize {
+    fn size(&self, heap_size: usize) -> usize {
         size_of::<Self>()
             + self.row_converter.size()
             + self.scratch_rows.size()
-            + self.heap.size()
+            + heap_size
     }
 }
 
@@ -270,8 +322,20 @@ struct TopKHeap {
     owned_bytes: usize,
 }
 
+/// Holds threshold value and sort order information for a column
+struct ColumnThreshold {
+    /// The column expression
+    pub expr: Arc<dyn PhysicalExpr>,
+    /// The threshold value
+    pub value: datafusion_common::ScalarValue,
+    /// Whether the sort order is descending
+    pub is_descending: bool,
+    /// Whether nulls should be sorted first
+    pub nulls_first: bool,
+}
+
 impl TopKHeap {
-    fn new(k: usize, batch_size: usize, schema: SchemaRef) -> Self {
+    pub fn new(k: usize, batch_size: usize, schema: SchemaRef) -> Self {
         assert!(k > 0);
         Self {
             k,
@@ -280,6 +344,69 @@ impl TopKHeap {
             store: RecordBatchStore::new(schema),
             owned_bytes: 0,
         }
+    }
+
+    /// Returns the max k value that the heap is currently configured to store.
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Returns the batch size value.
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// Get threshold values for all columns in the given sort expressions.
+    /// If the heap does not yet have k items, returns None.
+    /// Otherwise, returns the threshold values from the max row in the heap.
+    pub fn get_threshold_values(
+        &self,
+        sort_exprs: &[PhysicalSortExpr],
+    ) -> Result<Option<Vec<ColumnThreshold>>> {
+        // If the heap doesn't have k elements yet, we can't create thresholds
+        let max_row = match self.max() {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+
+        // Get the batch that contains the max row
+        let batch_entry = match self.store.get(max_row.batch_id) {
+            Some(entry) => entry,
+            None => return internal_err!("Invalid batch ID in TopKRow"),
+        };
+
+        // Extract threshold values for each sort expression
+        let mut thresholds = Vec::with_capacity(sort_exprs.len());
+        for sort_expr in sort_exprs {
+            // Extract the value for this column from the max row
+            let expr = Arc::clone(&sort_expr.expr);
+            let value = expr.evaluate(&batch_entry.batch.slice(max_row.index, 1))?;
+
+            // Convert to scalar value - should be a single value since we're evaluating on a single row batch
+            let scalar = match value {
+                ColumnarValue::Scalar(scalar) => scalar,
+                ColumnarValue::Array(array) if array.len() == 1 => {
+                    // Extract the first (and only) value from the array
+                    datafusion_common::ScalarValue::try_from_array(&array, 0)?
+                }
+                array => {
+                    return internal_err!("Expected a scalar value, got {:?}", array)
+                }
+            };
+
+            // Get sort options
+            let is_descending = sort_expr.options.descending;
+            let nulls_first = sort_expr.options.nulls_first;
+
+            thresholds.push(ColumnThreshold {
+                expr,
+                value: scalar,
+                is_descending,
+                nulls_first,
+            });
+        }
+
+        Ok(Some(thresholds))
     }
 
     /// Register a [`RecordBatch`] with the heap, returning the
@@ -297,7 +424,7 @@ impl TopKHeap {
     /// Returns the largest value stored by the heap if there are k
     /// items, otherwise returns None. Remember this structure is
     /// keeping the "smallest" k values
-    fn max(&self) -> Option<&TopKRow> {
+    pub fn max(&self) -> Option<&TopKRow> {
         if self.inner.len() < self.k {
             None
         } else {
@@ -509,7 +636,7 @@ impl TopKRow {
     }
 
     /// Returns a slice to the owned row value
-    fn row(&self) -> &[u8] {
+    pub fn row(&self) -> &[u8] {
         self.row.as_slice()
     }
 }
@@ -529,7 +656,7 @@ impl Ord for TopKRow {
 }
 
 #[derive(Debug)]
-struct RecordBatchEntry {
+pub struct RecordBatchEntry {
     id: u32,
     batch: RecordBatch,
     // for this batch, how many times has it been used
@@ -644,10 +771,87 @@ impl RecordBatchStore {
     }
 }
 
+impl DynamicFilterSource for TopK {
+    fn current_filters(&self) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
+        let heap_guard = self.heap.read().map_err(|_| {
+            DataFusionError::Internal(
+                "Failed to acquire read lock on TopK heap".to_string(),
+            )
+        })?;
+
+        // Get the threshold values for all sort expressions
+        let Some(thresholds) = heap_guard.get_threshold_values(&self.expr)? else {
+            return Ok(vec![]); // No thresholds available yet
+        };
+
+        // Create filter expressions for each threshold
+        let mut filters: Vec<Arc<dyn PhysicalExpr>> =
+            Vec::with_capacity(thresholds.len());
+
+        for threshold in thresholds {
+            // Skip null threshold values - can't create a meaningful filter
+            if threshold.value.is_null() {
+                continue;
+            }
+
+            // Create the appropriate operator based on sort order
+            let op = if threshold.is_descending {
+                // For descending sort, we want col > threshold (exclude smaller values)
+                Operator::Gt
+            } else {
+                // For ascending sort, we want col < threshold (exclude larger values)
+                Operator::Lt
+            };
+
+            // Special handling for NULLs - if nulls_first is opposite of the sort direction,
+            // we need to add IS NOT NULL to ensure we don't include nulls
+            let include_nulls = threshold.nulls_first == threshold.is_descending;
+
+            // Create a comparison expression using the Column and the threshold value
+            use datafusion_physical_expr::expressions::{binary, is_not_null, lit};
+
+            // We need the schema to create binary expressions
+            // For testing purposes, create a minimal schema with just the column we need
+            use arrow::datatypes::{DataType, Field, Schema};
+            let schema = &Schema::new(vec![Field::new(
+                "value",
+                match &threshold.value {
+                    datafusion_common::ScalarValue::Float64(_) => DataType::Float64,
+                    datafusion_common::ScalarValue::Int32(_) => DataType::Int32,
+                    _ => DataType::Utf8, // Default to string type for other values
+                },
+                true,
+            )]);
+
+            let comparison = binary(
+                threshold.expr.clone(),
+                op,
+                lit(threshold.value.clone()),
+                schema,
+            )?;
+
+            // If nulls would be captured by the filter but shouldn't be, add IS NOT NULL
+            if !include_nulls {
+                let not_null = is_not_null(threshold.expr.clone())?;
+
+                // Combine with AND
+                let combined = binary(comparison, Operator::And, not_null, schema)?;
+
+                filters.push(combined);
+            } else {
+                filters.push(comparison);
+            }
+        }
+
+        Ok(filters)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::{Float64Array, Int32Array, RecordBatch};
+    use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema};
 
     /// This test ensures the size calculation is correct for RecordBatches with multiple columns.
@@ -680,5 +884,61 @@ mod tests {
         // when unuse record batch entry
         record_batch_store.unuse(0);
         assert_eq!(record_batch_store.batches_size, 0);
+    }
+
+    #[test]
+    fn test_topk_as_dynamic_filter_source() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col1", DataType::Int32, true),
+            Field::new("col2", DataType::Float64, false),
+        ]));
+
+        let runtime = Arc::new(RuntimeEnv::default());
+        let metrics = ExecutionPlanMetricsSet::new();
+
+        // Create a TopK with descending sort on col2
+        let sort_expr = vec![PhysicalSortExpr {
+            expr: Arc::new(datafusion_physical_expr::expressions::Column::new(
+                "col2", 1,
+            )),
+            options: SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        }];
+
+        let mut topk = TopK::try_new(
+            0,
+            Arc::clone(&schema),
+            sort_expr.into(),
+            5,   // k=5
+            100, // batch_size
+            runtime,
+            &metrics,
+        )
+        .unwrap();
+
+        // Initially there should be no filters (empty heap)
+        let filters = <TopK as DynamicFilterSource>::current_filters(&topk).unwrap();
+        assert_eq!(filters.len(), 0);
+
+        // Insert some data to fill the heap
+        let col1 = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let col2 =
+            Float64Array::from(vec![10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0]);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(col1), Arc::new(col2)],
+        )
+        .unwrap();
+
+        // Insert the data into TopK
+        topk.insert_batch(batch).unwrap();
+
+        // Now there should be a filter
+        let filters = <TopK as DynamicFilterSource>::current_filters(&topk).unwrap();
+
+        // We expect a filter for col2 > 6.0 (since we're doing descending sort and have 5 values)
+        assert_eq!(filters.len(), 1);
     }
 }

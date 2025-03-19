@@ -32,10 +32,12 @@ use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use datafusion_common::{exec_err, Result};
+use datafusion_physical_expr::expressions::BinaryExpr;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_optimizer::pruning::PruningPredicate;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 
+use datafusion_physical_plan::DynamicFilterSource;
 use futures::{StreamExt, TryStreamExt};
 use log::debug;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -54,6 +56,8 @@ pub(super) struct ParquetOpener {
     pub limit: Option<usize>,
     /// Optional predicate to apply during the scan
     pub predicate: Option<Arc<dyn PhysicalExpr>>,
+    /// Optional sources for dynamic filtes (e.g. joins, top-k filters)
+    pub dynamic_filters: Vec<Arc<dyn DynamicFilterSource>>,
     /// Optional pruning predicate applied to row group statistics
     pub pruning_predicate: Option<Arc<PruningPredicate>>,
     /// Optional pruning predicate applied to data page statistics
@@ -102,13 +106,42 @@ impl FileOpener for ParquetOpener {
 
         let batch_size = self.batch_size;
 
+        let dynamic_filters = self
+            .dynamic_filters
+            .iter()
+            .filter_map(|f| {
+                f.current_filters().ok().and_then(|filters| {
+                    if filters.is_empty() {
+                        None
+                    } else {
+                        Some(filters)
+                    }
+                })
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        // Collect dynamic_filters into a single predicate by reducing with AND
+        let dynamic_predicate = dynamic_filters.into_iter().reduce(|a, b| {
+            Arc::new(BinaryExpr::new(a, datafusion_expr::Operator::And, b))
+        });
+        let predicate = self.predicate.clone();
+        let predicate = match (predicate, dynamic_predicate) {
+            (Some(p), None) => Some(p),
+            (None, Some(d)) => Some(d),
+            (Some(p), Some(d)) => Some(Arc::new(BinaryExpr::new(
+                p,
+                datafusion_expr::Operator::And,
+                d,
+            )) as Arc<dyn PhysicalExpr>),
+            (None, None) => None,
+        };
+
         let projected_schema =
             SchemaRef::from(self.table_schema.project(&self.projection)?);
         let schema_adapter_factory = Arc::clone(&self.schema_adapter_factory);
         let schema_adapter = self
             .schema_adapter_factory
             .create(projected_schema, Arc::clone(&self.table_schema));
-        let predicate = self.predicate.clone();
         let pruning_predicate = self.pruning_predicate.clone();
         let page_pruning_predicate = self.page_pruning_predicate.clone();
         let table_schema = Arc::clone(&self.table_schema);

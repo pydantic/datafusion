@@ -59,6 +59,13 @@ impl FileSource for MockSource {
         Arc::new(Self { ..self.clone() })
     }
 
+    fn with_dynamic_filter(
+        &self,
+        _dynamic_filters: Arc<dyn datafusion_physical_plan::DynamicFilterSource>,
+    ) -> Arc<dyn FileSource> {
+        Arc::new(Self { ..self.clone() })
+    }
+
     fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
         let mut source = self.clone();
         source.projected_statistics = Some(statistics);
