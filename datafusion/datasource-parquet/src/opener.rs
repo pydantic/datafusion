@@ -118,6 +118,7 @@ impl FileOpener for ParquetOpener {
         let dynamic_predicate = dynamic_filters.into_iter().reduce(|a, b| {
             Arc::new(BinaryExpr::new(a, datafusion_expr::Operator::And, b))
         });
+        // TODO: need to recalculate page and row group pruning predicates to include dynamic filters
         let predicate = self.predicate.clone();
         let predicate = match (predicate, dynamic_predicate) {
             (Some(p), None) => Some(p),

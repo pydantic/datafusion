@@ -18,8 +18,8 @@
 //! TopK: Combination of Sort / LIMIT
 
 use std::mem::size_of;
-use std::sync::{Arc as StdArc, RwLock};
-use std::{cmp::Ordering, collections::BinaryHeap, sync::Arc};
+use std::sync::{Arc, RwLock};
+use std::{cmp::Ordering, collections::BinaryHeap};
 
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::SchemaRef;
@@ -96,7 +96,7 @@ pub struct TopK {
     /// scratch space for converting rows
     scratch_rows: Rows,
     /// stores the top k values and their sort key values, in order
-    heap: StdArc<RwLock<TopKHeap>>,
+    heap: Arc<RwLock<TopKHeap>>,
 }
 
 impl std::fmt::Debug for TopK {
@@ -153,13 +153,13 @@ impl TopK {
             expr,
             row_converter,
             scratch_rows,
-            heap: StdArc::new(RwLock::new(TopKHeap::new(k, batch_size, schema))),
+            heap: Arc::new(RwLock::new(TopKHeap::new(k, batch_size, schema))),
         })
     }
 
     pub fn dynamic_filter_source(&self) -> Arc<dyn DynamicFilterSource> {
         Arc::new(TopKDynamicFilterSource {
-            heap: StdArc::clone(&self.heap),
+            heap: Arc::clone(&self.heap),
             expr: Arc::clone(&self.expr),
         })
     }
@@ -232,51 +232,23 @@ impl TopK {
 
         // break into record batches as needed
         let mut batches = vec![];
+        let mut heap = heap
+            .write()
+            .map_err(|_| DataFusionError::Internal("Failed to acquire write lock on TopK heap".to_string()))?;
+        if let Some(mut batch) = heap.emit()? {
+            metrics.baseline.output_rows().add(batch.num_rows());
 
-        // Try to get the heap data, using one of two approaches
-        let maybe_heap = match StdArc::try_unwrap(Arc::clone(&heap)) {
-            Ok(lock) => {
-                // We got exclusive ownership of the heap
-                match lock.into_inner() {
-                    Ok(heap) => Some(heap),
-                    Err(_) => None, // Poisoned lock
+            loop {
+                if batch.num_rows() <= batch_size {
+                    batches.push(Ok(batch));
+                    break;
+                } else {
+                    batches.push(Ok(batch.slice(0, batch_size)));
+                    let remaining_length = batch.num_rows() - batch_size;
+                    batch = batch.slice(batch_size, remaining_length);
                 }
-            }
-            Err(_) => {
-                // If we couldn't get ownership, try a write lock and swap
-                let result = heap.write().ok().map(|mut guard| {
-                    // Create a new empty heap and swap it with the current one
-                    let mut empty_heap = TopKHeap::new(
-                        guard.k(),
-                        guard.batch_size(),
-                        Arc::clone(guard.store.schema()),
-                    );
-                    std::mem::swap(&mut *guard, &mut empty_heap);
-                    // Return the heap we swapped out
-                    empty_heap
-                });
-                result
             }
         };
-
-        // Process the heap if we obtained it successfully
-        if let Some(mut heap) = maybe_heap {
-            if let Some(mut batch) = heap.emit()? {
-                metrics.baseline.output_rows().add(batch.num_rows());
-
-                loop {
-                    if batch.num_rows() <= batch_size {
-                        batches.push(Ok(batch));
-                        break;
-                    } else {
-                        batches.push(Ok(batch.slice(0, batch_size)));
-                        let remaining_length = batch.num_rows() - batch_size;
-                        batch = batch.slice(batch_size, remaining_length);
-                    }
-                }
-            }
-        }
-
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
             futures::stream::iter(batches),
@@ -351,16 +323,6 @@ impl TopKHeap {
             store: RecordBatchStore::new(schema),
             owned_bytes: 0,
         }
-    }
-
-    /// Returns the max k value that the heap is currently configured to store.
-    pub fn k(&self) -> usize {
-        self.k
-    }
-
-    /// Returns the batch size value.
-    pub fn batch_size(&self) -> usize {
-        self.batch_size
     }
 
     /// Get threshold values for all columns in the given sort expressions.
@@ -775,7 +737,7 @@ impl RecordBatchStore {
 
 struct TopKDynamicFilterSource {
     /// The TopK heap that provides the current filters
-    heap: StdArc<RwLock<TopKHeap>>,
+    heap: Arc<RwLock<TopKHeap>>,
     /// The sort expressions used to create the TopK
     expr: Arc<[PhysicalSortExpr]>,
 }
