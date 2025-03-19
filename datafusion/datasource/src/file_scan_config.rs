@@ -313,6 +313,17 @@ impl DataSource for FileScanConfig {
                 .build() as _
         }))
     }
+
+    fn with_dynamic_filter(
+        &self,
+        dynamic_filters: Vec<Arc<dyn datafusion_physical_expr::PhysicalExpr>>,
+    ) -> Arc<dyn DataSource> {
+        file_source = self.file_source.with_dynamic_filter(dynamic_filters);
+        Arc::new(Self {
+            file_source,
+            ..self.clone()
+        })
+    }
 }
 
 impl FileScanConfig {
