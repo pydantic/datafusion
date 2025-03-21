@@ -26,15 +26,15 @@ use crate::{
     apply_file_schema_type_coercions, row_filter, should_enable_page_index,
     ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
 };
-use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter};
 use datafusion_datasource::file_meta::FileMeta;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
-use datafusion_common::{exec_err, Result, SchemaError};
-use datafusion_physical_expr::expressions::{BinaryExpr, Column};
+use datafusion_common::{exec_err, Result};
+use datafusion_physical_expr::expressions::{lit, BinaryExpr, Column};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_optimizer::pruning::PruningPredicate;
 use datafusion_physical_plan::dynamic_filters::DynamicFilterSource;
@@ -187,16 +187,16 @@ impl FileOpener for ParquetOpener {
             if let Some(predicate) = predicate.as_ref() {
                 let mut filter_schema_builder: FilterSchemaBuilder<'_> =
                     FilterSchemaBuilder::new(&file_schema, &table_schema);
-                predicate.visit(&mut filter_schema_builder)?;
+                let predicate = Arc::clone(&predicate).rewrite(&mut filter_schema_builder).data()?;
                 let filter_schema = filter_schema_builder.build();
 
                 pruning_predicate = build_pruning_predicate(
-                    Arc::clone(predicate),
+                    Arc::clone(&predicate),
                     &filter_schema,
                     &predicate_creation_errors,
                 );
                 page_pruning_predicate =
-                    Some(build_page_pruning_predicate(predicate, &filter_schema));
+                    Some(build_page_pruning_predicate(&predicate, &filter_schema));
             }
 
             let (schema_mapping, adapted_projections) =
@@ -426,47 +426,29 @@ impl<'schema> FilterSchemaBuilder<'schema> {
     }
 }
 
-impl<'node> TreeNodeVisitor<'node> for FilterSchemaBuilder<'_> {
+impl<'node> TreeNodeRewriter for FilterSchemaBuilder<'_> {
     type Node = Arc<dyn PhysicalExpr>;
 
     fn f_down(
         &mut self,
-        node: &'node Arc<dyn PhysicalExpr>,
-    ) -> Result<TreeNodeRecursion> {
+        node: Arc<dyn PhysicalExpr>,
+    ) -> Result<Transformed<Self::Node>> {
         if let Some(column) = node.as_any().downcast_ref::<Column>() {
             if let Ok(field) = self.table_schema.field_with_name(column.name()) {
                 self.filter_schema_fields.insert(Arc::new(field.clone()));
             } else if let Ok(field) = self.file_schema.field_with_name(column.name()) {
                 self.filter_schema_fields.insert(Arc::new(field.clone()));
             } else {
-                // valid fields are the table schema's fields + the file schema's fields, preferring the table schema's fields when there is a conflict
-                let mut valid_fields = self
-                    .table_schema
-                    .fields()
-                    .iter()
-                    .chain(self.file_schema.fields().iter())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                FilterSchemaBuilder::sort_fields(
-                    &mut valid_fields,
-                    self.table_schema,
-                    self.file_schema,
-                );
-                let valid_fields = valid_fields
-                    .into_iter()
-                    .map(|f| datafusion_common::Column::new_unqualified(f.name()))
-                    .collect();
-                let field = datafusion_common::Column::new_unqualified(column.name());
-                return Err(datafusion_common::DataFusionError::SchemaError(
-                    SchemaError::FieldNotFound {
-                        field: Box::new(field),
-                        valid_fields,
-                    },
-                    Box::new(None),
+                // If it's not in either schema it must be a partition column
+                // (as in a column generated from hive partitioning) so we ignore it by:
+                // - Not adding it to the filter schema
+                // - Rewriting the filter to `true` so it doesn't affect the pruning
+                return Ok(Transformed::yes(
+                    lit(true)
                 ));
             }
         }
 
-        Ok(TreeNodeRecursion::Continue)
+        Ok(Transformed::no(node))
     }
 }
