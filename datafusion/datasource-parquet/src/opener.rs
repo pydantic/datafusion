@@ -26,7 +26,9 @@ use crate::{
     apply_file_schema_type_coercions, row_filter, should_enable_page_index,
     ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
 };
-use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter};
+use datafusion_common::tree_node::{
+    Transformed, TransformedResult, TreeNode, TreeNodeRewriter,
+};
 use datafusion_datasource::file_meta::FileMeta;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
@@ -187,7 +189,9 @@ impl FileOpener for ParquetOpener {
             if let Some(predicate) = predicate.as_ref() {
                 let mut filter_schema_builder: FilterSchemaBuilder<'_> =
                     FilterSchemaBuilder::new(&file_schema, &table_schema);
-                let predicate = Arc::clone(&predicate).rewrite(&mut filter_schema_builder).data()?;
+                let predicate = Arc::clone(&predicate)
+                    .rewrite(&mut filter_schema_builder)
+                    .data()?;
                 let filter_schema = filter_schema_builder.build();
 
                 pruning_predicate = build_pruning_predicate(
@@ -429,10 +433,7 @@ impl<'schema> FilterSchemaBuilder<'schema> {
 impl<'node> TreeNodeRewriter for FilterSchemaBuilder<'_> {
     type Node = Arc<dyn PhysicalExpr>;
 
-    fn f_down(
-        &mut self,
-        node: Arc<dyn PhysicalExpr>,
-    ) -> Result<Transformed<Self::Node>> {
+    fn f_down(&mut self, node: Arc<dyn PhysicalExpr>) -> Result<Transformed<Self::Node>> {
         if let Some(column) = node.as_any().downcast_ref::<Column>() {
             if let Ok(field) = self.table_schema.field_with_name(column.name()) {
                 self.filter_schema_fields.insert(Arc::new(field.clone()));
@@ -443,9 +444,7 @@ impl<'node> TreeNodeRewriter for FilterSchemaBuilder<'_> {
                 // (as in a column generated from hive partitioning) so we ignore it by:
                 // - Not adding it to the filter schema
                 // - Rewriting the filter to `true` so it doesn't affect the pruning
-                return Ok(Transformed::yes(
-                    lit(true)
-                ));
+                return Ok(Transformed::yes(lit(true)));
             }
         }
 
