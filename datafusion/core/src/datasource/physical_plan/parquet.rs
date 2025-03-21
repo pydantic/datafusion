@@ -2025,7 +2025,7 @@ mod tests {
 
         let ctx = SessionContext::new();
         let opt = ListingOptions::new(Arc::new(ParquetFormat::default()))
-        .with_table_partition_cols(vec![("file_id".to_string(), DataType::UInt32)])
+            .with_table_partition_cols(vec![("file_id".to_string(), DataType::UInt32)])
             // We need to force 1 partition because TopK predicate pushdown happens on a per-partition basis
             // If we had 1 file per partition (as an example) no pushdown would happen
             .with_target_partitions(1);
