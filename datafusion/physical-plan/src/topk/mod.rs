@@ -36,7 +36,8 @@ use datafusion_execution::{
 };
 use datafusion_expr::ColumnarValue;
 use datafusion_expr::Operator;
-use datafusion_physical_expr::expressions::{lit, BinaryExpr};
+use datafusion_expr::Operator::Or;
+use datafusion_physical_expr::expressions::{is_not_null, is_null, lit, BinaryExpr};
 use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
@@ -770,11 +771,6 @@ impl DynamicFilterSource for TopKDynamicFilterSource {
             Vec::with_capacity(thresholds.len());
 
         for threshold in thresholds {
-            // Skip null threshold values - can't create a meaningful filter
-            if threshold.value.is_null() {
-                continue;
-            }
-
             // Create the appropriate operator based on sort order
             let op = if threshold.sort_options.descending {
                 // For descending sort, we want col > threshold (exclude smaller values)
@@ -790,8 +786,28 @@ impl DynamicFilterSource for TopKDynamicFilterSource {
                 lit(threshold.value.clone()),
             ));
 
-            // TODO: handle nulls first/last?
-            filters.push(comparison);
+            let predicate = if threshold.sort_options.nulls_first {
+                // For nulls first, transform to (threshold.value is not null) and (threshold.expr is null or comparison)
+                if threshold.value.is_null() {
+                    lit(false)
+                } else {
+                    Arc::new(BinaryExpr::new(
+                        is_null(Arc::clone(&threshold.expr))?,
+                        Or,
+                        comparison,
+                    ))
+                }
+            } else {
+                // For nulls last, transform to (threshold.value is null and threshold.expr is not null)
+                // or (threshold.value is not null and comparison)
+                if threshold.value.is_null() {
+                    is_not_null(Arc::clone(&threshold.expr))?
+                } else {
+                    comparison
+                }
+            };
+
+            filters.push(predicate);
         }
 
         Ok(filters)
