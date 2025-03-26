@@ -738,6 +738,41 @@ impl RecordBatchStore {
     }
 }
 
+/// Pushdown of dynamic fitlers from TopK operators is used to speed up queries
+/// such as `SELECT * FROM table ORDER BY col DESC LIMIT 10` by pushing down the
+/// threshold values for the sort columns to the data source.
+/// That is, the TopK operator will keep track of the top 10 values for the sort
+/// and before a new file is opened it's statitics will be checked against the
+/// threshold values to determine if the file can be skipped and predicate pushdown
+/// will use these to skip rows during the scan.
+/// 
+/// For example, imagine this data gets created if multiple sources with clock skews,
+/// network delays, etc. are writing data and you don't do anything fancy to guarantee
+/// perfect sorting by `timestamp` (i.e. you naively write out the data to Parquet, maybe do some compaction, etc.).
+/// The point is that 99% of yesterday's files have a `timestamp` smaller than 99% of today's files
+/// but there may be a couple seconds of overlap between files.
+/// To be concrete, let's say this is our data:
+//
+// | file | min | max |
+// |------|-----|-----|
+// | 1    | 1   | 10  |
+// | 2    | 9   | 19  |
+// | 3    | 20  | 31  |
+// | 4    | 30  | 35  |
+//
+// Ideally a [`TableProvider`] is able to use file level stats or other methods to roughly order the files
+// within each partition / file group such that we start with the newest / largest `timestamp`s.
+// If this is not possible the optimization still works but is less efficient and harder to visualize,
+// so for this example let's assume that we process 1 file at a time and we started with file 4.
+// After processing file 4 let's say we have 10 values in our TopK heap, the smallest of which is 30.
+// The TopK operator will then push down the filter `timestamp < 30` down the tree of [`ExecutionPlan`]s
+// and if the data source supports dynamic filter pushdown it will accept a reference to this [`DynamicFilterSource`]
+// and when it goes to open file 3 it will ask the [`DynamicFilterSource`] for the current filters.
+// Since file 3 may contain values larger than 30 we cannot skip it entirely,
+// but scanning it may still be more efficient due to page pruning and other optimizations.
+// Once we get to file 2 however we can skip it entirely because we know that all values in file 2 are smaller than 30.
+// The same goes for file 1.
+// So this optimization just saved us 50% of the work of scanning the data.
 struct TopKDynamicFilterSource {
     /// The TopK heap that provides the current filters
     heap: Arc<RwLock<TopKHeap>>,

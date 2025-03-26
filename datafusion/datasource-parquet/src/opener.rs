@@ -189,7 +189,7 @@ impl FileOpener for ParquetOpener {
             if let Some(predicate) = predicate.as_ref() {
                 let mut filter_schema_builder: FilterSchemaBuilder<'_> =
                     FilterSchemaBuilder::new(&file_schema, &table_schema);
-                let predicate = Arc::clone(&predicate)
+                let predicate = Arc::clone(predicate)
                     .rewrite(&mut filter_schema_builder)
                     .data()?;
                 let filter_schema = filter_schema_builder.build();
@@ -430,7 +430,7 @@ impl<'schema> FilterSchemaBuilder<'schema> {
     }
 }
 
-impl<'node> TreeNodeRewriter for FilterSchemaBuilder<'_> {
+impl TreeNodeRewriter for FilterSchemaBuilder<'_> {
     type Node = Arc<dyn PhysicalExpr>;
 
     fn f_down(&mut self, node: Arc<dyn PhysicalExpr>) -> Result<Transformed<Self::Node>> {
