@@ -389,10 +389,9 @@ impl ExecutionPlan for FilterExec {
             std::iter::once(Arc::clone(&self.predicate)).chain(
                 self.dynamic_filter_sources
                     .iter()
-                    .map(|source| source.current_filters())
-                    .flatten()
-                    .flatten()
-            )
+                    .flat_map(|source| source.current_filters())
+                    .flatten(),
+            ),
         );
         Ok(Box::pin(FilterExecStream {
             schema: self.schema(),
@@ -457,22 +456,31 @@ impl ExecutionPlan for FilterExec {
         dynamic_filter: Arc<dyn crate::DynamicFilterSource>,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if self.input.supports_dynamic_filter_pushdown() {
-            if let Some(input) = self.input.push_down_dynamic_filter(dynamic_filter.clone())? {
-                return Ok(
-                    Some(Arc::new(Self {
-                        input,
-                        dynamic_filter_sources: self.dynamic_filter_sources.iter().cloned().chain(Some(dynamic_filter)).collect(),
-                        ..self.clone()
-                    }))
-                )
+            if let Some(input) = self
+                .input
+                .push_down_dynamic_filter(Arc::clone(&dynamic_filter))?
+            {
+                return Ok(Some(Arc::new(Self {
+                    input,
+                    dynamic_filter_sources: self
+                        .dynamic_filter_sources
+                        .iter()
+                        .cloned()
+                        .chain(Some(dynamic_filter))
+                        .collect(),
+                    ..self.clone()
+                })));
             }
         }
-        Ok(
-            Some(Arc::new(Self {
-                dynamic_filter_sources: self.dynamic_filter_sources.iter().cloned().chain(Some(dynamic_filter)).collect(),
-                ..self.clone()
-            }))
-        )
+        Ok(Some(Arc::new(Self {
+            dynamic_filter_sources: self
+                .dynamic_filter_sources
+                .iter()
+                .cloned()
+                .chain(Some(dynamic_filter))
+                .collect(),
+            ..self.clone()
+        })))
     }
 }
 
