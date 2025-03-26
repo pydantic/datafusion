@@ -36,7 +36,6 @@ use datafusion_execution::{
 };
 use datafusion_expr::ColumnarValue;
 use datafusion_expr::Operator;
-use datafusion_expr::Operator::Or;
 use datafusion_physical_expr::expressions::{is_not_null, is_null, lit, BinaryExpr};
 use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -745,7 +744,7 @@ impl RecordBatchStore {
 /// and before a new file is opened it's statitics will be checked against the
 /// threshold values to determine if the file can be skipped and predicate pushdown
 /// will use these to skip rows during the scan.
-/// 
+///
 /// For example, imagine this data gets created if multiple sources with clock skews,
 /// network delays, etc. are writing data and you don't do anything fancy to guarantee
 /// perfect sorting by `timestamp` (i.e. you naively write out the data to Parquet, maybe do some compaction, etc.).
@@ -805,6 +804,7 @@ impl DynamicFilterSource for TopKDynamicFilterSource {
         let mut filters: Vec<Arc<dyn PhysicalExpr>> =
             Vec::with_capacity(thresholds.len());
 
+        let mut prev_sort_expr: Option<Arc<dyn PhysicalExpr>> = None;
         for threshold in thresholds {
             // Create the appropriate operator based on sort order
             let op = if threshold.sort_options.descending {
@@ -815,37 +815,73 @@ impl DynamicFilterSource for TopKDynamicFilterSource {
                 Operator::Lt
             };
 
+            let value_null = threshold.value.is_null();
+
             let comparison = Arc::new(BinaryExpr::new(
                 Arc::clone(&threshold.expr),
                 op,
                 lit(threshold.value.clone()),
             ));
 
-            let predicate = if threshold.sort_options.nulls_first {
-                // For nulls first, transform to (threshold.value is not null) and (threshold.expr is null or comparison)
-                if threshold.value.is_null() {
-                    lit(false)
-                } else {
-                    Arc::new(BinaryExpr::new(
+            let comparison_with_null =
+                match (threshold.sort_options.nulls_first, value_null) {
+                    // For nulls first, transform to (threshold.value is not null) and (threshold.expr is null or comparison)
+                    (true, true) => lit(false),
+                    (true, false) => Arc::new(BinaryExpr::new(
                         is_null(Arc::clone(&threshold.expr))?,
-                        Or,
+                        Operator::Or,
                         comparison,
-                    ))
-                }
-            } else {
-                // For nulls last, transform to (threshold.value is null and threshold.expr is not null)
-                // or (threshold.value is not null and comparison)
-                if threshold.value.is_null() {
-                    is_not_null(Arc::clone(&threshold.expr))?
-                } else {
-                    comparison
-                }
-            };
+                    )),
+                    // For nulls last, transform to (threshold.value is null and threshold.expr is not null)
+                    // or (threshold.value is not null and comparison)
+                    (false, true) => is_not_null(Arc::clone(&threshold.expr))?,
+                    (false, false) => comparison,
+                };
 
-            filters.push(predicate);
+            let mut eq_expr = Arc::new(BinaryExpr::new(
+                Arc::clone(&threshold.expr),
+                Operator::Eq,
+                lit(threshold.value.clone()),
+            ));
+
+            if value_null {
+                eq_expr = Arc::new(BinaryExpr::new(
+                    is_null(Arc::clone(&threshold.expr))?,
+                    Operator::Or,
+                    eq_expr,
+                ));
+            }
+
+            // For a query like order by a, b, the filter for column `b` is only applied if
+            // the condition a = threshold.value (considering null equality) is met.
+            // Therefore, we add equality predicates for all preceding fields to the filter logic of the current field,
+            // and include the current field's equality predicate in `prev_sort_expr` for use with subsequent fields.
+            match prev_sort_expr.take() {
+                None => {
+                    prev_sort_expr = Some(eq_expr);
+                    filters.push(comparison_with_null);
+                }
+                Some(p) => {
+                    filters.push(Arc::new(BinaryExpr::new(
+                        Arc::clone(&p),
+                        Operator::And,
+                        comparison_with_null,
+                    )));
+
+                    prev_sort_expr =
+                        Some(Arc::new(BinaryExpr::new(p, Operator::And, eq_expr)));
+                }
+            }
         }
 
-        Ok(filters)
+        let dynamic_predicate = filters
+            .into_iter()
+            .reduce(|a, b| Arc::new(BinaryExpr::new(a, Operator::Or, b)));
+
+        match dynamic_predicate {
+            None => Ok(vec![]),
+            Some(p) => Ok(vec![p]),
+        }
     }
 }
 

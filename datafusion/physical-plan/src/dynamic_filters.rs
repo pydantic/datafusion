@@ -24,7 +24,7 @@ use datafusion_physical_expr::PhysicalExpr;
 ///
 /// During query execution, operators implementing this trait can provide
 /// filter expressions that other operators can use to dynamically prune data.
-/// 
+///
 /// See [`TopKDynamicFilterSource`] for examples.
 pub trait DynamicFilterSource: Send + Sync + std::fmt::Debug + 'static {
     /// Returns a list of filter expressions that can be used for dynamic pruning.

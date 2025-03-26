@@ -1841,12 +1841,24 @@ mod tests {
             ],
         )
         .unwrap();
-        let file = File::create(file).unwrap();
-        let w_opt = WriterProperties::builder().build();
-        let mut writer = ArrowWriter::try_new(file, schema, Some(w_opt)).unwrap();
-        writer.write(&batch).unwrap();
-        writer.flush().unwrap();
-        writer.close().unwrap();
+        write_record_batch(file, batch).unwrap();
+    }
+
+    fn write_file_value(file: &String, value: i64) {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+        let id_array = Int64Array::from(vec![Some(value)]);
+        let name_array = StringArray::from(vec![Some("test")]);
+        let schema = Arc::new(schema);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(id_array), Arc::new(name_array)],
+        )
+        .unwrap();
+        write_record_batch(file, batch).unwrap();
     }
 
     fn write_file_null(file: &String) {
@@ -1863,12 +1875,17 @@ mod tests {
             vec![Arc::new(id_array), Arc::new(name_array)],
         )
         .unwrap();
-        let file = File::create(file).unwrap();
+        write_record_batch(file, batch).unwrap();
+    }
+
+    fn write_record_batch(file: &String, batch: RecordBatch) -> Result<()> {
+        let file = File::create(file)?;
         let w_opt = WriterProperties::builder().build();
-        let mut writer = ArrowWriter::try_new(file, schema, Some(w_opt)).unwrap();
-        writer.write(&batch).unwrap();
-        writer.flush().unwrap();
-        writer.close().unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(w_opt))?;
+        writer.write(&batch)?;
+        writer.flush()?;
+        writer.close()?;
+        Ok(())
     }
 
     /// Write out a batch to a parquet file and return the total size of the file
@@ -1928,6 +1945,52 @@ mod tests {
                 metrics,
             )
         }
+    }
+
+    async fn assert_dynamic_filter_batch_eq(
+        query: &str,
+        expected: &[&str],
+        path: impl AsRef<str>,
+    ) {
+        let ctx = SessionContext::new();
+
+        let opt = ListingOptions::new(Arc::new(ParquetFormat::default()))
+            // We need to force 1 partition because TopK predicate pushdown happens on a per-partition basis
+            // If we had 1 file per partition (as an example) no pushdown would happen
+            .with_target_partitions(1);
+        ctx.register_listing_table("base_table", path, opt, None, None)
+            .await
+            .unwrap();
+
+        let batches = ctx.sql(query).await.unwrap().collect().await.unwrap();
+        assert_batches_eq!(expected, &batches);
+    }
+
+    async fn assert_dynamic_filter_analyze_contains(
+        query: &str,
+        expected: &str,
+        path: impl AsRef<str>,
+    ) {
+        let ctx = SessionContext::new();
+        let explain = format!("explain analyze {query}");
+
+        let opt = ListingOptions::new(Arc::new(ParquetFormat::default()))
+            // We need to force 1 partition because TopK predicate pushdown happens on a per-partition basis
+            // If we had 1 file per partition (as an example) no pushdown would happen
+            .with_target_partitions(1);
+        ctx.register_listing_table("base_table", path, opt, None, None)
+            .await
+            .unwrap();
+
+        let batches = ctx
+            .sql(explain.as_str())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let explain_plan = format!("{}", pretty_format_batches(&batches).unwrap());
+        assert_contains!(explain_plan, expected);
     }
 
     /// Test passing `metadata_size_hint` to either a single file or the whole exec
@@ -2003,28 +2066,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_topk_predicate_pushdown() {
-        let ctx = SessionContext::new();
-        let opt = ListingOptions::new(Arc::new(ParquetFormat::default()))
-            // We need to force 1 partition because TopK predicate pushdown happens on a per-partition basis
-            // If we had 1 file per partition (as an example) no pushdown would happen
-            .with_target_partitions(1);
-
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().to_str().unwrap().to_string();
-        // The point here is that we write many, many files.
-        // So when we scan after we processed the first one we should be able to skip the rest
-        // because of the TopK predicate pushdown.
+
         for file in 0..100 {
             let name = format!("test{:02}.parquet", file);
             write_file(&format!("{path}/{name}"));
         }
-        ctx.register_listing_table("base_table", path, opt, None, None)
-            .await
-            .unwrap();
 
         let query = "select name from base_table order by id desc limit 3";
-
-        let batches = ctx.sql(query).await.unwrap().collect().await.unwrap();
         #[rustfmt::skip]
         let expected = [
             "+--------+",
@@ -2035,27 +2085,21 @@ mod tests {
             "| test02 |",
             "+--------+",
         ];
-        assert_batches_eq!(expected, &batches);
+        assert_dynamic_filter_batch_eq(query, &expected, &path).await;
 
-        let sql = format!("explain analyze {query}");
-        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
-        let explain_plan = format!("{}", pretty_format_batches(&batches).unwrap());
-        assert_contains!(explain_plan, "row_groups_pruned_statistics=96");
+        assert_dynamic_filter_analyze_contains(
+            query,
+            "row_groups_pruned_statistics=96",
+            &path,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn test_topk_predicate_pushdown_nulls_fist() {
-        let ctx = SessionContext::new();
-        let opt = ListingOptions::new(Arc::new(ParquetFormat::default()))
-            // We need to force 1 partition because TopK predicate pushdown happens on a per-partition basis
-            // If we had 1 file per partition (as an example) no pushdown would happen
-            .with_target_partitions(1);
-
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().to_str().unwrap().to_string();
-        // The point here is that we write many, many files.
-        // So when we scan after we processed the first one we should be able to skip the rest
-        // because of the TopK predicate pushdown.
+
         for file in 0..100 {
             let name = format!("test{:02}.parquet", file);
             write_file(&format!("{path}/{name}"));
@@ -2063,14 +2107,9 @@ mod tests {
 
         let name = format!("test{:02}.parquet", 100);
         write_file_null(&format!("{path}/{name}"));
-        ctx.register_listing_table("base_table", path, opt, None, None)
-            .await
-            .unwrap();
 
         // nulls first by default
         let query = "select name from base_table order by id desc limit 3";
-
-        let batches = ctx.sql(query).await.unwrap().collect().await.unwrap();
         #[rustfmt::skip]
         let expected = [
             "+----------+",
@@ -2081,41 +2120,81 @@ mod tests {
             "| test02   |",
             "+----------+",
         ];
-        assert_batches_eq!(expected, &batches);
+        assert_dynamic_filter_batch_eq(query, &expected, &path).await;
 
-        let sql = format!("explain analyze {query}");
-        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
-        let explain_plan = format!("{}", pretty_format_batches(&batches).unwrap());
-        assert_contains!(explain_plan, "row_groups_pruned_statistics=96");
+        assert_dynamic_filter_analyze_contains(
+            query,
+            "row_groups_pruned_statistics=96",
+            &path,
+        )
+        .await;
     }
 
     #[tokio::test]
-    async fn test_topk_predicate_pushdown_nulls_last() {
-        let ctx = SessionContext::new();
-        let opt = ListingOptions::new(Arc::new(ParquetFormat::default()))
-            // We need to force 1 partition because TopK predicate pushdown happens on a per-partition basis
-            // If we had 1 file per partition (as an example) no pushdown would happen
-            .with_target_partitions(1);
-
+    async fn test_topk_predicate_pushdown_multi_key() {
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().to_str().unwrap().to_string();
         // The point here is that we write many, many files.
         // So when we scan after we processed the first one we should be able to skip the rest
         // because of the TopK predicate pushdown.
+        for file in 0..20 {
+            // Ensure files are read in order
+            let name = format!("test{:02}.parquet", file);
+            write_file_value(&format!("{path}/{name}"), file);
+        }
+
+        let query = "select id from base_table order by name desc, id limit 3";
+        #[rustfmt::skip]
+        let expected = [
+            "+----+",
+            "| id |",
+            "+----+",
+            "| 0  |",
+            "| 1  |",
+            "| 2  |",
+            "+----+",
+        ];
+        assert_dynamic_filter_batch_eq(query, &expected, &path).await;
+        assert_dynamic_filter_analyze_contains(
+            query,
+            "row_groups_pruned_statistics=16",
+            &path,
+        )
+        .await;
+
+        let query1 = "select id from base_table order by name desc, id desc limit 3";
+        #[rustfmt::skip]
+        let expected0 = [
+            "+----+",
+            "| id |",
+            "+----+",
+            "| 19 |",
+            "| 18 |",
+            "| 17 |",
+            "+----+",
+        ];
+        assert_dynamic_filter_batch_eq(query1, &expected0, &path).await;
+        assert_dynamic_filter_analyze_contains(
+            query1,
+            "row_groups_pruned_statistics=0",
+            &path,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_topk_predicate_pushdown_nulls_last() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().to_str().unwrap().to_string();
+
         for file in 0..100 {
             let name = format!("test{:02}.parquet", file);
             write_file(&format!("{path}/{name}"));
         }
-
         let name = format!("test{:02}.parquet", 100);
         write_file_null(&format!("{path}/{name}"));
-        ctx.register_listing_table("base_table", path, opt, None, None)
-            .await
-            .unwrap();
 
         let query = "select name from base_table order by id desc nulls last limit 3";
-
-        let batches = ctx.sql(query).await.unwrap().collect().await.unwrap();
         #[rustfmt::skip]
         let expected = [
             "+--------+",
@@ -2126,12 +2205,14 @@ mod tests {
             "| test02 |",
             "+--------+",
         ];
-        assert_batches_eq!(expected, &batches);
+        assert_dynamic_filter_batch_eq(query, &expected, &path).await;
 
-        let sql = format!("explain analyze {query}");
-        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
-        let explain_plan = format!("{}", pretty_format_batches(&batches).unwrap());
-        assert_contains!(explain_plan, "row_groups_pruned_statistics=97");
+        assert_dynamic_filter_analyze_contains(
+            query,
+            "row_groups_pruned_statistics=97",
+            &path,
+        )
+        .await;
     }
 
     #[tokio::test]
