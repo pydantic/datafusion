@@ -1833,7 +1833,7 @@ mod tests {
         write_record_batch(file, batch).unwrap();
     }
 
-    fn write_file_value(file: &String, value: i64) {
+    fn write_file_with_non_null_ids(file: &String, value: i64) {
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, true),
             Field::new("name", DataType::Utf8, false),
@@ -1850,7 +1850,7 @@ mod tests {
         write_record_batch(file, batch).unwrap();
     }
 
-    fn write_file_null(file: &String) {
+    fn write_file_with_null_ids(file: &String) {
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, true),
             Field::new("name", DataType::Utf8, false),
@@ -2095,7 +2095,7 @@ mod tests {
         }
 
         let name = format!("test{:02}.parquet", 100);
-        write_file_null(&format!("{path}/{name}"));
+        write_file_with_null_ids(&format!("{path}/{name}"));
 
         // nulls first by default
         let query = "select name from base_table order by id desc limit 3";
@@ -2129,7 +2129,7 @@ mod tests {
         for file in 0..20 {
             // Ensure files are read in order
             let name = format!("test{:02}.parquet", file);
-            write_file_value(&format!("{path}/{name}"), file);
+            write_file_with_non_null_ids(&format!("{path}/{name}"), file);
         }
 
         let query = "select id from base_table order by name desc, id limit 3";
@@ -2181,7 +2181,7 @@ mod tests {
             write_file(&format!("{path}/{name}"));
         }
         let name = format!("test{:02}.parquet", 100);
-        write_file_null(&format!("{path}/{name}"));
+        write_file_with_null_ids(&format!("{path}/{name}"));
 
         let query = "select name from base_table order by id desc nulls last limit 3";
         #[rustfmt::skip]
