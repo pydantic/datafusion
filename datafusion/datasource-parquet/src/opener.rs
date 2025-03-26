@@ -61,7 +61,7 @@ pub(super) struct ParquetOpener {
     /// Optional predicate to apply during the scan
     pub predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Optional sources for dynamic filtes (e.g. joins, top-k filters)
-    pub dynamic_filters: Vec<Arc<dyn DynamicFilterSource>>,
+    pub dynamic_filter_sources: Vec<Arc<dyn DynamicFilterSource>>,
     /// Optional pruning predicate applied to row group statistics
     pub pruning_predicate: Option<Arc<PruningPredicate>>,
     /// Optional pruning predicate applied to data page statistics
@@ -111,7 +111,7 @@ impl FileOpener for ParquetOpener {
         let batch_size = self.batch_size;
 
         let dynamic_filters = self
-            .dynamic_filters
+            .dynamic_filter_sources
             .iter()
             .map(|f| f.current_filters())
             .collect::<Result<Vec<_>>>()?

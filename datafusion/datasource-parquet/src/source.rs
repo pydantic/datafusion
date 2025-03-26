@@ -262,7 +262,7 @@ pub struct ParquetSource {
     /// Optional predicate for row filtering during parquet scan
     pub(crate) predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Dynamic filters for row filtering during parquet scan
-    pub(crate) dynamic_filters: Vec<Arc<dyn DynamicFilterSource>>,
+    pub(crate) dynamic_filter_sources: Vec<Arc<dyn DynamicFilterSource>>,
     /// Optional predicate for pruning row groups (derived from `predicate`)
     pub(crate) pruning_predicate: Option<Arc<PruningPredicate>>,
     /// Optional predicate for pruning pages (derived from `predicate`)
@@ -479,7 +479,7 @@ impl FileSource for ParquetSource {
                 .expect("Batch size must set before creating ParquetOpener"),
             limit: base_config.limit,
             predicate: self.predicate.clone(),
-            dynamic_filters: self.dynamic_filters.clone(),
+            dynamic_filter_sources: self.dynamic_filter_sources.clone(),
             pruning_predicate: self.pruning_predicate.clone(),
             page_pruning_predicate: self.page_pruning_predicate.clone(),
             table_schema: Arc::clone(&base_config.file_schema),
@@ -588,7 +588,7 @@ impl FileSource for ParquetSource {
         dynamic_filter: Arc<dyn DynamicFilterSource>,
     ) -> datafusion_common::Result<Option<Arc<dyn FileSource>>> {
         let mut conf = self.clone();
-        conf.dynamic_filters.push(dynamic_filter);
+        conf.dynamic_filter_sources.push(dynamic_filter);
         Ok(Some(Arc::new(conf)))
     }
 }
