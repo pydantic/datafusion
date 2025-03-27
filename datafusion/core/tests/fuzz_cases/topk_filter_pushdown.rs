@@ -182,7 +182,7 @@ async fn run_query_with_config(
             .with_options(ctx.state().table_options().parquet.clone()),
     );
     let options = ListingOptions::new(format);
-    let table_path = ListingTableUrl::parse(format!("memory:///")).unwrap();
+    let table_path = ListingTableUrl::parse("memory:///".to_string()).unwrap();
     let config = ListingTableConfig::new(table_path)
         .with_listing_options(options)
         .with_schema(schema);
@@ -244,7 +244,7 @@ async fn test_fuzz_topk_filter_pushdown() {
                 // if there is a vec for this column insert the order, otherwise create a new vec
                 let ordering =
                     format!("{} {} {}", order_column, order_direction, null_order);
-                match orders.get_mut(&order_column.to_string()) {
+                match orders.get_mut(*order_column) {
                     Some(order_vec) => {
                         order_vec.push(ordering);
                     }
@@ -266,7 +266,7 @@ async fn test_fuzz_topk_filter_pushdown() {
             {
                 for orderings in order_columns
                     .iter()
-                    .map(|col| orders.get(&col.to_string()).unwrap())
+                    .map(|col| orders.get(**col).unwrap())
                     .multi_cartesian_product()
                 {
                     let query = format!(
