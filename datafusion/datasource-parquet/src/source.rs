@@ -579,10 +579,6 @@ impl FileSource for ParquetSource {
         }
     }
 
-    fn supports_dynamic_filter_pushdown(&self) -> bool {
-        true
-    }
-
     fn push_down_dynamic_filter(
         &self,
         dynamic_filter: Arc<dyn DynamicFilterSource>,

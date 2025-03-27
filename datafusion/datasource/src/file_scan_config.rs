@@ -314,14 +314,11 @@ impl DataSource for FileScanConfig {
         }))
     }
 
-    fn supports_dynamic_filter_pushdown(&self) -> bool {
-        self.file_source.supports_dynamic_filter_pushdown()
-    }
-
     fn push_down_dynamic_filter(
         &self,
         dynamic_filter: Arc<dyn DynamicFilterSource>,
     ) -> Result<Option<Arc<dyn DataSource>>> {
+        // Try to push down to the file source
         if let Some(file_source) =
             self.file_source.push_down_dynamic_filter(dynamic_filter)?
         {

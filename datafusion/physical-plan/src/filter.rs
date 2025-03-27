@@ -447,31 +447,28 @@ impl ExecutionPlan for FilterExec {
         try_embed_projection(projection, self)
     }
 
-    fn supports_dynamic_filter_pushdown(&self) -> bool {
-        true
-    }
-
     fn push_down_dynamic_filter(
         &self,
         dynamic_filter: Arc<dyn crate::DynamicFilterSource>,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        if self.input.supports_dynamic_filter_pushdown() {
-            if let Some(input) = self
-                .input
-                .push_down_dynamic_filter(Arc::clone(&dynamic_filter))?
-            {
-                return Ok(Some(Arc::new(Self {
-                    input,
-                    dynamic_filter_sources: self
-                        .dynamic_filter_sources
-                        .iter()
-                        .cloned()
-                        .chain(Some(dynamic_filter))
-                        .collect(),
-                    ..self.clone()
-                })));
-            }
+        // Try to push down the filter to the input
+        let input_result = self
+            .input
+            .push_down_dynamic_filter(Arc::clone(&dynamic_filter))?;
+        if let Some(input) = input_result {
+            return Ok(Some(Arc::new(Self {
+                input,
+                dynamic_filter_sources: self
+                    .dynamic_filter_sources
+                    .iter()
+                    .cloned()
+                    .chain(Some(dynamic_filter))
+                    .collect(),
+                ..self.clone()
+            })));
         }
+
+        // If input doesn't support dynamic filter pushdown, apply it at this level
         Ok(Some(Arc::new(Self {
             dynamic_filter_sources: self
                 .dynamic_filter_sources

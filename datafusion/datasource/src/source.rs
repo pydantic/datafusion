@@ -80,10 +80,6 @@ pub trait DataSource: Send + Sync + Debug {
         _projection: &ProjectionExec,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>>;
 
-    fn supports_dynamic_filter_pushdown(&self) -> bool {
-        false
-    }
-
     fn push_down_dynamic_filter(
         &self,
         _dynamic_filter: Arc<dyn DynamicFilterSource>,
@@ -204,14 +200,11 @@ impl ExecutionPlan for DataSourceExec {
         self.data_source.try_swapping_with_projection(projection)
     }
 
-    fn supports_dynamic_filter_pushdown(&self) -> bool {
-        self.data_source.supports_dynamic_filter_pushdown()
-    }
-
     fn push_down_dynamic_filter(
         &self,
         dynamic_filter: Arc<dyn DynamicFilterSource>,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
+        // Try to push down to the data source
         if let Some(data_source) =
             self.data_source.push_down_dynamic_filter(dynamic_filter)?
         {

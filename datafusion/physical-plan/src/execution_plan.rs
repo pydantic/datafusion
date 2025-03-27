@@ -469,10 +469,6 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
         Ok(None)
     }
 
-    fn supports_dynamic_filter_pushdown(&self) -> bool {
-        false
-    }
-
     fn push_down_dynamic_filter(
         &self,
         _dynamic_filter: Arc<dyn DynamicFilterSource>,
