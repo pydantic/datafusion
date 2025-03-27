@@ -789,14 +789,15 @@ impl std::fmt::Debug for TopKDynamicFilterSource {
 
 impl DynamicFilterSource for TopKDynamicFilterSource {
     fn current_filters(&self) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
-        let heap_guard = self.heap.read().map_err(|_| {
-            DataFusionError::Internal(
-                "Failed to acquire read lock on TopK heap".to_string(),
-            )
-        })?;
-
         // Get the threshold values for all sort expressions
-        let Some(thresholds) = heap_guard.get_threshold_values(&self.expr)? else {
+        let Some(thresholds) = ({
+            let heap_guard = self.heap.read().map_err(|_| {
+                DataFusionError::Internal(
+                    "Failed to acquire read lock on TopK heap".to_string(),
+                )
+            })?;
+            heap_guard.get_threshold_values(&self.expr)?
+        }) else {
             return Ok(vec![]); // No thresholds available yet
         };
 
