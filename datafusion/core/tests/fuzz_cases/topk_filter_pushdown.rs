@@ -182,7 +182,7 @@ async fn run_query_with_config(
             .with_options(ctx.state().table_options().parquet.clone()),
     );
     let options = ListingOptions::new(format);
-    let table_path = ListingTableUrl::parse("memory:///".to_string()).unwrap();
+    let table_path = ListingTableUrl::parse("memory:///").unwrap();
     let config = ListingTableConfig::new(table_path)
         .with_listing_options(options)
         .with_schema(schema);
