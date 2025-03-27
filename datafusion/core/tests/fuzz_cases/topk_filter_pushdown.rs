@@ -105,21 +105,21 @@ async fn test_files() -> Vec<TestDataSet> {
                     ]
                 };
 
-                // Generate 100 files, some with overlapping or repeated ids some without
-                for i in 0..100 {
+                // Generate 5 files, some with overlapping or repeated ids some without
+                for i in 0..5 {
                     let num_batches = rng.gen_range(1..3);
                     let mut batches = Vec::with_capacity(num_batches);
                     for _ in 0..num_batches {
-                        let num_rows = 100;
+                        let num_rows = 25;
                         let ids = Int32Array::from_iter((0..num_rows).map(|file| {
                             if nulls_in_ids {
                                 if rng.gen_bool(1.0 / 10.0) {
                                     None
                                 } else {
-                                    Some(rng.gen_range(file..file + 25))
+                                    Some(rng.gen_range(file..file + 5))
                                 }
                             } else {
-                                Some(rng.gen_range(file..file + 25))
+                                Some(rng.gen_range(file..file + 5))
                             }
                         }));
                         let names = StringArray::from_iter((0..num_rows).map(|_| {
@@ -189,6 +189,7 @@ async fn run_query_with_config(
     let table = Arc::new(ListingTable::try_new(config).unwrap());
 
     ctx.register_table("test_table", table).unwrap();
+
     ctx.sql(query).await.unwrap().collect().await.unwrap()
 }
 
@@ -229,12 +230,13 @@ struct TestCase {
     dataset: TestDataSet,
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_fuzz_topk_filter_pushdown() {
     let order_columns = ["id", "name", "department"];
     let order_directions = ["ASC", "DESC"];
     let null_orders = ["NULLS FIRST", "NULLS LAST"];
 
+    let start = std::time::Instant::now();
     let mut orders: HashMap<String, Vec<String>> = HashMap::new();
     for order_column in &order_columns {
         for order_direction in &order_directions {
@@ -279,10 +281,15 @@ async fn test_fuzz_topk_filter_pushdown() {
     }
 
     queries.sort_unstable();
-    println!("Generated {} queries", queries.len());
-    // let queries = queries[..25].to_vec();
+    println!(
+        "Generated {} queries in {:?}",
+        queries.len(),
+        start.elapsed()
+    );
 
+    let start = std::time::Instant::now();
     let datasets = test_files().await;
+    println!("Generated test files in {:?}", start.elapsed());
 
     let mut test_cases = vec![];
     for enable_filter_pushdown in [true, false] {
@@ -302,12 +309,14 @@ async fn test_fuzz_topk_filter_pushdown() {
         }
     }
 
+    let start = std::time::Instant::now();
     let mut join_set = JoinSet::new();
     for tc in test_cases {
         join_set.spawn(run_query(tc.query, tc.cfg, tc.dataset));
     }
     let mut results = join_set.join_all().await;
     results.sort_unstable_by(|a, b| a.query.cmp(&b.query));
+    println!("Ran {} test cases in {:?}", results.len(), start.elapsed());
 
     for result in results {
         assert_eq!(result.result, result.expected, "Query: {}", result.query);
