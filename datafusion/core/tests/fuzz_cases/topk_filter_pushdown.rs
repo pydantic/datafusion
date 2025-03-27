@@ -236,7 +236,7 @@ async fn test_fuzz_topk_filter_pushdown() {
     let order_directions = ["ASC", "DESC"];
     let null_orders = ["NULLS FIRST", "NULLS LAST"];
 
-    let start = std::time::Instant::now();
+    let start = datafusion_common::instant::Instant::now();
     let mut orders: HashMap<String, Vec<String>> = HashMap::new();
     for order_column in &order_columns {
         for order_direction in &order_directions {
@@ -287,7 +287,7 @@ async fn test_fuzz_topk_filter_pushdown() {
         start.elapsed()
     );
 
-    let start = std::time::Instant::now();
+    let start = datafusion_common::instant::Instant::now();
     let datasets = test_files().await;
     println!("Generated test files in {:?}", start.elapsed());
 
@@ -309,7 +309,7 @@ async fn test_fuzz_topk_filter_pushdown() {
         }
     }
 
-    let start = std::time::Instant::now();
+    let start = datafusion_common::instant::Instant::now();
     let mut join_set = JoinSet::new();
     for tc in test_cases {
         join_set.spawn(run_query(tc.query, tc.cfg, tc.dataset));
