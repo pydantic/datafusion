@@ -36,7 +36,8 @@ use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use datafusion_common::{exec_err, Result};
-use datafusion_physical_expr::expressions::{lit, BinaryExpr, Column};
+use datafusion_physical_expr::expressions::{lit, Column};
+use datafusion_physical_expr::utils::conjunction;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_optimizer::pruning::PruningPredicate;
 use datafusion_physical_plan::dynamic_filters::DynamicFilterSource;
@@ -118,10 +119,18 @@ impl FileOpener for ParquetOpener {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        // Collect dynamic_filters into a single predicate by reducing with AND
-        let dynamic_predicate = dynamic_filters.into_iter().reduce(|a, b| {
-            Arc::new(BinaryExpr::new(a, datafusion_expr::Operator::And, b))
-        });
+        // Using the AND operator to combine the dynamic filters with the static predicate means that
+        // a row (or a row group) must satisfy both conditions before it's read from disk.
+        // The approach assumes that the static predicate and dynamic filters are independent and complementary.
+        // In other words, the dynamic filters are not meant to replace or override the original predicate; they refine the set of rows even further.
+        // If they were combined using OR, you might end up with more rows than necessary, which would negate the benefits of dynamic filtering.
+        // Since the dynamic filters are calculated at runtime, they might sometimes be conservative estimates.
+        // By combining them with AND, the system errs on the side of safety—only excluding data when it’s reasonably certain that the rows won’t match the overall query conditions.
+        let dynamic_predicate = if dynamic_filters.is_empty() {
+            None
+        } else {
+            Some(conjunction(dynamic_filters))
+        };
         let enable_page_index = should_enable_page_index(
             self.enable_page_index,
             &self.page_pruning_predicate,
@@ -131,11 +140,7 @@ impl FileOpener for ParquetOpener {
         let predicate = match (predicate, dynamic_predicate) {
             (Some(p), None) => Some(p),
             (None, Some(d)) => Some(d),
-            (Some(p), Some(d)) => Some(Arc::new(BinaryExpr::new(
-                p,
-                datafusion_expr::Operator::And,
-                d,
-            )) as Arc<dyn PhysicalExpr>),
+            (Some(p), Some(d)) => Some(conjunction([p, d])),
             (None, None) => None,
         };
 
