@@ -48,7 +48,7 @@ mod tests {
     use bytes::{BufMut, BytesMut};
     use datafusion_common::config::TableParquetOptions;
     use datafusion_common::test_util::{batches_to_sort_string, batches_to_string};
-    use datafusion_common::{assert_contains, Result, ScalarValue};
+    use datafusion_common::{assert_batches_eq, assert_contains, Result, ScalarValue};
     use datafusion_datasource::file_format::FileFormat;
     use datafusion_datasource::file_meta::FileMeta;
     use datafusion_datasource::file_scan_config::FileScanConfig;
