@@ -1142,10 +1142,10 @@ impl ExecutionPlan for SortExec {
                     .enable_dynamic_filter_pushdown
                 {
                     // Try to push down the dynamic filter. If the execution plan doesn't
-                    // support it, push_down_dynamic_filter will return None and we'll
+                    // support it, push_down_filter will return None and we'll
                     // keep the original input_exec.
                     input_exec
-                        .push_down_dynamic_filter(topk.dynamic_filter_source())?
+                        .push_down_filter(topk.dynamic_filter_source())?
                         .unwrap_or(input_exec)
                 } else {
                     input_exec

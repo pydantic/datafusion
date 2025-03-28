@@ -1487,6 +1487,14 @@ fn build_predicate_expression(
             return unhandled_hook.handle(expr);
         }
     }
+    if let Some(expr) = expr_any.downcast_ref::<phys_expr::DynamicPhysicalExpr>() {
+        return build_predicate_expression(
+            &expr.current(),
+            schema,
+            required_columns,
+            unhandled_hook,
+        );
+    }
 
     let (left, op, right) = {
         if let Some(bin_expr) = expr_any.downcast_ref::<phys_expr::BinaryExpr>() {

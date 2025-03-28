@@ -37,14 +37,14 @@ use datafusion_execution::{
     object_store::ObjectStoreUrl, SendableRecordBatchStream, TaskContext,
 };
 use datafusion_physical_expr::{
-    expressions::Column, EquivalenceProperties, LexOrdering, Partitioning,
+    expressions::Column, EquivalenceProperties, LexOrdering, Partitioning, PhysicalExpr,
     PhysicalSortExpr,
 };
 use datafusion_physical_plan::{
     display::{display_orderings, ProjectSchemaDisplay},
     metrics::ExecutionPlanMetricsSet,
     projection::{all_alias_free_columns, new_projections_for_columns, ProjectionExec},
-    DisplayAs, DisplayFormatType, DynamicFilterSource, ExecutionPlan,
+    DisplayAs, DisplayFormatType, ExecutionPlan,
 };
 use log::{debug, warn};
 
@@ -314,14 +314,12 @@ impl DataSource for FileScanConfig {
         }))
     }
 
-    fn push_down_dynamic_filter(
+    fn push_down_filter(
         &self,
-        dynamic_filter: Arc<dyn DynamicFilterSource>,
+        expr: Arc<dyn PhysicalExpr>,
     ) -> Result<Option<Arc<dyn DataSource>>> {
         // Try to push down to the file source
-        if let Some(file_source) =
-            self.file_source.push_down_dynamic_filter(dynamic_filter)?
-        {
+        if let Some(file_source) = self.file_source.push_down_filter(expr)? {
             return Ok(Some(Arc::new(Self {
                 file_source,
                 ..self.clone()

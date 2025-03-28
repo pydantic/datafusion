@@ -36,13 +36,13 @@ use datafusion_common::config::TableParquetOptions;
 use datafusion_common::Statistics;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_physical_expr::utils::conjunction;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_optimizer::pruning::PruningPredicate;
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
 use datafusion_physical_plan::DisplayFormatType;
 
-use datafusion_physical_plan::DynamicFilterSource;
 use itertools::Itertools;
 use object_store::ObjectStore;
 
@@ -261,8 +261,6 @@ pub struct ParquetSource {
     pub(crate) metrics: ExecutionPlanMetricsSet,
     /// Optional predicate for row filtering during parquet scan
     pub(crate) predicate: Option<Arc<dyn PhysicalExpr>>,
-    /// Dynamic filters for row filtering during parquet scan
-    pub(crate) dynamic_filter_sources: Vec<Arc<dyn DynamicFilterSource>>,
     /// Optional predicate for pruning row groups (derived from `predicate`)
     pub(crate) pruning_predicate: Option<Arc<PruningPredicate>>,
     /// Optional predicate for pruning pages (derived from `predicate`)
@@ -479,7 +477,6 @@ impl FileSource for ParquetSource {
                 .expect("Batch size must set before creating ParquetOpener"),
             limit: base_config.limit,
             predicate: self.predicate.clone(),
-            dynamic_filter_sources: self.dynamic_filter_sources.clone(),
             pruning_predicate: self.pruning_predicate.clone(),
             page_pruning_predicate: self.page_pruning_predicate.clone(),
             table_schema: Arc::clone(&base_config.file_schema),
@@ -579,12 +576,17 @@ impl FileSource for ParquetSource {
         }
     }
 
-    fn push_down_dynamic_filter(
+    fn push_down_filter(
         &self,
-        dynamic_filter: Arc<dyn DynamicFilterSource>,
+        expr: Arc<dyn PhysicalExpr>,
     ) -> datafusion_common::Result<Option<Arc<dyn FileSource>>> {
         let mut conf = self.clone();
-        conf.dynamic_filter_sources.push(dynamic_filter);
+        let predicate = if let Some(existing_predicate) = &conf.predicate {
+            conjunction([existing_predicate.clone(), expr])
+        } else {
+            expr
+        };
+        conf.predicate = Some(predicate);
         Ok(Some(Arc::new(conf)))
     }
 }

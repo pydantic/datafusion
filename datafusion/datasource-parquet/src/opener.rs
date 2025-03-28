@@ -37,10 +37,8 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use datafusion_common::{exec_err, Result};
 use datafusion_physical_expr::expressions::{lit, Column};
-use datafusion_physical_expr::utils::conjunction;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_optimizer::pruning::PruningPredicate;
-use datafusion_physical_plan::dynamic_filters::DynamicFilterSource;
 use datafusion_physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
 
 use futures::{StreamExt, TryStreamExt};
@@ -61,8 +59,6 @@ pub(super) struct ParquetOpener {
     pub limit: Option<usize>,
     /// Optional predicate to apply during the scan
     pub predicate: Option<Arc<dyn PhysicalExpr>>,
-    /// Optional sources for dynamic filtes (e.g. joins, top-k filters)
-    pub dynamic_filter_sources: Vec<Arc<dyn DynamicFilterSource>>,
     /// Optional pruning predicate applied to row group statistics
     pub pruning_predicate: Option<Arc<PruningPredicate>>,
     /// Optional pruning predicate applied to data page statistics
@@ -111,38 +107,16 @@ impl FileOpener for ParquetOpener {
 
         let batch_size = self.batch_size;
 
-        let dynamic_filters = self
-            .dynamic_filter_sources
-            .iter()
-            .map(|f| f.current_filters())
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        // Using the AND operator to combine the dynamic filters with the static predicate means that
-        // a row (or a row group) must satisfy both conditions before it's read from disk.
-        // The approach assumes that the static predicate and dynamic filters are independent and complementary.
-        // In other words, the dynamic filters are not meant to replace or override the original predicate; they refine the set of rows even further.
-        // If they were combined using OR, you might end up with more rows than necessary, which would negate the benefits of dynamic filtering.
-        // Since the dynamic filters are calculated at runtime, they might sometimes be conservative estimates.
-        // By combining them with AND, the system errs on the side of safety—only excluding data when it’s reasonably certain that the rows won’t match the overall query conditions.
-        let dynamic_predicate = if dynamic_filters.is_empty() {
-            None
-        } else {
-            Some(conjunction(dynamic_filters))
-        };
         let enable_page_index = should_enable_page_index(
             self.enable_page_index,
             &self.page_pruning_predicate,
-            dynamic_predicate.is_some(),
+            // What do we do here? we can't know if we have a dynamic filter or not because we hid it behind a PhysicalExpr.
+            // Do we match on PhysicalExpr (kinda gross?)
+            true,
         );
+
         let predicate = self.predicate.clone();
-        let predicate = match (predicate, dynamic_predicate) {
-            (Some(p), None) => Some(p),
-            (None, Some(d)) => Some(d),
-            (Some(p), Some(d)) => Some(conjunction([p, d])),
-            (None, None) => None,
-        };
+        println!("predicate: {:?}", predicate);
 
         let projected_schema =
             SchemaRef::from(self.table_schema.project(&self.projection)?);

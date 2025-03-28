@@ -724,12 +724,12 @@ impl ExecutionPlan for RepartitionExec {
         )?)))
     }
 
-    fn push_down_dynamic_filter(
+    fn push_down_filter(
         &self,
-        dynamic_filter: Arc<dyn crate::DynamicFilterSource>,
+        expr: Arc<dyn PhysicalExpr>,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         // Try to push down to the input
-        if let Some(input) = self.input.push_down_dynamic_filter(dynamic_filter)? {
+        if let Some(input) = self.input.push_down_filter(expr)? {
             return Ok(Some(Arc::new(Self {
                 input,
                 ..self.clone()

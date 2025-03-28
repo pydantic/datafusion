@@ -27,9 +27,9 @@ use crate::file_scan_config::FileScanConfig;
 use crate::file_stream::FileOpener;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::Statistics;
-use datafusion_physical_expr::LexOrdering;
+use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
-use datafusion_physical_plan::{DisplayFormatType, DynamicFilterSource};
+use datafusion_physical_plan::DisplayFormatType;
 
 use object_store::ObjectStore;
 
@@ -94,9 +94,9 @@ pub trait FileSource: Send + Sync {
         Ok(None)
     }
 
-    fn push_down_dynamic_filter(
+    fn push_down_filter(
         &self,
-        _dynamic_filter: Arc<dyn DynamicFilterSource>,
+        _expr: Arc<dyn PhysicalExpr>,
     ) -> datafusion_common::Result<Option<Arc<dyn FileSource>>> {
         Ok(None)
     }

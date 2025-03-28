@@ -20,7 +20,9 @@
 use std::sync::Arc;
 
 use crate::{
-    expressions::{BinaryExpr, CastExpr, Column, Literal, NegativeExpr},
+    expressions::{
+        BinaryExpr, CastExpr, Column, DynamicPhysicalExpr, Literal, NegativeExpr,
+    },
     PhysicalExpr,
 };
 
@@ -41,6 +43,8 @@ pub fn check_support(expr: &Arc<dyn PhysicalExpr>, schema: &SchemaRef) -> bool {
         is_operator_supported(binary_expr.op())
             && check_support(binary_expr.left(), schema)
             && check_support(binary_expr.right(), schema)
+    } else if let Some(expr) = expr_any.downcast_ref::<DynamicPhysicalExpr>() {
+        check_support(&expr.current(), schema)
     } else if let Some(column) = expr_any.downcast_ref::<Column>() {
         if let Ok(field) = schema.field_with_name(column.name()) {
             is_datatype_supported(field.data_type())
