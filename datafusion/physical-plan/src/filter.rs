@@ -46,7 +46,7 @@ use datafusion_common::{
 use datafusion_execution::TaskContext;
 use datafusion_expr::Operator;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
-use datafusion_physical_expr::expressions::{BinaryExpr, DynamicPhysicalExpr};
+use datafusion_physical_expr::expressions::BinaryExpr;
 use datafusion_physical_expr::intervals::utils::check_support;
 use datafusion_physical_expr::utils::{collect_columns, conjunction};
 use datafusion_physical_expr::{
@@ -64,6 +64,9 @@ use log::trace;
 pub struct FilterExec {
     /// The expression to filter on. This expression must evaluate to a boolean value.
     predicate: Arc<dyn PhysicalExpr>,
+    /// Dynamic predicate sources to poll at runtime for additional fitlers pushded down
+    /// from joins, topN operators, etc.
+    dynamic_filter_sources: Vec<Arc<dyn crate::DynamicFilterSource>>,
     /// The input plan
     input: Arc<dyn ExecutionPlan>,
     /// Execution metrics
@@ -93,6 +96,7 @@ impl FilterExec {
                 )?;
                 Ok(Self {
                     predicate,
+                    dynamic_filter_sources: vec![],
                     input: Arc::clone(&input),
                     metrics: ExecutionPlanMetricsSet::new(),
                     default_selectivity,
@@ -140,6 +144,7 @@ impl FilterExec {
         )?;
         Ok(Self {
             predicate: Arc::clone(&self.predicate),
+            dynamic_filter_sources: self.dynamic_filter_sources.clone(),
             input: Arc::clone(&self.input),
             metrics: self.metrics.clone(),
             default_selectivity: self.default_selectivity,
@@ -243,10 +248,6 @@ impl FilterExec {
                         );
                     }
                 }
-            } else if let Some(dynamic) =
-                conjunction.as_any().downcast_ref::<DynamicPhysicalExpr>()
-            {
-                res_constants.extend(Self::extend_constants(input, &dynamic.current()));
             }
         }
         res_constants
@@ -384,9 +385,16 @@ impl ExecutionPlan for FilterExec {
     ) -> Result<SendableRecordBatchStream> {
         trace!("Start FilterExec::execute for partition {} of context session_id {} and task_id {:?}", partition, context.session_id(), context.task_id());
         let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        let predicate = conjunction(
+            std::iter::once(Arc::clone(&self.predicate)).chain(
+                self.dynamic_filter_sources
+                    .iter()
+                    .map(|source| source.as_dynamic_physical_expr())
+            ),
+        );
         Ok(Box::pin(FilterExecStream {
             schema: self.schema(),
-            predicate: self.predicate.clone(),
+            predicate,
             input: self.input.execute(partition, context)?,
             baseline_metrics,
             projection: self.projection.clone(),
@@ -438,24 +446,35 @@ impl ExecutionPlan for FilterExec {
         try_embed_projection(projection, self)
     }
 
-    fn push_down_filter(
+    fn push_down_dynamic_filter(
         &self,
-        expr: Arc<dyn PhysicalExpr>,
+        dynamic_filter: Arc<dyn crate::DynamicFilterSource>,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         // Try to push down the filter to the input
-        let input_result = self.input.push_down_filter(Arc::clone(&expr))?;
-        let new_predicate = conjunction([Arc::clone(&self.predicate), expr]);
+        let input_result = self
+            .input
+            .push_down_dynamic_filter(Arc::clone(&dynamic_filter))?;
         if let Some(input) = input_result {
             return Ok(Some(Arc::new(Self {
                 input,
-                predicate: new_predicate,
+                dynamic_filter_sources: self
+                    .dynamic_filter_sources
+                    .iter()
+                    .cloned()
+                    .chain(Some(dynamic_filter))
+                    .collect(),
                 ..self.clone()
             })));
         }
 
         // If input doesn't support dynamic filter pushdown, apply it at this level
         Ok(Some(Arc::new(Self {
-            predicate: new_predicate,
+            dynamic_filter_sources: self
+                .dynamic_filter_sources
+                .iter()
+                .cloned()
+                .chain(Some(dynamic_filter))
+                .collect(),
             ..self.clone()
         })))
     }
@@ -634,8 +653,6 @@ fn collect_columns_from_predicate(predicate: &Arc<dyn PhysicalExpr>) -> EqualAnd
                 }
                 _ => {}
             }
-        } else if let Some(_dynamic) = p.as_any().downcast_ref::<DynamicPhysicalExpr>() {
-            // TODO: couldn't implement here, some issues with references
         }
     });
 

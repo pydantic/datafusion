@@ -26,14 +26,14 @@ use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+    DisplayAs, DisplayFormatType, DynamicFilterSource, ExecutionPlan, PlanProperties,
 };
 
 use crate::file_scan_config::FileScanConfig;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Constraints, Statistics};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
 /// Common behaviors in Data Sources for both from Files and Memory.
@@ -80,9 +80,9 @@ pub trait DataSource: Send + Sync + Debug {
         _projection: &ProjectionExec,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>>;
 
-    fn push_down_filter(
+    fn push_down_dynamic_filter(
         &self,
-        _expr: Arc<dyn PhysicalExpr>,
+        _dynamic_filter: Arc<dyn DynamicFilterSource>,
     ) -> datafusion_common::Result<Option<Arc<dyn DataSource>>> {
         Ok(None)
     }
@@ -200,12 +200,14 @@ impl ExecutionPlan for DataSourceExec {
         self.data_source.try_swapping_with_projection(projection)
     }
 
-    fn push_down_filter(
+    fn push_down_dynamic_filter(
         &self,
-        expr: Arc<dyn PhysicalExpr>,
+        dynamic_filter: Arc<dyn DynamicFilterSource>,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         // Try to push down to the data source
-        if let Some(data_source) = self.data_source.push_down_filter(expr)? {
+        if let Some(data_source) =
+            self.data_source.push_down_dynamic_filter(dynamic_filter)?
+        {
             return Ok(Some(Arc::new(Self {
                 data_source,
                 ..self.clone()

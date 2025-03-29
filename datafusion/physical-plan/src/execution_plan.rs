@@ -19,6 +19,7 @@ pub use crate::display::{DefaultDisplay, DisplayAs, DisplayFormatType, VerboseDi
 pub use crate::metrics::Metric;
 pub use crate::ordering::InputOrderMode;
 pub use crate::stream::EmptyRecordBatchStream;
+use crate::DynamicFilterSource;
 
 pub use datafusion_common::hash_utils;
 pub use datafusion_common::utils::project_schema;
@@ -468,9 +469,9 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
         Ok(None)
     }
 
-    fn push_down_filter(
+    fn push_down_dynamic_filter(
         &self,
-        _expr: Arc<dyn PhysicalExpr>,
+        _dynamic_filter: Arc<dyn DynamicFilterSource>,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         Ok(None)
     }

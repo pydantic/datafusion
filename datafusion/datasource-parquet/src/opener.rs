@@ -37,9 +37,11 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use datafusion_common::{exec_err, Result};
 use datafusion_physical_expr::expressions::{lit, Column};
+use datafusion_physical_expr::utils::conjunction;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_optimizer::pruning::PruningPredicate;
 use datafusion_physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
+use datafusion_physical_plan::DynamicFilterSource;
 
 use futures::{StreamExt, TryStreamExt};
 use log::debug;
@@ -59,6 +61,8 @@ pub(super) struct ParquetOpener {
     pub limit: Option<usize>,
     /// Optional predicate to apply during the scan
     pub predicate: Option<Arc<dyn PhysicalExpr>>,
+    /// Optional sources for dynamic filtes (e.g. joins, top-k filters)
+    pub dynamic_filter_sources: Vec<Arc<dyn DynamicFilterSource>>,
     /// Optional pruning predicate applied to row group statistics
     pub pruning_predicate: Option<Arc<PruningPredicate>>,
     /// Optional pruning predicate applied to data page statistics
@@ -107,16 +111,40 @@ impl FileOpener for ParquetOpener {
 
         let batch_size = self.batch_size;
 
+        let dynamic_filter_sources = self.dynamic_filter_sources.clone();
+        let dynamic_filters = self
+            .dynamic_filter_sources
+            .iter()
+            .map(|f| f.snapshot_current_filters())
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        // Using the AND operator to combine the dynamic filters with the static predicate means that
+        // a row (or a row group) must satisfy both conditions before it's read from disk.
+        // The approach assumes that the static predicate and dynamic filters are independent and complementary.
+        // In other words, the dynamic filters are not meant to replace or override the original predicate; they refine the set of rows even further.
+        // If they were combined using OR, you might end up with more rows than necessary, which would negate the benefits of dynamic filtering.
+        // Since the dynamic filters are calculated at runtime, they might sometimes be conservative estimates.
+        // By combining them with AND, the system errs on the side of safety—only excluding data when it’s reasonably certain that the rows won’t match the overall query conditions.
+        let dynamic_predicate_snapshot = if dynamic_filters.is_empty() {
+            None
+        } else {
+            Some(conjunction(dynamic_filters))
+        };
         let enable_page_index = should_enable_page_index(
             self.enable_page_index,
             &self.page_pruning_predicate,
-            // What do we do here? we can't know if we have a dynamic filter or not because we hid it behind a PhysicalExpr.
-            // Do we match on PhysicalExpr (kinda gross?)
-            true,
+            dynamic_predicate_snapshot.is_some(),
         );
-
-        let predicate = self.predicate.clone();
-        println!("predicate: {:?}", predicate);
+        let static_predicate = self.predicate.clone();
+        let predicate_with_dynamic_predicate_snapshot =
+            match (static_predicate.clone(), dynamic_predicate_snapshot) {
+                (Some(p), None) => Some(p),
+                (None, Some(d)) => Some(d),
+                (Some(p), Some(d)) => Some(conjunction([p, d])),
+                (None, None) => None,
+            };
 
         let projected_schema =
             SchemaRef::from(self.table_schema.project(&self.projection)?);
@@ -165,7 +193,7 @@ impl FileOpener for ParquetOpener {
             let mut pruning_predicate = pruning_predicate;
             let mut page_pruning_predicate = page_pruning_predicate;
 
-            if let Some(predicate) = predicate.as_ref() {
+            if let Some(predicate) = predicate_with_dynamic_predicate_snapshot.as_ref() {
                 let mut filter_schema_builder: FilterSchemaBuilder<'_> =
                     FilterSchemaBuilder::new(&file_schema, &table_schema);
                 let predicate = Arc::clone(predicate)
@@ -190,36 +218,10 @@ impl FileOpener for ParquetOpener {
                 adapted_projections.iter().cloned(),
             );
 
-            // Filter pushdown: evaluate predicates during scan
-            if let Some(predicate) = pushdown_filters.then_some(predicate).flatten() {
-                let row_filter = row_filter::build_row_filter(
-                    &predicate,
-                    &file_schema,
-                    &table_schema,
-                    builder.metadata(),
-                    reorder_predicates,
-                    &file_metrics,
-                    &schema_adapter_factory,
-                );
-
-                match row_filter {
-                    Ok(Some(filter)) => {
-                        builder = builder.with_row_filter(filter);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        debug!(
-                            "Ignoring error building row filter for '{:?}': {}",
-                            predicate, e
-                        );
-                    }
-                };
-            };
-
             // Determine which row groups to actually read. The idea is to skip
             // as many row groups as possible based on the metadata and query
             let file_metadata = Arc::clone(builder.metadata());
-            let predicate = pruning_predicate.as_ref().map(|p| p.as_ref());
+            let pruning_predicate = pruning_predicate.as_ref().map(|p| p.as_ref());
             let rg_metadata = file_metadata.row_groups();
             // track which row groups to actually read
             let access_plan =
@@ -230,7 +232,7 @@ impl FileOpener for ParquetOpener {
                 row_groups.prune_by_range(rg_metadata, range);
             }
             // If there is a predicate that can be evaluated against the metadata
-            if let Some(predicate) = predicate.as_ref() {
+            if let Some(predicate) = pruning_predicate.as_ref() {
                 row_groups.prune_by_statistics(
                     &file_schema,
                     builder.parquet_schema(),
@@ -268,6 +270,7 @@ impl FileOpener for ParquetOpener {
                 }
             }
 
+            let is_empty = access_plan.is_empty();
             let row_group_indexes = access_plan.row_group_indexes();
             if let Some(row_selection) =
                 access_plan.into_overall_row_selection(rg_metadata)?
@@ -277,6 +280,57 @@ impl FileOpener for ParquetOpener {
 
             if let Some(limit) = limit {
                 builder = builder.with_limit(limit)
+            }
+
+            // If we still have rows to scan wire up filter pushdown.
+            // If this plan is a no-op because we filtered out all of the rows there's no point in doing the work
+            // of building the filter pushdown machinery.
+            if !is_empty {
+                // Filter pushdown: evaluate predicates during scan
+                // At this point we pacakge up our dynamic filters into a `PhysicalExpr` that can be evaluated
+                // during the scan.
+                // This `PhysicalExpr` is expected to hold onto the current state of the dynamic filters
+                // and refresh them for every batch it processes.
+                let dynamic_filters_physical_expr = dynamic_filter_sources
+                    .iter()
+                    .map(|f| f.as_dynamic_physical_expr())
+                    .collect::<Vec<_>>();
+                let pushdown_predicate = if dynamic_filters_physical_expr.is_empty() {
+                    static_predicate
+                } else {
+                    Some(conjunction(
+                        dynamic_filters_physical_expr
+                            .iter()
+                            .chain(static_predicate.iter())
+                            .cloned(),
+                    ))
+                };
+                if let Some(predicate) =
+                    pushdown_filters.then_some(pushdown_predicate).flatten()
+                {
+                    let row_filter = row_filter::build_row_filter(
+                        &predicate,
+                        &file_schema,
+                        &table_schema,
+                        builder.metadata(),
+                        reorder_predicates,
+                        &file_metrics,
+                        &schema_adapter_factory,
+                    );
+
+                    match row_filter {
+                        Ok(Some(filter)) => {
+                            builder = builder.with_row_filter(filter);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            debug!(
+                                "Ignoring error building row filter for '{:?}': {}",
+                                predicate, e
+                            );
+                        }
+                    };
+                };
             }
 
             let stream = builder

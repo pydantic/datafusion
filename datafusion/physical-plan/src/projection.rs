@@ -272,12 +272,12 @@ impl ExecutionPlan for ProjectionExec {
         }
     }
 
-    fn push_down_filter(
+    fn push_down_dynamic_filter(
         &self,
-        expr: Arc<dyn PhysicalExpr>,
+        dynamic_filter: Arc<dyn crate::DynamicFilterSource>,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         // Try to push down to the input
-        if let Some(input) = self.input.push_down_filter(expr)? {
+        if let Some(input) = self.input.push_down_dynamic_filter(dynamic_filter)? {
             return Ok(Some(Arc::new(Self {
                 input,
                 ..self.clone()

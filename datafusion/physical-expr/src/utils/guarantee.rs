@@ -18,7 +18,6 @@
 //! [`LiteralGuarantee`] predicate analysis to determine if a column is a
 //! constant.
 
-use crate::expressions::DynamicPhysicalExpr;
 use crate::utils::split_disjunction;
 use crate::{split_conjunction, PhysicalExpr};
 use datafusion_common::{Column, HashMap, ScalarValue};
@@ -370,17 +369,9 @@ impl<'a> ColOpLit<'a> {
     ///
     /// Returns None otherwise
     fn try_new(expr: &'a Arc<dyn PhysicalExpr>) -> Option<Self> {
-        let binary_expr = if let Some(binary_expr) = expr
+        let binary_expr = expr
             .as_any()
-            .downcast_ref::<crate::expressions::BinaryExpr>()
-        {
-            binary_expr
-        } else if let Some(_expr) = expr.as_any().downcast_ref::<DynamicPhysicalExpr>() {
-            // Issues with returning a reference to a temporary value
-            return None;
-        } else {
-            return None;
-        };
+            .downcast_ref::<crate::expressions::BinaryExpr>()?;
 
         let (left, op, right) = (
             binary_expr.left().as_any(),

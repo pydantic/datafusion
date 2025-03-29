@@ -77,19 +77,16 @@ fn split_impl<'a>(
     predicate: &'a Arc<dyn PhysicalExpr>,
     mut exprs: Vec<&'a Arc<dyn PhysicalExpr>>,
 ) -> Vec<&'a Arc<dyn PhysicalExpr>> {
-    if let Some(binary) = predicate.as_any().downcast_ref::<BinaryExpr>() {
-        if binary.op() == &operator {
+    match predicate.as_any().downcast_ref::<BinaryExpr>() {
+        Some(binary) if binary.op() == &operator => {
             let exprs = split_impl(operator, binary.left(), exprs);
-            return split_impl(operator, binary.right(), exprs);
+            split_impl(operator, binary.right(), exprs)
         }
-    } else if let Some(_expr) = predicate
-        .as_any()
-        .downcast_ref::<crate::expressions::DynamicPhysicalExpr>()
-    {
-        // again issues with return value referencing temporary value
+        Some(_) | None => {
+            exprs.push(predicate);
+            exprs
+        }
     }
-    exprs.push(predicate);
-    exprs
 }
 
 /// This function maps back requirement after ProjectionExec

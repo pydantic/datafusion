@@ -20,16 +20,18 @@ use std::sync::Arc;
 #[cfg(feature = "parquet")]
 use datafusion::datasource::file_format::parquet::ParquetSink;
 use datafusion::datasource::physical_plan::FileSink;
+use datafusion::physical_expr::utils::conjunction;
 use datafusion::physical_expr::window::{SlidingAggregateWindowExpr, StandardWindowExpr};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, ScalarFunctionExpr};
 use datafusion::physical_plan::expressions::{
-    BinaryExpr, CaseExpr, CastExpr, Column, DynamicPhysicalExpr, InListExpr,
-    IsNotNullExpr, IsNullExpr, Literal, NegativeExpr, NotExpr, TryCastExpr,
-    UnKnownColumn,
+    BinaryExpr, CaseExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr,
+    Literal, NegativeExpr, NotExpr, TryCastExpr, UnKnownColumn,
 };
 use datafusion::physical_plan::udaf::AggregateFunctionExpr;
 use datafusion::physical_plan::windows::{PlainAggregateWindowExpr, WindowUDFExpr};
-use datafusion::physical_plan::{Partitioning, PhysicalExpr, WindowExpr};
+use datafusion::physical_plan::{
+    DynamicFilterPhysicalExpr, Partitioning, PhysicalExpr, WindowExpr,
+};
 use datafusion::{
     datasource::{
         file_format::{csv::CsvSink, json::JsonSink},
@@ -230,8 +232,9 @@ pub fn serialize_physical_expr(
                 },
             )),
         })
-    } else if let Some(expr) = expr.downcast_ref::<DynamicPhysicalExpr>() {
-        serialize_physical_expr(&expr.current(), codec)
+    } else if let Some(expr) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
+        let current = conjunction(expr.snapshot_current_filters()?);
+        serialize_physical_expr(&current, codec)
     } else if let Some(expr) = expr.downcast_ref::<BinaryExpr>() {
         let binary_expr = Box::new(protobuf::PhysicalBinaryExprNode {
             l: Some(Box::new(serialize_physical_expr(expr.left(), codec)?)),
