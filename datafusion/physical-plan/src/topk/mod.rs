@@ -997,7 +997,9 @@ mod tests {
             .dynamic_filter_source()
             .snapshot_current_filters()
             .unwrap();
-        assert_eq!(filters.len(), 0);
+        assert_eq!(filters.len(), 1);
+        let filter = &filters[0];
+        assert!(filter.eq(&lit(true)), "{filter:?}");
 
         // Insert some data to fill the heap
         let col1 = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);

@@ -17,7 +17,10 @@
 
 use std::{any::Any, hash::Hash, sync::Arc};
 
-use datafusion_common::{tree_node::{Transformed, TransformedResult, TreeNode}, Result};
+use datafusion_common::{
+    tree_node::{Transformed, TransformedResult, TreeNode},
+    Result,
+};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::{expressions::lit, utils::conjunction, PhysicalExpr};
 
@@ -31,6 +34,8 @@ pub trait DynamicFilterSource: Send + Sync + std::fmt::Debug + 'static {
     /// Take a snapshot of the current state of filtering, returning a non-dynamic PhysicalExpr.
     /// This is used to e.g. serialize dynamic filters across the wire or to pass them into systems
     /// that won't use the `PhysicalExpr` API (e.g. matching on the concrete types of the expressions like `PruningPredicate` does).
+    /// For example, it is expected that this returns a relatively simple expression such as `col1 > 5` for a TopK operator or
+    /// `col2 IN (1, 2, ... N)` for a HashJoin operator.
     fn snapshot_current_filters(&self) -> Result<Vec<Arc<dyn PhysicalExpr>>>;
 
     /// Transform this dynamic filter source into a PhysicalExpr.
@@ -41,6 +46,9 @@ pub trait DynamicFilterSource: Send + Sync + std::fmt::Debug + 'static {
     /// but it can also be a different expression that is more efficient to evaluate.
     /// This is used for systems that can evalaute a PhysicalExpr directly and want to optimize
     /// dynamic filter pushdown / effectiveness.
+    /// For example, this may return:
+    /// - A reference to a TopK's heap to filter out elements that won't replace the heap.
+    /// - A bloom filter tied to a HashJoin to filter out elements that definitely won't match.
     fn as_dynamic_physical_expr(&self) -> Arc<dyn PhysicalExpr>;
 }
 
@@ -85,7 +93,11 @@ impl DynamicFilterPhysicalExpr {
         children: Vec<Arc<dyn PhysicalExpr>>,
         inner: Arc<dyn DynamicFilterSource>,
     ) -> Self {
-        Self { children, remapped_children: None, inner }
+        Self {
+            children,
+            remapped_children: None,
+            inner,
+        }
     }
 
     pub fn snapshot_current_filters(&self) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
@@ -101,18 +113,25 @@ impl DynamicFilterPhysicalExpr {
         if let Some(remapped_children) = &self.remapped_children {
             // Remap children to the current children
             // of the expression.
-            current.transform_up(|expr| {
-                // Check if this is any of our original children
-                if let Some(pos) = self.children.iter().position(|c| c.as_ref() == expr.as_ref()) {
-                    // If so, remap it to the current children
-                    // of the expression.
-                    let new_child = remapped_children[pos].clone();
-                    Ok(Transformed::yes(new_child))
-                } else {
-                    // Otherwise, just return the expression
-                    Ok(Transformed::no(expr))
-                }
-            }).data().expect("transformation is infallible")
+            current
+                .transform_up(|expr| {
+                    // Check if this is any of our original children
+                    if let Some(pos) = self
+                        .children
+                        .iter()
+                        .position(|c| c.as_ref() == expr.as_ref())
+                    {
+                        // If so, remap it to the current children
+                        // of the expression.
+                        let new_child = remapped_children[pos].clone();
+                        Ok(Transformed::yes(new_child))
+                    } else {
+                        // Otherwise, just return the expression
+                        Ok(Transformed::no(expr))
+                    }
+                })
+                .data()
+                .expect("transformation is infallible")
         } else {
             current
         }
@@ -136,15 +155,11 @@ impl PhysicalExpr for DynamicFilterPhysicalExpr {
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        Ok(
-            Arc::new(
-                DynamicFilterPhysicalExpr {
-                    children: self.children.clone(),
-                    remapped_children: Some(children),
-                    inner: self.inner.clone(),
-                }
-            )
-        )
+        Ok(Arc::new(DynamicFilterPhysicalExpr {
+            children: self.children.clone(),
+            remapped_children: Some(children),
+            inner: self.inner.clone(),
+        }))
     }
 
     fn data_type(

@@ -389,7 +389,7 @@ impl ExecutionPlan for FilterExec {
             std::iter::once(Arc::clone(&self.predicate)).chain(
                 self.dynamic_filter_sources
                     .iter()
-                    .map(|source| source.as_dynamic_physical_expr())
+                    .map(|source| source.as_dynamic_physical_expr()),
             ),
         );
         Ok(Box::pin(FilterExecStream {
