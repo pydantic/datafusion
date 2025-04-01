@@ -25,7 +25,7 @@ use super::{
     RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
 use crate::common::can_project;
-use crate::execution_plan::CardinalityEffect;
+use crate::execution_plan::{CardinalityEffect, ExecutionPlanFilterPushdownResult, FilterPushdownResult};
 use crate::projection::{
     make_with_child, try_embed_projection, update_expr, EmbeddedProjection,
     ProjectionExec,
@@ -434,20 +434,55 @@ impl ExecutionPlan for FilterExec {
         try_embed_projection(projection, self)
     }
 
-    fn push_down_filter(
-        &self,
-        expr: Arc<dyn PhysicalExpr>,
+    fn filters_for_pushdown(&self) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
+        Ok(split_conjunction(self.predicate()).iter().map(|f| Arc::clone(f)).collect())
+    }
+
+    fn with_filter_pushdown_result(
+        self: Arc<Self>,
+        pushdown: &[FilterPushdownResult]
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let mut input = Arc::clone(&self.input);
-        if let Some(new_input) = input.push_down_filter(Arc::clone(&expr))? {
-            input = new_input;
+        // Only keep filters who's index maps to the pushdown result Unsupported
+        let new_filters = self.filters_for_pushdown()?.iter().zip(pushdown.iter()).filter_map(|(f, p)| {
+            if let FilterPushdownResult::Unsupported = p {
+                Some(Arc::clone(&f))
+            } else {
+                None
+            }
+        }).collect::<Vec<_>>();
+
+        if new_filters.is_empty() {
+            return Ok(Some(Arc::clone(self.input())))
         }
-        let new_predicate = conjunction([Arc::clone(&self.predicate), expr]);
-        Ok(Some(Arc::new(Self {
-            input,
-            predicate: Arc::clone(&new_predicate),
-            ..self.clone()
-        })))
+
+        let predicate = conjunction(new_filters.into_iter());
+
+        let new = FilterExec::try_new(predicate, Arc::clone(self.input()))
+            .and_then(|e| {
+                let selectivity = e.default_selectivity();
+                e.with_default_selectivity(selectivity)
+            })
+            .and_then(|e| e.with_projection(self.projection().cloned()))
+            .map(|e| Arc::new(e) as _)?;
+        Ok(Some(new))
+    }
+
+    fn push_down_filters(
+        &self,
+        filters: &[&Arc<dyn PhysicalExpr>],
+    ) -> Result<Option<ExecutionPlanFilterPushdownResult>> {
+        let new_predicates = conjunction(std::iter::once(Arc::clone(&self.predicate)).chain(filters.iter().map(|f| Arc::clone(f))));
+        Ok(
+            Some(
+                ExecutionPlanFilterPushdownResult {
+                    plan: Arc::new(Self {
+                        predicate: new_predicates,
+                        ..self.clone()
+                    }),
+                    pushdown: vec![FilterPushdownResult::Exact; filters.len()],
+                }
+            )
+        )
     }
 }
 
