@@ -136,8 +136,8 @@ jobs:
             });
             const baseSha = baseRef.object.sha;
             
-            const benchmarksResult = JSON.parse('${{ toJSON(steps.parse.outputs.result) }}');
-            const benchmarks = benchmarksResult.benchmarks;
+            // Parse the result from the previous step
+            const benchmarks = ${{ steps.parse.outputs.result }}.benchmarks;
             const commentId = context.payload.comment.id;
             
             // Comment to notify benchmark is starting
