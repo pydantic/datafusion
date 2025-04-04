@@ -52,7 +52,7 @@ env:
 jobs:
   benchmark:
     name: Run PR Benchmarks
-    runs-on: ubuntu-latest-large
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout PR branch
         uses: actions/checkout@v4
