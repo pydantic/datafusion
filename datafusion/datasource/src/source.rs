@@ -89,7 +89,7 @@ pub trait DataSource: Send + Sync + Debug {
     /// `DataSource`.
     ///
     /// If the filters can be evaluated by the `DataSource`,
-    /// sreturn a [`FilterPushdownResult`] containing an updated
+    /// return a [`FilterPushdownResult`] containing an updated
     /// `DataSource` and the support level for each filter (exact or inexact).
     ///
     /// Default implementation returns `Ok(None)`. See [`ExecutionPlan::with_filter_pushdown_result`]
@@ -99,7 +99,7 @@ pub trait DataSource: Send + Sync + Debug {
     fn push_down_filters(
         &self,
         _filters: &[PhysicalExprRef],
-    ) -> Result<Option<FilterPushdownResult<Arc<dyn DataSource>>>> {
+    ) -> Result<Option<DataSourceFilterPushdownResult>>> {
         Ok(None)
     }
 }

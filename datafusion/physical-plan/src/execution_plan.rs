@@ -431,7 +431,7 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
     /// `ExecutionPlan` node.
     ///
     /// If this method returns `true`, and the query plan contains a limit at
-    /// the output of this node, DataFusion will push the limit to the input    
+    /// the output of this node, DataFusion will push the limit to the input
     /// of this node.
     fn supports_limit_pushdown(&self) -> bool {
         false
