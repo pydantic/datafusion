@@ -26,6 +26,9 @@ on:
       pr_head_sha:
         description: 'PR Head SHA'
         required: true
+      pr_branch:
+        description: 'PR Branch'
+        required: true
       base_branch:
         description: 'Base branch to compare against (usually main)'
         required: true
@@ -79,123 +82,53 @@ jobs:
 
       - name: Generate benchmark data
         run: |
-          # Run data generation for each benchmark
+          ### Command used to pre-warm (aka precompile) the directories
+          export CARGO_COMMAND="cargo run --release"
+          
+          # start compiling the branch (in the background)
           cd pr_branch/benchmarks
-          
-          # Parse benchmarks from input
-          IFS=' ' read -r -a BENCHMARKS <<< "${{ github.event.inputs.benchmarks }}"
-          
-          # Generate data for each benchmark
-          for benchmark in "${BENCHMARKS[@]}"; do
-            echo "Generating data for $benchmark..."
-            ./bench.sh data "$benchmark"
-          done
-
-      - name: Run PR branch benchmarks
-        id: pr_benchmarks
-        run: |
-          # Navigate to PR branch
-          cd pr_branch/benchmarks
-
-          # Parse benchmarks from input
-          IFS=' ' read -r -a BENCHMARKS <<< "${{ github.event.inputs.benchmarks }}"
-          
-          # Use the branch name as results name
-          BRANCH_NAME=$(git rev-parse --abbrev-ref HEAD)
-          BRANCH_NAME=${BRANCH_NAME//\//_}
-          
-          # Run each benchmark
-          for benchmark in "${BENCHMARKS[@]}"; do
-            echo "Running $benchmark on PR branch..."
-            RESULTS_NAME="$BRANCH_NAME" ./bench.sh run "$benchmark"
-          done
-          
-          echo "pr_results_dir=pr_branch/benchmarks/results/$BRANCH_NAME" >> $GITHUB_OUTPUT
-
-      - name: Run base branch benchmarks
-        id: base_benchmarks
-        run: |
-          # Navigate to base branch
+          export BRANCH_NAME=`git rev-parse --abbrev-ref HEAD`
+          ${CARGO_COMMAND} --bin tpch >> build.log 2>&1 &
+          ${CARGO_COMMAND} --bin parquet >> build.log 2>&1 &
+          ${CARGO_COMMAND} --bin dfbench >> build.log 2>&1 &
+          popd
           cd base_branch/benchmarks
-          
-          # Parse benchmarks from input
-          IFS=' ' read -r -a BENCHMARKS <<< "${{ github.event.inputs.benchmarks }}"
-          
-          # Use 'base_branch' as results name
-          BRANCH_NAME="base_${BRANCH_NAME:-main}"
-          BRANCH_NAME=${BRANCH_NAME//\//_}
-          
-          # Run each benchmark
-          for benchmark in "${BENCHMARKS[@]}"; do
-            echo "Running $benchmark on base branch..."
-            RESULTS_NAME="$BRANCH_NAME" ./bench.sh run "$benchmark"
-          done
-          
-          echo "base_results_dir=base_branch/benchmarks/results/$BRANCH_NAME" >> $GITHUB_OUTPUT
+          ${CARGO_COMMAND} --bin tpch >> build.log 2>&1 &
+          ${CARGO_COMMAND} --bin parquet >> build.log 2>&1 &
+          ${CARGO_COMMAND} --bin dfbench >> build.log 2>&1 &
+          popd
 
-      - name: Install comparison requirements
-        run: |
-          # Setup virtual environment with requirements
-          cd pr_branch/benchmarks
+          # Wait for the compilation to finish
+          wait
+          # Check if the compilation was successful
+          if grep -q "error" build.log; then
+            echo "Compilation failed. Check build.log for details."
+            exit 1
+          fi
+          echo "Compilation completed successfully."
+
+          # Set up the benchmarks in the base branch
+          cd base_branch/benchmarks
+          # Download data for each benchmark
+          for benchmark in "${BENCHMARKS[@]}"; do
+            echo "** Creating data if needed **"
+            ./bench.sh data $bench
+            echo "** Running $bench baseline (merge-base from main)... **"
+            export DATAFUSION_DIR=${GITHUB_WORKSPACE}/base_branch
+            ./bench.sh run $bench
+            ## Run against branch
+            echo "** Running $bench branch... **"
+            export DATAFUSION_DIR=${GITHUB_WORKSPACE}/pr_branch
+            ./bench.sh run $bench
+          done
+
+          ## Compare
+          rm -f /tmp/report.txt
+          export BENCH_BRANCH_NAME=${{ github.event.inputs.pr_branch }} # mind blowing syntax to replace / with _
+          # Install requirements for comparison
           pip install -r requirements.txt
-
-      - name: Compare benchmark results
-        id: compare
-        run: |
-          # Navigate to PR branch benchmark directory
-          cd pr_branch/benchmarks
-          
-          # Parse benchmarks from input
-          IFS=' ' read -r -a BENCHMARKS <<< "${{ github.event.inputs.benchmarks }}"
-          
-          # Initialize results variable
-          COMPARISON_RESULTS=""
-          
-          # Get the directory names
-          PR_RESULTS_DIR="${{ steps.pr_benchmarks.outputs.pr_results_dir }}"
-          BASE_RESULTS_DIR="${{ steps.base_benchmarks.outputs.base_results_dir }}"
-          
-          # For each benchmark, run comparison
-          for benchmark in "${BENCHMARKS[@]}"; do
-            echo "Comparing $benchmark results..."
-            
-            # Determine result file names based on benchmark
-            if [[ "$benchmark" == "tpch" ]]; then
-              RESULT_FILE="tpch_sf1.json"
-            elif [[ "$benchmark" == "tpch_mem" ]]; then
-              RESULT_FILE="tpch_mem_sf1.json"
-            elif [[ "$benchmark" == "tpch10" ]]; then
-              RESULT_FILE="tpch_sf10.json"
-            elif [[ "$benchmark" == "tpch_mem10" ]]; then
-              RESULT_FILE="tpch_mem_sf10.json"
-            elif [[ "$benchmark" == "clickbench_1" ]]; then
-              RESULT_FILE="clickbench_1.json"
-            elif [[ "$benchmark" == "clickbench_partitioned" ]]; then
-              RESULT_FILE="clickbench_partitioned.json"
-            elif [[ "$benchmark" == "clickbench_extended" ]]; then
-              RESULT_FILE="clickbench_extended.json"
-            elif [[ "$benchmark" == "imdb" ]]; then
-              RESULT_FILE="imdb.json"
-            elif [[ "$benchmark" == "external_aggr" ]]; then
-              RESULT_FILE="external_aggr.json"
-            elif [[ "$benchmark" == "sort_tpch" ]]; then
-              RESULT_FILE="sort_tpch.json"
-            else
-              RESULT_FILE="$benchmark.json"
-            fi
-            
-            # Check if both result files exist
-            if [[ -f "$PR_RESULTS_DIR/$RESULT_FILE" && -f "$BASE_RESULTS_DIR/$RESULT_FILE" ]]; then
-              # Run comparison and capture output
-              OUTPUT=$(python compare.py "$PR_RESULTS_DIR/$RESULT_FILE" "$BASE_RESULTS_DIR/$RESULT_FILE")
-              COMPARISON_RESULTS+="## $benchmark\n\n\`\`\`\n$OUTPUT\n\`\`\`\n\n"
-            else
-              COMPARISON_RESULTS+="## $benchmark\n\nResults not available for comparison.\n\n"
-            fi
-          done
-          
-          # Save comparison results to file for use in PR comment
-          echo -e "$COMPARISON_RESULTS" > /tmp/benchmark_comparison.txt
+          # Run the comparison script
+          ./bench.sh compare HEAD "${BENCH_BRANCH_NAME}" | tee -a /tmp/report.txt
 
       - name: Post results as PR comment
         uses: actions/github-script@v7
@@ -210,7 +143,7 @@ jobs:
             const comment_id = ${{ github.event.inputs.comment_id }};
             
             // Read comparison results
-            const comparisonText = fs.readFileSync('/tmp/benchmark_comparison.txt', 'utf8');
+            const comparisonText = fs.readFileSync('/tmp/report.txt', 'utf8');
             
             // Parse benchmarks from input
             const benchmarks = '${{ github.event.inputs.benchmarks }}'.split(' ');
@@ -230,7 +163,7 @@ jobs:
 
             Triggered by [this comment](https://github.com/\${context.repo.owner}/\${context.repo.repo}/pull/\${pr_number}#issuecomment-\${comment_id})
             `;
-                        
+
             // Post comment to PR
             await github.rest.issues.createComment({
               owner: context.repo.owner,
