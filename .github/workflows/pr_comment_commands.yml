@@ -155,6 +155,7 @@ jobs:
               workflow_id: 'pr_benchmarks.yml',
               ref: branchName,
               inputs: {
+                pr_branch: branchName,
                 pr_number: context.payload.issue.number.toString(),
                 pr_head_sha: headSha,
                 base_branch: baseBranch,
