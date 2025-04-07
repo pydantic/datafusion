@@ -85,12 +85,10 @@ pub trait DataSource: Send + Sync + Debug {
         &self,
         _filters: &[PhysicalExprRef],
         _config: &ConfigOptions,
-    ) -> Result<DataSourceFilterPushdownResult> {
-        Ok(DataSourceFilterPushdownResult::NotPushed)
+    ) -> Result<FilterPushdownResult<Arc<dyn DataSource>>> {
+        Ok(FilterPushdownResult::NotPushed)
     }
 }
-
-pub type DataSourceFilterPushdownResult = FilterPushdownResult<Arc<dyn DataSource>>;
 
 /// [`ExecutionPlan`] handles different file formats like JSON, CSV, AVRO, ARROW, PARQUET
 ///
@@ -214,10 +212,8 @@ impl ExecutionPlan for DataSourceExec {
             .data_source
             .try_pushdown_filters(parent_filters, config)?
         {
-            DataSourceFilterPushdownResult::NotPushed => {
-                Ok(FilterPushdownResult::NotPushed)
-            }
-            DataSourceFilterPushdownResult::Pushed { inner, support } => {
+            FilterPushdownResult::NotPushed => Ok(FilterPushdownResult::NotPushed),
+            FilterPushdownResult::Pushed { inner, support } => {
                 let new_self = Arc::new(DataSourceExec::new(inner));
                 Ok(FilterPushdownResult::Pushed {
                     inner: new_self,
