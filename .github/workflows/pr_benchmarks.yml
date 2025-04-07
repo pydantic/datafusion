@@ -1,0 +1,173 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: PR Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR Number'
+        required: true
+      pr_head_sha:
+        description: 'PR Head SHA'
+        required: true
+      pr_branch:
+        description: 'PR Branch'
+        required: true
+      base_branch:
+        description: 'Base branch to compare against (usually main)'
+        required: true
+        default: 'main'
+      base_sha:
+        description: 'Exact SHA of base branch to compare against'
+        required: true
+      benchmarks:
+        description: 'Space-separated list of benchmarks to run'
+        required: true
+        default: 'tpch_mem clickbench_partitioned'
+      comment_id:
+        description: 'ID of the comment that triggered the benchmarks'
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Run PR Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.pr_head_sha }}
+          path: pr_branch
+
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.base_sha }}
+          path: base_branch
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Generate benchmark data
+        run: |
+          ### Command used to pre-warm (aka precompile) the directories
+          export CARGO_COMMAND="cargo run --release"
+          
+          # start compiling the branch (in the background)
+          cd pr_branch/benchmarks
+          export BRANCH_NAME=`git rev-parse --abbrev-ref HEAD`
+          ${CARGO_COMMAND} --bin tpch >> build.log 2>&1 &
+          ${CARGO_COMMAND} --bin parquet >> build.log 2>&1 &
+          ${CARGO_COMMAND} --bin dfbench >> build.log 2>&1 &
+          popd
+          cd base_branch/benchmarks
+          ${CARGO_COMMAND} --bin tpch >> build.log 2>&1 &
+          ${CARGO_COMMAND} --bin parquet >> build.log 2>&1 &
+          ${CARGO_COMMAND} --bin dfbench >> build.log 2>&1 &
+          popd
+
+          # Wait for the compilation to finish
+          wait
+          # Check if the compilation was successful
+          if grep -q "error" build.log; then
+            echo "Compilation failed. Check build.log for details."
+            exit 1
+          fi
+          echo "Compilation completed successfully."
+
+          # Set up the benchmarks in the base branch
+          cd base_branch/benchmarks
+          # Download data for each benchmark
+          for benchmark in "${BENCHMARKS[@]}"; do
+            echo "** Creating data if needed **"
+            ./bench.sh data $bench
+            echo "** Running $bench baseline (merge-base from main)... **"
+            export DATAFUSION_DIR=${GITHUB_WORKSPACE}/base_branch
+            ./bench.sh run $bench
+            ## Run against branch
+            echo "** Running $bench branch... **"
+            export DATAFUSION_DIR=${GITHUB_WORKSPACE}/pr_branch
+            ./bench.sh run $bench
+          done
+
+          ## Compare
+          rm -f /tmp/report.txt
+          export BENCH_BRANCH_NAME=${{ github.event.inputs.pr_branch }} # mind blowing syntax to replace / with _
+          # Install requirements for comparison
+          pip install -r requirements.txt
+          # Run the comparison script
+          ./bench.sh compare HEAD "${BENCH_BRANCH_NAME}" | tee -a /tmp/report.txt
+
+      - name: Post results as PR comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const pr_number = ${{ github.event.inputs.pr_number }};
+            const pr_head_sha = '${{ github.event.inputs.pr_head_sha }}';
+            const base_branch = '${{ github.event.inputs.base_branch }}';
+            const base_sha = '${{ github.event.inputs.base_sha }}';
+            const comment_id = ${{ github.event.inputs.comment_id }};
+            
+            // Read comparison results
+            const comparisonText = fs.readFileSync('/tmp/report.txt', 'utf8');
+            
+            // Parse benchmarks from input
+            const benchmarks = '${{ github.event.inputs.benchmarks }}'.split(' ');
+            
+            // Create comment with results in collapsible sections
+            const comment = `## 📊 Benchmark Results
+
+            <details>
+            <summary>Expand for detailed results</summary>
+
+            \${comparisonText}
+            </details>
+
+            Benchmarks run: \${benchmarks.join(', ')}
+
+            Comparing PR branch (\`\${pr_head_sha.substring(0, 8)}\`) with base branch \`\${base_branch}\` (\`\${base_sha.substring(0, 8)}\`)
+
+            Triggered by [this comment](https://github.com/\${context.repo.owner}/\${context.repo.repo}/pull/\${pr_number}#issuecomment-\${comment_id})
+            `;
+
+            // Post comment to PR
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr_number,
+              body: comment
+            });
