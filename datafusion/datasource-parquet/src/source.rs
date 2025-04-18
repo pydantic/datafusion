@@ -25,6 +25,7 @@ use crate::opener::build_page_pruning_predicate;
 use crate::opener::build_pruning_predicate;
 use crate::opener::ParquetOpener;
 use crate::page_filter::PagePruningAccessPlanFilter;
+use crate::row_filter::can_expr_be_pushed_down_with_schemas;
 use crate::DefaultParquetFileReaderFactory;
 use crate::ParquetFileReaderFactory;
 use datafusion_datasource::file_stream::FileOpener;
@@ -37,9 +38,13 @@ use datafusion_common::config::TableParquetOptions;
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_physical_expr::conjunction;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_optimizer::pruning::PruningPredicate;
+use datafusion_physical_plan::filter_pushdown::FilterDescription;
+use datafusion_physical_plan::filter_pushdown::FilterPushdownResult;
+use datafusion_physical_plan::filter_pushdown::FilterPushdownSupport;
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
 use datafusion_physical_plan::DisplayFormatType;
 
@@ -253,12 +258,16 @@ use object_store::ObjectStore;
 /// [`RecordBatch`]: arrow::record_batch::RecordBatch
 /// [`SchemaAdapter`]: datafusion_datasource::schema_adapter::SchemaAdapter
 /// [`ParquetMetadata`]: parquet::file::metadata::ParquetMetaData
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct ParquetSource {
     /// Options for reading Parquet files
     pub(crate) table_parquet_options: TableParquetOptions,
     /// Optional metrics
     pub(crate) metrics: ExecutionPlanMetricsSet,
+    /// The schema of the file.
+    /// In particular, this is the schema of the table without partition columns,
+    /// *not* the physical schema of the file.
+    pub(crate) file_schema: SchemaRef,
     /// Optional predicate for row filtering during parquet scan
     pub(crate) predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Optional predicate for pruning row groups (derived from `predicate`)
@@ -280,10 +289,19 @@ impl ParquetSource {
     /// Create a new ParquetSource to read the data specified in the file scan
     /// configuration with the provided `TableParquetOptions`.
     /// if default values are going to be used, use `ParguetConfig::default()` instead
-    pub fn new(table_parquet_options: TableParquetOptions) -> Self {
+    pub fn new(table_parquet_options: TableParquetOptions, file_schema: SchemaRef) -> Self {
         Self {
             table_parquet_options,
-            ..Self::default()
+            file_schema,
+            metrics: ExecutionPlanMetricsSet::default(),
+            predicate: None,
+            pruning_predicate: None,
+            page_pruning_predicate: None,
+            parquet_file_reader_factory: None,
+            schema_adapter_factory: None,
+            batch_size: None,
+            metadata_size_hint: None,
+            projected_statistics: None,
         }
     }
 
@@ -306,7 +324,6 @@ impl ParquetSource {
     /// Set predicate information, also sets pruning_predicate and page_pruning_predicate attributes
     pub fn with_predicate(
         &self,
-        file_schema: Arc<Schema>,
         predicate: Arc<dyn PhysicalExpr>,
     ) -> Self {
         let mut conf = self.clone();
@@ -319,9 +336,9 @@ impl ParquetSource {
         conf.predicate = Some(Arc::clone(&predicate));
 
         conf.page_pruning_predicate =
-            Some(build_page_pruning_predicate(&predicate, &file_schema));
+            Some(build_page_pruning_predicate(&predicate, &self.file_schema));
         conf.pruning_predicate =
-            build_pruning_predicate(predicate, &file_schema, &predicate_creation_errors);
+            build_pruning_predicate(predicate, &self.file_schema, &predicate_creation_errors);
 
         conf
     }
@@ -586,5 +603,41 @@ impl FileSource for ParquetSource {
                 Ok(())
             }
         }
+    }
+
+    fn try_pushdown_filters(
+        &self,
+        fd: FilterDescription,
+        config: &datafusion_common::config::ConfigOptions,
+    ) -> datafusion_common::Result<FilterPushdownResult<Arc<dyn FileSource>>> {
+        let mut conf = self.clone();
+        let filters = fd.filters.clone();
+        let predicate = match conf.predicate {
+            Some(predicate) => conjunction(std::iter::once(predicate).chain(filters.into_iter())),
+            None => conjunction(filters.into_iter()),
+        };
+        conf.predicate = Some(predicate);
+        let remaining_description = if config.execution.parquet.pushdown_filters {
+            let mut remaining_filters = fd.filters.clone();
+            for filter in &remaining_filters {
+                if can_expr_be_pushed_down_with_schemas(filter, &conf.file_schema) {
+                    // This filter can be pushed down
+                } else {
+                    // This filter cannot be pushed down
+                    remaining_filters.retain(|f| f != filter);
+                }
+            }
+        } else {
+            FilterDescription {
+                filters: fd.filters,
+            }
+        };
+        Ok(
+            FilterPushdownResult {
+                support: FilterPushdownSupport::Supported { child_descriptions: vec![], op: Arc::new(conf), revisit: false },
+                remaining_description,
+            }
+        )
+    
     }
 }

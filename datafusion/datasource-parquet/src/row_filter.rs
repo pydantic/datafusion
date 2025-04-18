@@ -386,21 +386,21 @@ fn would_column_prevent_pushdown(column_name: &str, table_schema: &Schema) -> bo
 /// this expression from being predicate pushed down. If any of them would, this returns false.
 /// Otherwise, true.
 pub fn can_expr_be_pushed_down_with_schemas(
-    expr: &datafusion_expr::Expr,
-    _file_schema: &Schema,
+    expr: &Arc<dyn PhysicalExpr>,
     table_schema: &Schema,
 ) -> bool {
     let mut can_be_pushed = true;
-    expr.apply(|expr| match expr {
-        datafusion_expr::Expr::Column(column) => {
+    expr.apply(|expr| {
+        if let Some(column) = expr.as_any().downcast_ref::<Column>() {
             can_be_pushed &= !would_column_prevent_pushdown(column.name(), table_schema);
             Ok(if can_be_pushed {
                 TreeNodeRecursion::Jump
             } else {
                 TreeNodeRecursion::Stop
             })
+        } else {
+            Ok(TreeNodeRecursion::Continue)
         }
-        _ => Ok(TreeNodeRecursion::Continue),
     })
     .unwrap(); // we never return an Err, so we can safely unwrap this
     can_be_pushed
@@ -516,7 +516,7 @@ mod test {
     use super::*;
     use datafusion_common::ScalarValue;
 
-    use arrow::datatypes::{Field, Fields, TimeUnit::Nanosecond};
+    use arrow::datatypes::{Field, TimeUnit::Nanosecond};
     use datafusion_datasource::schema_adapter::DefaultSchemaAdapterFactory;
     use datafusion_expr::{col, Expr};
     use datafusion_physical_expr::planner::logical2physical;
@@ -651,71 +651,38 @@ mod test {
     fn nested_data_structures_prevent_pushdown() {
         let table_schema = get_basic_table_schema();
 
-        let file_schema = Schema::new(vec![Field::new(
-            "list_col",
-            DataType::Struct(Fields::empty()),
-            true,
-        )]);
-
         let expr = col("list_col").is_not_null();
 
-        assert!(!can_expr_be_pushed_down_with_schemas(
-            &expr,
-            &file_schema,
-            &table_schema
-        ));
+        assert!(!can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
     }
 
     #[test]
     fn projected_columns_prevent_pushdown() {
         let table_schema = get_basic_table_schema();
 
-        let file_schema =
-            Schema::new(vec![Field::new("existing_col", DataType::Int64, true)]);
-
         let expr = col("nonexistent_column").is_null();
 
-        assert!(!can_expr_be_pushed_down_with_schemas(
-            &expr,
-            &file_schema,
-            &table_schema
-        ));
+        assert!(!can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
     }
 
     #[test]
     fn basic_expr_doesnt_prevent_pushdown() {
         let table_schema = get_basic_table_schema();
 
-        let file_schema =
-            Schema::new(vec![Field::new("string_col", DataType::Utf8, true)]);
-
         let expr = col("string_col").is_null();
 
-        assert!(can_expr_be_pushed_down_with_schemas(
-            &expr,
-            &file_schema,
-            &table_schema
-        ));
+        assert!(can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
     }
 
     #[test]
     fn complex_expr_doesnt_prevent_pushdown() {
         let table_schema = get_basic_table_schema();
 
-        let file_schema = Schema::new(vec![
-            Field::new("string_col", DataType::Utf8, true),
-            Field::new("bigint_col", DataType::Int64, true),
-        ]);
-
         let expr = col("string_col")
             .is_not_null()
             .or(col("bigint_col").gt(Expr::Literal(ScalarValue::Int64(Some(5)))));
 
-        assert!(can_expr_be_pushed_down_with_schemas(
-            &expr,
-            &file_schema,
-            &table_schema
-        ));
+        assert!(can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
     }
 
     fn get_basic_table_schema() -> Schema {

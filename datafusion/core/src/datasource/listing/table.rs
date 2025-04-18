@@ -25,7 +25,7 @@ use std::{any::Any, str::FromStr, sync::Arc};
 use crate::datasource::{
     create_ordering,
     file_format::{
-        file_compression_type::FileCompressionType, FileFormat, FilePushdownSupport,
+        file_compression_type::FileCompressionType, FileFormat,
     },
     physical_plan::FileSinkConfig,
 };
@@ -979,18 +979,6 @@ impl TableProvider for ListingTable {
                 if can_be_evaluted_for_partition_pruning(&partition_column_names, filter)
                 {
                     // if filter can be handled by partition pruning, it is exact
-                    return Ok(TableProviderFilterPushDown::Exact);
-                }
-
-                // if we can't push it down completely with only the filename-based/path-based
-                // column names, then we should check if we can do parquet predicate pushdown
-                let supports_pushdown = self.options.format.supports_filters_pushdown(
-                    &self.file_schema,
-                    &self.table_schema,
-                    &[filter],
-                )?;
-
-                if supports_pushdown == FilePushdownSupport::Supported {
                     return Ok(TableProviderFilterPushDown::Exact);
                 }
 
