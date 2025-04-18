@@ -22,7 +22,7 @@ mod binary;
 mod case;
 mod cast;
 mod column;
-mod dynamic_filters;
+pub mod dynamic_filters;
 mod in_list;
 mod is_not_null;
 mod is_null;

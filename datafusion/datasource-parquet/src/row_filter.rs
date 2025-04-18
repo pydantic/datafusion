@@ -145,10 +145,16 @@ impl ArrowPredicate for DatafusionArrowPredicate {
     fn evaluate(&mut self, batch: RecordBatch) -> ArrowResult<BooleanArray> {
         let batch = self.schema_mapper.map_batch(batch)?;
 
+        println!(
+            "evaluating filter predicate {:?} on batch: {batch:?}",
+            self.physical_expr
+        );
+
         // scoped timer updates on drop
         let mut timer = self.time.timer();
 
-        self.physical_expr
+        let res = self
+            .physical_expr
             .evaluate(&batch)
             .and_then(|v| v.into_array(batch.num_rows()))
             .and_then(|array| {
@@ -164,7 +170,10 @@ impl ArrowPredicate for DatafusionArrowPredicate {
                 ArrowError::ComputeError(format!(
                     "Error evaluating filter predicate: {e:?}"
                 ))
-            })
+            })?;
+
+        println!("evaluated filter predicate on batch: {res:?}");
+        Ok(res)
     }
 }
 
