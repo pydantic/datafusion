@@ -120,7 +120,7 @@ pub struct TopK {
     /// Common sort prefix between the input and the sort expressions to allow early exit optimization
     common_sort_prefix: Arc<[PhysicalSortExpr]>,
     /// Filter matching the state of the `TopK` heap used for dynamic filter pushdown
-    batch_filter: Option<Arc<DynamicFilterPhysicalExpr>>,
+    filter: Arc<DynamicFilterPhysicalExpr>,
     /// If true, indicates that all rows of subsequent batches are guaranteed
     /// to be greater (by byte order, after row conversion) than the top K,
     /// which means the top K won't change and the computation can be finished early.
@@ -159,6 +159,7 @@ impl TopK {
         batch_size: usize,
         runtime: Arc<RuntimeEnv>,
         metrics: &ExecutionPlanMetricsSet,
+        filter: Arc<DynamicFilterPhysicalExpr>,
     ) -> Result<Self> {
         let reservation = MemoryConsumer::new(format!("TopK[{partition_id}]"))
             .register(&runtime.memory_pool);
@@ -191,7 +192,7 @@ impl TopK {
             common_sort_prefix_converter: prefix_row_converter,
             common_sort_prefix: Arc::from(common_sort_prefix),
             finished: false,
-            batch_filter: None,
+            filter,
         })
     }
 
@@ -254,11 +255,13 @@ impl TopK {
         Ok(())
     }
 
+    pub fn get_dynamic_filter(&mut self) -> Arc<dyn PhysicalExpr> {
+        Arc::clone(&self.filter) as Arc<dyn PhysicalExpr>
+    }
+
     /// Update the filter representation of our TopK heap
     fn update_filter(&mut self) -> Result<()> {
-        if let Some(thresholds) =
-            self.heap.get_threshold_values(&self.expr)?
-        {
+        if let Some(thresholds) = self.heap.get_threshold_values(&self.expr)? {
             // Create filter expressions for each threshold
             let mut filters: Vec<Arc<dyn PhysicalExpr>> =
                 Vec::with_capacity(thresholds.len());
@@ -339,17 +342,10 @@ impl TopK {
 
             if let Some(predicate) = dynamic_predicate {
                 if !predicate.eq(&lit(true)) {
-                    match self.batch_filter {
-                        Some(ref mut filter) => {
-                            filter.update(predicate)?;
-                        }
-                    }
+                    self.filter.update(predicate)?;
                 }
             }
-        }?;
-
-        // If the filter is not empty, update the filter
-        self.batch_filter = new_filter;
+        }
 
         Ok(())
     }
@@ -443,7 +439,7 @@ impl TopK {
             common_sort_prefix_converter: _,
             common_sort_prefix: _,
             finished: _,
-            batch_filter: _,
+            filter: _,
         } = self;
         let _timer = metrics.baseline.elapsed_compute().timer(); // time updated on drop
 
@@ -995,6 +991,7 @@ mod tests {
             2,
             runtime,
             &metrics,
+            Arc::new(DynamicFilterPhysicalExpr::new(vec![], lit(true)))
         )?;
 
         // Create the first batch with two columns:
