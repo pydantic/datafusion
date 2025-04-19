@@ -213,7 +213,6 @@ impl FileOpener for ParquetOpener {
 
             // Filter pushdown: evaluate predicates during scan
             if let Some(predicate) = pushdown_filters.then_some(predicate).flatten() {
-                println!("attaching pushdown filter for predicate: {predicate:?}");
                 let row_filter = row_filter::build_row_filter(
                     &predicate,
                     &physical_file_schema,
@@ -226,14 +225,11 @@ impl FileOpener for ParquetOpener {
 
                 match row_filter {
                     Ok(Some(filter)) => {
-                        println!("attaching row_filter");
                         builder = builder.with_row_filter(filter);
                     }
-                    Ok(None) => {
-                        println!("no row filter");
-                    }
+                    Ok(None) => {}
                     Err(e) => {
-                        println!(
+                        debug!(
                             "Ignoring error building row filter for '{:?}': {}",
                             predicate, e
                         );
