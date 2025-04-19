@@ -583,9 +583,9 @@ impl FileSource for ParquetSource {
                 }
             }
             let predicate = match conf.predicate {
-                Some(predicate) => conjunction(
-                    std::iter::once(predicate).chain(allowed_filters),
-                ),
+                Some(predicate) => {
+                    conjunction(std::iter::once(predicate).chain(allowed_filters))
+                }
                 None => conjunction(allowed_filters),
             };
             conf.predicate = Some(predicate);

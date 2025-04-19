@@ -649,10 +649,11 @@ mod test {
 
     #[test]
     fn nested_data_structures_prevent_pushdown() {
-        let table_schema = get_basic_table_schema();
+        let table_schema = Arc::new(get_lists_table_schema());
 
-        let expr = col("list_col").is_not_null();
+        let expr = col("utf8_list").is_not_null();
         let expr = logical2physical(&expr, &table_schema);
+        check_expression_can_evaluate_against_schema(&expr, &table_schema);
 
         assert!(!can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
     }
@@ -661,8 +662,8 @@ mod test {
     fn projected_columns_prevent_pushdown() {
         let table_schema = get_basic_table_schema();
 
-        let expr = col("nonexistent_column").is_null();
-        let expr = logical2physical(&expr, &table_schema);
+        let expr =
+            Arc::new(Column::new("nonexistent_column", 0)) as Arc<dyn PhysicalExpr>;
 
         assert!(!can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
     }
@@ -700,5 +701,28 @@ mod test {
 
         parquet_to_arrow_schema(metadata.file_metadata().schema_descr(), None)
             .expect("parsing schema")
+    }
+
+    fn get_lists_table_schema() -> Schema {
+        let testdata = datafusion_common::test_util::parquet_test_data();
+        let file = std::fs::File::open(format!("{testdata}/list_columns.parquet"))
+            .expect("opening file");
+
+        let reader = SerializedFileReader::new(file).expect("creating reader");
+
+        let metadata = reader.metadata();
+
+        parquet_to_arrow_schema(metadata.file_metadata().schema_descr(), None)
+            .expect("parsing schema")
+    }
+
+    /// Sanity check that the given expression could be evaluated against the given schema without any errors.
+    /// This will fail if the expression references columns that are not in the schema or if the types of the columns are incompatible, etc.
+    fn check_expression_can_evaluate_against_schema(
+        expr: &Arc<dyn PhysicalExpr>,
+        table_schema: &Arc<Schema>,
+    ) -> bool {
+        let batch = RecordBatch::new_empty(Arc::clone(table_schema));
+        expr.evaluate(&batch).is_ok()
     }
 }
