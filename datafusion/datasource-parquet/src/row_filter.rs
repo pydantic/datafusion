@@ -652,6 +652,7 @@ mod test {
         let table_schema = get_basic_table_schema();
 
         let expr = col("list_col").is_not_null();
+        let expr = logical2physical(&expr, &table_schema);
 
         assert!(!can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
     }
@@ -661,6 +662,7 @@ mod test {
         let table_schema = get_basic_table_schema();
 
         let expr = col("nonexistent_column").is_null();
+        let expr = logical2physical(&expr, &table_schema);
 
         assert!(!can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
     }
@@ -670,6 +672,7 @@ mod test {
         let table_schema = get_basic_table_schema();
 
         let expr = col("string_col").is_null();
+        let expr = logical2physical(&expr, &table_schema);
 
         assert!(can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
     }
@@ -681,6 +684,7 @@ mod test {
         let expr = col("string_col")
             .is_not_null()
             .or(col("bigint_col").gt(Expr::Literal(ScalarValue::Int64(Some(5)))));
+        let expr = logical2physical(&expr, &table_schema);
 
         assert!(can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
     }

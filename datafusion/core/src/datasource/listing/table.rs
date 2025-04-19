@@ -24,9 +24,7 @@ use std::{any::Any, str::FromStr, sync::Arc};
 
 use crate::datasource::{
     create_ordering,
-    file_format::{
-        file_compression_type::FileCompressionType, FileFormat,
-    },
+    file_format::{file_compression_type::FileCompressionType, FileFormat},
     physical_plan::FileSinkConfig,
 };
 use crate::execution::context::SessionState;

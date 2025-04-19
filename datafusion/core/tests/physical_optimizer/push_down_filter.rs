@@ -99,7 +99,7 @@ impl FileSource for TestSource {
     }
 
     fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
-        todo!("should not be called")
+        Arc::new(self.clone()) as Arc<dyn FileSource>
     }
 
     fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {

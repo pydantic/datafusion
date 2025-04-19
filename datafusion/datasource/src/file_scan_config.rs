@@ -407,7 +407,9 @@ impl FileScanConfigBuilder {
         let statistics =
             statistics.unwrap_or_else(|| Statistics::new_unknown(&file_schema));
 
-        let file_source = file_source.with_statistics(statistics.clone());
+        let file_source = file_source
+            .with_statistics(statistics.clone())
+            .with_schema(Arc::clone(&file_schema));
         let file_compression_type =
             file_compression_type.unwrap_or(FileCompressionType::UNCOMPRESSED);
         let new_lines_in_values = new_lines_in_values.unwrap_or(false);
@@ -463,7 +465,6 @@ impl DataSource for FileScanConfig {
         let source = self
             .file_source
             .with_batch_size(batch_size)
-            .with_schema(Arc::clone(&self.file_schema))
             .with_projection(self);
 
         let opener = source.create_file_opener(object_store, self, partition);

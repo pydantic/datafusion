@@ -220,7 +220,7 @@ impl ParquetExecBuilder {
             parquet_file_reader_factory,
             schema_adapter_factory,
         } = self;
-        let mut parquet = ParquetSource::new(table_parquet_options, Arc::clone(&file_scan_config.file_schema));
+        let mut parquet = ParquetSource::new(table_parquet_options);
         if let Some(predicate) = predicate.clone() {
             parquet = parquet.with_predicate(predicate);
         }
@@ -242,7 +242,7 @@ impl ParquetExecBuilder {
             inner: DataSourceExec::new(Arc::new(base_config.clone())),
             base_config,
             predicate,
-            pruning_predicate: parquet.pruning_predicate,
+            pruning_predicate: None, // for backwards compat since `ParquetExec` is only for backwards compat anyway
             schema_adapter_factory: parquet.schema_adapter_factory,
             parquet_file_reader_factory: parquet.parquet_file_reader_factory,
             table_parquet_options: parquet.table_parquet_options,

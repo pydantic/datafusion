@@ -29,9 +29,7 @@ use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_sink_config::{FileSink, FileSinkConfig};
 use datafusion_datasource::write::{create_writer, get_writer_schema, SharedBuffer};
 
-use datafusion_datasource::file_format::{
-    FileFormat, FileFormatFactory
-};
+use datafusion_datasource::file_format::{FileFormat, FileFormatFactory};
 use datafusion_datasource::write::demux::DemuxedStreamReceiver;
 
 use arrow::compute::sum;
@@ -420,7 +418,7 @@ impl FileFormat for ParquetFormat {
             metadata_size_hint = Some(metadata);
         }
 
-        let mut source = ParquetSource::new(self.options.clone(), Arc::clone(&conf.file_schema));
+        let mut source = ParquetSource::new(self.options.clone());
 
         if let Some(predicate) = predicate {
             source = source.with_predicate(predicate);
@@ -452,7 +450,7 @@ impl FileFormat for ParquetFormat {
     }
 
     fn file_source(&self) -> Arc<dyn FileSource> {
-        todo!() // need access of file schema?
+        Arc::new(ParquetSource::default())
     }
 }
 

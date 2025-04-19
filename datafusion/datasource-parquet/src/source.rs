@@ -21,10 +21,7 @@ use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
-use crate::opener::build_page_pruning_predicate;
-use crate::opener::build_pruning_predicate;
 use crate::opener::ParquetOpener;
-use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::row_filter::can_expr_be_pushed_down_with_schemas;
 use crate::DefaultParquetFileReaderFactory;
 use crate::ParquetFileReaderFactory;
@@ -33,7 +30,7 @@ use datafusion_datasource::schema_adapter::{
     DefaultSchemaAdapterFactory, SchemaAdapterFactory,
 };
 
-use arrow::datatypes::{Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{SchemaRef, TimeUnit};
 use datafusion_common::config::TableParquetOptions;
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_datasource::file::FileSource;
@@ -41,14 +38,13 @@ use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_physical_expr::conjunction;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
-use datafusion_physical_optimizer::pruning::PruningPredicate;
+use datafusion_physical_plan::filter_pushdown::filter_pushdown_not_supported;
 use datafusion_physical_plan::filter_pushdown::FilterDescription;
 use datafusion_physical_plan::filter_pushdown::FilterPushdownResult;
 use datafusion_physical_plan::filter_pushdown::FilterPushdownSupport;
-use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
+use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::DisplayFormatType;
 
-use itertools::Itertools;
 use object_store::ObjectStore;
 
 /// Execution plan for reading one or more Parquet files.
@@ -258,7 +254,7 @@ use object_store::ObjectStore;
 /// [`RecordBatch`]: arrow::record_batch::RecordBatch
 /// [`SchemaAdapter`]: datafusion_datasource::schema_adapter::SchemaAdapter
 /// [`ParquetMetadata`]: parquet::file::metadata::ParquetMetaData
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ParquetSource {
     /// Options for reading Parquet files
     pub(crate) table_parquet_options: TableParquetOptions,
@@ -267,13 +263,9 @@ pub struct ParquetSource {
     /// The schema of the file.
     /// In particular, this is the schema of the table without partition columns,
     /// *not* the physical schema of the file.
-    pub(crate) file_schema: SchemaRef,
+    pub(crate) file_schema: Option<SchemaRef>,
     /// Optional predicate for row filtering during parquet scan
     pub(crate) predicate: Option<Arc<dyn PhysicalExpr>>,
-    /// Optional predicate for pruning row groups (derived from `predicate`)
-    pub(crate) pruning_predicate: Option<Arc<PruningPredicate>>,
-    /// Optional predicate for pruning pages (derived from `predicate`)
-    pub(crate) page_pruning_predicate: Option<Arc<PagePruningAccessPlanFilter>>,
     /// Optional user defined parquet file reader factory
     pub(crate) parquet_file_reader_factory: Option<Arc<dyn ParquetFileReaderFactory>>,
     /// Optional user defined schema adapter
@@ -289,19 +281,10 @@ impl ParquetSource {
     /// Create a new ParquetSource to read the data specified in the file scan
     /// configuration with the provided `TableParquetOptions`.
     /// if default values are going to be used, use `ParguetConfig::default()` instead
-    pub fn new(table_parquet_options: TableParquetOptions, file_schema: SchemaRef) -> Self {
+    pub fn new(table_parquet_options: TableParquetOptions) -> Self {
         Self {
             table_parquet_options,
-            file_schema,
-            metrics: ExecutionPlanMetricsSet::default(),
-            predicate: None,
-            pruning_predicate: None,
-            page_pruning_predicate: None,
-            parquet_file_reader_factory: None,
-            schema_adapter_factory: None,
-            batch_size: None,
-            metadata_size_hint: None,
-            projected_statistics: None,
+            ..Self::default()
         }
     }
 
@@ -321,25 +304,12 @@ impl ParquetSource {
         self
     }
 
-    /// Set predicate information, also sets pruning_predicate and page_pruning_predicate attributes
-    pub fn with_predicate(
-        &self,
-        predicate: Arc<dyn PhysicalExpr>,
-    ) -> Self {
+    /// Set predicate information
+    pub fn with_predicate(&self, predicate: Arc<dyn PhysicalExpr>) -> Self {
         let mut conf = self.clone();
-
         let metrics = ExecutionPlanMetricsSet::new();
-        let predicate_creation_errors =
-            MetricBuilder::new(&metrics).global_counter("num_predicate_creation_errors");
-
         conf = conf.with_metrics(metrics);
         conf.predicate = Some(Arc::clone(&predicate));
-
-        conf.page_pruning_predicate =
-            Some(build_page_pruning_predicate(&predicate, &self.file_schema));
-        conf.pruning_predicate =
-            build_pruning_predicate(predicate, &self.file_schema, &predicate_creation_errors);
-
         conf
     }
 
@@ -530,8 +500,11 @@ impl FileSource for ParquetSource {
         Arc::new(conf)
     }
 
-    fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
+    fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource> {
+        Arc::new(Self {
+            file_schema: Some(schema),
+            ..self.clone()
+        })
     }
 
     fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
@@ -576,25 +549,8 @@ impl FileSource for ParquetSource {
                     .predicate()
                     .map(|p| format!(", predicate={p}"))
                     .unwrap_or_default();
-                let pruning_predicate_string = self
-                    .pruning_predicate
-                    .as_ref()
-                    .map(|pre| {
-                        let mut guarantees = pre
-                            .literal_guarantees()
-                            .iter()
-                            .map(|item| format!("{}", item))
-                            .collect_vec();
-                        guarantees.sort();
-                        format!(
-                            ", pruning_predicate={}, required_guarantees=[{}]",
-                            pre.predicate_expr(),
-                            guarantees.join(", ")
-                        )
-                    })
-                    .unwrap_or_default();
 
-                write!(f, "{}{}", predicate_string, pruning_predicate_string)
+                write!(f, "{}", predicate_string)
             }
             DisplayFormatType::TreeRender => {
                 if let Some(predicate) = self.predicate() {
@@ -610,34 +566,41 @@ impl FileSource for ParquetSource {
         fd: FilterDescription,
         config: &datafusion_common::config::ConfigOptions,
     ) -> datafusion_common::Result<FilterPushdownResult<Arc<dyn FileSource>>> {
-        let mut conf = self.clone();
-        let filters = fd.filters.clone();
-        let predicate = match conf.predicate {
-            Some(predicate) => conjunction(std::iter::once(predicate).chain(filters.into_iter())),
-            None => conjunction(filters.into_iter()),
+        let Some(file_schema) = self.file_schema.clone() else {
+            return Ok(filter_pushdown_not_supported(fd));
         };
-        conf.predicate = Some(predicate);
-        let remaining_description = if config.execution.parquet.pushdown_filters {
-            let mut remaining_filters = fd.filters.clone();
-            for filter in &remaining_filters {
-                if can_expr_be_pushed_down_with_schemas(filter, &conf.file_schema) {
+        if config.execution.parquet.pushdown_filters {
+            let mut conf = self.clone();
+            let mut allowed_filters = vec![];
+            let mut remaining_filters = vec![];
+            for filter in &fd.filters {
+                if can_expr_be_pushed_down_with_schemas(filter, &file_schema) {
                     // This filter can be pushed down
+                    allowed_filters.push(filter.clone());
                 } else {
                     // This filter cannot be pushed down
-                    remaining_filters.retain(|f| f != filter);
+                    remaining_filters.push(filter.clone());
                 }
             }
+            let predicate = match conf.predicate {
+                Some(predicate) => conjunction(
+                    std::iter::once(predicate).chain(allowed_filters.into_iter()),
+                ),
+                None => conjunction(allowed_filters.into_iter()),
+            };
+            conf.predicate = Some(predicate);
+            Ok(FilterPushdownResult {
+                support: FilterPushdownSupport::Supported {
+                    child_descriptions: vec![],
+                    op: Arc::new(conf),
+                    revisit: false,
+                },
+                remaining_description: FilterDescription {
+                    filters: remaining_filters,
+                },
+            })
         } else {
-            FilterDescription {
-                filters: fd.filters,
-            }
-        };
-        Ok(
-            FilterPushdownResult {
-                support: FilterPushdownSupport::Supported { child_descriptions: vec![], op: Arc::new(conf), revisit: false },
-                remaining_description,
-            }
-        )
-    
+            Ok(filter_pushdown_not_supported(fd))
+        }
     }
 }
