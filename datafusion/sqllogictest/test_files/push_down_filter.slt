@@ -181,7 +181,8 @@ explain select * from test_filter_with_limit where value = 2 limit 1;
 ----
 logical_plan
 01)Limit: skip=0, fetch=1
-02)--TableScan: test_filter_with_limit projection=[part_key, value], full_filters=[test_filter_with_limit.value = Int32(2)], fetch=1
+02)--Filter: test_filter_with_limit.value = Int32(2)
+03)----TableScan: test_filter_with_limit projection=[part_key, value], partial_filters=[test_filter_with_limit.value = Int32(2)]
 
 query II
 select * from test_filter_with_limit where value = 2 limit 1;
@@ -218,43 +219,57 @@ LOCATION 'test_files/scratch/push_down_filter/t.parquet';
 query TT
 explain select a from t where a = '100';
 ----
-logical_plan TableScan: t projection=[a], full_filters=[t.a = Int32(100)]
+logical_plan
+01)Filter: t.a = Int32(100)
+02)--TableScan: t projection=[a], partial_filters=[t.a = Int32(100)]
 
 # The predicate should not have a column cast  when the value is a valid i32
 query TT
 explain select a from t where a != '100';
 ----
-logical_plan TableScan: t projection=[a], full_filters=[t.a != Int32(100)]
+logical_plan
+01)Filter: t.a != Int32(100)
+02)--TableScan: t projection=[a], partial_filters=[t.a != Int32(100)]
 
 # The predicate should still have the column cast when the value is a NOT valid i32
 query TT
 explain select a from t where a = '99999999999';
 ----
-logical_plan TableScan: t projection=[a], full_filters=[CAST(t.a AS Utf8) = Utf8("99999999999")]
+logical_plan
+01)Filter: CAST(t.a AS Utf8) = Utf8("99999999999")
+02)--TableScan: t projection=[a], partial_filters=[CAST(t.a AS Utf8) = Utf8("99999999999")]
 
 # The predicate should still have the column cast when the value is a NOT valid i32
 query TT
 explain select a from t where a = '99.99';
 ----
-logical_plan TableScan: t projection=[a], full_filters=[CAST(t.a AS Utf8) = Utf8("99.99")]
+logical_plan
+01)Filter: CAST(t.a AS Utf8) = Utf8("99.99")
+02)--TableScan: t projection=[a], partial_filters=[CAST(t.a AS Utf8) = Utf8("99.99")]
 
 # The predicate should still have the column cast when the value is a NOT valid i32
 query TT
 explain select a from t where a = '';
 ----
-logical_plan TableScan: t projection=[a], full_filters=[CAST(t.a AS Utf8) = Utf8("")]
+logical_plan
+01)Filter: CAST(t.a AS Utf8) = Utf8("")
+02)--TableScan: t projection=[a], partial_filters=[CAST(t.a AS Utf8) = Utf8("")]
 
 # The predicate should not have a column cast when the operator is = or != and the literal can be round-trip casted without losing information.
 query TT
 explain select a from t where cast(a as string) = '100';
 ----
-logical_plan TableScan: t projection=[a], full_filters=[t.a = Int32(100)]
+logical_plan
+01)Filter: t.a = Int32(100)
+02)--TableScan: t projection=[a], partial_filters=[t.a = Int32(100)]
 
 # The predicate should still have the column cast when the literal alters its string representation after round-trip casting (leading zero lost).
 query TT
 explain select a from t where CAST(a AS string) = '0123';
 ----
-logical_plan TableScan: t projection=[a], full_filters=[CAST(t.a AS Utf8) = Utf8("0123")]
+logical_plan
+01)Filter: CAST(t.a AS Utf8) = Utf8("0123")
+02)--TableScan: t projection=[a], partial_filters=[CAST(t.a AS Utf8) = Utf8("0123")]
 
 
 statement ok
