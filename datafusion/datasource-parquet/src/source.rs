@@ -584,9 +584,9 @@ impl FileSource for ParquetSource {
             }
             let predicate = match conf.predicate {
                 Some(predicate) => conjunction(
-                    std::iter::once(predicate).chain(allowed_filters.into_iter()),
+                    std::iter::once(predicate).chain(allowed_filters),
                 ),
-                None => conjunction(allowed_filters.into_iter()),
+                None => conjunction(allowed_filters),
             };
             conf.predicate = Some(predicate);
             Ok(FilterPushdownResult {
