@@ -18,6 +18,7 @@
 //! TopK: Combination of Sort / LIMIT
 
 use arrow::{
+    array::Array,
     compute::interleave_record_batch,
     row::{RowConverter, Rows, SortField},
 };
@@ -120,7 +121,7 @@ pub struct TopK {
     /// Common sort prefix between the input and the sort expressions to allow early exit optimization
     common_sort_prefix: Arc<[PhysicalSortExpr]>,
     /// Filter matching the state of the `TopK` heap used for dynamic filter pushdown
-    filter: Arc<DynamicFilterPhysicalExpr>,
+    filter: Option<Arc<DynamicFilterPhysicalExpr>>,
     /// If true, indicates that all rows of subsequent batches are guaranteed
     /// to be greater (by byte order, after row conversion) than the top K,
     /// which means the top K won't change and the computation can be finished early.
@@ -159,7 +160,7 @@ impl TopK {
         batch_size: usize,
         runtime: Arc<RuntimeEnv>,
         metrics: &ExecutionPlanMetricsSet,
-        filter: Arc<DynamicFilterPhysicalExpr>,
+        filter: Option<Arc<DynamicFilterPhysicalExpr>>,
     ) -> Result<Self> {
         let reservation = MemoryConsumer::new(format!("TopK[{partition_id}]"))
             .register(&runtime.memory_pool);
@@ -255,12 +256,11 @@ impl TopK {
         Ok(())
     }
 
-    pub fn get_dynamic_filter(&mut self) -> Arc<dyn PhysicalExpr> {
-        Arc::clone(&self.filter) as Arc<dyn PhysicalExpr>
-    }
-
     /// Update the filter representation of our TopK heap
     fn update_filter(&mut self) -> Result<()> {
+        let Some(filter) = &self.filter else {
+            return Ok(());
+        };
         if let Some(thresholds) = self.heap.get_threshold_values(&self.expr)? {
             // Create filter expressions for each threshold
             let mut filters: Vec<Arc<dyn PhysicalExpr>> =
@@ -342,7 +342,7 @@ impl TopK {
 
             if let Some(predicate) = dynamic_predicate {
                 if !predicate.eq(&lit(true)) {
-                    self.filter.update(predicate)?;
+                    filter.update(predicate)?;
                 }
             }
         }
@@ -991,7 +991,7 @@ mod tests {
             2,
             runtime,
             &metrics,
-            Arc::new(DynamicFilterPhysicalExpr::new(vec![], lit(true))),
+            None,
         )?;
 
         // Create the first batch with two columns:
