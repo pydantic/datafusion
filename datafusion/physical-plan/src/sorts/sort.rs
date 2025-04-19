@@ -27,7 +27,9 @@ use std::sync::Arc;
 use crate::common::spawn_buffered;
 use crate::execution_plan::{Boundedness, CardinalityEffect, EmissionType};
 use crate::expressions::PhysicalSortExpr;
-use crate::filter_pushdown::{FilterDescription, FilterPushdownResult, FilterPushdownSupport};
+use crate::filter_pushdown::{
+    FilterDescription, FilterPushdownResult, FilterPushdownSupport,
+};
 use crate::limit::LimitStream;
 use crate::metrics::{
     BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, SpillMetrics,
@@ -59,7 +61,9 @@ use datafusion_execution::disk_manager::RefCountedTempFile;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::expressions::{dynamic_filters::DynamicFilterPhysicalExpr, lit};
+use datafusion_physical_expr::expressions::{
+    dynamic_filters::DynamicFilterPhysicalExpr, lit,
+};
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
 use datafusion_physical_expr_common::sort_expr::LexRequirement;
 
@@ -978,7 +982,7 @@ pub struct SortExec {
     /// Cache holding plan properties like equivalences, output partitioning etc.
     cache: PlanProperties,
     /// Filter matching the state of the sort for dynamic filter pushdown
-    batch_filter: Arc<DynamicFilterPhysicalExpr>,
+    filter: Arc<DynamicFilterPhysicalExpr>,
 }
 
 impl SortExec {
@@ -992,10 +996,7 @@ impl SortExec {
             .iter()
             .map(|sort_expr| Arc::clone(&sort_expr.expr))
             .collect::<Vec<_>>();
-        let batch_filter = Arc::new(DynamicFilterPhysicalExpr::new(
-            children,
-            lit(true),
-        ));
+        let filter = Arc::new(DynamicFilterPhysicalExpr::new(children, lit(true)));
         Self {
             expr,
             input,
@@ -1004,7 +1005,7 @@ impl SortExec {
             fetch: None,
             common_sort_prefix: sort_prefix,
             cache,
-            batch_filter
+            filter,
         }
     }
 
@@ -1058,7 +1059,7 @@ impl SortExec {
             common_sort_prefix: self.common_sort_prefix.clone(),
             fetch,
             cache,
-            batch_filter: Arc::clone(&self.batch_filter),
+            filter: Arc::clone(&self.filter),
         }
     }
 
@@ -1159,14 +1160,14 @@ impl DisplayAs for SortExec {
                 let preserve_partitioning = self.preserve_partitioning;
                 match self.fetch {
                     Some(fetch) => {
-                        write!(f, "SortExec: TopK(fetch={fetch}), expr=[{}], preserve_partitioning=[{preserve_partitioning}]", self.expr)?;
+                        write!(f, "SortExec: TopK(fetch={fetch}), expr=[{}], preserve_partitioning=[{preserve_partitioning}], filter={}", self.expr, self.filter)?;
                         if !self.common_sort_prefix.is_empty() {
                             write!(f, ", sort_prefix=[{}]", self.common_sort_prefix)
                         } else {
                             Ok(())
                         }
                     }
-                    None => write!(f, "SortExec: expr=[{}], preserve_partitioning=[{preserve_partitioning}]", self.expr),
+                    None => write!(f, "SortExec: expr=[{}], preserve_partitioning=[{preserve_partitioning}], filter={}", self.expr, self.filter),
                 }
             }
             DisplayFormatType::TreeRender => match self.fetch {
@@ -1220,9 +1221,10 @@ impl ExecutionPlan for SortExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let new_sort = SortExec::new(self.expr.clone(), Arc::clone(&children[0]))
+        let mut new_sort = SortExec::new(self.expr.clone(), Arc::clone(&children[0]))
             .with_fetch(self.fetch)
             .with_preserve_partitioning(self.preserve_partitioning);
+        new_sort.filter = Arc::clone(&self.filter);
 
         Ok(Arc::new(new_sort))
     }
@@ -1265,7 +1267,7 @@ impl ExecutionPlan for SortExec {
                     context.session_config().batch_size(),
                     context.runtime_env(),
                     &self.metrics_set,
-                    Arc::clone(&self.batch_filter),
+                    Arc::clone(&self.filter),
                 )?;
                 Ok(Box::pin(RecordBatchStreamAdapter::new(
                     self.schema(),
@@ -1368,9 +1370,10 @@ impl ExecutionPlan for SortExec {
         mut fd: FilterDescription,
         config: &datafusion_common::config::ConfigOptions,
     ) -> Result<FilterPushdownResult<Arc<dyn ExecutionPlan>>> {
-        if config.optimizer.enable_dynamic_filter_pushdown {
+        if config.optimizer.enable_dynamic_filter_pushdown && self.fetch.is_some() {
             // Extend the filter descriptions with our dynamic filter
-            fd.filters.push(Arc::clone(&self.batch_filter) as Arc<dyn PhysicalExpr>);
+            fd.filters
+                .push(Arc::clone(&self.filter) as Arc<dyn PhysicalExpr>);
         }
         let child_descriptions = vec![fd];
         let remaining_description = FilterDescription { filters: vec![] };

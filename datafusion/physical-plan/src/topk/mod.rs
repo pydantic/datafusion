@@ -991,7 +991,7 @@ mod tests {
             2,
             runtime,
             &metrics,
-            Arc::new(DynamicFilterPhysicalExpr::new(vec![], lit(true)))
+            Arc::new(DynamicFilterPhysicalExpr::new(vec![], lit(true))),
         )?;
 
         // Create the first batch with two columns:

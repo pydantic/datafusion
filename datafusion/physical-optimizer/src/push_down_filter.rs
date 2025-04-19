@@ -383,7 +383,9 @@ impl PhysicalOptimizerRule for PushdownFilter {
 
         context
             .transform_up(|node| {
-                if node.plan.as_any().downcast_ref::<FilterExec>().is_some() || node.plan.as_any().downcast_ref::<SortExec>().is_some() {
+                if node.plan.as_any().downcast_ref::<FilterExec>().is_some()
+                    || node.plan.as_any().downcast_ref::<SortExec>().is_some()
+                {
                     let initial_plan = Arc::clone(&node.plan);
                     let mut accept_updated = false;
                     let updated_node = node.transform_down(|filter_node| {
@@ -397,8 +399,7 @@ impl PhysicalOptimizerRule for PushdownFilter {
                             initial_plan,
                         )))
                     }
-                }
-                else {
+                } else {
                     Ok(Transformed::no(node))
                 }
             })

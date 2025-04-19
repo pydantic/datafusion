@@ -40,10 +40,12 @@ use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::ListingOptions;
 use datafusion::physical_plan::collect;
 use datafusion::physical_plan::metrics::MetricsSet;
-use datafusion::prelude::{col, lit, lit_timestamp_nano, Expr, SessionConfig, SessionContext};
+use datafusion::prelude::{
+    col, lit, lit_timestamp_nano, Expr, SessionConfig, SessionContext,
+};
 use datafusion::test_util::parquet::{ParquetScanOptions, TestParquetFile};
-use datafusion_common::{assert_contains, Result};
 use datafusion_common::instant::Instant;
+use datafusion_common::{assert_contains, Result};
 use datafusion_datasource_parquet::ParquetFormat;
 use datafusion_expr::utils::{conjunction, disjunction, split_conjunction};
 
