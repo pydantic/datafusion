@@ -1382,7 +1382,7 @@ impl ExecutionPlan for SortExec {
     ) -> Result<FilterPushdownResult<Arc<dyn ExecutionPlan>>> {
         if let Some(filter) = &self.filter {
             if config.optimizer.enable_dynamic_filter_pushdown {
-                let filter = Arc::clone(&filter) as Arc<dyn PhysicalExpr>;
+                let filter = Arc::clone(filter) as Arc<dyn PhysicalExpr>;
                 fd.filters.push(filter);
             }
         }
