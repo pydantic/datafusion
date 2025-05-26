@@ -23,6 +23,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
+use crate::coalesce::BatchCoalescer;
 use crate::metrics::BaselineMetrics;
 use crate::sorts::builder::BatchBuilder;
 use crate::sorts::cursor::{Cursor, CursorValues};
@@ -43,6 +44,8 @@ type CursorStream<C> = Box<dyn PartitionedStream<Output = Result<(C, RecordBatch
 #[derive(Debug)]
 pub(crate) struct SortPreservingMergeStream<C: CursorValues> {
     in_progress: BatchBuilder,
+
+    coalescer: BatchCoalescer,
 
     /// The sorted input streams to merge together
     streams: CursorStream<C>,
@@ -163,7 +166,13 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         let stream_count = streams.partitions();
 
         Self {
-            in_progress: BatchBuilder::new(schema, stream_count, batch_size, reservation),
+            in_progress: BatchBuilder::new(
+                schema.clone(),
+                stream_count,
+                batch_size,
+                reservation,
+            ),
+            coalescer: BatchCoalescer::new(schema, batch_size, fetch),
             streams,
             metrics,
             aborted: false,
@@ -213,38 +222,37 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         if self.aborted {
             return Poll::Ready(None);
         }
+
+        while let Some(&partition_idx) = self.uninitiated_partitions.front() {
+            match self.maybe_poll_stream(cx, partition_idx) {
+                Poll::Ready(Err(e)) => {
+                    self.aborted = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Pending => {
+                    // If a partition returns Poll::Pending, to avoid continuously polling it
+                    // and potentially increasing upstream buffer sizes, we move it to the
+                    // back of the polling queue.
+                    self.uninitiated_partitions.rotate_left(1);
+
+                    // This function could remain in a pending state, so we manually wake it here.
+                    // However, this approach can be investigated further to find a more natural way
+                    // to avoid disrupting the runtime scheduler.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                _ => {
+                    // If the polling result is Poll::Ready(Some(batch)) or Poll::Ready(None),
+                    // we remove this partition from the queue so it is not polled again.
+                    self.uninitiated_partitions.pop_front();
+                }
+            }
+        }
+
         // Once all partitions have set their corresponding cursors for the loser tree,
         // we skip the following block. Until then, this function may be called multiple
         // times and can return Poll::Pending if any partition returns Poll::Pending.
         if self.loser_tree.is_empty() {
-            while let Some(&partition_idx) = self.uninitiated_partitions.front() {
-                match self.maybe_poll_stream(cx, partition_idx) {
-                    Poll::Ready(Err(e)) => {
-                        self.aborted = true;
-                        return Poll::Ready(Some(Err(e)));
-                    }
-                    Poll::Pending => {
-                        // If a partition returns Poll::Pending, to avoid continuously polling it
-                        // and potentially increasing upstream buffer sizes, we move it to the
-                        // back of the polling queue.
-                        self.uninitiated_partitions.rotate_left(1);
-
-                        // This function could remain in a pending state, so we manually wake it here.
-                        // However, this approach can be investigated further to find a more natural way
-                        // to avoid disrupting the runtime scheduler.
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
-                    }
-                    _ => {
-                        // If the polling result is Poll::Ready(Some(batch)) or Poll::Ready(None),
-                        // we remove this partition from the queue so it is not polled again.
-                        self.uninitiated_partitions.pop_front();
-                    }
-                }
-            }
-
-            // Claim the memory for the uninitiated partitions
-            self.uninitiated_partitions.shrink_to_fit();
             self.init_loser_tree();
         }
 
@@ -254,13 +262,18 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         let _timer = elapsed_compute.timer();
 
         loop {
+            // If we have reached the end of one of our cursors
+            if !self.uninitiated_partitions.is_empty() {
+                cx.waker().wake_by_ref();
+                if let Some(batch) = self.in_progress.build_record_batch()? {
+                    self.produced += batch.num_rows();
+                    self.coalescer.push_batch(batch);
+                }
+                return Poll::Pending;
+            }
+
             // Adjust the loser tree if necessary, returning control if needed
             if !self.loser_tree_adjusted {
-                let winner = self.loser_tree[0];
-                if let Err(e) = ready!(self.maybe_poll_stream(cx, winner)) {
-                    self.aborted = true;
-                    return Poll::Ready(Some(Err(e)));
-                }
                 self.update_loser_tree();
             }
 
@@ -279,7 +292,17 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
 
             self.produced += self.in_progress.len();
 
-            return Poll::Ready(self.in_progress.build_record_batch().transpose());
+            if let Some(batch) = self.in_progress.build_record_batch()? {
+                self.coalescer.push_batch(batch);
+            }
+
+            let next_batch = self.coalescer.finish_batch()?;
+
+            if next_batch.num_rows() != 0 {
+                return Poll::Ready(Some(Ok(next_batch)));
+            } else {
+                return Poll::Ready(None);
+            }
         }
     }
 
@@ -321,6 +344,9 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
             if cursor.is_finished() {
                 // Take the current cursor, leaving `None` in its place
                 self.prev_cursors[stream_idx] = self.cursors[stream_idx].take();
+
+                // Make it poll next run
+                self.uninitiated_partitions.push_front(stream_idx);
             }
             true
         } else {
