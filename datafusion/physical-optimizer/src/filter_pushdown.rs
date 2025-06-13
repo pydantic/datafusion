@@ -362,17 +362,21 @@ use itertools::izip;
 /// [`ProjectionExec`]: datafusion_physical_plan::projection::ProjectionExec
 /// [`AggregateExec`]: datafusion_physical_plan::aggregates::AggregateExec
 #[derive(Debug)]
-pub struct FilterPushdown {}
-
-impl FilterPushdown {
-    pub fn new() -> Self {
-        Self {}
-    }
+pub struct FilterPushdown {
+    phase: PushdownPhase,
 }
 
-impl Default for FilterPushdown {
-    fn default() -> Self {
-        Self::new()
+impl FilterPushdown {
+    pub fn new_static() -> Self {
+        Self {
+            phase: PushdownPhase::Static,
+        }
+    }
+
+    pub fn new_dynamic() -> Self {
+        Self {
+            phase: PushdownPhase::Dynamic,
+        }
     }
 }
 
@@ -382,9 +386,11 @@ impl PhysicalOptimizerRule for FilterPushdown {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(push_down_filters(Arc::clone(&plan), vec![], config)?
-            .updated_node
-            .unwrap_or(plan))
+        Ok(
+            push_down_filters(Arc::clone(&plan), vec![], config, self.phase)?
+                .updated_node
+                .unwrap_or(plan),
+        )
     }
 
     fn name(&self) -> &str {
@@ -409,6 +415,7 @@ fn push_down_filters(
     node: Arc<dyn ExecutionPlan>,
     parent_predicates: Vec<Arc<dyn PhysicalExpr>>,
     config: &ConfigOptions,
+    phase: PushdownPhase,
 ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
     // If the node has any child, these will be rewritten as supported or unsupported
     let mut parent_predicates_pushdown_states =
@@ -417,8 +424,16 @@ fn push_down_filters(
     let mut new_children = Vec::with_capacity(node.children().len());
 
     let children = node.children();
-    let filter_description =
-        node.gather_filters_for_pushdown(parent_predicates.clone(), config)?;
+    let filter_description = match phase {
+        PushdownPhase::Static => {
+            // Gather filters for static pushdown
+            node.gather_static_filters_for_pushdown(parent_predicates.clone(), config)?
+        }
+        PushdownPhase::Dynamic => {
+            // Gather filters for dynamic pushdown
+            node.gather_dynamic_filters_for_pushdown(parent_predicates.clone(), config)?
+        }
+    };
 
     for (child, parent_filters, self_filters) in izip!(
         children,
@@ -460,7 +475,7 @@ fn push_down_filters(
         }
 
         // Any filters that could not be pushed down to a child are marked as not-supported to our parents
-        let result = push_down_filters(Arc::clone(child), all_predicates, config)?;
+        let result = push_down_filters(Arc::clone(child), all_predicates, config, phase)?;
 
         if let Some(new_child) = result.updated_node {
             // If we have a filter pushdown result, we need to update our children
@@ -524,7 +539,9 @@ fn push_down_filters(
             })
             .collect(),
     );
-    // Check what the current node wants to do given the result of pushdown to it's children
+    // TODO: by calling `handle_child_pushdown_result` we are assuming that the
+    // `ExecutionPlan` implementation will not change the plan itself.
+    // Should we have a separate method for dynamic pushdown that does not allow modifying the plan?
     let mut res = updated_node.handle_child_pushdown_result(
         ChildPushdownResult {
             parent_filters: parent_pushdown_result,
@@ -538,4 +555,18 @@ fn push_down_filters(
         res.updated_node = Some(updated_node)
     }
     Ok(res)
+}
+
+/// Which phase of pushdown we are in.
+/// We have two phases:
+/// 1. Static: We are pushing down filters that have no references to plan nodes and thus the plan can be modified after they are pushed down.
+///    This phase also gives nodes the opportunity to rewrite the plan itself since we are early on in the optimization process.
+///    In practice this means we call [`ExecutionPlan::gather_filters_for_pushdown`] and [`ExecutionPlan::handle_child_pushdown_result`].
+/// 2. Dynamic: We are pushing down filters that have references to plan nodes and thus the plan cannot be modified after they are pushed down.
+///    This phase does not permit nodes to rewrite the plan itself since we are late in the optimization process.
+///    In practice this means we call [`ExecutionPlan::gather_dynamic_filters_for_pushdown`] but not [`ExecutionPlan::handle_child_pushdown_result`].
+#[derive(Debug, Clone, Copy)]
+enum PushdownPhase {
+    Static,
+    Dynamic,
 }

@@ -508,7 +508,17 @@ impl ExecutionPlan for TestNode {
         unimplemented!("TestInsertExec is a stub for testing.")
     }
 
-    fn gather_filters_for_pushdown(
+    fn gather_static_filters_for_pushdown(
+        &self,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        Ok(FilterDescription::new_with_child_count(1)
+            .all_parent_filters_supported(parent_filters)
+            .with_self_filter(Arc::clone(&self.predicate)))
+    }
+
+    fn gather_dynamic_filters_for_pushdown(
         &self,
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,

@@ -491,6 +491,41 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
         Ok(None)
     }
 
+    /// Collect any *dynamic* filters that this node can push down to its children.
+    /// The return value is expected a vector of vectors, where each inner vector
+    /// represents a set of filters that can be pushed down to a single child and the length of the outer vector
+    /// is equal to the number of children of this node.
+    ///
+    /// Dynamic filters are filters that have references to this node's internal state, or otherwise
+    /// depend on the shape the the execution plan tree.
+    /// This is different than static filters (see [`ExecutionPlan::gather_filters_for_pushdown`])
+    /// which can be pushed down from a node and that node is later removed from the plan, or where the plan tree may be
+    /// arbitrarily modified by other optimizations.
+    /// Dynamic filter pushdown does not afford the ability to later edit the plan tree (e.g. to remove the current node) so it is allowed
+    /// for filters to have references to specific nodes in the plan tree.
+    /// Combinations of these requirements (e.g. pushing down dynamic filters and editing the plan tree or manipulating parent filters)
+    /// are not supported.
+    ///
+    /// The default implementation returns an empty vector, meaning that no dynamic filters are pushed down.
+    ///
+    /// This is currently used by `SortExec` when it is used to implement a `TopK` operation to
+    /// push down a filter representing the current state of the heap for early pruning during the scan phase.
+    /// It is planned to be used by `HashJoinExec` to push down a filter representing the hash table
+    /// to the scan side of the join.
+    ///
+    /// Since this does not perform any modifications to the plan tree it is called late in the optimization phase
+    /// once the plan tree is finalized.
+    fn gather_dynamic_filters_for_pushdown(
+        &self,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        Ok(
+            FilterDescription::new_with_child_count(self.children().len())
+                .all_parent_filters_unsupported(parent_filters),
+        )
+    }
+
     /// Collect filters that this node can push down to its children.
     /// Filters that are being pushed down from parents are passed in,
     /// and the node may generate additional filters to push down.
@@ -509,7 +544,10 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
     ///
     /// The default implementation bars all parent filters from being pushed down and adds no new filters.
     /// This is the safest option, making filter pushdown opt-in on a per-node pasis.
-    fn gather_filters_for_pushdown(
+    ///
+    /// Since this may perform deep modifications to the plan tree it is called early in the optimization phase
+    /// and is not expected to be called multiple times on the same plan.
+    fn gather_static_filters_for_pushdown(
         &self,
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
