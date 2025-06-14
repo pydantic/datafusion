@@ -20,6 +20,18 @@ use std::vec::IntoIter;
 
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
+#[derive(Debug, Clone, Copy)]
+pub enum FilterPushdownPhase {
+    /// Pushdown that happens before most other optimizations.
+    /// This pushdown allows static filters that do not reference any [`ExectutionPlan`]s to be pushed down.
+    /// Filters that reference an [`ExecutionPlan`] cannot be pushed down at this stage since the whole plan tree may be rewritten
+    /// by other optimizations.
+    /// Implemneters are however allowed to modify the execution plan themselves during this phase.
+    BeforOptimization,
+    // TODO: docs.
+    AfterOptimization,
+}
+
 /// The result of a plan for pushing down a filter into a child node.
 /// This contains references to filters so that nodes can mutate a filter
 /// before pushing it down to a child node (e.g. to adjust a projection)
