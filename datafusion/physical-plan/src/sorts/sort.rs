@@ -1266,7 +1266,7 @@ impl ExecutionPlan for SortExec {
         )))
     }
 
-    fn gather_filters_for_pushdown(
+    fn gather_dynamic_filters_for_pushdown(
         &self,
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         config: &datafusion_common::config::ConfigOptions,
