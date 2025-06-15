@@ -27,10 +27,20 @@ pub enum FilterPushdownPhase {
     /// Filters that reference an [`ExecutionPlan`] cannot be pushed down at this stage since the whole plan tree may be rewritten
     /// by other optimizations.
     /// Implemneters are however allowed to modify the execution plan themselves during this phase.
-    BeforOptimization,
+    Pre,
     // TODO: docs.
-    AfterOptimization,
+    Post,
 }
+
+impl std::fmt::Display for FilterPushdownPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FilterPushdownPhase::Pre => write!(f,  "Pre"),
+            FilterPushdownPhase::Post => write!(f, "Post"),
+        }
+    }
+}
+
 
 /// The result of a plan for pushing down a filter into a child node.
 /// This contains references to filters so that nodes can mutate a filter

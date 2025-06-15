@@ -365,19 +365,23 @@ use itertools::izip;
 #[derive(Debug)]
 pub struct FilterPushdown {
     phase: FilterPushdownPhase,
+    name: String,
 }
 
 impl FilterPushdown {
-    pub fn new_pre_optimization() -> Self {
+    fn new(phase: FilterPushdownPhase) -> Self {
         Self {
-            phase: FilterPushdownPhase::BeforOptimization,
+            phase,
+            name: format!("FilterPushdown({phase})"),
         }
     }
 
+    pub fn new_pre_optimization() -> Self {
+        Self::new(FilterPushdownPhase::Pre)
+    }
+
     pub fn new_post_optimization() -> Self {
-        Self {
-            phase: FilterPushdownPhase::AfterOptimization,
-        }
+        Self::new(FilterPushdownPhase::Post)
     }
 }
 
@@ -395,7 +399,7 @@ impl PhysicalOptimizerRule for FilterPushdown {
     }
 
     fn name(&self) -> &str {
-        "FilterPushdown"
+        &self.name
     }
 
     fn schema_check(&self) -> bool {

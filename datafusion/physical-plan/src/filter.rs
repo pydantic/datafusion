@@ -454,7 +454,7 @@ impl ExecutionPlan for FilterExec {
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> Result<FilterDescription> {
-        if !matches!(phase, FilterPushdownPhase::BeforOptimization) {
+        if !matches!(phase, FilterPushdownPhase::Pre) {
             return Ok(FilterDescription::new_with_child_count(1)
                 .all_parent_filters_supported(parent_filters));
         }
@@ -513,7 +513,7 @@ impl ExecutionPlan for FilterExec {
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        if !matches!(phase, FilterPushdownPhase::BeforOptimization) {
+        if !matches!(phase, FilterPushdownPhase::Pre) {
             return Ok(FilterPushdownPropagation::transparent(
                 child_pushdown_result,
             ));

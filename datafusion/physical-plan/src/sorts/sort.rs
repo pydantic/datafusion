@@ -1272,7 +1272,7 @@ impl ExecutionPlan for SortExec {
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         config: &datafusion_common::config::ConfigOptions,
     ) -> Result<FilterDescription> {
-        if !matches!(phase, FilterPushdownPhase::AfterOptimization) {
+        if !matches!(phase, FilterPushdownPhase::Post) {
             return Ok(FilterDescription::new_with_child_count(1)
                 .all_parent_filters_supported(parent_filters));
         }
