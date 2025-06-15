@@ -23,12 +23,21 @@ use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 #[derive(Debug, Clone, Copy)]
 pub enum FilterPushdownPhase {
     /// Pushdown that happens before most other optimizations.
-    /// This pushdown allows static filters that do not reference any [`ExectutionPlan`]s to be pushed down.
+    /// This pushdown allows static filters that do not reference any [`ExecutionPlan`]s to be pushed down.
     /// Filters that reference an [`ExecutionPlan`] cannot be pushed down at this stage since the whole plan tree may be rewritten
     /// by other optimizations.
-    /// Implemneters are however allowed to modify the execution plan themselves during this phase.
+    /// Implemneters are however allowed to modify the execution plan themselves during this phase, for example by returning a completely
+    /// different [`ExecutionPlan`] from [`ExecutionPlan::handle_child_pushdown_result`].
+    /// 
+    /// [`ExecutionPlan`]: crate::ExecutionPlan
+    /// [`ExecutionPlan::handle_child_pushdown_result`]: crate::ExecutionPlan::handle_child_pushdown_result
     Pre,
-    // TODO: docs.
+    /// Pushdown that happens after most other optimizations.
+    /// This pushdown allows filters that reference an [`ExecutionPlan`] to be pushed down.
+    /// It is guaranteed that subsequent optimizations will not make large changes to the plan tree,
+    /// but implementers are likewise not allowed to modify the plan tree themselves.
+    /// [`ExecutionPlan::handle_child_pushdown_result`] may still return a different [`ExecutionPlan`] (e.g. with internal state replaced) but
+    /// larger changes to the plan tree are likely to conflict with other optimizations or break execution outright.
     Post,
 }
 
