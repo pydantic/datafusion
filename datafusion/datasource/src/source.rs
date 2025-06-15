@@ -36,7 +36,7 @@ use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use datafusion_physical_plan::filter_pushdown::{
-    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation
+    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation,
 };
 use datafusion_physical_plan::yield_stream::wrap_yield_stream;
 

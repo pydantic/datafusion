@@ -28,7 +28,7 @@ pub enum FilterPushdownPhase {
     /// by other optimizations.
     /// Implemneters are however allowed to modify the execution plan themselves during this phase, for example by returning a completely
     /// different [`ExecutionPlan`] from [`ExecutionPlan::handle_child_pushdown_result`].
-    /// 
+    ///
     /// [`ExecutionPlan`]: crate::ExecutionPlan
     /// [`ExecutionPlan::handle_child_pushdown_result`]: crate::ExecutionPlan::handle_child_pushdown_result
     Pre,
@@ -38,18 +38,20 @@ pub enum FilterPushdownPhase {
     /// but implementers are likewise not allowed to modify the plan tree themselves.
     /// [`ExecutionPlan::handle_child_pushdown_result`] may still return a different [`ExecutionPlan`] (e.g. with internal state replaced) but
     /// larger changes to the plan tree are likely to conflict with other optimizations or break execution outright.
+    ///
+    /// [`ExecutionPlan`]: crate::ExecutionPlan
+    /// [`ExecutionPlan::handle_child_pushdown_result`]: crate::ExecutionPlan::handle_child_pushdown_result
     Post,
 }
 
 impl std::fmt::Display for FilterPushdownPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FilterPushdownPhase::Pre => write!(f,  "Pre"),
+            FilterPushdownPhase::Pre => write!(f, "Pre"),
             FilterPushdownPhase::Post => write!(f, "Post"),
         }
     }
 }
-
 
 /// The result of a plan for pushing down a filter into a child node.
 /// This contains references to filters so that nodes can mutate a filter
