@@ -17,8 +17,8 @@
 
 //! Physical expression schema rewriting utilities
 
-use std::sync::Arc;
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use arrow::compute::can_cast_types;
 use arrow::datatypes::{
@@ -230,7 +230,9 @@ impl<'a> PhysicalExprSchemaRewriter<'a> {
             left.as_any().downcast_ref::<CastExpr>(),
             right.as_any().downcast_ref::<Literal>(),
         ) {
-            if let Some(optimized) = self.unwrap_cast_with_literal(cast_expr, literal, *op)? {
+            if let Some(optimized) =
+                self.unwrap_cast_with_literal(cast_expr, literal, *op)?
+            {
                 return Ok(Some(Arc::new(BinaryExpr::new(
                     optimized.0,
                     *op,
@@ -244,7 +246,9 @@ impl<'a> PhysicalExprSchemaRewriter<'a> {
             left.as_any().downcast_ref::<Literal>(),
             right.as_any().downcast_ref::<CastExpr>(),
         ) {
-            if let Some(optimized) = self.unwrap_cast_with_literal(cast_expr, literal, *op)? {
+            if let Some(optimized) =
+                self.unwrap_cast_with_literal(cast_expr, literal, *op)?
+            {
                 return Ok(Some(Arc::new(BinaryExpr::new(
                     optimized.1,
                     *op,
@@ -265,32 +269,36 @@ impl<'a> PhysicalExprSchemaRewriter<'a> {
     ) -> Result<Option<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)>> {
         // Get the inner expression (what's being cast)
         let inner_expr = cast_expr.expr();
-        
+
         // Handle the case where inner expression might be another cast (due to schema rewriting)
         // This can happen when the schema rewriter adds a cast to a column, and then we have
         // an original cast on top of that.
-        let (final_inner_expr, column) = if let Some(inner_cast) = inner_expr.as_any().downcast_ref::<CastExpr>() {
-            // We have a nested cast, check if the inner cast's expression is a column
-            let inner_inner_expr = inner_cast.expr();
-            if let Some(col) = inner_inner_expr.as_any().downcast_ref::<Column>() {
-                (inner_inner_expr, col)
+        let (final_inner_expr, column) =
+            if let Some(inner_cast) = inner_expr.as_any().downcast_ref::<CastExpr>() {
+                // We have a nested cast, check if the inner cast's expression is a column
+                let inner_inner_expr = inner_cast.expr();
+                if let Some(col) = inner_inner_expr.as_any().downcast_ref::<Column>() {
+                    (inner_inner_expr, col)
+                } else {
+                    return Ok(None);
+                }
+            } else if let Some(col) = inner_expr.as_any().downcast_ref::<Column>() {
+                (inner_expr, col)
             } else {
                 return Ok(None);
-            }
-        } else if let Some(col) = inner_expr.as_any().downcast_ref::<Column>() {
-            (inner_expr, col)
-        } else {
-            return Ok(None);
-        };
+            };
 
         // Get the column's data type from the physical schema
-        let column_data_type = match self.physical_file_schema.field_with_name(column.name()) {
-            Ok(field) => field.data_type(),
-            Err(_) => return Ok(None), // Column not found, can't optimize
-        };
+        let column_data_type =
+            match self.physical_file_schema.field_with_name(column.name()) {
+                Ok(field) => field.data_type(),
+                Err(_) => return Ok(None), // Column not found, can't optimize
+            };
 
         // Try to cast the literal to the column's data type
-        if let Some(casted_literal) = try_cast_literal_to_type(literal.value(), column_data_type, op) {
+        if let Some(casted_literal) =
+            try_cast_literal_to_type(literal.value(), column_data_type, op)
+        {
             return Ok(Some((
                 Arc::clone(final_inner_expr),
                 expressions::lit(casted_literal),
@@ -323,7 +331,6 @@ fn cast_literal_to_type_with_op(
     target_type: &DataType,
     op: Operator,
 ) -> Option<ScalarValue> {
-    
     match (op, lit_value) {
         (
             Operator::Eq | Operator::NotEq,
@@ -754,22 +761,27 @@ mod tests {
         let column_expr = Arc::new(Column::new("a", 0));
         let cast_expr = Arc::new(CastExpr::new(column_expr, DataType::Int64, None));
         let literal_expr = expressions::lit(ScalarValue::Int64(Some(123)));
-        let binary_expr = Arc::new(BinaryExpr::new(
-            cast_expr,
-            Operator::Eq,
-            literal_expr,
-        ));
+        let binary_expr =
+            Arc::new(BinaryExpr::new(cast_expr, Operator::Eq, literal_expr));
 
         let result = rewriter.rewrite(binary_expr.clone() as Arc<dyn PhysicalExpr>)?;
 
         // The result should be a binary expression with the cast unwrapped
         let result_binary = result.as_any().downcast_ref::<BinaryExpr>().unwrap();
-        
+
         // Left side should be the original column (no cast)
-        assert!(result_binary.left().as_any().downcast_ref::<Column>().is_some());
-        
+        assert!(result_binary
+            .left()
+            .as_any()
+            .downcast_ref::<Column>()
+            .is_some());
+
         // Right side should be a literal with the value cast to Int32
-        let right_literal = result_binary.right().as_any().downcast_ref::<Literal>().unwrap();
+        let right_literal = result_binary
+            .right()
+            .as_any()
+            .downcast_ref::<Literal>()
+            .unwrap();
         assert_eq!(*right_literal.value(), ScalarValue::Int32(Some(123)));
 
         Ok(())
@@ -787,23 +799,28 @@ mod tests {
         let literal_expr = expressions::lit(ScalarValue::Int64(Some(123)));
         let column_expr = Arc::new(Column::new("a", 0));
         let cast_expr = Arc::new(CastExpr::new(column_expr, DataType::Int64, None));
-        let binary_expr = Arc::new(BinaryExpr::new(
-            literal_expr,
-            Operator::Eq,
-            cast_expr,
-        ));
+        let binary_expr =
+            Arc::new(BinaryExpr::new(literal_expr, Operator::Eq, cast_expr));
 
         let result = rewriter.rewrite(binary_expr)?;
 
         // The result should be a binary expression with the cast unwrapped
         let result_binary = result.as_any().downcast_ref::<BinaryExpr>().unwrap();
-        
+
         // Left side should be a literal with the value cast to Int32
-        let left_literal = result_binary.left().as_any().downcast_ref::<Literal>().unwrap();
+        let left_literal = result_binary
+            .left()
+            .as_any()
+            .downcast_ref::<Literal>()
+            .unwrap();
         assert_eq!(*left_literal.value(), ScalarValue::Int32(Some(123)));
-        
+
         // Right side should be the original column (no cast)
-        assert!(result_binary.right().as_any().downcast_ref::<Column>().is_some());
+        assert!(result_binary
+            .right()
+            .as_any()
+            .downcast_ref::<Column>()
+            .is_some());
 
         Ok(())
     }
@@ -820,22 +837,27 @@ mod tests {
         let column_expr = Arc::new(Column::new("a", 0));
         let cast_expr = Arc::new(CastExpr::new(column_expr, DataType::Utf8, None));
         let literal_expr = expressions::lit(ScalarValue::Utf8(Some("123".to_string())));
-        let binary_expr = Arc::new(BinaryExpr::new(
-            cast_expr,
-            Operator::Eq,
-            literal_expr,
-        ));
+        let binary_expr =
+            Arc::new(BinaryExpr::new(cast_expr, Operator::Eq, literal_expr));
 
         let result = rewriter.rewrite(binary_expr)?;
 
         // The result should be a binary expression with the cast unwrapped
         let result_binary = result.as_any().downcast_ref::<BinaryExpr>().unwrap();
-        
+
         // Left side should be the original column (no cast)
-        assert!(result_binary.left().as_any().downcast_ref::<Column>().is_some());
-        
+        assert!(result_binary
+            .left()
+            .as_any()
+            .downcast_ref::<Column>()
+            .is_some());
+
         // Right side should be a literal with the value cast to Int32
-        let right_literal = result_binary.right().as_any().downcast_ref::<Literal>().unwrap();
+        let right_literal = result_binary
+            .right()
+            .as_any()
+            .downcast_ref::<Literal>()
+            .unwrap();
         assert_eq!(*right_literal.value(), ScalarValue::Int32(Some(123)));
 
         Ok(())
@@ -844,7 +866,8 @@ mod tests {
     #[test]
     fn test_no_unwrap_cast_optimization_when_not_applicable() -> Result<()> {
         // Test case where optimization should not apply - unsupported cast
-        let physical_schema = Schema::new(vec![Field::new("a", DataType::Float32, false)]);
+        let physical_schema =
+            Schema::new(vec![Field::new("a", DataType::Float32, false)]);
         let logical_schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
 
         let rewriter = PhysicalExprSchemaRewriter::new(&physical_schema, &logical_schema);
@@ -854,18 +877,19 @@ mod tests {
         let column_expr = Arc::new(Column::new("a", 0));
         let cast_expr = Arc::new(CastExpr::new(column_expr, DataType::Int64, None));
         let literal_expr = expressions::lit(ScalarValue::Int64(Some(123)));
-        let binary_expr = Arc::new(BinaryExpr::new(
-            cast_expr,
-            Operator::Eq,
-            literal_expr,
-        ));
+        let binary_expr =
+            Arc::new(BinaryExpr::new(cast_expr, Operator::Eq, literal_expr));
 
         let result = rewriter.rewrite(binary_expr)?;
 
         // The result should still be a binary expression with a cast on the left side
         // since Float32 is not in our supported types for unwrap cast optimization
         let result_binary = result.as_any().downcast_ref::<BinaryExpr>().unwrap();
-        assert!(result_binary.left().as_any().downcast_ref::<CastExpr>().is_some());
+        assert!(result_binary
+            .left()
+            .as_any()
+            .downcast_ref::<CastExpr>()
+            .is_some());
 
         Ok(())
     }
