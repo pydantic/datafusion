@@ -51,6 +51,7 @@ pub mod parsers;
 pub mod pruning;
 pub mod rounding;
 pub mod scalar;
+pub mod scalar_literal_cast;
 pub mod spans;
 pub mod stats;
 pub mod test_util;
