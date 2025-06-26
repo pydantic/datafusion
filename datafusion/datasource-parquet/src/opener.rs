@@ -265,16 +265,12 @@ impl FileOpener for ParquetOpener {
                         partition_fields.to_vec(),
                         file.partition_values,
                     );
-                    if let Some(predicate_rewrite_hook) =
-                        predicate_rewrite_hook.as_ref()
+                    if let Some(predicate_rewrite_hook) = predicate_rewrite_hook.as_ref()
                     {
-                        rewriter = rewriter.with_rewrite_hook(
-                            Arc::clone(predicate_rewrite_hook),
-                        );
+                        rewriter = rewriter
+                            .with_rewrite_hook(Arc::clone(predicate_rewrite_hook));
                     };
-                    rewriter
-                        .rewrite(p)
-                        .map_err(ArrowError::from)
+                    rewriter.rewrite(p).map_err(ArrowError::from)
                 })
                 .transpose()?;
 
