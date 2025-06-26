@@ -37,6 +37,7 @@ use datafusion_common::pruning::{
 };
 use datafusion_common::{exec_err, Result};
 use datafusion_datasource::PartitionedFile;
+use datafusion_physical_expr::schema_rewriter::PhysicalExprSchemaRewriteHook;
 use datafusion_physical_expr::PhysicalExprSchemaRewriter;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_optimizer::pruning::PruningPredicate;
@@ -91,6 +92,8 @@ pub(super) struct ParquetOpener {
     pub enable_row_group_stats_pruning: bool,
     /// Coerce INT96 timestamps to specific TimeUnit
     pub coerce_int96: Option<TimeUnit>,
+    /// Rewrite expressions in the context of the file schema
+    pub predicate_rewrite_hook: Option<Arc<dyn PhysicalExprSchemaRewriteHook>>,
 }
 
 impl FileOpener for ParquetOpener {
@@ -130,6 +133,8 @@ impl FileOpener for ParquetOpener {
         let enable_bloom_filter = self.enable_bloom_filter;
         let enable_row_group_stats_pruning = self.enable_row_group_stats_pruning;
         let limit = self.limit;
+
+        let predicate_rewrite_hook = self.predicate_rewrite_hook.clone();
 
         let enable_page_index = self.enable_page_index;
 
@@ -252,18 +257,28 @@ impl FileOpener for ParquetOpener {
             // This evaluates missing columns and inserts any necessary casts.
             let predicate = predicate
                 .map(|p| {
-                    PhysicalExprSchemaRewriter::new(
+                    let mut rewriter = PhysicalExprSchemaRewriter::new(
                         &physical_file_schema,
                         &logical_file_schema,
                     )
                     .with_partition_columns(
                         partition_fields.to_vec(),
                         file.partition_values,
-                    )
-                    .rewrite(p)
-                    .map_err(ArrowError::from)
+                    );
+                    if let Some(predicate_rewrite_hook) =
+                        predicate_rewrite_hook.as_ref()
+                    {
+                        rewriter = rewriter.with_rewrite_hook(
+                            Arc::clone(predicate_rewrite_hook),
+                        );
+                    };
+                    rewriter
+                        .rewrite(p)
+                        .map_err(ArrowError::from)
                 })
                 .transpose()?;
+
+            println!("predicate: {predicate:?}");
 
             // Build predicates for this specific file
             let (pruning_predicate, page_pruning_predicate) = build_pruning_predicates(
@@ -651,6 +666,7 @@ mod test {
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: true,
                 coerce_int96: None,
+                predicate_rewrite_hook: None,
             }
         };
 
@@ -735,6 +751,7 @@ mod test {
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: true,
                 coerce_int96: None,
+                predicate_rewrite_hook: None,
             }
         };
 
@@ -831,6 +848,7 @@ mod test {
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: true,
                 coerce_int96: None,
+                predicate_rewrite_hook: None,
             }
         };
         let make_meta = || FileMeta {
@@ -941,6 +959,7 @@ mod test {
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: false, // note that this is false!
                 coerce_int96: None,
+                predicate_rewrite_hook: None,
             }
         };
 
