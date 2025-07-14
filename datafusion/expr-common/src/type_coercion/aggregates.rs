@@ -249,7 +249,7 @@ pub fn is_sum_support_arg_type(arg_type: &DataType) -> bool {
         _ => matches!(
             arg_type,
             arg_type if NUMERICS.contains(arg_type)
-            || matches!(arg_type, DataType::Decimal128(_, _) | DataType::Decimal256(_, _))
+            || matches!(arg_type, DataType::Decimal32(_, _) | DataType::Decimal64(_, _) | DataType::Decimal128(_, _) | DataType::Decimal256(_, _))
         ),
     }
 }
@@ -262,7 +262,7 @@ pub fn is_avg_support_arg_type(arg_type: &DataType) -> bool {
         _ => matches!(
             arg_type,
             arg_type if NUMERICS.contains(arg_type)
-                || matches!(arg_type, DataType::Decimal128(_, _)| DataType::Decimal256(_, _))
+                || matches!(arg_type, DataType::Decimal32(_, _) | DataType::Decimal64(_, _) | DataType::Decimal128(_, _)| DataType::Decimal256(_, _))
         ),
     }
 }

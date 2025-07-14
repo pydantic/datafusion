@@ -358,7 +358,6 @@ impl TableParquetOptionsProto {
         };
 
         let column_specific_options = global_options.column_specific_options;
-        #[allow(deprecated)] // max_statistics_size
         TableParquetOptionsProto {
             global: Some(ParquetOptionsProto {
                 enable_page_index: global_options.global.enable_page_index,
@@ -381,9 +380,6 @@ impl TableParquetOptionsProto {
                 dictionary_page_size_limit: global_options.global.dictionary_page_size_limit as u64,
                 statistics_enabled_opt: global_options.global.statistics_enabled.map(|enabled| {
                     parquet_options::StatisticsEnabledOpt::StatisticsEnabled(enabled)
-                }),
-                max_statistics_size_opt: global_options.global.max_statistics_size.map(|size| {
-                    parquet_options::MaxStatisticsSizeOpt::MaxStatisticsSize(size as u64)
                 }),
                 max_row_group_size: global_options.global.max_row_group_size as u64,
                 created_by: global_options.global.created_by.clone(),
@@ -440,9 +436,6 @@ impl TableParquetOptionsProto {
                         bloom_filter_ndv_opt: options.bloom_filter_ndv.map(|ndv| {
                             parquet_column_options::BloomFilterNdvOpt::BloomFilterNdv(ndv)
                         }),
-                        max_statistics_size_opt: options.max_statistics_size.map(|size| {
-                            parquet_column_options::MaxStatisticsSizeOpt::MaxStatisticsSize(size as u32)
-                        }),
                     })
                 }
             }).collect(),
@@ -458,7 +451,6 @@ impl TableParquetOptionsProto {
 
 impl From<&ParquetOptionsProto> for ParquetOptions {
     fn from(proto: &ParquetOptionsProto) -> Self {
-        #[allow(deprecated)] // max_statistics_size
         ParquetOptions {
             enable_page_index: proto.enable_page_index,
             pruning: proto.pruning,
@@ -480,9 +472,6 @@ impl From<&ParquetOptionsProto> for ParquetOptions {
             dictionary_page_size_limit: proto.dictionary_page_size_limit as usize,
             statistics_enabled: proto.statistics_enabled_opt.as_ref().map(|opt| match opt {
                 parquet_options::StatisticsEnabledOpt::StatisticsEnabled(statistics) => statistics.clone(),
-            }),
-            max_statistics_size: proto.max_statistics_size_opt.as_ref().map(|opt| match opt {
-                parquet_options::MaxStatisticsSizeOpt::MaxStatisticsSize(size) => *size as usize,
             }),
             max_row_group_size: proto.max_row_group_size as usize,
             created_by: proto.created_by.clone(),
@@ -542,11 +531,6 @@ impl From<ParquetColumnOptionsProto> for ParquetColumnOptions {
             bloom_filter_ndv: proto
                 .bloom_filter_ndv_opt
                 .map(|parquet_column_options::BloomFilterNdvOpt::BloomFilterNdv(v)| v),
-            max_statistics_size: proto.max_statistics_size_opt.map(
-                |parquet_column_options::MaxStatisticsSizeOpt::MaxStatisticsSize(v)| {
-                    v as usize
-                },
-            ),
         }
     }
 }
