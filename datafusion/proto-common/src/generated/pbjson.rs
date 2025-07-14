@@ -175,6 +175,12 @@ impl serde::Serialize for ArrowType {
                 arrow_type::ArrowTypeEnum::Decimal(v) => {
                     struct_ser.serialize_field("DECIMAL", v)?;
                 }
+                arrow_type::ArrowTypeEnum::Decimal32(v) => {
+                    struct_ser.serialize_field("DECIMAL32", v)?;
+                }
+                arrow_type::ArrowTypeEnum::Decimal64(v) => {
+                    struct_ser.serialize_field("DECIMAL64", v)?;
+                }
                 arrow_type::ArrowTypeEnum::Decimal256(v) => {
                     struct_ser.serialize_field("DECIMAL256", v)?;
                 }
@@ -244,6 +250,8 @@ impl<'de> serde::Deserialize<'de> for ArrowType {
             "TIME64",
             "INTERVAL",
             "DECIMAL",
+            "DECIMAL32",
+            "DECIMAL64",
             "DECIMAL256",
             "LIST",
             "LARGE_LIST",
@@ -286,6 +294,8 @@ impl<'de> serde::Deserialize<'de> for ArrowType {
             Time64,
             Interval,
             Decimal,
+            Decimal32,
+            Decimal64,
             Decimal256,
             List,
             LargeList,
@@ -343,6 +353,8 @@ impl<'de> serde::Deserialize<'de> for ArrowType {
                             "TIME64" => Ok(GeneratedField::Time64),
                             "INTERVAL" => Ok(GeneratedField::Interval),
                             "DECIMAL" => Ok(GeneratedField::Decimal),
+                            "DECIMAL32" => Ok(GeneratedField::Decimal32),
+                            "DECIMAL64" => Ok(GeneratedField::Decimal64),
                             "DECIMAL256" => Ok(GeneratedField::Decimal256),
                             "LIST" => Ok(GeneratedField::List),
                             "LARGELIST" | "LARGE_LIST" => Ok(GeneratedField::LargeList),
@@ -562,6 +574,20 @@ impl<'de> serde::Deserialize<'de> for ArrowType {
                                 return Err(serde::de::Error::duplicate_field("DECIMAL"));
                             }
                             arrow_type_enum__ = map_.next_value::<::std::option::Option<_>>()?.map(arrow_type::ArrowTypeEnum::Decimal)
+;
+                        }
+                        GeneratedField::Decimal32 => {
+                            if arrow_type_enum__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("DECIMAL32"));
+                            }
+                            arrow_type_enum__ = map_.next_value::<::std::option::Option<_>>()?.map(arrow_type::ArrowTypeEnum::Decimal32)
+;
+                        }
+                        GeneratedField::Decimal64 => {
+                            if arrow_type_enum__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("DECIMAL64"));
+                            }
+                            arrow_type_enum__ = map_.next_value::<::std::option::Option<_>>()?.map(arrow_type::ArrowTypeEnum::Decimal64)
 ;
                         }
                         GeneratedField::Decimal256 => {
@@ -2685,6 +2711,502 @@ impl<'de> serde::Deserialize<'de> for Decimal256Type {
             }
         }
         deserializer.deserialize_struct("datafusion_common.Decimal256Type", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for Decimal32 {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.value != 0 {
+            len += 1;
+        }
+        if self.p != 0 {
+            len += 1;
+        }
+        if self.s != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("datafusion_common.Decimal32", len)?;
+        if self.value != 0 {
+            struct_ser.serialize_field("value", &self.value)?;
+        }
+        if self.p != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("p", ToString::to_string(&self.p).as_str())?;
+        }
+        if self.s != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("s", ToString::to_string(&self.s).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for Decimal32 {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "value",
+            "p",
+            "s",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Value,
+            P,
+            S,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "value" => Ok(GeneratedField::Value),
+                            "p" => Ok(GeneratedField::P),
+                            "s" => Ok(GeneratedField::S),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = Decimal32;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct datafusion_common.Decimal32")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<Decimal32, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut value__ = None;
+                let mut p__ = None;
+                let mut s__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Value => {
+                            if value__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("value"));
+                            }
+                            value__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::P => {
+                            if p__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("p"));
+                            }
+                            p__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::S => {
+                            if s__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("s"));
+                            }
+                            s__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(Decimal32 {
+                    value: value__.unwrap_or_default(),
+                    p: p__.unwrap_or_default(),
+                    s: s__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("datafusion_common.Decimal32", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for Decimal32Type {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.precision != 0 {
+            len += 1;
+        }
+        if self.scale != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("datafusion_common.Decimal32Type", len)?;
+        if self.precision != 0 {
+            struct_ser.serialize_field("precision", &self.precision)?;
+        }
+        if self.scale != 0 {
+            struct_ser.serialize_field("scale", &self.scale)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for Decimal32Type {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "precision",
+            "scale",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Precision,
+            Scale,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "precision" => Ok(GeneratedField::Precision),
+                            "scale" => Ok(GeneratedField::Scale),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = Decimal32Type;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct datafusion_common.Decimal32Type")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<Decimal32Type, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut precision__ = None;
+                let mut scale__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Precision => {
+                            if precision__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("precision"));
+                            }
+                            precision__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Scale => {
+                            if scale__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("scale"));
+                            }
+                            scale__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(Decimal32Type {
+                    precision: precision__.unwrap_or_default(),
+                    scale: scale__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("datafusion_common.Decimal32Type", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for Decimal64 {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.value != 0 {
+            len += 1;
+        }
+        if self.p != 0 {
+            len += 1;
+        }
+        if self.s != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("datafusion_common.Decimal64", len)?;
+        if self.value != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("value", ToString::to_string(&self.value).as_str())?;
+        }
+        if self.p != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("p", ToString::to_string(&self.p).as_str())?;
+        }
+        if self.s != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("s", ToString::to_string(&self.s).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for Decimal64 {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "value",
+            "p",
+            "s",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Value,
+            P,
+            S,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "value" => Ok(GeneratedField::Value),
+                            "p" => Ok(GeneratedField::P),
+                            "s" => Ok(GeneratedField::S),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = Decimal64;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct datafusion_common.Decimal64")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<Decimal64, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut value__ = None;
+                let mut p__ = None;
+                let mut s__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Value => {
+                            if value__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("value"));
+                            }
+                            value__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::P => {
+                            if p__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("p"));
+                            }
+                            p__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::S => {
+                            if s__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("s"));
+                            }
+                            s__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(Decimal64 {
+                    value: value__.unwrap_or_default(),
+                    p: p__.unwrap_or_default(),
+                    s: s__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("datafusion_common.Decimal64", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for Decimal64Type {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.precision != 0 {
+            len += 1;
+        }
+        if self.scale != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("datafusion_common.Decimal64Type", len)?;
+        if self.precision != 0 {
+            struct_ser.serialize_field("precision", &self.precision)?;
+        }
+        if self.scale != 0 {
+            struct_ser.serialize_field("scale", &self.scale)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for Decimal64Type {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "precision",
+            "scale",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Precision,
+            Scale,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "precision" => Ok(GeneratedField::Precision),
+                            "scale" => Ok(GeneratedField::Scale),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = Decimal64Type;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct datafusion_common.Decimal64Type")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<Decimal64Type, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut precision__ = None;
+                let mut scale__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Precision => {
+                            if precision__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("precision"));
+                            }
+                            precision__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Scale => {
+                            if scale__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("scale"));
+                            }
+                            scale__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(Decimal64Type {
+                    precision: precision__.unwrap_or_default(),
+                    scale: scale__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("datafusion_common.Decimal64Type", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for DfField {
@@ -6888,6 +7410,12 @@ impl serde::Serialize for ScalarValue {
                 scalar_value::Value::MapValue(v) => {
                     struct_ser.serialize_field("mapValue", v)?;
                 }
+                scalar_value::Value::Decimal32Value(v) => {
+                    struct_ser.serialize_field("decimal32Value", v)?;
+                }
+                scalar_value::Value::Decimal64Value(v) => {
+                    struct_ser.serialize_field("decimal64Value", v)?;
+                }
                 scalar_value::Value::Decimal128Value(v) => {
                     struct_ser.serialize_field("decimal128Value", v)?;
                 }
@@ -7014,6 +7542,10 @@ impl<'de> serde::Deserialize<'de> for ScalarValue {
             "structValue",
             "map_value",
             "mapValue",
+            "decimal32_value",
+            "decimal32Value",
+            "decimal64_value",
+            "decimal64Value",
             "decimal128_value",
             "decimal128Value",
             "decimal256_value",
@@ -7076,6 +7608,8 @@ impl<'de> serde::Deserialize<'de> for ScalarValue {
             FixedSizeListValue,
             StructValue,
             MapValue,
+            Decimal32Value,
+            Decimal64Value,
             Decimal128Value,
             Decimal256Value,
             Date64Value,
@@ -7137,6 +7671,8 @@ impl<'de> serde::Deserialize<'de> for ScalarValue {
                             "fixedSizeListValue" | "fixed_size_list_value" => Ok(GeneratedField::FixedSizeListValue),
                             "structValue" | "struct_value" => Ok(GeneratedField::StructValue),
                             "mapValue" | "map_value" => Ok(GeneratedField::MapValue),
+                            "decimal32Value" | "decimal32_value" => Ok(GeneratedField::Decimal32Value),
+                            "decimal64Value" | "decimal64_value" => Ok(GeneratedField::Decimal64Value),
                             "decimal128Value" | "decimal128_value" => Ok(GeneratedField::Decimal128Value),
                             "decimal256Value" | "decimal256_value" => Ok(GeneratedField::Decimal256Value),
                             "date64Value" | "date_64_value" => Ok(GeneratedField::Date64Value),
@@ -7314,6 +7850,20 @@ impl<'de> serde::Deserialize<'de> for ScalarValue {
                                 return Err(serde::de::Error::duplicate_field("mapValue"));
                             }
                             value__ = map_.next_value::<::std::option::Option<_>>()?.map(scalar_value::Value::MapValue)
+;
+                        }
+                        GeneratedField::Decimal32Value => {
+                            if value__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("decimal32Value"));
+                            }
+                            value__ = map_.next_value::<::std::option::Option<_>>()?.map(scalar_value::Value::Decimal32Value)
+;
+                        }
+                        GeneratedField::Decimal64Value => {
+                            if value__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("decimal64Value"));
+                            }
+                            value__ = map_.next_value::<::std::option::Option<_>>()?.map(scalar_value::Value::Decimal64Value)
 ;
                         }
                         GeneratedField::Decimal128Value => {

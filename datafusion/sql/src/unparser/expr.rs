@@ -34,7 +34,7 @@ use arrow::array::{
     },
     ArrayRef, Date32Array, Date64Array, PrimitiveArray,
 };
-use arrow::datatypes::{DataType, Decimal128Type, Decimal256Type, DecimalType};
+use arrow::datatypes::{DataType, Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type, DecimalType};
 use arrow::util::display::array_value_to_string;
 use datafusion_common::{
     internal_datafusion_err, internal_err, not_impl_err, plan_err, Column, Result,
@@ -1171,6 +1171,20 @@ impl Unparser<'_> {
                 Ok(ast::Expr::value(ast::Value::Number(f_val, false)))
             }
             ScalarValue::Float64(None) => Ok(ast::Expr::value(ast::Value::Null)),
+            ScalarValue::Decimal32(Some(value), precision, scale) => {
+                Ok(ast::Expr::value(ast::Value::Number(
+                    Decimal32Type::format_decimal(*value, *precision, *scale),
+                    false,
+                )))
+            }
+            ScalarValue::Decimal32(None, ..) => Ok(ast::Expr::value(ast::Value::Null)),
+            ScalarValue::Decimal64(Some(value), precision, scale) => {
+                Ok(ast::Expr::value(ast::Value::Number(
+                    Decimal64Type::format_decimal(*value, *precision, *scale),
+                    false,
+                )))
+            }
+            ScalarValue::Decimal64(None, ..) => Ok(ast::Expr::value(ast::Value::Null)),
             ScalarValue::Decimal128(Some(value), precision, scale) => {
                 Ok(ast::Expr::value(ast::Value::Number(
                     Decimal128Type::format_decimal(*value, *precision, *scale),
@@ -1715,7 +1729,9 @@ impl Unparser<'_> {
                 not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
             }
             DataType::Dictionary(_, val) => self.arrow_dtype_to_ast_dtype(val),
-            DataType::Decimal128(precision, scale)
+            DataType::Decimal32(precision, scale)
+            | DataType::Decimal64(precision, scale)
+            | DataType::Decimal128(precision, scale)
             | DataType::Decimal256(precision, scale) => {
                 let mut new_precision = *precision as u64;
                 let mut new_scale = *scale as u64;

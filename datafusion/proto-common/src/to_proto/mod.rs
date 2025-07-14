@@ -189,6 +189,14 @@ impl TryFrom<&DataType> for protobuf::arrow_type::ArrowTypeEnum {
                     value: Some(Box::new(value_type.as_ref().try_into()?)),
                 }))
             }
+            DataType::Decimal32(precision, scale) => Self::Decimal32(protobuf::Decimal32Type {
+                precision: *precision as u32,
+                scale: *scale as i32,
+            }),
+            DataType::Decimal64(precision, scale) => Self::Decimal64(protobuf::Decimal64Type {
+                precision: *precision as u32,
+                scale: *scale as i32,
+            }),
             DataType::Decimal128(precision, scale) => Self::Decimal(protobuf::Decimal {
                 precision: *precision as u32,
                 scale: *scale as i32,
@@ -397,6 +405,48 @@ impl TryFrom<&ScalarValue> for protobuf::ScalarValue {
                     })
                 })
             }
+            ScalarValue::Decimal32(val, p, s) => match *val {
+                Some(v) => Ok(protobuf::ScalarValue {
+                    value: Some(Value::Decimal32Value(protobuf::Decimal32 {
+                        value: v,
+                        p: *p as i64,
+                        s: *s as i64,
+                    })),
+                }),
+                None => Ok(protobuf::ScalarValue {
+                    value: Some(Value::NullValue(protobuf::ArrowType {
+                        arrow_type_enum: Some(
+                            protobuf::arrow_type::ArrowTypeEnum::Decimal32(
+                                protobuf::Decimal32Type {
+                                    precision: *p as u32,
+                                    scale: *s as i32,
+                                },
+                            ),
+                        ),
+                    })),
+                }),
+            },
+            ScalarValue::Decimal64(val, p, s) => match *val {
+                Some(v) => Ok(protobuf::ScalarValue {
+                    value: Some(Value::Decimal64Value(protobuf::Decimal64 {
+                        value: v,
+                        p: *p as i64,
+                        s: *s as i64,
+                    })),
+                }),
+                None => Ok(protobuf::ScalarValue {
+                    value: Some(Value::NullValue(protobuf::ArrowType {
+                        arrow_type_enum: Some(
+                            protobuf::arrow_type::ArrowTypeEnum::Decimal64(
+                                protobuf::Decimal64Type {
+                                    precision: *p as u32,
+                                    scale: *s as i32,
+                                },
+                            ),
+                        ),
+                    })),
+                }),
+            },
             ScalarValue::Decimal128(val, p, s) => match *val {
                 Some(v) => {
                     let array = v.to_be_bytes();
@@ -817,8 +867,7 @@ impl TryFrom<&ParquetOptions> for protobuf::ParquetOptions {
             dictionary_enabled_opt: value.dictionary_enabled.map(protobuf::parquet_options::DictionaryEnabledOpt::DictionaryEnabled),
             dictionary_page_size_limit: value.dictionary_page_size_limit as u64,
             statistics_enabled_opt: value.statistics_enabled.clone().map(protobuf::parquet_options::StatisticsEnabledOpt::StatisticsEnabled),
-            #[allow(deprecated)]
-            max_statistics_size_opt: value.max_statistics_size.map(|v| protobuf::parquet_options::MaxStatisticsSizeOpt::MaxStatisticsSize(v as u64)),
+            max_statistics_size_opt: None,
             max_row_group_size: value.max_row_group_size as u64,
             created_by: value.created_by.clone(),
             column_index_truncate_length_opt: value.column_index_truncate_length.map(|v| protobuf::parquet_options::ColumnIndexTruncateLengthOpt::ColumnIndexTruncateLength(v as u64)),
@@ -858,12 +907,7 @@ impl TryFrom<&ParquetColumnOptions> for protobuf::ParquetColumnOptions {
                 .statistics_enabled
                 .clone()
                 .map(protobuf::parquet_column_options::StatisticsEnabledOpt::StatisticsEnabled),
-            #[allow(deprecated)]
-            max_statistics_size_opt: value.max_statistics_size.map(|v| {
-                protobuf::parquet_column_options::MaxStatisticsSizeOpt::MaxStatisticsSize(
-                    v as u32,
-                )
-            }),
+            max_statistics_size_opt: None,
             encoding_opt: value
                 .encoding
                 .clone()

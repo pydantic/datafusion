@@ -227,3 +227,16 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(tarpaulin_include)",
 ] }
 unused_qualifications = "deny"
+
+[patch.crates-io]
+arrow = { git = "https://github.com/apache/arrow-rs.git", rev = "7b219f98c25fcd318a0c207f51a41398d1b23724" }
+arrow-array = { git = "https://github.com/apache/arrow-rs.git", rev = "7b219f98c25fcd318a0c207f51a41398d1b23724" }
+arrow-buffer = { git = "https://github.com/apache/arrow-rs.git", rev = "7b219f98c25fcd318a0c207f51a41398d1b23724" }
+arrow-cast = { git = "https://github.com/apache/arrow-rs.git", rev = "7b219f98c25fcd318a0c207f51a41398d1b23724" }
+arrow-data = { git = "https://github.com/apache/arrow-rs.git", rev = "7b219f98c25fcd318a0c207f51a41398d1b23724" }
+arrow-ipc = { git = "https://github.com/apache/arrow-rs.git", rev = "7b219f98c25fcd318a0c207f51a41398d1b23724" }
+arrow-ord = { git = "https://github.com/apache/arrow-rs.git", rev = "7b219f98c25fcd318a0c207f51a41398d1b23724" }
+arrow-schema = { git = "https://github.com/apache/arrow-rs.git", rev = "7b219f98c25fcd318a0c207f51a41398d1b23724" }
+arrow-select = { git = "https://github.com/apache/arrow-rs.git", rev = "7b219f98c25fcd318a0c207f51a41398d1b23724" }
+arrow-json = { git = "https://github.com/apache/arrow-rs.git", rev = "7b219f98c25fcd318a0c207f51a41398d1b23724" }
+parquet = { git = "https://github.com/apache/arrow-rs.git", rev = "7b219f98c25fcd318a0c207f51a41398d1b23724" }
