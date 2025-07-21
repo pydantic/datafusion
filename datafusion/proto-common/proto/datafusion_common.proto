@@ -140,6 +140,18 @@ message Decimal{
   int32 scale = 4;
 }
 
+message Decimal32Type {
+  reserved 1, 2;
+  uint32 precision = 3;
+  int32 scale = 4;
+}
+
+message Decimal64Type {
+  reserved 1, 2;
+  uint32 precision = 3;
+  int32 scale = 4;
+}
+
 message Decimal256Type{
   reserved 1, 2;
   uint32 precision = 3;
@@ -284,6 +296,8 @@ message ScalarValue{
     ScalarNestedValue struct_value = 32;
     ScalarNestedValue map_value = 41;
 
+    Decimal32 decimal32_value = 43;
+    Decimal64 decimal64_value = 44;
     Decimal128 decimal128_value = 20;
     Decimal256 decimal256_value = 39;
 
@@ -306,6 +320,18 @@ message ScalarValue{
     ScalarFixedSizeBinary fixed_size_binary_value = 34;
     UnionValue union_value = 42;
   }
+}
+
+message Decimal32 {
+  int32 value = 1;
+  int64 p = 2;
+  int64 s = 3;
+}
+
+message Decimal64 {
+  int64 value = 1;
+  int64 p = 2;
+  int64 s = 3;
 }
 
 message Decimal128{
@@ -351,6 +377,8 @@ message ArrowType{
     TimeUnit TIME64 = 22 ;
     IntervalUnit INTERVAL = 23 ;
     Decimal DECIMAL = 24 ;
+    Decimal32Type DECIMAL32 = 37;
+    Decimal64Type DECIMAL64 = 38;
     Decimal256Type DECIMAL256 = 36;
     List LIST = 25;
     List LARGE_LIST = 26;
@@ -478,9 +506,7 @@ message ParquetColumnOptions {
     uint64 bloom_filter_ndv = 7;
   }
 
-  oneof max_statistics_size_opt {
-    uint32 max_statistics_size = 8;
-  }
+  reserved 8; // removed max_statistics_size
 }
 
 message ParquetOptions {
@@ -519,9 +545,7 @@ message ParquetOptions {
     string statistics_enabled = 13;
   }
 
-  oneof max_statistics_size_opt {
-    uint64 max_statistics_size = 14;
-  }
+  reserved 14; // removed max_statistics_size
 
   oneof column_index_truncate_length_opt {
     uint64 column_index_truncate_length = 17;

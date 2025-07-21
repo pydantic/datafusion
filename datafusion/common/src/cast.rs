@@ -28,8 +28,8 @@ use arrow::array::{
 };
 use arrow::{
     array::{
-        Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
-        Decimal256Array, DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray,
+        Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
+        Decimal64Array, Decimal128Array, Decimal256Array, DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray,
         Float32Array, Float64Array, GenericBinaryArray, GenericListArray,
         GenericStringArray, Int32Array, Int64Array, IntervalDayTimeArray,
         IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeListArray, ListArray,
@@ -95,6 +95,16 @@ pub fn as_int64_array(array: &dyn Array) -> Result<&Int64Array> {
 // Downcast Array to UInt64Array
 pub fn as_uint64_array(array: &dyn Array) -> Result<&UInt64Array> {
     Ok(downcast_value!(array, UInt64Array))
+}
+
+// Downcast Array to Decimal32Array
+pub fn as_decimal32_array(array: &dyn Array) -> Result<&Decimal32Array> {
+    Ok(downcast_value!(array, Decimal32Array))
+}
+
+// Downcast Array to Decimal64Array
+pub fn as_decimal64_array(array: &dyn Array) -> Result<&Decimal64Array> {
+    Ok(downcast_value!(array, Decimal64Array))
 }
 
 // Downcast Array to Decimal128Array

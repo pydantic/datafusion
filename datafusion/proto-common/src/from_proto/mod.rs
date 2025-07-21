@@ -261,6 +261,14 @@ impl TryFrom<&protobuf::arrow_type::ArrowTypeEnum> for DataType {
                 precision,
                 scale,
             }) => DataType::Decimal128(*precision as u8, *scale as i8),
+            arrow_type::ArrowTypeEnum::Decimal32(protobuf::Decimal32Type {
+                precision,
+                scale,
+            }) => DataType::Decimal32(*precision as u8, *scale as i8),
+            arrow_type::ArrowTypeEnum::Decimal64(protobuf::Decimal64Type {
+                precision,
+                scale,
+            }) => DataType::Decimal64(*precision as u8, *scale as i8),
             arrow_type::ArrowTypeEnum::Decimal256(protobuf::Decimal256Type {
                 precision,
                 scale,
@@ -468,6 +476,12 @@ impl TryFrom<&protobuf::ScalarValue> for ScalarValue {
             Value::NullValue(v) => {
                 let null_type: DataType = v.try_into()?;
                 null_type.try_into().map_err(Error::DataFusionError)?
+            }
+            Value::Decimal32Value(val) => {
+                Self::Decimal32(Some(val.value), val.p as u8, val.s as i8)
+            }
+            Value::Decimal64Value(val) => {
+                Self::Decimal64(Some(val.value), val.p as u8, val.s as i8)
             }
             Value::Decimal128Value(val) => {
                 let array = vec_to_array(val.value.clone());
@@ -938,12 +952,6 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
                     protobuf::parquet_options::StatisticsEnabledOpt::StatisticsEnabled(v) => Some(v),
                 })
                 .unwrap_or(None),
-            max_statistics_size: value
-                .max_statistics_size_opt.as_ref()
-                .map(|opt| match opt {
-                    protobuf::parquet_options::MaxStatisticsSizeOpt::MaxStatisticsSize(v) => Some(*v as usize),
-                })
-                .unwrap_or(None),
             max_row_group_size: value.max_row_group_size as usize,
             created_by: value.created_by.clone(),
             column_index_truncate_length: value
@@ -1007,12 +1015,6 @@ impl TryFrom<&protobuf::ParquetColumnOptions> for ParquetColumnOptions {
                 .statistics_enabled_opt.clone()
                 .map(|opt| match opt {
                     protobuf::parquet_column_options::StatisticsEnabledOpt::StatisticsEnabled(v) => Some(v),
-                })
-                .unwrap_or(None),
-            max_statistics_size: value
-                .max_statistics_size_opt
-                .map(|opt| match opt {
-                    protobuf::parquet_column_options::MaxStatisticsSizeOpt::MaxStatisticsSize(v) => Some(v as usize),
                 })
                 .unwrap_or(None),
             encoding: value

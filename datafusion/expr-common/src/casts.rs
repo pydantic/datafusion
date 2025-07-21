@@ -24,8 +24,9 @@
 use std::cmp::Ordering;
 
 use arrow::datatypes::{
-    DataType, TimeUnit, MAX_DECIMAL128_FOR_EACH_PRECISION,
-    MIN_DECIMAL128_FOR_EACH_PRECISION,
+    DataType, TimeUnit, MAX_DECIMAL32_FOR_EACH_PRECISION, MAX_DECIMAL64_FOR_EACH_PRECISION,
+    MAX_DECIMAL128_FOR_EACH_PRECISION, MIN_DECIMAL32_FOR_EACH_PRECISION, 
+    MIN_DECIMAL64_FOR_EACH_PRECISION, MIN_DECIMAL128_FOR_EACH_PRECISION,
 };
 use arrow::temporal_conversions::{MICROSECONDS, MILLISECONDS, NANOSECONDS};
 use datafusion_common::ScalarValue;
@@ -69,6 +70,8 @@ fn is_supported_numeric_type(data_type: &DataType) -> bool {
             | DataType::Int16
             | DataType::Int32
             | DataType::Int64
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
             | DataType::Decimal128(_, _)
             | DataType::Timestamp(_, _)
     )
@@ -114,6 +117,8 @@ fn try_cast_numeric_literal(
         | DataType::Int32
         | DataType::Int64 => 1_i128,
         DataType::Timestamp(_, _) => 1_i128,
+        DataType::Decimal32(_, scale) => 10_i128.pow(*scale as u32),
+        DataType::Decimal64(_, scale) => 10_i128.pow(*scale as u32),
         DataType::Decimal128(_, scale) => 10_i128.pow(*scale as u32),
         _ => return None,
     };
@@ -127,6 +132,14 @@ fn try_cast_numeric_literal(
         DataType::Int32 => (i32::MIN as i128, i32::MAX as i128),
         DataType::Int64 => (i64::MIN as i128, i64::MAX as i128),
         DataType::Timestamp(_, _) => (i64::MIN as i128, i64::MAX as i128),
+        DataType::Decimal32(precision, _) => (
+            MIN_DECIMAL32_FOR_EACH_PRECISION[*precision as usize] as i128,
+            MAX_DECIMAL32_FOR_EACH_PRECISION[*precision as usize] as i128,
+        ),
+        DataType::Decimal64(precision, _) => (
+            MIN_DECIMAL64_FOR_EACH_PRECISION[*precision as usize] as i128,
+            MAX_DECIMAL64_FOR_EACH_PRECISION[*precision as usize] as i128,
+        ),
         DataType::Decimal128(precision, _) => (
             // Different precision for decimal128 can store different range of value.
             // For example, the precision is 3, the max of value is `999` and the min
@@ -149,6 +162,26 @@ fn try_cast_numeric_literal(
         ScalarValue::TimestampMillisecond(Some(v), _) => (*v as i128).checked_mul(mul),
         ScalarValue::TimestampMicrosecond(Some(v), _) => (*v as i128).checked_mul(mul),
         ScalarValue::TimestampNanosecond(Some(v), _) => (*v as i128).checked_mul(mul),
+        ScalarValue::Decimal32(Some(v), _, scale) => {
+            let lit_scale_mul = 10_i128.pow(*scale as u32);
+            if mul >= lit_scale_mul {
+                (*v as i128).checked_mul(mul / lit_scale_mul)
+            } else if (*v as i128) % (lit_scale_mul / mul) == 0 {
+                Some((*v as i128) / (lit_scale_mul / mul))
+            } else {
+                return None;
+            }
+        }
+        ScalarValue::Decimal64(Some(v), _, scale) => {
+            let lit_scale_mul = 10_i128.pow(*scale as u32);
+            if mul >= lit_scale_mul {
+                (*v as i128).checked_mul(mul / lit_scale_mul)
+            } else if (*v as i128) % (lit_scale_mul / mul) == 0 {
+                Some((*v as i128) / (lit_scale_mul / mul))
+            } else {
+                return None;
+            }
+        }
         ScalarValue::Decimal128(Some(v), _, scale) => {
             let lit_scale_mul = 10_i128.pow(*scale as u32);
             if mul >= lit_scale_mul {
@@ -217,6 +250,12 @@ fn try_cast_numeric_literal(
                             value,
                         );
                         ScalarValue::TimestampNanosecond(value, tz.clone())
+                    }
+                    DataType::Decimal32(p, s) => {
+                        ScalarValue::Decimal32(Some(value as i32), *p, *s)
+                    }
+                    DataType::Decimal64(p, s) => {
+                        ScalarValue::Decimal64(Some(value as i64), *p, *s)
                     }
                     DataType::Decimal128(p, s) => {
                         ScalarValue::Decimal128(Some(value), *p, *s)
