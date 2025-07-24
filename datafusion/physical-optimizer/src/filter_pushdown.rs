@@ -37,6 +37,7 @@ use crate::PhysicalOptimizerRule;
 
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{config::ConfigOptions, Result};
+use datafusion_expr_common::signature::Volatility;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::filter_pushdown::{
     ChildFilterPushdownResult, ChildPushdownResult, FilterPushdownPhase,
@@ -647,16 +648,13 @@ fn allow_pushdown_for_expr(expr: &Arc<dyn PhysicalExpr>) -> bool {
 }
 
 fn allow_pushdown_for_expr_inner(expr: &Arc<dyn PhysicalExpr>) -> bool {
-    // TODO: do downcast matching on specific expressions, or add a method to the PhysicalExpr trait
-    // to check if the expression is volatile or otherwise unsuitable for pushdown.
     if let Some(scalar_function) =
         expr.as_any()
             .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>()
     {
-        let name = scalar_function.fun().name();
-        // Check if the function is volatile
-        if name == "random" {
-            // Random function is volatile, do not allow pushdown
+        // Check if the function is volatile using the proper volatility API
+        if scalar_function.fun().signature().volatility == Volatility::Volatile {
+            // Volatile functions should not be pushed down
             return false;
         }
     }
