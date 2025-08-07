@@ -503,11 +503,15 @@ impl DataSource for FileScanConfig {
             .batch_size
             .unwrap_or_else(|| context.session_config().batch_size());
 
-        let source = self.file_source.with_projection(self);
+        let opener = self.file_source.create_file_opener(
+            object_store,
+            self,
+            partition,
+            batch_size,
+        );
 
-        let opener = source.create_file_opener(object_store, self, partition, batch_size);
-
-        let stream = FileStream::new(self, partition, opener, source.metrics())?;
+        let stream =
+            FileStream::new(self, partition, opener, self.file_source.metrics())?;
         Ok(Box::pin(cooperative(stream)))
     }
 

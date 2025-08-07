@@ -563,9 +563,9 @@ impl FileSource for ParquetSource {
         Arc::new(conf)
     }
 
-    fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
-    }
+    // fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
+    //     Arc::new(Self { ..self.clone() })
+    // }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
         &self.metrics

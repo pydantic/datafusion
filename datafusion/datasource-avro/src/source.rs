@@ -68,12 +68,15 @@ impl FileSource for AvroSource {
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
-        _base_config: &FileScanConfig,
+        base_config: &FileScanConfig,
         _partition: usize,
         batch_size: usize,
     ) -> Arc<dyn FileOpener> {
+        let mut project = self.clone();
+        project.projection = base_config.projected_file_column_names();
+
         Arc::new(private::AvroOpener {
-            config: Arc::new(self.clone()),
+            config: Arc::new(project),
             object_store,
             batch_size,
         })
@@ -94,11 +97,11 @@ impl FileSource for AvroSource {
         Arc::new(conf)
     }
 
-    fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.projection = config.projected_file_column_names();
-        Arc::new(conf)
-    }
+    // fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource> {
+    //     let mut conf = self.clone();
+    //     conf.projection = config.projected_file_column_names();
+    //     Arc::new(conf)
+    // }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
         &self.metrics

@@ -154,12 +154,12 @@ impl FileSource for TestSource {
         })
     }
 
-    fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource> {
-        Arc::new(TestSource {
-            projection: config.projection.clone(),
-            ..self.clone()
-        })
-    }
+    // fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource> {
+    //     Arc::new(TestSource {
+    //         projection: config.projection.clone(),
+    //         ..self.clone()
+    //     })
+    // }
 
     fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
         Arc::new(TestSource {

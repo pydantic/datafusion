@@ -65,7 +65,7 @@ pub trait FileSource: Send + Sync {
     /// Initialize new instance with a new schema
     fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource>;
     /// Initialize new instance with projection information
-    fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource>;
+    // fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource>;
     /// Initialize new instance with projected statistics
     fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource>;
     /// Return execution plan metrics

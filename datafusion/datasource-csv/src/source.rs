@@ -227,8 +227,11 @@ impl FileSource for CsvSource {
         _partition: usize,
         batch_size: usize,
     ) -> Arc<dyn FileOpener> {
+        let mut conf = self.clone();
+        conf.file_projection = base_config.file_column_projection_indices();
+
         Arc::new(CsvOpener {
-            config: Arc::new(self.clone()),
+            config: Arc::new(conf),
             file_compression_type: base_config.file_compression_type,
             object_store,
             batch_size,
@@ -251,11 +254,11 @@ impl FileSource for CsvSource {
         Arc::new(conf)
     }
 
-    fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.file_projection = config.file_column_projection_indices();
-        Arc::new(conf)
-    }
+    // fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource> {
+    //     let mut conf = self.clone();
+    //     conf.file_projection = config.file_column_projection_indices();
+    //     Arc::new(conf)
+    // }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
         &self.metrics
