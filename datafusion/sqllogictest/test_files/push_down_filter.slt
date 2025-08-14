@@ -288,3 +288,33 @@ physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/
 
 statement ok
 drop table t;
+
+# Regression test for https://github.com/apache/datafusion/issues/17188
+query I
+COPY (select i as k from generate_series(1, 10000000) as t(i))
+TO 'test_files/scratch/push_down_filter/t1.parquet'
+STORED AS PARQUET;
+----
+10000000
+
+query I
+COPY (select i as k, i as v from generate_series(1, 10000000) as t(i))
+TO 'test_files/scratch/push_down_filter/t2.parquet'
+STORED AS PARQUET;
+----
+10000000
+
+statement ok
+create external table t1 stored as parquet location 'test_files/scratch/push_down_filter/t1.parquet';
+
+statement ok
+create external table t2 stored as parquet location 'test_files/scratch/push_down_filter/t2.parquet';
+
+query III
+select *
+from t1
+join t2 on t1.k = t2.k
+where v = 1 or v = 10000000;
+----
+1 1 1
+10000000 10000000 10000000
