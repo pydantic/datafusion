@@ -121,37 +121,49 @@ impl SharedBoundsAccumulator {
     fn merge_bounds(&self) -> Option<Vec<(ScalarValue, ScalarValue)>> {
         let bounds = self.bounds.lock();
         let all_bounds: Vec<_> = bounds.values().collect();
-        
+
         if all_bounds.is_empty() {
             return None;
         }
-        
+
         let num_columns = all_bounds[0].len();
         let mut merged = Vec::with_capacity(num_columns);
-        
+
         for col_idx in 0..num_columns {
             let mut global_min = None;
             let mut global_max = None;
-            
+
             for partition_bounds in &all_bounds {
                 if let Some((min_val, max_val)) = partition_bounds.get(col_idx) {
                     global_min = match global_min {
                         None => Some(min_val.clone()),
-                        Some(current_min) => Some(if min_val < &current_min { min_val.clone() } else { current_min }),
+                        Some(current_min) => Some(if min_val < &current_min {
+                            min_val.clone()
+                        } else {
+                            current_min
+                        }),
                     };
                     global_max = match global_max {
                         None => Some(max_val.clone()),
-                        Some(current_max) => Some(if max_val > &current_max { max_val.clone() } else { current_max }),
+                        Some(current_max) => Some(if max_val > &current_max {
+                            max_val.clone()
+                        } else {
+                            current_max
+                        }),
                     };
                 }
             }
-            
+
             if let (Some(min), Some(max)) = (global_min, global_max) {
                 merged.push((min, max));
             }
         }
-        
-        if merged.is_empty() { None } else { Some(merged) }
+
+        if merged.is_empty() {
+            None
+        } else {
+            Some(merged)
+        }
     }
 }
 
@@ -484,7 +496,8 @@ impl HashJoinExec {
 
         let dynamic_filter = Self::create_dynamic_filter(&on);
         let output_partitions = cache.output_partitioning().partition_count();
-        let bounds_accumulator = Arc::new(SharedBoundsAccumulator::new(output_partitions));
+        let bounds_accumulator =
+            Arc::new(SharedBoundsAccumulator::new(output_partitions));
 
         Ok(HashJoinExec {
             left,
@@ -1301,7 +1314,6 @@ async fn collect_left_input(
         bounds,
     );
 
-
     Ok(data)
 }
 
@@ -1691,13 +1703,25 @@ impl HashJoinStream {
             .left_fut
             .get_shared(cx))?;
         build_timer.done();
-        
+
         // Handle dynamic filter bounds accumulation
-        if let (Some(dynamic_filter), Some(bounds)) = (&self.dynamic_filter, &left_data.bounds) {
+        if let (Some(dynamic_filter), Some(bounds)) =
+            (&self.dynamic_filter, &left_data.bounds)
+        {
             // Store bounds in the accumulator
-            self.bounds_accumulator.bounds.lock().insert(self.partition_id, bounds.clone());
-            let completed = self.bounds_accumulator.completed_partitions.fetch_add(1, Ordering::SeqCst) + 1;
-            let total_partitions = self.bounds_accumulator.total_partitions.load(Ordering::SeqCst);
+            self.bounds_accumulator
+                .bounds
+                .lock()
+                .insert(self.partition_id, bounds.clone());
+            let completed = self
+                .bounds_accumulator
+                .completed_partitions
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+            let total_partitions = self
+                .bounds_accumulator
+                .total_partitions
+                .load(Ordering::SeqCst);
 
             // If this is the last partition to complete, update the filter
             if completed == total_partitions {
@@ -1733,12 +1757,11 @@ impl HashJoinStream {
                 Operator::LtEq,
                 lit(max_val.clone()),
             )) as Arc<dyn PhysicalExpr>;
-            let range_expr =
-                Arc::new(BinaryExpr::new(min_expr, Operator::And, max_expr))
-                    as Arc<dyn PhysicalExpr>;
+            let range_expr = Arc::new(BinaryExpr::new(min_expr, Operator::And, max_expr))
+                as Arc<dyn PhysicalExpr>;
             predicates.push(range_expr);
         }
-        
+
         // Combine all predicates with AND
         let combined_predicate = predicates
             .into_iter()
@@ -1747,7 +1770,7 @@ impl HashJoinStream {
                     as Arc<dyn PhysicalExpr>
             })
             .unwrap_or_else(|| lit(true));
-            
+
         Ok(combined_predicate)
     }
 
