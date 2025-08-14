@@ -98,6 +98,69 @@ use parking_lot::Mutex;
 const HASH_JOIN_SEED: RandomState =
     RandomState::with_seeds('J' as u64, 'O' as u64, 'I' as u64, 'N' as u64);
 
+/// Structure to accumulate bounds from all partitions for dynamic filter pushdown
+struct SharedBoundsAccumulator {
+    /// Bounds from each partition (indexed by partition_id)
+    bounds: Mutex<std::collections::HashMap<usize, Vec<(ScalarValue, ScalarValue)>>>,
+    /// Counter of completed partitions
+    completed_partitions: AtomicUsize,
+    /// Total number of partitions (will be updated when known)
+    total_partitions: AtomicUsize,
+}
+
+impl SharedBoundsAccumulator {
+    fn new(total_partitions: usize) -> Self {
+        Self {
+            bounds: Mutex::new(std::collections::HashMap::new()),
+            completed_partitions: AtomicUsize::new(0),
+            total_partitions: AtomicUsize::new(total_partitions),
+        }
+    }
+
+    /// Merge all bounds from completed partitions into global min/max
+    fn merge_bounds(&self) -> Option<Vec<(ScalarValue, ScalarValue)>> {
+        let bounds = self.bounds.lock();
+        let all_bounds: Vec<_> = bounds.values().collect();
+        
+        if all_bounds.is_empty() {
+            return None;
+        }
+        
+        let num_columns = all_bounds[0].len();
+        let mut merged = Vec::with_capacity(num_columns);
+        
+        for col_idx in 0..num_columns {
+            let mut global_min = None;
+            let mut global_max = None;
+            
+            for partition_bounds in &all_bounds {
+                if let Some((min_val, max_val)) = partition_bounds.get(col_idx) {
+                    global_min = match global_min {
+                        None => Some(min_val.clone()),
+                        Some(current_min) => Some(if min_val < &current_min { min_val.clone() } else { current_min }),
+                    };
+                    global_max = match global_max {
+                        None => Some(max_val.clone()),
+                        Some(current_max) => Some(if max_val > &current_max { max_val.clone() } else { current_max }),
+                    };
+                }
+            }
+            
+            if let (Some(min), Some(max)) = (global_min, global_max) {
+                merged.push((min, max));
+            }
+        }
+        
+        if merged.is_empty() { None } else { Some(merged) }
+    }
+}
+
+impl fmt::Debug for SharedBoundsAccumulator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SharedBoundsAccumulator")
+    }
+}
+
 /// HashTable and input data for the left (build side) of a join
 struct JoinLeftData {
     /// The hash table with indices into `batch`
@@ -116,6 +179,8 @@ struct JoinLeftData {
     /// This could hide potential out-of-memory issues, especially when upstream operators increase their memory consumption.
     /// The MemoryReservation ensures proper tracking of memory resources throughout the join operation's lifecycle.
     _reservation: MemoryReservation,
+    /// Bounds computed from the build side for dynamic filter pushdown
+    bounds: Option<Vec<(ScalarValue, ScalarValue)>>,
 }
 
 impl JoinLeftData {
@@ -127,6 +192,7 @@ impl JoinLeftData {
         visited_indices_bitmap: SharedBitmapBuilder,
         probe_threads_counter: AtomicUsize,
         reservation: MemoryReservation,
+        bounds: Option<Vec<(ScalarValue, ScalarValue)>>,
     ) -> Self {
         Self {
             hash_map,
@@ -135,6 +201,7 @@ impl JoinLeftData {
             visited_indices_bitmap,
             probe_threads_counter,
             _reservation: reservation,
+            bounds,
         }
     }
 
@@ -367,6 +434,8 @@ pub struct HashJoinExec {
     cache: PlanProperties,
     /// Dynamic filter for pushing down to the probe side
     dynamic_filter: Arc<DynamicFilterPhysicalExpr>,
+    /// Shared bounds accumulator for coordinating dynamic filter updates across partitions
+    bounds_accumulator: Arc<SharedBoundsAccumulator>,
 }
 
 impl HashJoinExec {
@@ -414,6 +483,8 @@ impl HashJoinExec {
         )?;
 
         let dynamic_filter = Self::create_dynamic_filter(&on);
+        let output_partitions = cache.output_partitioning().partition_count();
+        let bounds_accumulator = Arc::new(SharedBoundsAccumulator::new(output_partitions));
 
         Ok(HashJoinExec {
             left,
@@ -431,6 +502,7 @@ impl HashJoinExec {
             null_equality,
             cache,
             dynamic_filter,
+            bounds_accumulator,
         })
     }
 
@@ -804,8 +876,9 @@ impl ExecutionPlan for HashJoinExec {
             self.mode,
             self.null_equality,
         )?;
-        // Preserve the dynamic filter if it exists
+        // Preserve the dynamic filter and bounds accumulator if they exist
         new_join.dynamic_filter = Arc::clone(&self.dynamic_filter);
+        new_join.bounds_accumulator = Arc::clone(&self.bounds_accumulator);
         Ok(Arc::new(new_join))
     }
 
@@ -827,6 +900,7 @@ impl ExecutionPlan for HashJoinExec {
             null_equality: self.null_equality,
             cache: self.cache.clone(),
             dynamic_filter: Self::create_dynamic_filter(&self.on),
+            bounds_accumulator: Arc::clone(&self.bounds_accumulator),
         }))
     }
 
@@ -948,6 +1022,10 @@ impl ExecutionPlan for HashJoinExec {
             batch_size,
             hashes_buffer: vec![],
             right_side_ordered: self.right.output_ordering().is_some(),
+            bounds_accumulator: Arc::clone(&self.bounds_accumulator),
+            dynamic_filter: enable_dynamic_filter_pushdown
+                .then_some(Arc::clone(&self.dynamic_filter)),
+            partition_id: partition,
         }))
     }
 
@@ -1116,7 +1194,7 @@ async fn collect_left_input(
     with_visited_indices_bitmap: bool,
     probe_threads_count: usize,
     dynamic_filter: Option<Arc<DynamicFilterPhysicalExpr>>,
-    on_right: Vec<PhysicalExprRef>,
+    _on_right: Vec<PhysicalExprRef>,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
 
@@ -1206,6 +1284,13 @@ async fn collect_left_input(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // Compute bounds for dynamic filter if enabled
+    let bounds = if dynamic_filter.is_some() && num_rows > 0 {
+        Some(compute_bounds(&left_values)?)
+    } else {
+        None
+    };
+
     let data = JoinLeftData::new(
         hashmap,
         single_batch,
@@ -1213,48 +1298,9 @@ async fn collect_left_input(
         Mutex::new(visited_indices_bitmap),
         AtomicUsize::new(probe_threads_count),
         reservation,
+        bounds,
     );
 
-    // Update dynamic filter with min/max bounds if provided
-    if let Some(dynamic_filter) = dynamic_filter {
-        if num_rows > 0 {
-            let bounds = compute_bounds(&left_values)?;
-
-            // Create range predicates for each join key
-            let mut predicates = Vec::with_capacity(bounds.len());
-            for ((min_val, max_val), right_expr) in bounds.iter().zip(on_right.iter()) {
-                // Create predicate: col >= min AND col <= max
-                let min_expr = Arc::new(BinaryExpr::new(
-                    Arc::clone(right_expr),
-                    Operator::GtEq,
-                    lit(min_val.clone()),
-                )) as Arc<dyn PhysicalExpr>;
-
-                let max_expr = Arc::new(BinaryExpr::new(
-                    Arc::clone(right_expr),
-                    Operator::LtEq,
-                    lit(max_val.clone()),
-                )) as Arc<dyn PhysicalExpr>;
-
-                let range_expr =
-                    Arc::new(BinaryExpr::new(min_expr, Operator::And, max_expr))
-                        as Arc<dyn PhysicalExpr>;
-
-                predicates.push(range_expr);
-            }
-
-            // Combine all predicates with AND
-            let combined_predicate = predicates
-                .into_iter()
-                .reduce(|acc, pred| {
-                    Arc::new(BinaryExpr::new(acc, Operator::And, pred))
-                        as Arc<dyn PhysicalExpr>
-                })
-                .unwrap_or_else(|| lit(true));
-
-            dynamic_filter.update(combined_predicate)?;
-        }
-    }
 
     Ok(data)
 }
@@ -1451,6 +1497,12 @@ struct HashJoinStream {
     hashes_buffer: Vec<u64>,
     /// Specifies whether the right side has an ordering to potentially preserve
     right_side_ordered: bool,
+    /// Shared bounds accumulator for coordinating dynamic filter updates
+    bounds_accumulator: Arc<SharedBoundsAccumulator>,
+    /// Dynamic filter for pushdown to probe side
+    dynamic_filter: Option<Arc<DynamicFilterPhysicalExpr>>,
+    /// Partition ID for tracking in bounds accumulator
+    partition_id: usize,
 }
 
 impl RecordBatchStream for HashJoinStream {
@@ -1639,11 +1691,64 @@ impl HashJoinStream {
             .left_fut
             .get_shared(cx))?;
         build_timer.done();
+        
+        // Handle dynamic filter bounds accumulation
+        if let (Some(dynamic_filter), Some(bounds)) = (&self.dynamic_filter, &left_data.bounds) {
+            // Store bounds in the accumulator
+            self.bounds_accumulator.bounds.lock().insert(self.partition_id, bounds.clone());
+            let completed = self.bounds_accumulator.completed_partitions.fetch_add(1, Ordering::SeqCst) + 1;
+            let total_partitions = self.bounds_accumulator.total_partitions.load(Ordering::SeqCst);
+
+            // If this is the last partition to complete, update the filter
+            if completed == total_partitions {
+                if let Some(merged_bounds) = self.bounds_accumulator.merge_bounds() {
+                    let filter_expr = self.create_filter_from_bounds(merged_bounds)?;
+                    dynamic_filter.update(filter_expr)?;
+                }
+            }
+        }
 
         self.state = HashJoinStreamState::FetchProbeBatch;
         self.build_side = BuildSide::Ready(BuildSideReadyState { left_data });
 
         Poll::Ready(Ok(StatefulStreamResult::Continue))
+    }
+
+    /// Create a filter expression from merged bounds
+    fn create_filter_from_bounds(
+        &self,
+        bounds: Vec<(ScalarValue, ScalarValue)>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        // Create range predicates for each join key
+        let mut predicates = Vec::with_capacity(bounds.len());
+        for ((min_val, max_val), right_expr) in bounds.iter().zip(self.on_right.iter()) {
+            // Create predicate: col >= min AND col <= max
+            let min_expr = Arc::new(BinaryExpr::new(
+                Arc::clone(right_expr),
+                Operator::GtEq,
+                lit(min_val.clone()),
+            )) as Arc<dyn PhysicalExpr>;
+            let max_expr = Arc::new(BinaryExpr::new(
+                Arc::clone(right_expr),
+                Operator::LtEq,
+                lit(max_val.clone()),
+            )) as Arc<dyn PhysicalExpr>;
+            let range_expr =
+                Arc::new(BinaryExpr::new(min_expr, Operator::And, max_expr))
+                    as Arc<dyn PhysicalExpr>;
+            predicates.push(range_expr);
+        }
+        
+        // Combine all predicates with AND
+        let combined_predicate = predicates
+            .into_iter()
+            .reduce(|acc, pred| {
+                Arc::new(BinaryExpr::new(acc, Operator::And, pred))
+                    as Arc<dyn PhysicalExpr>
+            })
+            .unwrap_or_else(|| lit(true));
+            
+        Ok(combined_predicate)
     }
 
     /// Fetches next batch from probe-side

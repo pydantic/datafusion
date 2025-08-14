@@ -310,7 +310,7 @@ create external table t1 stored as parquet location 'test_files/scratch/push_dow
 statement ok
 create external table t2 stored as parquet location 'test_files/scratch/push_down_filter/t2.parquet';
 
-query III
+query III rowsort
 select *
 from t1
 join t2 on t1.k = t2.k
