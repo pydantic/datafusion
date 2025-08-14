@@ -58,7 +58,6 @@ use datafusion_session::Session;
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
-use datafusion_datasource::source::DataSourceExec;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
 
 #[derive(Default)]
@@ -253,14 +252,16 @@ impl FileFormat for JsonFormat {
         _state: &dyn Session,
         conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let source = Arc::new(JsonSource::new());
         let conf = FileScanConfigBuilder::from(conf)
             .with_file_compression_type(FileCompressionType::from(
                 self.options.compression,
             ))
-            .with_source(source)
             .build();
-        Ok(DataSourceExec::from_data_source(conf))
+        let _source = Arc::new(JsonSource::new(conf.clone()));
+
+        // Ok(DataSourceExec::from_data_source(conf))
+
+        todo!("matthew, what does this look like now?")
     }
 
     async fn create_writer_physical_plan(
@@ -282,7 +283,8 @@ impl FileFormat for JsonFormat {
     }
 
     fn file_source(&self) -> Arc<dyn FileSource> {
-        Arc::new(JsonSource::default())
+        // Arc::new(JsonSource::default())
+        todo!("matthew, what does this look like?")
     }
 }
 

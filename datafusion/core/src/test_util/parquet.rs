@@ -155,47 +155,52 @@ impl TestParquetFile {
         ctx: &SessionContext,
         maybe_filter: Option<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let parquet_options = ctx.copied_table_options().parquet;
-        let source = Arc::new(ParquetSource::new(parquet_options.clone()));
-        let scan_config_builder = FileScanConfigBuilder::new(
-            self.object_store_url.clone(),
-            Arc::clone(&self.schema),
-            source,
-        )
-        .with_file(PartitionedFile {
-            object_meta: self.object_meta.clone(),
-            partition_values: vec![],
-            range: None,
-            statistics: None,
-            extensions: None,
-            metadata_size_hint: None,
-        });
+        // let parquet_options = ctx.copied_table_options().parquet;
+        // let scan_config_builder = FileScanConfigBuilder::new(
+        //     self.object_store_url.clone(),
+        //     Arc::clone(&self.schema),
+        //     source,
+        // )
+        // .with_file(PartitionedFile {
+        //     object_meta: self.object_meta.clone(),
+        //     partition_values: vec![],
+        //     range: None,
+        //     statistics: None,
+        //     extensions: None,
+        //     metadata_size_hint: None,
+        // });
 
-        let df_schema = Arc::clone(&self.schema).to_dfschema_ref()?;
+        // let source = Arc::new(ParquetSource::new(
+        //     parquet_options.clone(),
+        //     scan_config_builder.build(),
+        // ));
 
-        // run coercion on the filters to coerce types etc.
-        let props = ExecutionProps::new();
-        let context = SimplifyContext::new(&props).with_schema(Arc::clone(&df_schema));
-        if let Some(filter) = maybe_filter {
-            let simplifier = ExprSimplifier::new(context);
-            let filter = simplifier.coerce(filter, &df_schema).unwrap();
-            let physical_filter_expr =
-                create_physical_expr(&filter, &df_schema, &ExecutionProps::default())?;
+        // let df_schema = Arc::clone(&self.schema).to_dfschema_ref()?;
 
-            let source = Arc::new(
-                ParquetSource::new(parquet_options)
-                    .with_predicate(Arc::clone(&physical_filter_expr)),
-            )
-            .with_schema(Arc::clone(&self.schema));
-            let config = scan_config_builder.with_source(source).build();
-            let parquet_exec = DataSourceExec::from_data_source(config);
+        // // run coercion on the filters to coerce types etc.
+        // let props = ExecutionProps::new();
+        // let context = SimplifyContext::new(&props).with_schema(Arc::clone(&df_schema));
+        // if let Some(filter) = maybe_filter {
+        //     let simplifier = ExprSimplifier::new(context);
+        //     let filter = simplifier.coerce(filter, &df_schema).unwrap();
+        //     let physical_filter_expr =
+        //         create_physical_expr(&filter, &df_schema, &ExecutionProps::default())?;
 
-            let exec = Arc::new(FilterExec::try_new(physical_filter_expr, parquet_exec)?);
-            Ok(exec)
-        } else {
-            let config = scan_config_builder.build();
-            Ok(DataSourceExec::from_data_source(config))
-        }
+        //     let source = Arc::new(
+        //         ParquetSource::new(parquet_options, scan_config_builder.build())
+        //             .with_predicate(Arc::clone(&physical_filter_expr)),
+        //     )
+        //     .with_schema(Arc::clone(&self.schema));
+        //     let parquet_exec = DataSourceExec::from_data_source(config);
+
+        //     let exec = Arc::new(FilterExec::try_new(physical_filter_expr, parquet_exec)?);
+        //     Ok(exec)
+        // } else {
+        //     let config = scan_config_builder.build();
+        //     Ok(DataSourceExec::from_data_source(config))
+        // }
+
+        todo!("what does this look like?")
     }
 
     /// Retrieve metrics from the parquet exec returned from `create_scan`

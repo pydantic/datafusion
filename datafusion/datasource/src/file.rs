@@ -56,7 +56,7 @@ pub trait FileSource: Send + Sync {
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
-        base_config: &FileScanConfig,
+        // base_config: &FileScanConfig,
         partition: usize,
     ) -> Arc<dyn FileOpener>;
     /// Any
@@ -66,13 +66,13 @@ pub trait FileSource: Send + Sync {
     /// Initialize new instance with a new schema
     fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource>;
     /// Initialize new instance with projection information
-    fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource>;
+    fn with_projection(&self) -> Arc<dyn FileSource>;
     /// Initialize new instance with projected statistics
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource>;
+    fn with_projected_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource>;
     /// Return execution plan metrics
     fn metrics(&self) -> &ExecutionPlanMetricsSet;
     /// Return projected statistics
-    fn statistics(&self) -> Result<Statistics>;
+    fn projected_statistics(&self) -> Result<Statistics>;
     /// String representation of file source such as "csv", "json", "parquet"
     fn file_type(&self) -> &str;
     /// Format FileType specific information

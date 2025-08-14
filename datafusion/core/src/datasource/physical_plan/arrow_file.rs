@@ -38,11 +38,24 @@ use object_store::{GetOptions, GetRange, GetResultPayload, ObjectStore};
 
 /// Arrow configuration struct that is given to DataSourceExec
 /// Does not hold anything special, since [`FileScanConfig`] is sufficient for arrow
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ArrowSource {
     metrics: ExecutionPlanMetricsSet,
     projected_statistics: Option<Statistics>,
     schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
+
+    config: FileScanConfig,
+}
+
+impl ArrowSource {
+    pub fn new(config: FileScanConfig) -> Self {
+        Self {
+            config,
+            metrics: ExecutionPlanMetricsSet::default(),
+            projected_statistics: None,
+            schema_adapter_factory: None,
+        }
+    }
 }
 
 impl From<ArrowSource> for Arc<dyn FileSource> {
@@ -55,12 +68,11 @@ impl FileSource for ArrowSource {
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
-        base_config: &FileScanConfig,
         _partition: usize,
     ) -> Arc<dyn FileOpener> {
         Arc::new(ArrowOpener {
             object_store,
-            projection: base_config.file_column_projection_indices(),
+            projection: self.config.file_column_projection_indices(),
         })
     }
 
@@ -81,7 +93,7 @@ impl FileSource for ArrowSource {
         Arc::new(conf)
     }
 
-    fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
+    fn with_projection(&self) -> Arc<dyn FileSource> {
         Arc::new(Self { ..self.clone() })
     }
 

@@ -23,7 +23,6 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::avro_to_arrow::read_avro_schema_from_reader;
-use crate::source::AvroSource;
 
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
@@ -154,13 +153,12 @@ impl FileFormat for AvroFormat {
         _state: &dyn Session,
         conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let config = FileScanConfigBuilder::from(conf)
-            .with_source(self.file_source())
-            .build();
+        let config = FileScanConfigBuilder::from(conf).build();
         Ok(DataSourceExec::from_data_source(config))
     }
 
     fn file_source(&self) -> Arc<dyn FileSource> {
-        Arc::new(AvroSource::new())
+        // Arc::new(AvroSource::new())
+        todo!()
     }
 }

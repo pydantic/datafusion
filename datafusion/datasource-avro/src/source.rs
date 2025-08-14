@@ -35,27 +35,35 @@ use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use object_store::ObjectStore;
 
 /// AvroSource holds the extra configuration that is necessary for opening avro files
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AvroSource {
-    schema: Option<SchemaRef>,
-    batch_size: Option<usize>,
     projection: Option<Vec<String>>,
     metrics: ExecutionPlanMetricsSet,
     projected_statistics: Option<Statistics>,
     schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
+
+    config: FileScanConfig,
 }
 
 impl AvroSource {
     /// Initialize an AvroSource with default values
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(config: FileScanConfig) -> Self {
+        Self {
+            projection: None,
+            metrics: ExecutionPlanMetricsSet::default(),
+            projected_statistics: None,
+            schema_adapter_factory: None,
+            config,
+        }
     }
 
     fn open<R: std::io::Read>(&self, reader: R) -> Result<AvroReader<'static, R>> {
         AvroReader::try_new(
             reader,
-            Arc::clone(self.schema.as_ref().expect("Schema must set before open")),
-            self.batch_size.expect("Batch size must set before open"),
+            Arc::clone(&self.config.file_schema),
+            self.config
+                .batch_size
+                .expect("Batch size must set before open"),
             self.projection.clone(),
         )
     }
@@ -65,11 +73,13 @@ impl FileSource for AvroSource {
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
-        _base_config: &FileScanConfig,
         _partition: usize,
     ) -> Arc<dyn FileOpener> {
+        let mut this = self.clone();
+        this.projection = this.config.projected_file_column_names();
+
         Arc::new(private::AvroOpener {
-            config: Arc::new(self.clone()),
+            config: Arc::new(this),
             object_store,
         })
     }
@@ -79,15 +89,17 @@ impl FileSource for AvroSource {
     }
 
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.batch_size = Some(batch_size);
-        Arc::new(conf)
+        let mut this = self.clone();
+        this.config.batch_size = Some(batch_size);
+
+        Arc::new(this)
     }
 
     fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.schema = Some(schema);
-        Arc::new(conf)
+        let mut this = self.clone();
+        this.config.file_schema = schema;
+
+        Arc::new(this)
     }
     fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
         let mut conf = self.clone();
@@ -95,10 +107,8 @@ impl FileSource for AvroSource {
         Arc::new(conf)
     }
 
-    fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.projection = config.projected_file_column_names();
-        Arc::new(conf)
+    fn with_projection(&self) -> Arc<dyn FileSource> {
+        Arc::new(Self { ..self.clone() })
     }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {

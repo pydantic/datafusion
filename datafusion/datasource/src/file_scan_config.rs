@@ -184,8 +184,6 @@ pub struct FileScanConfig {
     pub file_compression_type: FileCompressionType,
     /// Are new lines in values supported for CSVOptions
     pub new_lines_in_values: bool,
-    /// File source such as `ParquetSource`, `CsvSource`, `JsonSource`, etc.
-    pub file_source: Arc<dyn FileSource>,
     /// Batch size while creating new batches
     /// Defaults to [`datafusion_common::config::ExecutionOptions`] batch_size.
     pub batch_size: Option<usize>,
@@ -257,8 +255,7 @@ pub struct FileScanConfigBuilder {
     ///
     /// This probably would be better named `table_schema`
     file_schema: SchemaRef,
-    file_source: Arc<dyn FileSource>,
-
+    // file_source: Arc<dyn FileSource>,
     limit: Option<usize>,
     projection: Option<Vec<usize>>,
     table_partition_cols: Vec<FieldRef>,
@@ -278,16 +275,15 @@ impl FileScanConfigBuilder {
     /// # Parameters:
     /// * `object_store_url`: See [`FileScanConfig::object_store_url`]
     /// * `file_schema`: See [`FileScanConfig::file_schema`]
-    /// * `file_source`: See [`FileScanConfig::file_source`]
     pub fn new(
         object_store_url: ObjectStoreUrl,
         file_schema: SchemaRef,
-        file_source: Arc<dyn FileSource>,
+        // file_source: Arc<dyn FileSource>,
     ) -> Self {
         Self {
             object_store_url,
             file_schema,
-            file_source,
+            // file_source,
             file_groups: vec![],
             statistics: None,
             output_ordering: vec![],
@@ -306,15 +302,6 @@ impl FileScanConfigBuilder {
     /// all records after filtering are returned.
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.limit = limit;
-        self
-    }
-
-    /// Set the file source for scanning files.
-    ///
-    /// This method allows you to change the file source implementation (e.g. ParquetSource, CsvSource, etc.)
-    /// after the builder has been created.
-    pub fn with_source(mut self, file_source: Arc<dyn FileSource>) -> Self {
-        self.file_source = file_source;
         self
     }
 
@@ -429,7 +416,6 @@ impl FileScanConfigBuilder {
         let Self {
             object_store_url,
             file_schema,
-            file_source,
             limit,
             projection,
             table_partition_cols,
@@ -447,9 +433,6 @@ impl FileScanConfigBuilder {
         let statistics =
             statistics.unwrap_or_else(|| Statistics::new_unknown(&file_schema));
 
-        let file_source = file_source
-            .with_statistics(statistics.clone())
-            .with_schema(Arc::clone(&file_schema));
         let file_compression_type =
             file_compression_type.unwrap_or(FileCompressionType::UNCOMPRESSED);
         let new_lines_in_values = new_lines_in_values.unwrap_or(false);
@@ -457,7 +440,6 @@ impl FileScanConfigBuilder {
         FileScanConfig {
             object_store_url,
             file_schema,
-            file_source,
             limit,
             projection,
             table_partition_cols,
@@ -477,9 +459,11 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
         Self {
             object_store_url: config.object_store_url,
             file_schema: config.file_schema,
-            file_source: Arc::<dyn FileSource>::clone(&config.file_source),
             file_groups: config.file_groups,
-            statistics: config.file_source.statistics().ok(),
+            statistics: {
+                // config.file_source.statistics().ok(),
+                None
+            },
             output_ordering: config.output_ordering,
             file_compression_type: Some(config.file_compression_type),
             new_lines_in_values: Some(config.new_lines_in_values),
@@ -499,6 +483,52 @@ impl DataSource for FileScanConfig {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        todo!()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        todo!()
+    }
+
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+        todo!()
+    }
+
+    fn output_partitioning(&self) -> Partitioning {
+        todo!()
+    }
+
+    fn eq_properties(&self) -> EquivalenceProperties {
+        todo!()
+    }
+
+    fn statistics(&self) -> Result<Statistics> {
+        todo!()
+    }
+
+    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
+        todo!()
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        todo!()
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        _projection: &ProjectionExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        todo!()
+    }
+}
+
+/*
+impl DataSource for FileScanConfig {
+    fn open(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
         let object_store = context.runtime_env().object_store(&self.object_store_url)?;
         let batch_size = self
             .batch_size
@@ -507,9 +537,9 @@ impl DataSource for FileScanConfig {
         let source = self
             .file_source
             .with_batch_size(batch_size)
-            .with_projection(self);
+            .with_projection();
 
-        let opener = source.create_file_opener(object_store, self, partition);
+        let opener = source.create_file_opener(object_store, partition);
 
         let stream = FileStream::new(self, partition, opener, source.metrics())?;
         Ok(Box::pin(cooperative(stream)))
@@ -667,6 +697,7 @@ impl DataSource for FileScanConfig {
         }
     }
 }
+*/
 
 impl FileScanConfig {
     fn projection_indices(&self) -> Vec<usize> {
@@ -678,9 +709,7 @@ impl FileScanConfig {
         }
     }
 
-    pub fn projected_stats(&self) -> Statistics {
-        let statistics = self.file_source.statistics().unwrap();
-
+    pub fn projected_stats(&self, statistics: Statistics) -> Statistics {
         let table_cols_stats = self
             .projection_indices()
             .into_iter()
@@ -741,19 +770,22 @@ impl FileScanConfig {
     }
 
     /// Project the schema, constraints, and the statistics on the given column indices
-    pub fn project(&self) -> (SchemaRef, Constraints, Statistics, Vec<LexOrdering>) {
+    pub fn project(
+        &self,
+        statistics: Statistics,
+    ) -> (SchemaRef, Constraints, Statistics, Vec<LexOrdering>) {
         if self.projection.is_none() && self.table_partition_cols.is_empty() {
             return (
                 Arc::clone(&self.file_schema),
                 self.constraints.clone(),
-                self.file_source.statistics().unwrap().clone(),
+                statistics,
                 self.output_ordering.clone(),
             );
         }
 
         let schema = self.projected_schema();
         let constraints = self.projected_constraints();
-        let stats = self.projected_stats();
+        let stats = self.projected_stats(statistics);
 
         let output_ordering = get_projected_output_ordering(self, &schema);
 
@@ -958,16 +990,11 @@ impl FileScanConfig {
             .collect())
     }
 
-    /// Write the data_type based on file_source
-    fn fmt_file_source(&self, t: DisplayFormatType, f: &mut Formatter) -> FmtResult {
-        write!(f, ", file_type={}", self.file_source.file_type())?;
-        self.file_source.fmt_extra(t, f)
-    }
-
-    /// Returns the file_source
-    pub fn file_source(&self) -> &Arc<dyn FileSource> {
-        &self.file_source
-    }
+    // /// Write the data_type based on file_source
+    // fn fmt_file_source(&self, t: DisplayFormatType, f: &mut Formatter) -> FmtResult {
+    //     write!(f, ", file_type={}", self.file_source.file_type())?;
+    //     self.file_source.fmt_extra(t, f)
+    // }
 }
 
 impl Debug for FileScanConfig {
@@ -975,11 +1002,11 @@ impl Debug for FileScanConfig {
         write!(f, "FileScanConfig {{")?;
         write!(f, "object_store_url={:?}, ", self.object_store_url)?;
 
-        write!(
-            f,
-            "statistics={:?}, ",
-            self.file_source.statistics().unwrap()
-        )?;
+        // write!(
+        //     f,
+        //     "statistics={:?}, ",
+        //     self.file_source.statistics().unwrap()
+        // )?;
 
         DisplayAs::fmt_as(self, DisplayFormatType::Verbose, f)?;
         write!(f, "}}")
@@ -1319,7 +1346,7 @@ fn create_output_array(
 ///
 ///              DataSourceExec
 ///```
-fn get_projected_output_ordering(
+pub fn get_projected_output_ordering(
     base_config: &FileScanConfig,
     projected_schema: &SchemaRef,
 ) -> Vec<LexOrdering> {

@@ -75,18 +75,24 @@ impl JsonOpener {
 }
 
 /// JsonSource holds the extra configuration that is necessary for [`JsonOpener`]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct JsonSource {
-    batch_size: Option<usize>,
     metrics: ExecutionPlanMetricsSet,
     projected_statistics: Option<Statistics>,
     schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
+
+    config: FileScanConfig,
 }
 
 impl JsonSource {
     /// Initialize a JsonSource with default values
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(config: FileScanConfig) -> Self {
+        Self {
+            metrics: ExecutionPlanMetricsSet::default(),
+            projected_statistics: None,
+            schema_adapter_factory: None,
+            config,
+        }
     }
 }
 
@@ -100,15 +106,15 @@ impl FileSource for JsonSource {
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
-        base_config: &FileScanConfig,
         _partition: usize,
     ) -> Arc<dyn FileOpener> {
         Arc::new(JsonOpener {
             batch_size: self
+                .config
                 .batch_size
                 .expect("Batch size must set before creating opener"),
-            projected_schema: base_config.projected_file_schema(),
-            file_compression_type: base_config.file_compression_type,
+            projected_schema: self.config.projected_file_schema(),
+            file_compression_type: self.config.file_compression_type,
             object_store,
         })
     }
@@ -118,9 +124,10 @@ impl FileSource for JsonSource {
     }
 
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.batch_size = Some(batch_size);
-        Arc::new(conf)
+        let mut this = self.clone();
+        this.config.batch_size = Some(batch_size);
+
+        Arc::new(this)
     }
 
     fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
@@ -132,7 +139,7 @@ impl FileSource for JsonSource {
         Arc::new(conf)
     }
 
-    fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
+    fn with_projection(&self) -> Arc<dyn FileSource> {
         Arc::new(Self { ..self.clone() })
     }
 

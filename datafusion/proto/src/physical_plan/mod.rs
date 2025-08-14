@@ -641,26 +641,29 @@ impl protobuf::PhysicalPlanNode {
             None
         };
 
+        let conf = FileScanConfigBuilder::from(parse_protobuf_file_scan_config(
+            scan.base_conf.as_ref().unwrap(),
+            ctx,
+            extension_codec,
+        )?)
+        .with_newlines_in_values(scan.newlines_in_values)
+        .with_file_compression_type(FileCompressionType::UNCOMPRESSED)
+        .build();
+
         let source = Arc::new(
             CsvSource::new(
                 scan.has_header,
                 str_to_byte(&scan.delimiter, "delimiter")?,
                 0,
+                conf,
             )
             .with_escape(escape)
             .with_comment(comment),
         );
 
-        let conf = FileScanConfigBuilder::from(parse_protobuf_file_scan_config(
-            scan.base_conf.as_ref().unwrap(),
-            ctx,
-            extension_codec,
-            source,
-        )?)
-        .with_newlines_in_values(scan.newlines_in_values)
-        .with_file_compression_type(FileCompressionType::UNCOMPRESSED)
-        .build();
-        Ok(DataSourceExec::from_data_source(conf))
+        todo!("what does this look like");
+
+        // Ok(DataSourceExec::from_data_source(conf))
     }
 
     fn try_into_json_scan_physical_plan(

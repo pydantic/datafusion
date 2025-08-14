@@ -56,7 +56,6 @@ use datafusion_session::Session;
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
-use datafusion_datasource::source::DataSourceExec;
 use futures::stream::BoxStream;
 use futures::{pin_mut, Stream, StreamExt, TryStreamExt};
 use object_store::{delimited::newline_delimited_stream, ObjectMeta, ObjectStore};
@@ -426,16 +425,23 @@ impl FileFormat for CsvFormat {
             .with_file_compression_type(self.options.compression.into())
             .with_newlines_in_values(newlines_in_values);
 
+        let config = conf_builder.build();
+
         let source = Arc::new(
-            CsvSource::new(has_header, self.options.delimiter, self.options.quote)
-                .with_escape(self.options.escape)
-                .with_terminator(self.options.terminator)
-                .with_comment(self.options.comment),
+            CsvSource::new(
+                has_header,
+                self.options.delimiter,
+                self.options.quote,
+                config,
+            )
+            .with_escape(self.options.escape)
+            .with_terminator(self.options.terminator)
+            .with_comment(self.options.comment),
         );
 
-        let config = conf_builder.with_source(source).build();
-
-        Ok(DataSourceExec::from_data_source(config))
+        // todo, investigate
+        // Ok(DataSourceExec::from_data_source(config))
+        todo!("matthew what does this look like now?")
     }
 
     async fn create_writer_physical_plan(
@@ -476,7 +482,8 @@ impl FileFormat for CsvFormat {
     }
 
     fn file_source(&self) -> Arc<dyn FileSource> {
-        Arc::new(CsvSource::default())
+        // Arc::new(CsvSource::default())
+        todo!("matthew what does this look like now?")
     }
 }
 

@@ -51,6 +51,8 @@ pub async fn from_substrait_rel(
     rel: &Rel,
     _extensions: &HashMap<u32, &String>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    todo!("how does this work?");
+    /*
     let mut base_config_builder;
 
     let source = Arc::new(ParquetSource::default());
@@ -168,6 +170,7 @@ pub async fn from_substrait_rel(
         }
         _ => not_impl_err!("Unsupported RelType: {:?}", rel.rel_type),
     }
+    */
 }
 
 fn to_field(name: &String, r#type: &Type) -> Result<Field> {
