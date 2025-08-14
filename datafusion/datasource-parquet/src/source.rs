@@ -26,11 +26,16 @@ use crate::opener::ParquetOpener;
 use crate::row_filter::can_expr_be_pushed_down_with_schemas;
 use crate::DefaultParquetFileReaderFactory;
 use crate::ParquetFileReaderFactory;
+use datafusion_catalog::memory::DataSourceExec;
 use datafusion_common::config::ConfigOptions;
 #[cfg(feature = "parquet_encryption")]
 use datafusion_common::config::EncryptionFactoryOptions;
 use datafusion_datasource::as_file_source;
+use datafusion_datasource::display::FileGroupsDisplay;
+use datafusion_datasource::file_scan_config::get_projected_output_ordering;
+use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::file_stream::FileOpener;
+use datafusion_datasource::file_stream::FileStream;
 use datafusion_datasource::schema_adapter::{
     DefaultSchemaAdapterFactory, SchemaAdapterFactory,
 };
@@ -40,16 +45,27 @@ use datafusion_common::config::TableParquetOptions;
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::source::DataSource;
 use datafusion_physical_expr::conjunction;
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::schema_rewriter::DefaultPhysicalExprAdapterFactory;
+use datafusion_physical_expr::schema_rewriter::PhysicalExprAdapterFactory;
+use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::Partitioning;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
+use datafusion_physical_plan::coop::cooperative;
+use datafusion_physical_plan::display::display_orderings;
+use datafusion_physical_plan::display::ProjectSchemaDisplay;
+use datafusion_physical_plan::execution_plan::SchedulingType;
 use datafusion_physical_plan::filter_pushdown::PushedDown;
 use datafusion_physical_plan::filter_pushdown::{
     FilterPushdownPropagation, PushedDownPredicate,
 };
 use datafusion_physical_plan::metrics::Count;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_physical_plan::projection::all_alias_free_columns;
+use datafusion_physical_plan::projection::new_projections_for_columns;
 use datafusion_physical_plan::DisplayFormatType;
 
 use datafusion_common::encryption::map_config_decryption_to_decryption;
@@ -265,39 +281,54 @@ use object_store::ObjectStore;
 /// [`RecordBatch`]: arrow::record_batch::RecordBatch
 /// [`SchemaAdapter`]: datafusion_datasource::schema_adapter::SchemaAdapter
 /// [`ParquetMetadata`]: parquet::file::metadata::ParquetMetaData
-#[derive(Clone, Default, Debug)]
+#[derive(Debug, Clone)]
 pub struct ParquetSource {
     /// Options for reading Parquet files
     pub(crate) table_parquet_options: TableParquetOptions,
     /// Optional metrics
     pub(crate) metrics: ExecutionPlanMetricsSet,
-    /// The schema of the file.
-    /// In particular, this is the schema of the table without partition columns,
-    /// *not* the physical schema of the file.
-    pub(crate) file_schema: Option<SchemaRef>,
     /// Optional predicate for row filtering during parquet scan
     pub(crate) predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Optional user defined parquet file reader factory
     pub(crate) parquet_file_reader_factory: Option<Arc<dyn ParquetFileReaderFactory>>,
     /// Optional user defined schema adapter
     pub(crate) schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
-    /// Batch size configuration
-    pub(crate) batch_size: Option<usize>,
+
+    /// matthew: add a comment here
+    pub(crate) expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+
     /// Optional hint for the size of the parquet metadata
     pub(crate) metadata_size_hint: Option<usize>,
     pub(crate) projected_statistics: Option<Statistics>,
     #[cfg(feature = "parquet_encryption")]
     pub(crate) encryption_factory: Option<Arc<dyn EncryptionFactory>>,
+
+    /// matthew: add a comment here
+    pub(crate) config: FileScanConfig,
 }
 
 impl ParquetSource {
     /// Create a new ParquetSource to read the data specified in the file scan
     /// configuration with the provided `TableParquetOptions`.
     /// if default values are going to be used, use `ParguetConfig::default()` instead
-    pub fn new(table_parquet_options: TableParquetOptions) -> Self {
+    pub fn new(
+        table_parquet_options: TableParquetOptions,
+        config: FileScanConfig,
+    ) -> Self {
         Self {
             table_parquet_options,
-            ..Self::default()
+            config,
+
+            metrics: ExecutionPlanMetricsSet::default(),
+            predicate: None,
+            parquet_file_reader_factory: None,
+            schema_adapter_factory: None,
+            expr_adapter_factory: None,
+            metadata_size_hint: None,
+            projected_statistics: None,
+
+            #[cfg(feature = "parquet_encryption")]
+            encryption_factory: None,
         }
     }
 
@@ -436,16 +467,7 @@ impl ParquetSource {
         self,
         conf: &FileScanConfig,
     ) -> datafusion_common::Result<Arc<dyn FileSource>> {
-        let file_source: Arc<dyn FileSource> = self.into();
-
-        // If the FileScanConfig.file_source() has a schema adapter factory, apply it
-        if let Some(factory) = conf.file_source().schema_adapter_factory() {
-            file_source.with_schema_adapter_factory(
-                Arc::<dyn SchemaAdapterFactory>::clone(&factory),
-            )
-        } else {
-            Ok(file_source)
-        }
+        Ok(self.into())
     }
 
     #[cfg(feature = "parquet_encryption")]
@@ -491,15 +513,15 @@ impl FileSource for ParquetSource {
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
-        base_config: &FileScanConfig,
         partition: usize,
     ) -> Arc<dyn FileOpener> {
-        let projection = base_config
+        let projection = self
+            .config
             .file_column_projection_indices()
-            .unwrap_or_else(|| (0..base_config.file_schema.fields().len()).collect());
+            .unwrap_or_else(|| (0..self.config.file_schema.fields().len()).collect());
 
         let (expr_adapter_factory, schema_adapter_factory) = match (
-            base_config.expr_adapter_factory.as_ref(),
+            self.expr_adapter_factory.as_ref(),
             self.schema_adapter_factory.as_ref(),
         ) {
             (Some(expr_adapter_factory), Some(schema_adapter_factory)) => {
@@ -560,14 +582,15 @@ impl FileSource for ParquetSource {
             partition_index: partition,
             projection: Arc::from(projection),
             batch_size: self
+                .config
                 .batch_size
                 .expect("Batch size must set before creating ParquetOpener"),
-            limit: base_config.limit,
+            limit: self.config.limit,
             predicate: self.predicate.clone(),
-            logical_file_schema: Arc::clone(&base_config.file_schema),
-            partition_fields: base_config.table_partition_cols.clone(),
+            logical_file_schema: Arc::clone(&self.config.file_schema),
+            partition_fields: self.config.table_partition_cols.clone(),
             metadata_size_hint: self.metadata_size_hint,
-            metrics: self.metrics().clone(),
+            metrics: self.metrics.clone(),
             parquet_file_reader_factory,
             pushdown_filters: self.pushdown_filters(),
             reorder_filters: self.reorder_filters(),
@@ -588,25 +611,26 @@ impl FileSource for ParquetSource {
     }
 
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.batch_size = Some(batch_size);
-        Arc::new(conf)
+        let mut this = self.clone();
+        this.config.batch_size = Some(batch_size);
+
+        Arc::new(this)
     }
 
     fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource> {
-        Arc::new(Self {
-            file_schema: Some(schema),
-            ..self.clone()
-        })
+        let mut this = self.clone();
+        this.config.file_schema = schema;
+
+        Arc::new(this)
     }
 
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
+    fn with_projected_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
         let mut conf = self.clone();
         conf.projected_statistics = Some(statistics);
         Arc::new(conf)
     }
 
-    fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
+    fn with_projection(&self) -> Arc<dyn FileSource> {
         Arc::new(Self { ..self.clone() })
     }
 
@@ -614,7 +638,7 @@ impl FileSource for ParquetSource {
         &self.metrics
     }
 
-    fn statistics(&self) -> datafusion_common::Result<Statistics> {
+    fn projected_statistics(&self) -> datafusion_common::Result<Statistics> {
         let statistics = &self.projected_statistics;
         let statistics = statistics
             .clone()
@@ -653,8 +677,8 @@ impl FileSource for ParquetSource {
                 // the actual predicates are built in reference to the physical schema of
                 // each file, which we do not have at this point and hence cannot use.
                 // Instead we use the logical schema of the file (the table schema without partition columns).
-                if let (Some(file_schema), Some(predicate)) =
-                    (&self.file_schema, &self.predicate)
+                if let (file_schema, Some(predicate)) =
+                    (&self.config.file_schema, &self.predicate)
                 {
                     let predicate_creation_errors = Count::new();
                     if let (Some(pruning_predicate), _) = build_pruning_predicates(
@@ -692,11 +716,16 @@ impl FileSource for ParquetSource {
         filters: Vec<Arc<dyn PhysicalExpr>>,
         config: &ConfigOptions,
     ) -> datafusion_common::Result<FilterPushdownPropagation<Arc<dyn FileSource>>> {
-        let Some(file_schema) = self.file_schema.clone() else {
-            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                vec![PushedDown::No; filters.len()],
-            ));
+        let file_schema = {
+            // let Some(file_schema) = self.file_schema.clone() else {
+            //     return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+            //         vec![PushedDown::No; filters.len()],
+            //     ));
+            // };
+
+            self.config.file_schema.clone()
         };
+
         // Determine if based on configs we should push filters down.
         // If either the table / scan itself or the config has pushdown enabled,
         // we will push down the filters.
@@ -771,5 +800,173 @@ impl FileSource for ParquetSource {
 
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
         self.schema_adapter_factory.clone()
+    }
+}
+
+impl DataSource for ParquetSource {
+    fn open(
+        &self,
+        partition: usize,
+        context: Arc<datafusion_execution::TaskContext>,
+    ) -> datafusion_common::Result<datafusion_execution::SendableRecordBatchStream> {
+        let object_store = context
+            .runtime_env()
+            .object_store(&self.config.object_store_url)?;
+        let batch_size = self
+            .config
+            .batch_size
+            .unwrap_or_else(|| context.session_config().batch_size());
+
+        let source = self.with_batch_size(batch_size).with_projection();
+
+        let opener = source.create_file_opener(object_store, partition);
+
+        let stream = FileStream::new(&self.config, partition, opener, source.metrics())?;
+        Ok(Box::pin(cooperative(stream)))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                let schema = self.config.projected_schema();
+                let orderings = get_projected_output_ordering(&self.config, &schema);
+
+                write!(f, "file_groups=")?;
+                // FileGroupsDisplay(&self.config.file_groups).fmt_as(t, f)?;
+
+                if !schema.fields().is_empty() {
+                    write!(f, ", projection={}", ProjectSchemaDisplay(&schema))?;
+                }
+
+                if let Some(limit) = self.config.limit {
+                    write!(f, ", limit={limit}")?;
+                }
+
+                display_orderings(f, &orderings)?;
+
+                if !self.config.constraints.is_empty() {
+                    write!(f, ", {}", self.config.constraints)?;
+                }
+
+                self.fmt_extra(t, f)
+            }
+            DisplayFormatType::TreeRender => {
+                writeln!(f, "format={}", self.file_type())?;
+                self.fmt_extra(t, f)?;
+                let num_files = self
+                    .config
+                    .file_groups
+                    .iter()
+                    .map(|fg| fg.len())
+                    .sum::<usize>();
+                writeln!(f, "files={num_files}")?;
+                Ok(())
+            }
+        }
+    }
+
+    fn output_partitioning(&self) -> Partitioning {
+        Partitioning::UnknownPartitioning(self.config.file_groups.len())
+    }
+
+    fn eq_properties(&self) -> EquivalenceProperties {
+        let (schema, constraints, _, orderings) = self.config.project();
+        EquivalenceProperties::new_with_orderings(schema, orderings)
+            .with_constraints(constraints)
+    }
+
+    fn scheduling_type(&self) -> SchedulingType {
+        SchedulingType::Cooperative
+    }
+
+    fn statistics(&self) -> datafusion_common::Result<Statistics> {
+        Ok(self
+            .config
+            .projected_stats(self.projected_statistics().unwrap()))
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
+        let config = FileScanConfigBuilder::from(self.config.clone())
+            .with_limit(limit)
+            .build();
+
+        Some(Arc::new(ParquetSource::new(
+            self.table_parquet_options.clone(),
+            config,
+        )))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.config.limit
+    }
+
+    fn metrics(&self) -> ExecutionPlanMetricsSet {
+        self.metrics.clone()
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        projection: &datafusion_physical_plan::projection::ProjectionExec,
+    ) -> datafusion_common::Result<Option<Arc<dyn datafusion_physical_plan::ExecutionPlan>>>
+    {
+        // This process can be moved into CsvExec, but it would be an overlap of their responsibility.
+
+        // Must be all column references, with no table partition columns (which can not be projected)
+        let partitioned_columns_in_proj = projection.expr().iter().any(|(expr, _)| {
+            expr.as_any()
+                .downcast_ref::<Column>()
+                .map(|expr| expr.index() >= self.config.file_schema.fields().len())
+                .unwrap_or(false)
+        });
+
+        // If there is any non-column or alias-carrier expression, Projection should not be removed.
+        let no_aliases = all_alias_free_columns(projection.expr());
+
+        Ok((no_aliases && !partitioned_columns_in_proj).then(|| {
+            let file_scan = self.config.clone();
+            let new_projections = new_projections_for_columns(
+                projection,
+                &file_scan.projection.clone().unwrap_or_else(|| {
+                    (0..self.config.file_schema.fields().len()).collect()
+                }),
+            );
+
+            let config = FileScanConfigBuilder::from(file_scan)
+                // Assign projected statistics to source
+                .with_projection(Some(new_projections))
+                .build();
+
+            DataSourceExec::from_data_source(ParquetSource::new(
+                self.table_parquet_options.clone(),
+                config,
+            )) as _
+        }))
+    }
+
+    fn try_pushdown_filters(
+        &self,
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+        config: &ConfigOptions,
+    ) -> datafusion_common::Result<FilterPushdownPropagation<Arc<dyn DataSource>>> {
+        // let result = FileSource::try_pushdown_filters(self, filters, config)?;
+        // match result.updated_node {
+        //     Some(new_file_source) => Ok(FilterPushdownPropagation {
+        //         filters: result.filters,
+        //         updated_node: Some(Arc::new(new_file_source) as _),
+        //     }),
+        //     None => {
+        //         // If the file source does not support filter pushdown, return the original config
+        //         Ok(FilterPushdownPropagation {
+        //             filters: result.filters,
+        //             updated_node: None,
+        //         })
+        //     }
+        // }
+
+        todo!("")
     }
 }

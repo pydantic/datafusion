@@ -482,7 +482,7 @@ impl FileFormat for ParquetFormat {
             metadata_size_hint = Some(metadata);
         }
 
-        let mut source = ParquetSource::new(self.options.clone());
+        let mut source = ParquetSource::new(self.options.clone(), conf.clone());
 
         // Use the CachedParquetFileReaderFactory
         let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
@@ -502,10 +502,12 @@ impl FileFormat for ParquetFormat {
         // Apply schema adapter factory before building the new config
         let file_source = source.apply_schema_adapter(&conf)?;
 
-        let conf = FileScanConfigBuilder::from(conf)
-            .with_source(file_source)
-            .build();
-        Ok(DataSourceExec::from_data_source(conf))
+        // let conf = FileScanConfigBuilder::from(conf)
+        //     .with_source(file_source)
+        //     .build();
+        // Ok(DataSourceExec::from_data_source(conf))
+
+        todo!("what does htis look like?")
     }
 
     async fn create_writer_physical_plan(
@@ -525,7 +527,8 @@ impl FileFormat for ParquetFormat {
     }
 
     fn file_source(&self) -> Arc<dyn FileSource> {
-        Arc::new(ParquetSource::default())
+        // Arc::new(ParquetSource::default())
+        todo!("matthew what does this look like")
     }
 }
 
