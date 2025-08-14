@@ -905,9 +905,8 @@ impl ExecutionPlan for HashJoinExec {
                     reservation,
                     need_produce_result_in_final(self.join_type),
                     1,
-                    // Disable dynamic filter bounds for partitioned mode to avoid race conditions
-                    // where multiple partitions overwrite each other's bounds
-                    None,
+                    enable_dynamic_filter_pushdown
+                        .then_some(Arc::clone(&self.dynamic_filter)),
                     on_right.clone(),
                 ))
             }
