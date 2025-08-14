@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Fields, Schema, SchemaRef, TimeUnit};
+use datafusion_catalog::memory::DataSourceExec;
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_sink_config::{FileSink, FileSinkConfig};
 use datafusion_datasource::write::{
@@ -52,7 +53,7 @@ use datafusion_common::{HashMap, Statistics};
 use datafusion_common_runtime::{JoinSet, SpawnedTask};
 use datafusion_datasource::display::FileGroupDisplay;
 use datafusion_datasource::file::FileSource;
-use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
+use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
@@ -67,7 +68,6 @@ use crate::reader::{CachedParquetFileReaderFactory, CachedParquetMetaData};
 use crate::source::{parse_coerce_int96_string, ParquetSource};
 use async_trait::async_trait;
 use bytes::Bytes;
-use datafusion_datasource::source::DataSourceExec;
 use datafusion_execution::runtime_env::RuntimeEnv;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
@@ -471,18 +471,15 @@ impl FileFormat for ParquetFormat {
         Ok(stats)
     }
 
+    #[allow(unused_variables, unreachable_code)]
     async fn create_physical_plan(
         &self,
         state: &dyn Session,
         conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut metadata_size_hint = None;
+        let metadata_size_hint = self.metadata_size_hint();
 
-        if let Some(metadata) = self.metadata_size_hint() {
-            metadata_size_hint = Some(metadata);
-        }
-
-        let mut source = ParquetSource::new(self.options.clone());
+        let mut source = ParquetSource::new(conf.clone(), self.options.clone());
 
         // Use the CachedParquetFileReaderFactory
         let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
@@ -500,12 +497,15 @@ impl FileFormat for ParquetFormat {
         source = self.set_source_encryption_factory(source, state)?;
 
         // Apply schema adapter factory before building the new config
-        let file_source = source.apply_schema_adapter(&conf)?;
+        let file_source = source.apply_schema_adapter()?;
 
-        let conf = FileScanConfigBuilder::from(conf)
-            .with_source(file_source)
-            .build();
-        Ok(DataSourceExec::from_data_source(conf))
+        let parquet_source = file_source
+            .as_any()
+            .downcast_ref::<ParquetSource>()
+            .unwrap()
+            .clone();
+
+        Ok(DataSourceExec::from_data_source(parquet_source))
     }
 
     async fn create_writer_physical_plan(
@@ -525,7 +525,8 @@ impl FileFormat for ParquetFormat {
     }
 
     fn file_source(&self) -> Arc<dyn FileSource> {
-        Arc::new(ParquetSource::default())
+        todo!("friendly")
+        // Arc::new(ParquetSource::default())
     }
 }
 

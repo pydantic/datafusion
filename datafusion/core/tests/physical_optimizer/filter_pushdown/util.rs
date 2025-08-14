@@ -103,41 +103,44 @@ impl FileOpener for TestOpener {
 }
 
 /// A placeholder data source that accepts filter pushdown
-#[derive(Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TestSource {
     support: bool,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     statistics: Option<Statistics>,
-    batch_size: Option<usize>,
     batches: Vec<RecordBatch>,
-    schema: Option<SchemaRef>,
-    metrics: ExecutionPlanMetricsSet,
     projection: Option<Vec<usize>>,
-    schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
+
+    config: FileScanConfig,
 }
 
 impl TestSource {
-    fn new(support: bool, batches: Vec<RecordBatch>) -> Self {
+    fn new(support: bool, batches: Vec<RecordBatch>, config: FileScanConfig) -> Self {
         Self {
             support,
-            metrics: ExecutionPlanMetricsSet::new(),
             batches,
-            ..Default::default()
+            config,
+            predicate: None,
+            statistics: None,
+            projection: None,
         }
     }
 }
 
 impl FileSource for TestSource {
+    fn config(&self) -> FileScanConfig {
+        self.config.clone()
+    }
+
     fn create_file_opener(
         &self,
-        _object_store: Arc<dyn ObjectStore>,
-        _base_config: &FileScanConfig,
-        _partition: usize,
+        object_store: Arc<dyn ObjectStore>,
+        partition: usize,
     ) -> Arc<dyn FileOpener> {
         Arc::new(TestOpener {
             batches: self.batches.clone(),
-            batch_size: self.batch_size,
-            schema: self.schema.clone(),
+            batch_size: self.config.batch_size,
+            schema: self.config.schema.clone(),
             projection: self.projection.clone(),
         })
     }
@@ -147,27 +150,24 @@ impl FileSource for TestSource {
     }
 
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
-        Arc::new(TestSource {
-            batch_size: Some(batch_size),
-            ..self.clone()
-        })
+        let mut this = self.clone();
+        this.config.batch_size = Some(batch_size);
+
+        Arc::new(this)
     }
 
     fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource> {
-        Arc::new(TestSource {
-            schema: Some(schema),
-            ..self.clone()
-        })
+        let mut this = self.clone();
+        this.config.file_schema = Some(schema);
+
+        Arc::new(this)
     }
 
-    fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource> {
-        Arc::new(TestSource {
-            projection: config.projection.clone(),
-            ..self.clone()
-        })
+    fn with_projection(&self) -> Arc<dyn FileSource> {
+        Arc::new(Self { ..self.clone() })
     }
 
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
+    fn with_projected_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
         Arc::new(TestSource {
             statistics: Some(statistics),
             ..self.clone()
@@ -178,7 +178,7 @@ impl FileSource for TestSource {
         &self.metrics
     }
 
-    fn statistics(&self) -> Result<Statistics> {
+    fn projected_statistics(&self) -> Result<Statistics> {
         Ok(self
             .statistics
             .as_ref()
@@ -243,10 +243,10 @@ impl FileSource for TestSource {
         &self,
         schema_adapter_factory: Arc<dyn SchemaAdapterFactory>,
     ) -> Result<Arc<dyn FileSource>> {
-        Ok(Arc::new(Self {
-            schema_adapter_factory: Some(schema_adapter_factory),
-            ..self.clone()
-        }))
+        let mut this = self.clone();
+        this.config.schema_adapter_factory = Some(schema_adapter_factory);
+
+        Ok(Arc::new(this))
     }
 
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {

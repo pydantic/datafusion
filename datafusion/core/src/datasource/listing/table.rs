@@ -1087,6 +1087,7 @@ impl ListingTable {
     }
 
     /// Creates a file source and applies schema adapter factory if available
+    #[allow(dead_code)]
     fn create_file_source_with_schema_adapter(&self) -> Result<Arc<dyn FileSource>> {
         let mut source = self.options.format.file_source();
         // Apply schema adapter to source if available
@@ -1207,17 +1208,16 @@ impl TableProvider for ListingTable {
             return Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty()))));
         };
 
-        let file_source = self.create_file_source_with_schema_adapter()?;
+        // let file_source = self.create_file_source_with_schema_adapter()?;
 
         // create the execution plan
-        self.options
+        let _ = self.options
             .format
             .create_physical_plan(
                 state,
                 FileScanConfigBuilder::new(
                     object_store_url,
                     Arc::clone(&self.file_schema),
-                    file_source,
                 )
                 .with_file_groups(partitioned_file_lists)
                 .with_constraints(self.constraints.clone())
@@ -1229,7 +1229,9 @@ impl TableProvider for ListingTable {
                 .with_expr_adapter(self.expr_adapter_factory.clone())
                 .build(),
             )
-            .await
+            .await;
+
+        todo!("friendly investigate");
     }
 
     fn supports_filters_pushdown(

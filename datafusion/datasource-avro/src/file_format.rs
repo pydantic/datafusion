@@ -23,7 +23,6 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::avro_to_arrow::read_avro_schema_from_reader;
-use crate::source::AvroSource;
 
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
@@ -35,8 +34,7 @@ use datafusion_common::{Result, Statistics};
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_format::{FileFormat, FileFormatFactory};
-use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
-use datafusion_datasource::source::DataSourceExec;
+use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_session::Session;
 
@@ -152,15 +150,18 @@ impl FileFormat for AvroFormat {
     async fn create_physical_plan(
         &self,
         _state: &dyn Session,
-        conf: FileScanConfig,
+        _conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let config = FileScanConfigBuilder::from(conf)
-            .with_source(self.file_source())
-            .build();
-        Ok(DataSourceExec::from_data_source(config))
+        // let config = FileScanConfigBuilder::from(conf)
+        //     .with_source(self.file_source())
+        //     .build();
+        // Ok(DataSourceExec::from_data_source(config))
+
+        todo!("impl data source for avro source")
     }
 
     fn file_source(&self) -> Arc<dyn FileSource> {
-        Arc::new(AvroSource::new())
+        // Arc::new(AvroSource::new())
+        todo!("friendly")
     }
 }

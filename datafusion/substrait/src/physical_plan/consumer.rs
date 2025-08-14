@@ -19,7 +19,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::{not_impl_err, substrait_err};
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::{
@@ -35,7 +37,6 @@ use crate::variation_const::{
 };
 use async_recursion::async_recursion;
 use chrono::DateTime;
-use datafusion::datasource::memory::DataSourceExec;
 use object_store::ObjectMeta;
 use substrait::proto::r#type::{Kind, Nullability};
 use substrait::proto::read_rel::local_files::file_or_files::PathType;
@@ -51,9 +52,6 @@ pub async fn from_substrait_rel(
     rel: &Rel,
     _extensions: &HashMap<u32, &String>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let mut base_config_builder;
-
-    let source = Arc::new(ParquetSource::default());
     match &rel.rel_type {
         Some(RelType::Read(read)) => {
             if read.filter.is_some() || read.best_effort_filter.is_some() {
@@ -72,20 +70,17 @@ pub async fn from_substrait_rel(
                 return substrait_err!("Missing struct in the schema");
             };
 
-            match schema
+            let mut base_config_builder = match schema
                 .names
                 .iter()
                 .zip(r#struct.types.iter())
                 .map(|(name, r#type)| to_field(name, r#type))
                 .collect::<Result<Vec<Field>>>()
             {
-                Ok(fields) => {
-                    base_config_builder = FileScanConfigBuilder::new(
-                        ObjectStoreUrl::local_filesystem(),
-                        Arc::new(Schema::new(fields)),
-                        source,
-                    );
-                }
+                Ok(fields) => FileScanConfigBuilder::new(
+                    ObjectStoreUrl::local_filesystem(),
+                    Arc::new(Schema::new(fields)),
+                ),
                 Err(e) => return Err(e),
             };
 
@@ -156,10 +151,10 @@ pub async fn from_substrait_rel(
                         }
                     }
 
-                    Ok(
-                        DataSourceExec::from_data_source(base_config_builder.build())
-                            as Arc<dyn ExecutionPlan>,
-                    )
+                    Ok(DataSourceExec::from_data_source(ParquetSource::new(
+                        base_config_builder.build(),
+                        TableParquetOptions::default(),
+                    )) as Arc<dyn ExecutionPlan>)
                 }
                 _ => not_impl_err!(
                     "Only LocalFile reads are supported when parsing physical"

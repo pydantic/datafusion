@@ -23,15 +23,23 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use crate::file_groups::FileGroupPartitioner;
-use crate::file_scan_config::FileScanConfig;
-use crate::file_stream::FileOpener;
+use crate::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
+use crate::file_stream::{FileOpener, FileStream};
 use crate::schema_adapter::SchemaAdapterFactory;
+use crate::source::DataSource;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{not_impl_err, Result, Statistics};
-use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::{
+    EquivalenceProperties, LexOrdering, Partitioning, PhysicalExpr,
+};
+use datafusion_physical_plan::coop::cooperative;
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_physical_plan::projection::{
+    all_alias_free_columns, new_projections_for_columns,
+};
 use datafusion_physical_plan::DisplayFormatType;
 
 use object_store::ObjectStore;
@@ -51,12 +59,13 @@ pub fn as_file_source<T: FileSource + 'static>(source: T) -> Arc<dyn FileSource>
 /// * [`ParquetSource`](https://docs.rs/datafusion/latest/datafusion/datasource/physical_plan/struct.ParquetSource.html)
 ///
 /// [`DataSource`]: crate::source::DataSource
-pub trait FileSource: Send + Sync {
+pub trait FileSource: Send + Sync + fmt::Debug {
+    fn config(&self) -> FileScanConfig;
+
     /// Creates a `dyn FileOpener` based on given parameters
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
-        base_config: &FileScanConfig,
         partition: usize,
     ) -> Arc<dyn FileOpener>;
     /// Any
@@ -66,13 +75,14 @@ pub trait FileSource: Send + Sync {
     /// Initialize new instance with a new schema
     fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource>;
     /// Initialize new instance with projection information
-    fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource>;
+    fn with_projection(&self) -> Arc<dyn FileSource>;
     /// Initialize new instance with projected statistics
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource>;
-    /// Return execution plan metrics
-    fn metrics(&self) -> &ExecutionPlanMetricsSet;
+    fn with_projected_statistics(
+        &self,
+        projected_statistics: Statistics,
+    ) -> Arc<dyn FileSource>;
     /// Return projected statistics
-    fn statistics(&self) -> Result<Statistics>;
+    fn projected_statistics(&self) -> Result<Statistics>;
     /// String representation of file source such as "csv", "json", "parquet"
     fn file_type(&self) -> &str;
     /// Format FileType specific information
@@ -149,5 +159,131 @@ pub trait FileSource: Send + Sync {
     /// Default implementation returns `None`.
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
         None
+    }
+}
+
+impl<T: FileSource + 'static> DataSource for T {
+    fn open(
+        &self,
+        partition: usize,
+        context: Arc<datafusion_execution::TaskContext>,
+    ) -> Result<datafusion_execution::SendableRecordBatchStream> {
+        let object_store = context
+            .runtime_env()
+            .object_store(&self.config().object_store_url)?;
+        let batch_size = self
+            .config()
+            .batch_size
+            .unwrap_or_else(|| context.session_config().batch_size());
+
+        let source = self.with_batch_size(batch_size).with_projection();
+
+        let opener = source.create_file_opener(object_store, partition);
+
+        let stream =
+            FileStream::new(&self.config(), partition, opener, &source.config().metrics)?;
+        Ok(Box::pin(cooperative(stream)))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn fmt_as(&self, _t: DisplayFormatType, _f: &mut Formatter) -> fmt::Result {
+        todo!()
+    }
+
+    fn output_partitioning(&self) -> Partitioning {
+        Partitioning::UnknownPartitioning(self.config().file_groups.len())
+    }
+
+    fn eq_properties(&self) -> EquivalenceProperties {
+        let (schema, constraints, _, orderings) =
+            self.config().project(self.projected_statistics().ok());
+        EquivalenceProperties::new_with_orderings(schema, orderings)
+            .with_constraints(constraints)
+    }
+
+    fn statistics(&self) -> Result<Statistics> {
+        Ok(self
+            .config()
+            .projected_stats(self.projected_statistics().ok()))
+    }
+
+    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
+        todo!("")
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.config().limit
+    }
+
+    fn metrics(&self) -> ExecutionPlanMetricsSet {
+        self.config().metrics.clone()
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        projection: &datafusion_physical_plan::projection::ProjectionExec,
+    ) -> Result<Option<Arc<dyn datafusion_physical_plan::ExecutionPlan>>> {
+        // This process can be moved into CsvExec, but it would be an overlap of their responsibility.
+
+        // Must be all column references, with no table partition columns (which can not be projected)
+        let partitioned_columns_in_proj = projection.expr().iter().any(|(expr, _)| {
+            expr.as_any()
+                .downcast_ref::<Column>()
+                .map(|expr| expr.index() >= self.config().file_schema.fields().len())
+                .unwrap_or(false)
+        });
+
+        // If there is any non-column or alias-carrier expression, Projection should not be removed.
+        let no_aliases = all_alias_free_columns(projection.expr());
+
+        Ok((no_aliases && !partitioned_columns_in_proj).then(|| {
+            let file_scan = self.config();
+            let new_projections = new_projections_for_columns(
+                projection,
+                &file_scan.projection.clone().unwrap_or_else(|| {
+                    (0..file_scan.file_schema.fields().len()).collect()
+                }),
+            );
+
+            let _config = FileScanConfigBuilder::from(file_scan)
+                // Assign projected statistics to source
+                .with_projection(Some(new_projections))
+                .build();
+
+            // DataSourceExec::from_data_source() as _
+            todo!("I need to find a way to abstract constructors across file sources...")
+        }))
+    }
+
+    fn try_pushdown_filters(
+        &self,
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+        config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn DataSource>>> {
+        let result = FileSource::try_pushdown_filters(self, filters, config)?;
+        match result.updated_node {
+            Some(_new_file_source) => {
+                // // this is safe, but i don't like this
+                // let raw_ptr = Arc::into_raw(new_file_source);
+                // let data_source =
+                //     unsafe { Arc::from_raw(raw_ptr as *const dyn DataSource) };
+
+                // Ok(FilterPushdownPropagation {
+                //     filters: result.filters,
+                //     updated_node: Some(data_source),
+                // })
+                todo!("ask dh")
+            }
+            None => {
+                // If the file source does not support filter pushdown, return the original config
+                Ok(FilterPushdownPropagation {
+                    filters: result.filters,
+                    updated_node: None,
+                })
+            }
+        }
     }
 }

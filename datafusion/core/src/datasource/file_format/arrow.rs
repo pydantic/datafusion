@@ -41,6 +41,7 @@ use arrow::ipc::convert::fb_to_schema;
 use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::IpcWriteOptions;
 use arrow::ipc::{root_as_message, CompressionType};
+use datafusion_catalog::memory::DataSourceExec;
 use datafusion_catalog::Session;
 use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::{
@@ -49,7 +50,7 @@ use datafusion_common::{
 use datafusion_common_runtime::{JoinSet, SpawnedTask};
 use datafusion_datasource::display::FileGroupDisplay;
 use datafusion_datasource::file::FileSource;
-use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
+use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use datafusion_datasource::write::ObjectWriterBuilder;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
@@ -58,7 +59,6 @@ use datafusion_physical_expr_common::sort_expr::LexRequirement;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use datafusion_datasource::source::DataSourceExec;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
@@ -178,12 +178,11 @@ impl FileFormat for ArrowFormat {
         _state: &dyn Session,
         conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let source = Arc::new(ArrowSource::default());
-        let config = FileScanConfigBuilder::from(conf)
-            .with_source(source)
-            .build();
+        let source = Arc::new(ArrowSource::new(conf));
 
-        Ok(DataSourceExec::from_data_source(config))
+        Ok(DataSourceExec::from_data_source(
+            Arc::try_unwrap(source).unwrap().clone(),
+        ))
     }
 
     async fn create_writer_physical_plan(
@@ -203,7 +202,8 @@ impl FileFormat for ArrowFormat {
     }
 
     fn file_source(&self) -> Arc<dyn FileSource> {
-        Arc::new(ArrowSource::default())
+        // Arc::new(ArrowSource::default())
+        todo!("friendly")
     }
 }
 

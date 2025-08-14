@@ -1641,7 +1641,8 @@ async fn roundtrip_projection_source() -> Result<()> {
 
     let statistics = Statistics::new_unknown(&schema);
 
-    let file_source = ParquetSource::default().with_statistics(statistics.clone());
+    let file_source =
+        ParquetSource::default().with_projected_statistics(statistics.clone());
     let scan_config = FileScanConfigBuilder::new(
         ObjectStoreUrl::local_filesystem(),
         schema.clone(),

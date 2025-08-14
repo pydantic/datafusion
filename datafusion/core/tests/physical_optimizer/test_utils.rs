@@ -135,7 +135,7 @@ pub(crate) fn parquet_exec_with_stats(file_size: u64) -> Arc<DataSourceExec> {
     .build();
 
     assert_eq!(
-        config.file_source.statistics().unwrap().num_rows,
+        config.file_source.projected_statistics().unwrap().num_rows,
         Precision::Inexact(10000)
     );
     DataSourceExec::from_data_source(config)

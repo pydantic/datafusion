@@ -28,6 +28,7 @@ use arrow::array::RecordBatch;
 use arrow::csv::WriterBuilder;
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow::error::ArrowError;
+use datafusion_catalog::memory::DataSourceExec;
 use datafusion_common::config::{ConfigField, ConfigFileType, CsvOptions};
 use datafusion_common::file_options::csv_writer::CsvWriterOptions;
 use datafusion_common::{
@@ -56,7 +57,6 @@ use datafusion_session::Session;
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
-use datafusion_datasource::source::DataSourceExec;
 use futures::stream::BoxStream;
 use futures::{pin_mut, Stream, StreamExt, TryStreamExt};
 use object_store::{delimited::newline_delimited_stream, ObjectMeta, ObjectStore};
@@ -422,20 +422,17 @@ impl FileFormat for CsvFormat {
             .newlines_in_values
             .unwrap_or_else(|| state.config_options().catalog.newlines_in_values);
 
-        let conf_builder = FileScanConfigBuilder::from(conf)
+        let conf = FileScanConfigBuilder::from(conf)
             .with_file_compression_type(self.options.compression.into())
-            .with_newlines_in_values(newlines_in_values);
+            .with_newlines_in_values(newlines_in_values)
+            .build();
 
-        let source = Arc::new(
-            CsvSource::new(has_header, self.options.delimiter, self.options.quote)
+        Ok(DataSourceExec::from_data_source(
+            CsvSource::new(has_header, self.options.delimiter, self.options.quote, conf)
                 .with_escape(self.options.escape)
                 .with_terminator(self.options.terminator)
                 .with_comment(self.options.comment),
-        );
-
-        let config = conf_builder.with_source(source).build();
-
-        Ok(DataSourceExec::from_data_source(config))
+        ))
     }
 
     async fn create_writer_physical_plan(
@@ -476,7 +473,8 @@ impl FileFormat for CsvFormat {
     }
 
     fn file_source(&self) -> Arc<dyn FileSource> {
-        Arc::new(CsvSource::default())
+        // Arc::new(CsvSource::default())
+        todo!("friendly")
     }
 }
 

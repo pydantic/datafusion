@@ -29,18 +29,19 @@ use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use object_store::ObjectStore;
 
 /// Minimal [`crate::file::FileSource`] implementation for use in tests.
-#[derive(Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct MockSource {
-    metrics: ExecutionPlanMetricsSet,
-    projected_statistics: Option<Statistics>,
-    schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
+    pub(crate) config: FileScanConfig,
 }
 
 impl FileSource for MockSource {
+    fn config(&self) -> FileScanConfig {
+        self.config.clone()
+    }
+
     fn create_file_opener(
         &self,
         _object_store: Arc<dyn ObjectStore>,
-        _base_config: &FileScanConfig,
         _partition: usize,
     ) -> Arc<dyn FileOpener> {
         unimplemented!()
@@ -58,22 +59,19 @@ impl FileSource for MockSource {
         Arc::new(Self { ..self.clone() })
     }
 
-    fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
+    fn with_projection(&self) -> Arc<dyn FileSource> {
         Arc::new(Self { ..self.clone() })
     }
 
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
+    fn with_projected_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
         let mut source = self.clone();
-        source.projected_statistics = Some(statistics);
+        source.config.projected_statistics = Some(statistics);
         Arc::new(source)
     }
 
-    fn metrics(&self) -> &ExecutionPlanMetricsSet {
-        &self.metrics
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
+    fn projected_statistics(&self) -> Result<Statistics> {
         Ok(self
+            .config
             .projected_statistics
             .as_ref()
             .expect("projected_statistics must be set")
@@ -88,14 +86,14 @@ impl FileSource for MockSource {
         &self,
         schema_adapter_factory: Arc<dyn SchemaAdapterFactory>,
     ) -> Result<Arc<dyn FileSource>> {
-        Ok(Arc::new(Self {
-            schema_adapter_factory: Some(schema_adapter_factory),
-            ..self.clone()
-        }))
+        let mut this = self.clone();
+        this.config.schema_adapter_factory = Some(schema_adapter_factory);
+
+        Ok(Arc::new(this))
     }
 
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
-        self.schema_adapter_factory.clone()
+        self.config.schema_adapter_factory.clone()
     }
 }
 

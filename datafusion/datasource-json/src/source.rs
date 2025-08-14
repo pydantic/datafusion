@@ -42,7 +42,6 @@ use datafusion_common::Statistics;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_execution::TaskContext;
-use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 
 use futures::{StreamExt, TryStreamExt};
 use object_store::buffered::BufWriter;
@@ -75,18 +74,15 @@ impl JsonOpener {
 }
 
 /// JsonSource holds the extra configuration that is necessary for [`JsonOpener`]
-#[derive(Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct JsonSource {
-    batch_size: Option<usize>,
-    metrics: ExecutionPlanMetricsSet,
-    projected_statistics: Option<Statistics>,
-    schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
+    pub config: FileScanConfig,
 }
 
 impl JsonSource {
     /// Initialize a JsonSource with default values
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(config: FileScanConfig) -> Self {
+        Self { config }
     }
 }
 
@@ -100,15 +96,15 @@ impl FileSource for JsonSource {
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
-        base_config: &FileScanConfig,
         _partition: usize,
     ) -> Arc<dyn FileOpener> {
         Arc::new(JsonOpener {
             batch_size: self
+                .config
                 .batch_size
                 .expect("Batch size must set before creating opener"),
-            projected_schema: base_config.projected_file_schema(),
-            file_compression_type: base_config.file_compression_type,
+            projected_schema: self.config.projected_file_schema(),
+            file_compression_type: self.config.file_compression_type,
             object_store,
         })
     }
@@ -118,30 +114,28 @@ impl FileSource for JsonSource {
     }
 
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.batch_size = Some(batch_size);
-        Arc::new(conf)
+        let mut this = self.clone();
+        this.config.batch_size = Some(batch_size);
+
+        Arc::new(this)
     }
 
     fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
         Arc::new(Self { ..self.clone() })
     }
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.projected_statistics = Some(statistics);
-        Arc::new(conf)
+    fn with_projected_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
+        let mut this = self.clone();
+        this.config.projected_statistics = Some(statistics);
+
+        Arc::new(this)
     }
 
-    fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
+    fn with_projection(&self) -> Arc<dyn FileSource> {
         Arc::new(Self { ..self.clone() })
     }
 
-    fn metrics(&self) -> &ExecutionPlanMetricsSet {
-        &self.metrics
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        let statistics = &self.projected_statistics;
+    fn projected_statistics(&self) -> Result<Statistics> {
+        let statistics = &self.config.projected_statistics;
         Ok(statistics
             .clone()
             .expect("projected_statistics must be set to call"))
@@ -155,14 +149,18 @@ impl FileSource for JsonSource {
         &self,
         schema_adapter_factory: Arc<dyn SchemaAdapterFactory>,
     ) -> Result<Arc<dyn FileSource>> {
-        Ok(Arc::new(Self {
-            schema_adapter_factory: Some(schema_adapter_factory),
-            ..self.clone()
-        }))
+        let mut this = self.clone();
+        this.config.schema_adapter_factory = Some(schema_adapter_factory);
+
+        Ok(Arc::new(this))
     }
 
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
-        self.schema_adapter_factory.clone()
+        self.config.schema_adapter_factory.clone()
+    }
+
+    fn config(&self) -> FileScanConfig {
+        self.config.clone()
     }
 }
 

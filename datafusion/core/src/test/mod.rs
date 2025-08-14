@@ -29,7 +29,6 @@ use crate::datasource::file_format::csv::CsvFormat;
 use crate::datasource::file_format::file_compression_type::FileCompressionType;
 use crate::datasource::file_format::FileFormat;
 
-use crate::datasource::physical_plan::CsvSource;
 use crate::datasource::{MemTable, TableProvider};
 use crate::error::Result;
 use crate::logical_expr::LogicalPlan;
@@ -40,6 +39,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 #[cfg(feature = "compression")]
 use datafusion_common::DataFusionError;
+use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::source::DataSourceExec;
 
 #[cfg(feature = "compression")]
@@ -47,8 +47,8 @@ use bzip2::write::BzEncoder;
 #[cfg(feature = "compression")]
 use bzip2::Compression as BzCompression;
 use datafusion_datasource::file_groups::FileGroup;
-use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource_csv::partitioned_csv_config;
+use datafusion_datasource_csv::source::CsvSource;
 #[cfg(feature = "compression")]
 use flate2::write::GzEncoder;
 #[cfg(feature = "compression")]
@@ -92,12 +92,14 @@ pub fn scan_partitioned_csv(
         FileCompressionType::UNCOMPRESSED,
         work_dir,
     )?;
-    let source = Arc::new(CsvSource::new(true, b'"', b'"'));
-    let config =
-        FileScanConfigBuilder::from(partitioned_csv_config(schema, file_groups, source))
-            .with_file_compression_type(FileCompressionType::UNCOMPRESSED)
-            .build();
-    Ok(DataSourceExec::from_data_source(config))
+
+    let config = FileScanConfigBuilder::from(partitioned_csv_config(schema, file_groups))
+        .with_file_compression_type(FileCompressionType::UNCOMPRESSED)
+        .build();
+
+    Ok(DataSourceExec::from_data_source(CsvSource::new(
+        true, b'"', b'"', config,
+    )))
 }
 
 /// Returns file groups [`Vec<FileGroup>`] for scanning `partitions` of `filename`

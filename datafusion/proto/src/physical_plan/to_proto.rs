@@ -40,7 +40,9 @@ use datafusion::{
     },
     physical_plan::expressions::LikeExpr,
 };
-use datafusion_common::{internal_err, not_impl_err, DataFusionError, Result};
+use datafusion_common::{
+    internal_err, not_impl_err, DataFusionError, Result, Statistics,
+};
 use datafusion_expr::WindowFrame;
 
 use crate::protobuf::{
@@ -489,6 +491,7 @@ impl TryFrom<&[PartitionedFile]> for protobuf::FileGroup {
 pub fn serialize_file_scan_config(
     conf: &FileScanConfig,
     codec: &dyn PhysicalExtensionCodec,
+    statistics: Option<Statistics>,
 ) -> Result<protobuf::FileScanExecConf> {
     let file_groups = conf
         .file_groups
@@ -515,7 +518,7 @@ pub fn serialize_file_scan_config(
 
     Ok(protobuf::FileScanExecConf {
         file_groups,
-        statistics: Some((&conf.file_source.statistics().unwrap()).into()),
+        statistics: Some((&statistics.unwrap()).into()),
         limit: conf.limit.map(|l| protobuf::ScanLimit { limit: l as u32 }),
         projection: conf
             .projection

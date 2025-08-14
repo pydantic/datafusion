@@ -31,6 +31,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::json;
 use arrow::json::reader::{infer_json_schema_from_iterator, ValueIter};
+use datafusion_catalog::memory::DataSourceExec;
 use datafusion_common::config::{ConfigField, ConfigFileType, JsonOptions};
 use datafusion_common::file_options::json_writer::JsonWriterOptions;
 use datafusion_common::{
@@ -58,7 +59,6 @@ use datafusion_session::Session;
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
-use datafusion_datasource::source::DataSourceExec;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
 
 #[derive(Default)]
@@ -253,14 +253,15 @@ impl FileFormat for JsonFormat {
         _state: &dyn Session,
         conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let source = Arc::new(JsonSource::new());
         let conf = FileScanConfigBuilder::from(conf)
             .with_file_compression_type(FileCompressionType::from(
                 self.options.compression,
             ))
-            .with_source(source)
             .build();
-        Ok(DataSourceExec::from_data_source(conf))
+
+        Ok(DataSourceExec::from_data_source(JsonSource::new(
+            conf.clone(),
+        )))
     }
 
     async fn create_writer_physical_plan(
@@ -282,7 +283,8 @@ impl FileFormat for JsonFormat {
     }
 
     fn file_source(&self) -> Arc<dyn FileSource> {
-        Arc::new(JsonSource::default())
+        // Arc::new(JsonSource::default())
+        todo!("friendly")
     }
 }
 
