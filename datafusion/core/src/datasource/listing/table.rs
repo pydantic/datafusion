@@ -1207,8 +1207,6 @@ impl TableProvider for ListingTable {
             return Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty()))));
         };
 
-        // let file_source = self.create_file_source_with_schema_adapter()?;
-
         // create the execution plan
         self.options
             .format
