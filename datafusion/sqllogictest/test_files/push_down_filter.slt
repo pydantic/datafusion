@@ -318,7 +318,8 @@ query III rowsort
 select *
 from t1
 join t2 on t1.k = t2.k
-where v = 1 or v = 10000000;
+where v = 1 or v = 10000000
+order by t1.k, t2.v;
 ----
 1 1 1
 10000000 10000000 10000000
@@ -327,31 +328,38 @@ query III rowsort
 select *
 from t1
 join t2 on t1.k = t2.k
-where v = 1 or v = 10000000;
+where v = 1 or v = 10000000
+order by t1.k, t2.v;
 ----
 1 1 1
 10000000 10000000 10000000
+
 query III rowsort
 select *
 from t1
 join t2 on t1.k = t2.k
-where v = 1 or v = 10000000;
+where v = 1 or v = 10000000
+order by t1.k, t2.v;
 ----
 1 1 1
 10000000 10000000 10000000
+
 query III rowsort
 select *
 from t1
 join t2 on t1.k = t2.k
-where v = 1 or v = 10000000;
+where v = 1 or v = 10000000
+order by t1.k, t2.v;
 ----
 1 1 1
 10000000 10000000 10000000
+
 query III rowsort
 select *
 from t1
 join t2 on t1.k = t2.k
-where v = 1 or v = 10000000;
+where v = 1 or v = 10000000
+order by t1.k, t2.v;
 ----
 1 1 1
 10000000 10000000 10000000
