@@ -156,9 +156,4 @@ impl FileFormat for AvroFormat {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(DataSourceExec::from_data_source(AvroSource::new(conf)))
     }
-
-    fn file_source(&self) -> Arc<dyn FileSource> {
-        // Arc::new(AvroSource::new())
-        todo!("friendly")
-    }
 }

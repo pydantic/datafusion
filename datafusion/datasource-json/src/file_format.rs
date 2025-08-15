@@ -40,7 +40,6 @@ use datafusion_common::{
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_datasource::decoder::Decoder;
 use datafusion_datasource::display::FileGroupDisplay;
-use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_format::{
     FileFormat, FileFormatFactory, DEFAULT_SCHEMA_INFER_MAX_RECORD,
@@ -280,11 +279,6 @@ impl FileFormat for JsonFormat {
         let sink = Arc::new(JsonSink::new(conf, writer_options));
 
         Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)
-    }
-
-    fn file_source(&self) -> Arc<dyn FileSource> {
-        // Arc::new(JsonSource::default())
-        todo!("friendly")
     }
 }
 

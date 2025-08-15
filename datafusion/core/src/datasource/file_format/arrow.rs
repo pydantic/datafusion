@@ -196,11 +196,6 @@ impl FileFormat for ArrowFormat {
 
         Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)
     }
-
-    fn file_source(&self) -> Arc<dyn FileSource> {
-        // Arc::new(ArrowSource::default())
-        todo!("friendly")
-    }
 }
 
 /// Implements [`FileSink`] for writing to arrow_ipc files

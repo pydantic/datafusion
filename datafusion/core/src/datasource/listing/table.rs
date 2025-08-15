@@ -36,7 +36,6 @@ use datafusion_common::{
 };
 use datafusion_datasource::{
     compute_all_files_statistics,
-    file::FileSource,
     file_groups::FileGroup,
     file_scan_config::{FileScanConfig, FileScanConfigBuilder},
     schema_adapter::{DefaultSchemaAdapterFactory, SchemaAdapter, SchemaAdapterFactory},
@@ -1086,19 +1085,19 @@ impl ListingTable {
         }
     }
 
-    /// Creates a file source and applies schema adapter factory if available
-    #[allow(dead_code)]
-    fn create_file_source_with_schema_adapter(&self) -> Result<Arc<dyn FileSource>> {
-        let mut source = self.options.format.file_source();
-        // Apply schema adapter to source if available
-        //
-        // The source will use this SchemaAdapter to adapt data batches as they flow up the plan.
-        // Note: ListingTable also creates a SchemaAdapter in `scan()` but that is only used to adapt collected statistics.
-        if let Some(factory) = &self.schema_adapter_factory {
-            source = source.with_schema_adapter_factory(Arc::clone(factory))?;
-        }
-        Ok(source)
-    }
+    // /// Creates a file source and applies schema adapter factory if available
+    // #[allow(dead_code)]
+    // fn create_file_source_with_schema_adapter(&self) -> Result<Arc<dyn FileSource>> {
+    //     let mut source = self.options.format.file_source();
+    //     // Apply schema adapter to source if available
+    //     //
+    //     // The source will use this SchemaAdapter to adapt data batches as they flow up the plan.
+    //     // Note: ListingTable also creates a SchemaAdapter in `scan()` but that is only used to adapt collected statistics.
+    //     if let Some(factory) = &self.schema_adapter_factory {
+    //         source = source.with_schema_adapter_factory(Arc::clone(factory))?;
+    //     }
+    //     Ok(source)
+    // }
 
     /// If file_sort_order is specified, creates the appropriate physical expressions
     fn try_create_output_ordering(&self) -> Result<Vec<LexOrdering>> {

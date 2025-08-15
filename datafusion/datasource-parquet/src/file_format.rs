@@ -523,11 +523,6 @@ impl FileFormat for ParquetFormat {
 
         Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)
     }
-
-    fn file_source(&self) -> Arc<dyn FileSource> {
-        todo!("friendly")
-        // Arc::new(ParquetSource::default())
-    }
 }
 
 #[cfg(feature = "parquet_encryption")]
