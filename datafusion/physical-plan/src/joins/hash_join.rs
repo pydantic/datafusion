@@ -1120,7 +1120,6 @@ impl ExecutionPlan for HashJoinExec {
             bounds_accumulator: Arc::clone(&self.bounds_accumulator),
             dynamic_filter: enable_dynamic_filter_pushdown
                 .then_some(Arc::clone(&self.dynamic_filter)),
-            partition_id: partition,
         }))
     }
 
@@ -1620,8 +1619,6 @@ struct HashJoinStream {
     bounds_accumulator: Arc<SharedBoundsAccumulator>,
     /// Dynamic filter for pushdown to probe side
     dynamic_filter: Option<Arc<DynamicFilterPhysicalExpr>>,
-    /// Partition ID for tracking in bounds accumulator
-    partition_id: usize,
 }
 
 impl RecordBatchStream for HashJoinStream {
