@@ -23,9 +23,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::avro_to_arrow::read_avro_schema_from_reader;
+use crate::source::AvroSource;
 
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
+use datafusion_catalog::memory::DataSourceExec;
 use datafusion_common::internal_err;
 use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::GetExt;
@@ -150,14 +152,9 @@ impl FileFormat for AvroFormat {
     async fn create_physical_plan(
         &self,
         _state: &dyn Session,
-        _conf: FileScanConfig,
+        conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // let config = FileScanConfigBuilder::from(conf)
-        //     .with_source(self.file_source())
-        //     .build();
-        // Ok(DataSourceExec::from_data_source(config))
-
-        todo!("impl data source for avro source")
+        Ok(DataSourceExec::from_data_source(AvroSource::new(conf)))
     }
 
     fn file_source(&self) -> Arc<dyn FileSource> {

@@ -140,7 +140,7 @@ impl FileSource for TestSource {
         Arc::new(TestOpener {
             batches: self.batches.clone(),
             batch_size: self.config.batch_size,
-            schema: self.config.schema.clone(),
+            schema: self.config.file_schema.clone(),
             projection: self.projection.clone(),
         })
     }
@@ -172,10 +172,6 @@ impl FileSource for TestSource {
             statistics: Some(statistics),
             ..self.clone()
         })
-    }
-
-    fn metrics(&self) -> &ExecutionPlanMetricsSet {
-        &self.metrics
     }
 
     fn projected_statistics(&self) -> Result<Statistics> {
@@ -281,15 +277,18 @@ impl TestScanBuilder {
     }
 
     pub fn build(self) -> Arc<dyn ExecutionPlan> {
-        let source = Arc::new(TestSource::new(self.support, self.batches));
         let base_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&self.schema),
-            source,
         )
         .with_file(PartitionedFile::new("test.parquet", 123))
         .build();
-        DataSourceExec::from_data_source(base_config)
+
+        DataSourceExec::from_data_source(TestSource::new(
+            self.support,
+            self.batches,
+            base_config,
+        ))
     }
 }
 

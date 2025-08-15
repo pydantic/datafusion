@@ -35,6 +35,7 @@ use datafusion_physical_plan::{
 };
 use itertools::Itertools;
 
+use crate::file::FileSource;
 use crate::file_scan_config::FileScanConfig;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Constraints, Result, Statistics};
@@ -47,6 +48,11 @@ use datafusion_physical_plan::filter::collect_columns_from_predicate;
 use datafusion_physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
 };
+
+/// Helper function to convert any type implementing FileSource to Arc&lt;dyn DataSource&gt;
+pub fn as_data_source<T: FileSource + 'static>(source: T) -> Arc<dyn DataSource> {
+    Arc::new(source)
+}
 
 /// A source of data, typically a list of files or memory
 ///
