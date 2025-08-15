@@ -16,6 +16,31 @@
 // under the License.
 
 //! [`HashJoinExec`] Partitioned Hash Join Operator
+//!
+//! This module implements hash joins with support for different partition modes and dynamic filter
+//! pushdown optimization.
+//!
+//! ## Dynamic Filter Pushdown
+//!
+//! Dynamic filter pushdown is an optimization that creates filters from the build side's join keys
+//! and applies them to probe-side scans to reduce data processing. This is particularly effective
+//! for joins where the build side has selective predicates.
+//!
+//! ### Partition Mode Coordination
+//!
+//! The challenge with dynamic filter pushdown in partitioned execution is ensuring the filter
+//! contains complete information from ALL build-side partitions before being applied. Partial
+//! filters would incorrectly eliminate valid rows.
+//!
+//! - **CollectLeft Mode**: Build side is collected once from partition 0 and shared across all
+//!   output partitions via `OnceFut`. Each output partition calls `collect_build_side` to access
+//!   the shared build data, so we expect N calls where N = number of output partitions.
+//!
+//! - **Partitioned Mode**: Each partition independently builds its own hash table. We expect N
+//!   calls to `collect_build_side` where N = number of input partitions.
+//!
+//! The `SharedBoundsAccumulator` coordinates between these calls, ensuring the dynamic filter is
+//! updated exactly once after all relevant partitions have completed their build phase.
 
 use std::fmt;
 use std::mem::size_of;
@@ -98,7 +123,29 @@ use parking_lot::Mutex;
 const HASH_JOIN_SEED: RandomState =
     RandomState::with_seeds('J' as u64, 'O' as u64, 'I' as u64, 'N' as u64);
 
-/// Structure to accumulate bounds from all partitions for dynamic filter pushdown
+/// Coordinates dynamic filter bounds collection across multiple partitions
+///
+/// This structure ensures that dynamic filters are built with complete information from all
+/// relevant partitions before being applied to probe-side scans. Incomplete filters would
+/// incorrectly eliminate valid join results.
+///
+/// ## Synchronization Strategy
+///
+/// 1. Each partition computes bounds from its build-side data
+/// 2. Bounds are stored in the shared HashMap (indexed by partition_id)  
+/// 3. A counter tracks how many partitions have reported their bounds
+/// 4. When the last partition reports (completed == total), bounds are merged and filter is updated
+///
+/// ## Partition Counting
+///
+/// The `total_partitions` count represents how many times `collect_build_side` will be called:
+/// - **CollectLeft**: Number of output partitions (each accesses shared build data)
+/// - **Partitioned**: Number of input partitions (each builds independently)
+///
+/// ## Thread Safety
+///
+/// All fields use atomic operations or mutexes to ensure correct coordination between concurrent
+/// partition executions.
 struct SharedBoundsAccumulator {
     /// Bounds from each partition (indexed by partition_id)
     bounds: Mutex<std::collections::HashMap<usize, Vec<(ScalarValue, ScalarValue)>>>,
@@ -109,24 +156,36 @@ struct SharedBoundsAccumulator {
 }
 
 impl SharedBoundsAccumulator {
-    fn new(total_partitions: usize) -> Self {
-        Self {
-            bounds: Mutex::new(std::collections::HashMap::new()),
-            completed_partitions: AtomicUsize::new(0),
-            total_partitions: AtomicUsize::new(total_partitions),
-        }
-    }
-
-    /// Calculate how many times collect_build_side will be called.
-    /// This is used to know when we've finished building the build-side for all partitions
-    /// and can thus build a dynamic filter to push down into subsequent scans.
-    /// We cannot build a filter per partition so we must wait until we have the full information from the build side
-    /// before we can start filtering out rows on the probe side during scans.
+    /// Creates a new SharedBoundsAccumulator configured for the given partition mode
+    ///
+    /// This method calculates how many times `collect_build_side` will be called based on the
+    /// partition mode's execution pattern. This count is critical for determining when we have
+    /// complete information from all partitions to build the dynamic filter.
+    ///
+    /// ## Partition Mode Execution Patterns
+    ///
+    /// - **CollectLeft**: Build side is collected ONCE from partition 0 and shared via `OnceFut`
+    ///   across all output partitions. Each output partition calls `collect_build_side` to access
+    ///   the shared build data. Expected calls = number of output partitions.
+    ///
+    /// - **Partitioned**: Each partition independently builds its own hash table by calling
+    ///   `collect_build_side` once. Expected calls = number of build partitions.
+    ///
+    /// - **Auto**: Placeholder mode resolved during optimization. Uses 1 as safe default since
+    ///   the actual mode will be determined and a new bounds_accumulator created before execution.
+    ///
+    /// ## Why This Matters
+    ///
+    /// We cannot build a partial filter from some partitions - it would incorrectly eliminate
+    /// valid join results. We must wait until we have complete bounds information from ALL
+    /// relevant partitions before updating the dynamic filter.
     fn new_from_partition_mode(
         partition_mode: PartitionMode,
         left_child: &dyn ExecutionPlan,
         right_child: &dyn ExecutionPlan,
     ) -> Self {
+        // Troubleshooting: If partition counts are incorrect, verify this logic matches
+        // the actual execution pattern in collect_build_side()
         let expected_calls = match partition_mode {
             // Each output partition accesses shared build data
             PartitionMode::CollectLeft => {
@@ -146,7 +205,12 @@ impl SharedBoundsAccumulator {
         }
     }
 
-    /// Merge all bounds from completed partitions into global min/max
+    /// Merge all bounds from completed partitions into global min/max.
+    ///
+    /// Troubleshooting: If this returns None when you expect bounds, check:
+    /// 1. All partitions called collect_build_side with bounds data
+    /// 2. collect_left_input was called with should_compute_bounds=true
+    /// 3. The build side had at least one non-empty batch
     fn merge_bounds(&self) -> Option<Vec<(ScalarValue, ScalarValue)>> {
         let bounds = self.bounds.lock();
         let all_bounds: Vec<_> = bounds.values().collect();
@@ -908,6 +972,18 @@ impl ExecutionPlan for HashJoinExec {
         vec![&self.left, &self.right]
     }
 
+    /// Creates a new HashJoinExec with different children while preserving configuration.
+    ///
+    /// This method is called during query optimization when the optimizer creates new
+    /// plan nodes. Importantly, it creates a fresh bounds_accumulator via `try_new`
+    /// rather than cloning the existing one, because:
+    ///
+    /// 1. The new child plans may have different partition counts, requiring a new
+    ///    bounds_accumulator with the correct total_partitions count
+    /// 2. The accumulator contains execution state (completed_partitions, bounds)
+    ///    that should be reset for the new execution context
+    /// 3. The dynamic_filter is preserved separately to maintain filter state
+    ///    across plan transformations
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -945,15 +1021,13 @@ impl ExecutionPlan for HashJoinExec {
             null_equality: self.null_equality,
             cache: self.cache.clone(),
             dynamic_filter: Self::create_dynamic_filter(&self.on),
-            bounds_accumulator: Arc::new(SharedBoundsAccumulator::new(match self.mode {
-                PartitionMode::CollectLeft => {
-                    self.right.output_partitioning().partition_count()
-                }
-                PartitionMode::Partitioned => {
-                    self.left.output_partitioning().partition_count()
-                }
-                PartitionMode::Auto => 1, // Should not happen, but safe default
-            })),
+            bounds_accumulator: Arc::new(
+                SharedBoundsAccumulator::new_from_partition_mode(
+                    self.mode,
+                    self.left.as_ref(),
+                    self.right.as_ref(),
+                ),
+            ),
         }))
     }
 
@@ -1231,9 +1305,35 @@ fn compute_bounds(arrays: &[ArrayRef]) -> Result<Vec<(ScalarValue, ScalarValue)>
         .collect()
 }
 
-/// Reads the left (build) side of the input, buffering it in memory, to build a
-/// hash table (`LeftJoinData`)
 #[expect(clippy::too_many_arguments)]
+/// Collects all batches from the left (build) side stream and creates a hash map for joining.
+///
+/// This function is responsible for:
+/// 1. Consuming the entire left stream and collecting all batches into memory
+/// 2. Building a hash map from the join key columns for efficient probe operations
+/// 3. Computing bounds for dynamic filter pushdown (if enabled)
+/// 4. Preparing visited indices bitmap for certain join types
+///
+/// # Parameters
+/// * `random_state` - Random state for consistent hashing across partitions
+/// * `left_stream` - Stream of record batches from the build side
+/// * `on_left` - Physical expressions for the left side join keys
+/// * `metrics` - Metrics collector for tracking memory usage and row counts
+/// * `reservation` - Memory reservation tracker for the hash table and data
+/// * `with_visited_indices_bitmap` - Whether to track visited indices (for outer joins)
+/// * `probe_threads_count` - Number of threads that will probe this hash table
+/// * `should_compute_bounds` - Whether to compute min/max bounds for dynamic filtering
+///
+/// # Dynamic Filter Coordination
+/// When `should_compute_bounds` is true, this function computes the min/max bounds
+/// for each join key column but does NOT update the dynamic filter. Instead, the
+/// bounds are stored in the returned `JoinLeftData` and later coordinated by
+/// `SharedBoundsAccumulator` to ensure all partitions contribute their bounds
+/// before updating the filter exactly once.
+///
+/// # Returns
+/// `JoinLeftData` containing the hash map, consolidated batch, join key values,
+/// visited indices bitmap, and computed bounds (if requested).
 async fn collect_left_input(
     random_state: RandomState,
     left_stream: SendableRecordBatchStream,
@@ -1740,10 +1840,24 @@ impl HashJoinStream {
         build_timer.done();
 
         // Handle dynamic filter bounds accumulation
+        //
+        // This coordination ensures the dynamic filter contains complete bounds information
+        // from all relevant partitions before being applied to probe-side scans.
+        //
+        // Process:
+        // 1. Store this partition's bounds in the shared accumulator
+        // 2. Atomically increment the completion counter
+        // 3. If we're the last partition to complete, merge all bounds and update the filter
+        //
+        // Note: In CollectLeft mode, multiple partitions may access the SAME build data
+        // (shared via OnceFut), but each partition must report separately to ensure proper
+        // coordination across all output partitions.
         if let (Some(dynamic_filter), Some(bounds)) =
             (&self.dynamic_filter, &left_data.bounds)
         {
-            // Store bounds in the accumulator
+            // Store bounds in the accumulator - this runs once per partition
+            // Troubleshooting: If bounds are empty/None, check collect_left_input
+            // was called with should_compute_bounds=true
             self.bounds_accumulator
                 .bounds
                 .lock()
@@ -1758,7 +1872,9 @@ impl HashJoinStream {
                 .total_partitions
                 .load(Ordering::SeqCst);
 
-            // If this is the last partition to complete, update the filter
+            // Critical synchronization point: Only the last partition updates the filter
+            // Troubleshooting: If you see "completed > total_partitions", check partition
+            // count calculation in try_new() - it may not match actual execution calls
             println!("Completed partition {completed}/{total_partitions}");
             if completed == total_partitions {
                 if let Some(merged_bounds) = self.bounds_accumulator.merge_bounds() {
