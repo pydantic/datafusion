@@ -176,9 +176,8 @@ impl FileSource for TestSource {
     fn projected_statistics(&self) -> Result<Statistics> {
         Ok(self
             .statistics
-            .as_ref()
-            .expect("statistics not set")
-            .clone())
+            .clone()
+            .unwrap_or(Statistics::new_unknown(&self.config.file_schema)))
     }
 
     fn file_type(&self) -> &str {

@@ -1207,25 +1207,28 @@ impl TableProvider for ListingTable {
             return Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty()))));
         };
 
-        // create the execution plan
-        self.options
-            .format
-            .create_physical_plan(
-                state,
-                FileScanConfigBuilder::new(
-                    object_store_url,
-                    Arc::clone(&self.file_schema),
-                )
+        let mut config =
+            FileScanConfigBuilder::new(object_store_url, Arc::clone(&self.file_schema))
                 .with_file_groups(partitioned_file_lists)
                 .with_constraints(self.constraints.clone())
                 .with_statistics(statistics)
                 .with_projection(projection.cloned())
                 .with_limit(limit)
                 .with_output_ordering(output_ordering)
-                .with_table_partition_cols(table_partition_cols)
-                .with_expr_adapter(self.expr_adapter_factory.clone())
-                .build(),
-            )
+                .with_table_partition_cols(table_partition_cols);
+
+        if let Some(factory) = self.schema_adapter_factory.clone() {
+            config = config.with_schema_adapter(Some(factory));
+        }
+
+        if let Some(factory) = self.expr_adapter_factory.clone() {
+            config = config.with_expr_adapter(Some(factory));
+        }
+
+        // create the execution plan
+        self.options
+            .format
+            .create_physical_plan(state, config.build())
             .await
     }
 

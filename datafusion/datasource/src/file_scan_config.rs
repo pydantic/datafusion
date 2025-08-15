@@ -399,6 +399,15 @@ impl FileScanConfigBuilder {
         self
     }
 
+    pub fn with_schema_adapter(
+        mut self,
+        schema_adapter: Option<Arc<dyn SchemaAdapterFactory>>,
+    ) -> Self {
+        self.schema_adapter_factory = schema_adapter;
+
+        self
+    }
+
     /// Build the final [`FileScanConfig`] with all the configured settings.
     ///
     /// This method takes ownership of the builder and returns the constructed `FileScanConfig`.
@@ -1216,6 +1225,7 @@ pub fn wrap_partition_value_in_dict(val: ScalarValue) -> ScalarValue {
 mod tests {
     use super::*;
     use crate::file::FileSource;
+    use crate::source::DataSource;
     use crate::{
         generate_test_files, test_util::MockSource, tests::aggr_test_schema,
         verify_sort_integrity,
@@ -1245,7 +1255,12 @@ mod tests {
             )]),
         );
 
-        let (proj_schema, _, proj_statistics, _) = conf.project(None);
+        let mock_source = MockSource {
+            config: conf.clone(),
+        };
+
+        let (proj_schema, _, proj_statistics, _) =
+            conf.project(mock_source.projected_statistics().ok());
         assert_eq!(proj_schema.fields().len(), file_schema.fields().len() + 1);
         assert_eq!(
             proj_schema.field(file_schema.fields().len()).name(),

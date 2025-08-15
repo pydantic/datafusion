@@ -39,6 +39,7 @@ use datafusion_physical_expr::{
 };
 use datafusion_physical_plan::coop::cooperative;
 use datafusion_physical_plan::display::{display_orderings, ProjectSchemaDisplay};
+use datafusion_physical_plan::execution_plan::SchedulingType;
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::projection::{
@@ -282,6 +283,10 @@ impl<T: FileSource + 'static> DataSource for T {
         self.config().metrics.clone()
     }
 
+    fn scheduling_type(&self) -> SchedulingType {
+        SchedulingType::Cooperative
+    }
+
     fn try_swapping_with_projection(
         &self,
         projection: &datafusion_physical_plan::projection::ProjectionExec,
@@ -319,6 +324,22 @@ impl<T: FileSource + 'static> DataSource for T {
         }))
     }
 
+    fn repartitioned(
+        &self,
+        target_partitions: usize,
+        repartition_file_min_size: usize,
+        output_ordering: Option<LexOrdering>,
+    ) -> Result<Option<Arc<dyn DataSource>>> {
+        let config = self.repartitioned(
+            target_partitions,
+            repartition_file_min_size,
+            output_ordering,
+            &self.config(),
+        )?;
+
+        Ok(config.map(|c| self.with_config(c).as_data_source().clone()))
+    }
+
     fn try_pushdown_filters(
         &self,
         filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -342,5 +363,10 @@ impl<T: FileSource + 'static> DataSource for T {
                 })
             }
         }
+    }
+
+    fn as_file_source(&self) -> Option<Arc<dyn FileSource>> {
+        // note, i just do this to force the clone
+        Some(self.with_config(self.config()))
     }
 }

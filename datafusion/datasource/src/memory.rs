@@ -234,6 +234,10 @@ impl DataSource for MemorySourceConfig {
             })
             .transpose()
     }
+
+    fn as_file_source(&self) -> Option<Arc<dyn crate::file::FileSource>> {
+        None
+    }
 }
 
 impl MemorySourceConfig {

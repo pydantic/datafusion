@@ -2288,7 +2288,7 @@ impl protobuf::PhysicalPlanNode {
 
         #[cfg(feature = "parquet")]
         if let Some(parquet_source) =
-            data_source_exec.as_any().downcast_ref::<ParquetSource>()
+            data_source.as_any().downcast_ref::<ParquetSource>()
         {
             use datafusion::datasource::source::DataSource;
 

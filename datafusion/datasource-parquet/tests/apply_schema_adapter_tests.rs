@@ -148,10 +148,17 @@ mod parquet_adapter_tests {
 
         // Create a parquet source
         let source = ParquetSource::new(config, TableParquetOptions::default());
-        let file_source = source.clone().with_schema_adapter_factory(factory).unwrap();
+        let file_source = source
+            .clone()
+            .with_schema_adapter_factory(factory)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ParquetSource>()
+            .unwrap()
+            .clone();
 
         // Apply schema adapter to a new source
-        let result_source = source.apply_schema_adapter().unwrap();
+        let result_source = file_source.apply_schema_adapter().unwrap();
 
         // Verify the adapter was applied
         assert!(result_source.schema_adapter_factory().is_some());

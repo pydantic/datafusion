@@ -49,7 +49,6 @@ use datafusion_physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
 };
 
-
 /// A source of data, typically a list of files or memory
 ///
 /// This trait provides common behaviors for abstract sources of data. It has
@@ -181,6 +180,8 @@ pub trait DataSource: Send + Sync + Debug {
             vec![PushedDown::No; filters.len()],
         ))
     }
+
+    fn as_file_source(&self) -> Option<Arc<dyn FileSource>>;
 }
 
 /// [`ExecutionPlan`] that reads one or more files
@@ -293,10 +294,10 @@ impl ExecutionPlan for DataSourceExec {
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
         if let Some(partition) = partition {
             let mut statistics = Statistics::new_unknown(&self.schema());
-            if let Some(file_config) =
-                self.data_source.as_any().downcast_ref::<FileScanConfig>()
-            {
-                if let Some(file_group) = file_config.file_groups.get(partition) {
+
+            if let Some(file_source) = self.data_source.as_file_source() {
+                if let Some(file_group) = file_source.config().file_groups.get(partition)
+                {
                     if let Some(stat) = file_group.file_statistics(None) {
                         statistics = stat.clone();
                     }
