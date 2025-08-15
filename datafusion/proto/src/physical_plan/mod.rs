@@ -650,7 +650,7 @@ impl protobuf::PhysicalPlanNode {
         .with_file_compression_type(FileCompressionType::UNCOMPRESSED)
         .build();
 
-        let source = Arc::new(
+        Ok(DataSourceExec::from_data_source(
             CsvSource::new(
                 scan.has_header,
                 str_to_byte(&scan.delimiter, "delimiter")?,
@@ -659,10 +659,6 @@ impl protobuf::PhysicalPlanNode {
             )
             .with_escape(escape)
             .with_comment(comment),
-        );
-
-        Ok(DataSourceExec::from_data_source(
-            Arc::try_unwrap(source).unwrap().clone(),
         ))
     }
 
@@ -679,11 +675,7 @@ impl protobuf::PhysicalPlanNode {
             extension_codec,
         )?;
 
-        let source = Arc::new(JsonSource::new(scan_conf));
-
-        Ok(DataSourceExec::from_data_source(
-            Arc::try_unwrap(source).unwrap().clone(),
-        ))
+        Ok(DataSourceExec::from_data_source(JsonSource::new(scan_conf)))
     }
 
     #[cfg_attr(not(feature = "parquet"), allow(unused_variables))]
