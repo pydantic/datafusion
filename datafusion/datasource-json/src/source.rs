@@ -92,7 +92,6 @@ impl From<JsonSource> for Arc<dyn FileSource> {
     }
 }
 
-
 impl FileSource for JsonSource {
     fn create_file_opener(
         &self,
@@ -162,6 +161,13 @@ impl FileSource for JsonSource {
 
     fn config(&self) -> FileScanConfig {
         self.config.clone()
+    }
+
+    fn with_config(&self, config: FileScanConfig) -> Arc<dyn FileSource> {
+        let mut this = self.clone();
+        this.config = config;
+
+        Arc::new(this)
     }
 }
 

@@ -116,6 +116,13 @@ impl FileSource for ArrowSource {
     fn config(&self) -> FileScanConfig {
         self.config.clone()
     }
+
+    fn with_config(&self, config: FileScanConfig) -> Arc<dyn FileSource> {
+        let mut this = self.clone();
+        this.config = config;
+
+        Arc::new(this)
+    }
 }
 
 /// The struct arrow that implements `[FileOpener]` trait

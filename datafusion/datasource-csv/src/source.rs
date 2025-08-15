@@ -214,7 +214,6 @@ impl From<CsvSource> for Arc<dyn FileSource> {
     }
 }
 
-
 impl FileSource for CsvSource {
     fn config(&self) -> FileScanConfig {
         self.config.clone()
@@ -293,6 +292,13 @@ impl FileSource for CsvSource {
 
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
         self.config.schema_adapter_factory.clone()
+    }
+
+    fn with_config(&self, config: FileScanConfig) -> Arc<dyn FileSource> {
+        let mut this = self.clone();
+        this.config = config;
+
+        Arc::new(this)
     }
 }
 

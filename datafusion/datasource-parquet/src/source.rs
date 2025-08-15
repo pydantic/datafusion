@@ -480,7 +480,6 @@ impl From<ParquetSource> for Arc<dyn FileSource> {
     }
 }
 
-
 impl FileSource for ParquetSource {
     fn create_file_opener(
         &self,
@@ -776,5 +775,12 @@ impl FileSource for ParquetSource {
 
     fn config(&self) -> FileScanConfig {
         self.config.clone()
+    }
+
+    fn with_config(&self, config: FileScanConfig) -> Arc<dyn FileSource> {
+        let mut this = self.clone();
+        this.config = config;
+
+        Arc::new(this)
     }
 }

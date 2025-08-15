@@ -26,7 +26,7 @@ use crate::file_groups::FileGroupPartitioner;
 use crate::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use crate::file_stream::{FileOpener, FileStream};
 use crate::schema_adapter::SchemaAdapterFactory;
-use crate::source::DataSource;
+use crate::source::{DataSource, DataSourceExec};
 use arrow::datatypes::SchemaRef;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{not_impl_err, Result, Statistics};
@@ -40,7 +40,7 @@ use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::projection::{
     all_alias_free_columns, new_projections_for_columns,
 };
-use datafusion_physical_plan::DisplayFormatType;
+use datafusion_physical_plan::{DisplayFormatType, ExecutionPlan};
 
 use object_store::ObjectStore;
 
@@ -70,6 +70,8 @@ pub trait FileSource: Send + Sync + fmt::Debug {
     ) -> Arc<dyn FileOpener>;
     /// Any
     fn as_any(&self) -> &dyn Any;
+    /// Initialize new type with file scan configuration
+    fn with_config(&self, config: FileScanConfig) -> Arc<dyn FileSource>;
     /// Initialize new type with batch size configuration
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource>;
     /// Initialize new instance with a new schema
@@ -162,7 +164,7 @@ pub trait FileSource: Send + Sync + fmt::Debug {
     }
 
     /// Convert this FileSource to a DataSource
-    /// 
+    ///
     /// This method is automatically implemented for all FileSource types
     /// and enforces that every FileSource can be converted to a DataSource.
     fn into_data_source(self) -> Arc<dyn DataSource>
@@ -236,7 +238,7 @@ impl<T: FileSource + 'static> DataSource for T {
     fn try_swapping_with_projection(
         &self,
         projection: &datafusion_physical_plan::projection::ProjectionExec,
-    ) -> Result<Option<Arc<dyn datafusion_physical_plan::ExecutionPlan>>> {
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         // This process can be moved into CsvExec, but it would be an overlap of their responsibility.
 
         // Must be all column references, with no table partition columns (which can not be projected)
@@ -259,13 +261,18 @@ impl<T: FileSource + 'static> DataSource for T {
                 }),
             );
 
-            let _config = FileScanConfigBuilder::from(file_scan)
+            let config = FileScanConfigBuilder::from(file_scan)
                 // Assign projected statistics to source
                 .with_projection(Some(new_projections))
                 .build();
 
-            // DataSourceExec::from_data_source() as _
-            todo!("I need to find a way to abstract constructors across file sources...")
+            let this = self.with_config(config);
+
+            // Convert Arc<dyn FileSource> to Arc<dyn DataSource>
+            // I'm not sure if this is super safe, but a file source always impls DataSource
+            let data_source: Arc<dyn DataSource> = unsafe { std::mem::transmute(this) };
+
+            Arc::new(DataSourceExec::new(data_source)) as Arc<dyn ExecutionPlan>
         }))
     }
 
@@ -276,18 +283,16 @@ impl<T: FileSource + 'static> DataSource for T {
     ) -> Result<FilterPushdownPropagation<Arc<dyn DataSource>>> {
         let result = FileSource::try_pushdown_filters(self, filters, config)?;
         match result.updated_node {
-            Some(_new_file_source) => {
-                // // this is safe, but i don't like this
-                // let raw_ptr = Arc::into_raw(new_file_source);
-                // let data_source =
-                //     unsafe { Arc::from_raw(raw_ptr as *const dyn DataSource) };
+            Some(new_file_source) => {
+                // Convert Arc<dyn FileSource> to Arc<dyn DataSource>
+                // I'm not sure if this is super safe, but a file source always impls DataSource
+                let data_source: Arc<dyn DataSource> =
+                    unsafe { std::mem::transmute(new_file_source) };
 
-                // Ok(FilterPushdownPropagation {
-                //     filters: result.filters,
-                //     updated_node: Some(data_source),
-                // })
-
-                todo!("golf: ask dh")
+                Ok(FilterPushdownPropagation {
+                    filters: result.filters,
+                    updated_node: Some(data_source),
+                })
             }
             None => {
                 // If the file source does not support filter pushdown, return the original config
