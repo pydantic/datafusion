@@ -178,11 +178,7 @@ impl FileFormat for ArrowFormat {
         _state: &dyn Session,
         conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let source = Arc::new(ArrowSource::new(conf));
-
-        Ok(DataSourceExec::from_data_source(
-            Arc::try_unwrap(source).unwrap().clone(),
-        ))
+        Ok(DataSourceExec::from_data_source(ArrowSource::new(conf)))
     }
 
     async fn create_writer_physical_plan(
