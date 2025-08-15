@@ -22,8 +22,11 @@ use std::fmt;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
+use crate::display::FileGroupsDisplay;
 use crate::file_groups::FileGroupPartitioner;
-use crate::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
+use crate::file_scan_config::{
+    get_projected_output_ordering, FileScanConfig, FileScanConfigBuilder,
+};
 use crate::file_stream::{FileOpener, FileStream};
 use crate::schema_adapter::SchemaAdapterFactory;
 use crate::source::{DataSource, DataSourceExec};
@@ -35,12 +38,13 @@ use datafusion_physical_expr::{
     EquivalenceProperties, LexOrdering, Partitioning, PhysicalExpr,
 };
 use datafusion_physical_plan::coop::cooperative;
+use datafusion_physical_plan::display::{display_orderings, ProjectSchemaDisplay};
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::projection::{
     all_alias_free_columns, new_projections_for_columns,
 };
-use datafusion_physical_plan::{DisplayFormatType, ExecutionPlan};
+use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 
 use object_store::ObjectStore;
 
@@ -79,6 +83,9 @@ pub trait FileSource: Send + Sync + fmt::Debug {
     fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource>;
     /// Initialize new instance with projection information
     fn with_projection(&self) -> Arc<dyn FileSource>;
+
+    fn with_limit(&self, limit: Option<usize>) -> Arc<dyn FileSource>;
+
     /// Initialize new instance with projected statistics
     fn with_projected_statistics(
         &self,
@@ -203,8 +210,45 @@ impl<T: FileSource + 'static> DataSource for T {
         self
     }
 
-    fn fmt_as(&self, _t: DisplayFormatType, _f: &mut Formatter) -> fmt::Result {
-        todo!()
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                let schema = self.config().projected_schema();
+                let orderings = get_projected_output_ordering(&self.config(), &schema);
+
+                write!(f, "file_groups=")?;
+                FileGroupsDisplay(&self.config().file_groups).fmt_as(t, f)?;
+
+                if !schema.fields().is_empty() {
+                    write!(f, ", projection={}", ProjectSchemaDisplay(&schema))?;
+                }
+
+                if let Some(limit) = self.config().limit {
+                    write!(f, ", limit={limit}")?;
+                }
+
+                display_orderings(f, &orderings)?;
+
+                if !self.config().constraints.is_empty() {
+                    write!(f, ", {}", self.config().constraints)?;
+                }
+
+                write!(f, ", file_type={}", self.file_type())?;
+                self.fmt_extra(t, f)
+            }
+            DisplayFormatType::TreeRender => {
+                writeln!(f, "format={}", self.file_type())?;
+                self.fmt_extra(t, f)?;
+                let num_files = self
+                    .config()
+                    .file_groups
+                    .iter()
+                    .map(|fg| fg.len())
+                    .sum::<usize>();
+                writeln!(f, "files={num_files}")?;
+                Ok(())
+            }
+        }
     }
 
     fn output_partitioning(&self) -> Partitioning {
@@ -224,8 +268,10 @@ impl<T: FileSource + 'static> DataSource for T {
             .projected_stats(self.projected_statistics().ok()))
     }
 
-    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
-        todo!("")
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
+        let this = self.with_limit(limit).as_data_source().clone();
+
+        Some(this)
     }
 
     fn fetch(&self) -> Option<usize> {

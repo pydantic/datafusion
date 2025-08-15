@@ -258,6 +258,13 @@ impl FileSource for TestSource {
     fn as_data_source(&self) -> Arc<dyn datafusion_datasource::source::DataSource> {
         Arc::new(self.clone())
     }
+
+    fn with_limit(&self, limit: Option<usize>) -> Arc<dyn FileSource> {
+        let mut this = self.clone();
+        this.config.limit = limit;
+
+        Arc::new(this)
+    }
 }
 
 #[derive(Debug, Clone)]

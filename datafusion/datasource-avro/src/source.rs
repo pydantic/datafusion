@@ -147,6 +147,13 @@ impl FileSource for AvroSource {
 
         Arc::new(this)
     }
+
+    fn with_limit(&self, limit: Option<usize>) -> Arc<dyn FileSource> {
+        let mut this = self.clone();
+        this.config.limit = limit;
+
+        Arc::new(this)
+    }
 }
 
 mod private {

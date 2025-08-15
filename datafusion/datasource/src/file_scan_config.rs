@@ -1127,7 +1127,7 @@ fn create_output_array(
 ///
 ///              DataSourceExec
 ///```
-fn get_projected_output_ordering(
+pub fn get_projected_output_ordering(
     base_config: &FileScanConfig,
     projected_schema: &SchemaRef,
 ) -> Vec<LexOrdering> {
