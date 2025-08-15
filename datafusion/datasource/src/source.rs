@@ -49,10 +49,6 @@ use datafusion_physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
 };
 
-/// Helper function to convert any type implementing FileSource to Arc&lt;dyn DataSource&gt;
-pub fn as_data_source<T: FileSource + 'static>(source: T) -> Arc<dyn DataSource> {
-    Arc::new(source)
-}
 
 /// A source of data, typically a list of files or memory
 ///

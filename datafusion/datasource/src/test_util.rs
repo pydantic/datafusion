@@ -20,7 +20,6 @@ use crate::{
     file_scan_config::FileScanConfig,
     file_stream::FileOpener,
     schema_adapter::SchemaAdapterFactory,
-    source::{as_data_source, DataSource},
 };
 
 use std::sync::Arc;
@@ -104,8 +103,3 @@ pub(crate) fn col(name: &str, schema: &Schema) -> Result<Arc<dyn PhysicalExpr>> 
     Ok(Arc::new(Column::new_with_schema(name, schema)?))
 }
 
-impl From<MockSource> for Arc<dyn DataSource> {
-    fn from(source: MockSource) -> Self {
-        as_data_source(source)
-    }
-}

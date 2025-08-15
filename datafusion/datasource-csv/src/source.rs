@@ -18,7 +18,6 @@
 //! Execution plan for reading CSV files
 
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
-use datafusion_datasource::source::{as_data_source, DataSource};
 use std::any::Any;
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
@@ -215,11 +214,6 @@ impl From<CsvSource> for Arc<dyn FileSource> {
     }
 }
 
-impl From<CsvSource> for Arc<dyn DataSource> {
-    fn from(source: CsvSource) -> Self {
-        as_data_source(source)
-    }
-}
 
 impl FileSource for CsvSource {
     fn config(&self) -> FileScanConfig {

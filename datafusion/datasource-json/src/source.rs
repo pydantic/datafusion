@@ -31,7 +31,6 @@ use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_meta::FileMeta;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
-use datafusion_datasource::source::{as_data_source, DataSource};
 use datafusion_datasource::{
     as_file_source, calculate_range, ListingTableUrl, PartitionedFile, RangeCalculation,
 };
@@ -93,11 +92,6 @@ impl From<JsonSource> for Arc<dyn FileSource> {
     }
 }
 
-impl From<JsonSource> for Arc<dyn DataSource> {
-    fn from(source: JsonSource) -> Self {
-        as_data_source(source)
-    }
-}
 
 impl FileSource for JsonSource {
     fn create_file_opener(

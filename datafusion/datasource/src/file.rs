@@ -160,6 +160,17 @@ pub trait FileSource: Send + Sync + fmt::Debug {
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
         None
     }
+
+    /// Convert this FileSource to a DataSource
+    /// 
+    /// This method is automatically implemented for all FileSource types
+    /// and enforces that every FileSource can be converted to a DataSource.
+    fn into_data_source(self) -> Arc<dyn DataSource>
+    where
+        Self: Sized + 'static,
+    {
+        Arc::new(self)
+    }
 }
 
 impl<T: FileSource + 'static> DataSource for T {

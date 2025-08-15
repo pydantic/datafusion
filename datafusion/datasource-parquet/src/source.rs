@@ -40,7 +40,6 @@ use datafusion_common::config::TableParquetOptions;
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
-use datafusion_datasource::source::as_data_source;
 use datafusion_datasource::source::DataSource;
 use datafusion_physical_expr::conjunction;
 use datafusion_physical_expr::schema_rewriter::DefaultPhysicalExprAdapterFactory;
@@ -481,12 +480,6 @@ impl From<ParquetSource> for Arc<dyn FileSource> {
     }
 }
 
-/// Allows easy conversion from ParquetSource to Arc&lt;dyn DataSource&gt;
-impl From<ParquetSource> for Arc<dyn DataSource> {
-    fn from(source: ParquetSource) -> Self {
-        as_data_source(source)
-    }
-}
 
 impl FileSource for ParquetSource {
     fn create_file_opener(
