@@ -1208,11 +1208,10 @@ impl TableProvider for ListingTable {
             return Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty()))));
         };
 
-        let file_source = self.create_file_source_with_schema_adapter()?;
+        // let file_source = self.create_file_source_with_schema_adapter()?;
 
         // create the execution plan
-        let _ = self
-            .options
+        self.options
             .format
             .create_physical_plan(
                 state,
@@ -1230,9 +1229,7 @@ impl TableProvider for ListingTable {
                 .with_expr_adapter(self.expr_adapter_factory.clone())
                 .build(),
             )
-            .await;
-
-        todo!("friendly investigate");
+            .await
     }
 
     fn supports_filters_pushdown(
