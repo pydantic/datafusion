@@ -122,10 +122,8 @@ const HASH_JOIN_SEED: RandomState =
 /// All fields use atomic operations or mutexes to ensure correct coordination between concurrent
 /// partition executions.
 struct SharedBoundsAccumulator {
-    /// Bounds from each partition (indexed by partition_id)
-    bounds: Mutex<std::collections::HashMap<usize, Vec<(ScalarValue, ScalarValue)>>>,
-    /// Counter of completed partitions
-    completed_partitions: AtomicUsize,
+    /// Bounds from completed partitions
+    bounds: Mutex<Vec<Vec<(ScalarValue, ScalarValue)>>>,
     /// Total number of partitions (needed to know when we are doing building the build-side)
     total_partitions: AtomicUsize,
 }
@@ -174,8 +172,7 @@ impl SharedBoundsAccumulator {
             PartitionMode::Auto => 1,
         };
         Self {
-            bounds: Mutex::new(std::collections::HashMap::new()),
-            completed_partitions: AtomicUsize::new(0),
+            bounds: Mutex::new(Vec::new()),
             total_partitions: AtomicUsize::new(expected_calls),
         }
     }
@@ -188,7 +185,7 @@ impl SharedBoundsAccumulator {
     /// 3. The build side had at least one non-empty batch
     fn merge_bounds(&self) -> Option<Vec<(ScalarValue, ScalarValue)>> {
         let bounds = self.bounds.lock();
-        let all_bounds: Vec<_> = bounds.values().collect();
+        let all_bounds: Vec<_> = bounds.iter().collect();
 
         if all_bounds.is_empty() {
             return None;
@@ -1833,15 +1830,9 @@ impl HashJoinStream {
             // Store bounds in the accumulator - this runs once per partition
             // Troubleshooting: If bounds are empty/None, check collect_left_input
             // was called with should_compute_bounds=true
-            self.bounds_accumulator
-                .bounds
-                .lock()
-                .insert(self.partition_id, bounds.clone());
-            let completed = self
-                .bounds_accumulator
-                .completed_partitions
-                .fetch_add(1, Ordering::SeqCst)
-                + 1;
+            let mut bounds_guard = self.bounds_accumulator.bounds.lock();
+            bounds_guard.push(bounds.clone());
+            let completed = bounds_guard.len();
             let total_partitions = self
                 .bounds_accumulator
                 .total_partitions
@@ -1851,6 +1842,7 @@ impl HashJoinStream {
             // Troubleshooting: If you see "completed > total_partitions", check partition
             // count calculation in try_new() - it may not match actual execution calls
             if completed == total_partitions {
+                drop(bounds_guard); // Release lock before merging
                 if let Some(merged_bounds) = self.bounds_accumulator.merge_bounds() {
                     let filter_expr = self.create_filter_from_bounds(merged_bounds)?;
                     dynamic_filter.update(filter_expr)?;

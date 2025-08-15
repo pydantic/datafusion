@@ -310,6 +310,43 @@ create external table t1 stored as parquet location 'test_files/scratch/push_dow
 statement ok
 create external table t2 stored as parquet location 'test_files/scratch/push_down_filter/t2.parquet';
 
+# The failure before https://github.com/apache/datafusion/pull/17197 was non-deterministic and random
+# So we'll run the same query a couple of times just to have more certainty it's fixed
+# Sorry about the spam in this slt test...
+
+query III rowsort
+select *
+from t1
+join t2 on t1.k = t2.k
+where v = 1 or v = 10000000;
+----
+1 1 1
+10000000 10000000 10000000
+
+query III rowsort
+select *
+from t1
+join t2 on t1.k = t2.k
+where v = 1 or v = 10000000;
+----
+1 1 1
+10000000 10000000 10000000
+query III rowsort
+select *
+from t1
+join t2 on t1.k = t2.k
+where v = 1 or v = 10000000;
+----
+1 1 1
+10000000 10000000 10000000
+query III rowsort
+select *
+from t1
+join t2 on t1.k = t2.k
+where v = 1 or v = 10000000;
+----
+1 1 1
+10000000 10000000 10000000
 query III rowsort
 select *
 from t1
