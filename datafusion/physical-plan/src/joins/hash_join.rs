@@ -16,31 +16,6 @@
 // under the License.
 
 //! [`HashJoinExec`] Partitioned Hash Join Operator
-//!
-//! This module implements hash joins with support for different partition modes and dynamic filter
-//! pushdown optimization.
-//!
-//! ## Dynamic Filter Pushdown
-//!
-//! Dynamic filter pushdown is an optimization that creates filters from the build side's join keys
-//! and applies them to probe-side scans to reduce data processing. This is particularly effective
-//! for joins where the build side has selective predicates.
-//!
-//! ### Partition Mode Coordination
-//!
-//! The challenge with dynamic filter pushdown in partitioned execution is ensuring the filter
-//! contains complete information from ALL build-side partitions before being applied. Partial
-//! filters would incorrectly eliminate valid rows.
-//!
-//! - **CollectLeft Mode**: Build side is collected once from partition 0 and shared across all
-//!   output partitions via `OnceFut`. Each output partition calls `collect_build_side` to access
-//!   the shared build data, so we expect N calls where N = number of output partitions.
-//!
-//! - **Partitioned Mode**: Each partition independently builds its own hash table. We expect N
-//!   calls to `collect_build_side` where N = number of input partitions.
-//!
-//! The `SharedBoundsAccumulator` coordinates between these calls, ensuring the dynamic filter is
-//! updated exactly once after all relevant partitions have completed their build phase.
 
 use std::fmt;
 use std::mem::size_of;
@@ -1875,7 +1850,6 @@ impl HashJoinStream {
             // Critical synchronization point: Only the last partition updates the filter
             // Troubleshooting: If you see "completed > total_partitions", check partition
             // count calculation in try_new() - it may not match actual execution calls
-            println!("Completed partition {completed}/{total_partitions}");
             if completed == total_partitions {
                 if let Some(merged_bounds) = self.bounds_accumulator.merge_bounds() {
                     let filter_expr = self.create_filter_from_bounds(merged_bounds)?;
