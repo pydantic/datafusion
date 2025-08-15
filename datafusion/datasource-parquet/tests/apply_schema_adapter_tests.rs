@@ -20,7 +20,9 @@ mod parquet_adapter_tests {
         datatypes::{DataType, Field, Schema, SchemaRef},
         record_batch::RecordBatch,
     };
-    use datafusion_common::{ColumnStatistics, DataFusionError, Result};
+    use datafusion_common::{
+        config::TableParquetOptions, ColumnStatistics, DataFusionError, Result,
+    };
     use datafusion_datasource::{
         file::FileSource,
         file_scan_config::FileScanConfigBuilder,
@@ -133,25 +135,23 @@ mod parquet_adapter_tests {
             Field::new("name", DataType::Utf8, true),
         ]));
 
-        // Create a parquet source
-        let source = ParquetSource::default();
-
         // Create a file scan config with source that has a schema adapter factory
         let factory = Arc::new(PrefixAdapterFactory {
             prefix: "test_".to_string(),
         });
 
-        let file_source = source.clone().with_schema_adapter_factory(factory).unwrap();
-
         let config = FileScanConfigBuilder::new(
             ObjectStoreUrl::local_filesystem(),
             schema.clone(),
-            file_source,
         )
         .build();
 
+        // Create a parquet source
+        let source = ParquetSource::new(config, TableParquetOptions::default());
+        let file_source = source.clone().with_schema_adapter_factory(factory).unwrap();
+
         // Apply schema adapter to a new source
-        let result_source = source.apply_schema_adapter(&config).unwrap();
+        let result_source = source.apply_schema_adapter().unwrap();
 
         // Verify the adapter was applied
         assert!(result_source.schema_adapter_factory().is_some());
@@ -183,22 +183,18 @@ mod parquet_adapter_tests {
             Field::new("name", DataType::Utf8, true),
         ]));
 
-        // Create a parquet source
-        let source = ParquetSource::default();
-
-        // Convert to Arc<dyn FileSource>
-        let file_source: Arc<dyn FileSource> = Arc::new(source.clone());
-
         // Create a file scan config without a schema adapter factory
         let config = FileScanConfigBuilder::new(
             ObjectStoreUrl::local_filesystem(),
             schema.clone(),
-            file_source,
         )
         .build();
 
+        // Create a parquet source
+        let source = ParquetSource::new(config, TableParquetOptions::default());
+
         // Apply schema adapter function - should pass through the source unchanged
-        let result_source = source.apply_schema_adapter(&config).unwrap();
+        let result_source = source.apply_schema_adapter().unwrap();
 
         // Verify no adapter was applied
         assert!(result_source.schema_adapter_factory().is_none());

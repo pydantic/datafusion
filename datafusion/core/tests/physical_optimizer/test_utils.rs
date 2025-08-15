@@ -25,6 +25,7 @@ use arrow::array::Int32Array;
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::ParquetSource;
@@ -34,6 +35,7 @@ use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::utils::expr::COUNT_STAR_EXPANSION;
 use datafusion_common::{ColumnStatistics, JoinType, NullEquality, Result, Statistics};
+use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
@@ -71,15 +73,15 @@ use datafusion_physical_plan::{
 
 /// Create a non sorted parquet exec
 pub fn parquet_exec(schema: SchemaRef) -> Arc<DataSourceExec> {
-    let config = FileScanConfigBuilder::new(
-        ObjectStoreUrl::parse("test:///").unwrap(),
-        schema,
-        Arc::new(ParquetSource::default()),
-    )
-    .with_file(PartitionedFile::new("x".to_string(), 100))
-    .build();
+    let config =
+        FileScanConfigBuilder::new(ObjectStoreUrl::parse("test:///").unwrap(), schema)
+            .with_file(PartitionedFile::new("x".to_string(), 100))
+            .build();
 
-    DataSourceExec::from_data_source(config)
+    DataSourceExec::from_data_source(ParquetSource::new(
+        config,
+        TableParquetOptions::default(),
+    ))
 }
 
 /// Create a single parquet file that is sorted
@@ -87,16 +89,16 @@ pub(crate) fn parquet_exec_with_sort(
     schema: SchemaRef,
     output_ordering: Vec<LexOrdering>,
 ) -> Arc<DataSourceExec> {
-    let config = FileScanConfigBuilder::new(
-        ObjectStoreUrl::parse("test:///").unwrap(),
-        schema,
-        Arc::new(ParquetSource::default()),
-    )
-    .with_file(PartitionedFile::new("x".to_string(), 100))
-    .with_output_ordering(output_ordering)
-    .build();
+    let config =
+        FileScanConfigBuilder::new(ObjectStoreUrl::parse("test:///").unwrap(), schema)
+            .with_file(PartitionedFile::new("x".to_string(), 100))
+            .with_output_ordering(output_ordering)
+            .build();
 
-    DataSourceExec::from_data_source(config)
+    DataSourceExec::from_data_source(ParquetSource::new(
+        config,
+        TableParquetOptions::default(),
+    ))
 }
 
 fn int64_stats() -> ColumnStatistics {
@@ -125,20 +127,19 @@ pub(crate) fn parquet_exec_with_stats(file_size: u64) -> Arc<DataSourceExec> {
     statistics.num_rows = Precision::Inexact(10000);
     statistics.column_statistics = column_stats();
 
-    let config = FileScanConfigBuilder::new(
-        ObjectStoreUrl::parse("test:///").unwrap(),
-        schema(),
-        Arc::new(ParquetSource::new(Default::default())),
-    )
-    .with_file(PartitionedFile::new("x".to_string(), file_size))
-    .with_statistics(statistics)
-    .build();
+    let config =
+        FileScanConfigBuilder::new(ObjectStoreUrl::parse("test:///").unwrap(), schema())
+            .with_file(PartitionedFile::new("x".to_string(), file_size))
+            .with_statistics(statistics)
+            .build();
+
+    let source = ParquetSource::new(config, TableParquetOptions::default());
 
     assert_eq!(
-        config.file_source.projected_statistics().unwrap().num_rows,
+        source.projected_statistics().unwrap().num_rows,
         Precision::Inexact(10000)
     );
-    DataSourceExec::from_data_source(config)
+    DataSourceExec::from_data_source(source)
 }
 
 pub fn schema() -> SchemaRef {

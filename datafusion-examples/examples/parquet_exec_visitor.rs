@@ -98,10 +98,10 @@ impl ExecutionPlanVisitor for ParquetExecVisitor {
     fn pre_visit(&mut self, plan: &dyn ExecutionPlan) -> Result<bool, Self::Error> {
         // If needed match on a specific `ExecutionPlan` node type
         if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
-            if let Some((file_config, _)) =
+            if let Some(parquet_source) =
                 data_source_exec.downcast_to_file_source::<ParquetSource>()
             {
-                self.file_groups = Some(file_config.file_groups.clone());
+                self.file_groups = Some(parquet_source.config.file_groups.clone());
 
                 let metrics = match data_source_exec.metrics() {
                     None => return Ok(true),

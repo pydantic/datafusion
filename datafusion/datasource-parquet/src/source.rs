@@ -783,4 +783,8 @@ impl FileSource for ParquetSource {
 
         Arc::new(this)
     }
+
+    fn as_data_source(&self) -> Arc<dyn DataSource> {
+        Arc::new(self.clone())
+    }
 }

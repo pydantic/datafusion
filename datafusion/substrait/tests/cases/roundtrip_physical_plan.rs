@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema;
+use datafusion::config::TableParquetOptions;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
@@ -35,12 +36,9 @@ use substrait::proto::extensions;
 
 #[tokio::test]
 async fn parquet_exec() -> Result<()> {
-    let source = Arc::new(ParquetSource::default());
-
     let scan_config = FileScanConfigBuilder::new(
         ObjectStoreUrl::local_filesystem(),
         Arc::new(Schema::empty()),
-        source,
     )
     .with_file_groups(vec![
         FileGroup::new(vec![PartitionedFile::new(
@@ -53,8 +51,9 @@ async fn parquet_exec() -> Result<()> {
         )]),
     ])
     .build();
-    let parquet_exec: Arc<dyn ExecutionPlan> =
-        DataSourceExec::from_data_source(scan_config);
+    let parquet_exec: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
+        ParquetSource::new(scan_config, TableParquetOptions::default()),
+    );
 
     let mut extension_info: (
         Vec<extensions::SimpleExtensionDeclaration>,

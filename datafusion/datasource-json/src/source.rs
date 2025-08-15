@@ -169,6 +169,10 @@ impl FileSource for JsonSource {
 
         Arc::new(this)
     }
+
+    fn as_data_source(&self) -> Arc<dyn datafusion_datasource::source::DataSource> {
+        Arc::new(self.clone())
+    }
 }
 
 impl FileOpener for JsonOpener {

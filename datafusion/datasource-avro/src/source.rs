@@ -29,6 +29,7 @@ use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::file_stream::FileOpener;
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
+use datafusion_datasource::source::DataSource;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
 use object_store::ObjectStore;
@@ -134,6 +135,10 @@ impl FileSource for AvroSource {
 
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
         self.config.schema_adapter_factory.clone()
+    }
+
+    fn as_data_source(&self) -> Arc<dyn DataSource> {
+        Arc::new(self.clone())
     }
 
     fn with_config(&self, config: FileScanConfig) -> Arc<dyn FileSource> {

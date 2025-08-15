@@ -21,6 +21,7 @@ use crate::parquet::Unit::Page;
 use crate::parquet::{ContextWithParquet, Scenario};
 
 use arrow::array::RecordBatch;
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::PartitionedFile;
@@ -80,17 +81,16 @@ async fn get_parquet_exec(
     let execution_props = ExecutionProps::new();
     let predicate = create_physical_expr(&filter, &df_schema, &execution_props).unwrap();
 
-    let source = Arc::new(
-        ParquetSource::default()
-            .with_predicate(predicate)
-            .with_enable_page_index(true)
-            .with_pushdown_filters(pushdown_filters),
-    );
-    let base_config = FileScanConfigBuilder::new(object_store_url, schema, source)
+    let base_config = FileScanConfigBuilder::new(object_store_url, schema)
         .with_file(partitioned_file)
         .build();
 
-    DataSourceExec::new(Arc::new(base_config))
+    let source = ParquetSource::new(base_config, TableParquetOptions::default())
+        .with_predicate(predicate)
+        .with_enable_page_index(true)
+        .with_pushdown_filters(pushdown_filters);
+
+    DataSourceExec::new(Arc::new(source))
 }
 
 async fn get_filter_results(

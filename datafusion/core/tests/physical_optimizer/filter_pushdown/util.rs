@@ -36,7 +36,6 @@ use datafusion_physical_plan::{
         ChildFilterDescription, ChildPushdownResult, FilterDescription,
         FilterPushdownPropagation,
     },
-    metrics::ExecutionPlanMetricsSet,
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
 use futures::stream::BoxStream;
@@ -140,7 +139,7 @@ impl FileSource for TestSource {
         Arc::new(TestOpener {
             batches: self.batches.clone(),
             batch_size: self.config.batch_size,
-            schema: self.config.file_schema.clone(),
+            schema: Some(self.config.file_schema.clone()),
             projection: self.projection.clone(),
         })
     }
@@ -158,7 +157,7 @@ impl FileSource for TestSource {
 
     fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource> {
         let mut this = self.clone();
-        this.config.file_schema = Some(schema);
+        this.config.file_schema = schema;
 
         Arc::new(this)
     }
@@ -254,6 +253,10 @@ impl FileSource for TestSource {
         this.config = config;
 
         Arc::new(this)
+    }
+
+    fn as_data_source(&self) -> Arc<dyn datafusion_datasource::source::DataSource> {
+        Arc::new(self.clone())
     }
 }
 

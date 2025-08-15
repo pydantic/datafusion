@@ -16,9 +16,7 @@
 // under the License.
 
 use crate::{
-    file::FileSource,
-    file_scan_config::FileScanConfig,
-    file_stream::FileOpener,
+    file::FileSource, file_scan_config::FileScanConfig, file_stream::FileOpener,
     schema_adapter::SchemaAdapterFactory,
 };
 
@@ -70,6 +68,7 @@ impl FileSource for MockSource {
         Arc::new(source)
     }
 
+    // todo friendly, does file scan config now need projected_statistics()?
     fn projected_statistics(&self) -> Result<Statistics> {
         Ok(self
             .config
@@ -96,10 +95,20 @@ impl FileSource for MockSource {
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
         self.config.schema_adapter_factory.clone()
     }
+
+    fn with_config(&self, config: FileScanConfig) -> Arc<dyn FileSource> {
+        let mut this = self.clone();
+        this.config = config;
+
+        Arc::new(this)
+    }
+
+    fn as_data_source(&self) -> Arc<dyn crate::source::DataSource> {
+        Arc::new(self.clone())
+    }
 }
 
 /// Create a column expression
 pub(crate) fn col(name: &str, schema: &Schema) -> Result<Arc<dyn PhysicalExpr>> {
     Ok(Arc::new(Column::new_with_schema(name, schema)?))
 }
-

@@ -123,6 +123,10 @@ impl FileSource for ArrowSource {
 
         Arc::new(this)
     }
+
+    fn as_data_source(&self) -> Arc<dyn datafusion_datasource::source::DataSource> {
+        Arc::new(self.clone())
+    }
 }
 
 /// The struct arrow that implements `[FileOpener]` trait

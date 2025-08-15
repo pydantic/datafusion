@@ -23,6 +23,7 @@ use std::time::SystemTime;
 use arrow::array::{ArrayRef, Int64Array, Int8Array, StringArray};
 use arrow::datatypes::{Field, Schema, SchemaBuilder};
 use arrow::record_batch::RecordBatch;
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::file_format::parquet::fetch_parquet_metadata;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
@@ -80,23 +81,21 @@ async fn route_data_access_ops_to_parquet_file_reader_factory() {
         })
         .collect();
 
-    let source = Arc::new(
-        ParquetSource::default()
-            // prepare the scan
-            .with_parquet_file_reader_factory(Arc::new(
-                InMemoryParquetFileReaderFactory(Arc::clone(&in_memory_object_store)),
-            )),
-    );
     let base_config = FileScanConfigBuilder::new(
         // just any url that doesn't point to in memory object store
         ObjectStoreUrl::local_filesystem(),
         file_schema,
-        source,
     )
     .with_file_group(file_group)
     .build();
 
-    let parquet_exec = DataSourceExec::from_data_source(base_config);
+    let source = ParquetSource::new(base_config, TableParquetOptions::default())
+        // prepare the scan
+        .with_parquet_file_reader_factory(Arc::new(InMemoryParquetFileReaderFactory(
+            Arc::clone(&in_memory_object_store),
+        )));
+
+    let parquet_exec = DataSourceExec::from_data_source(source);
 
     let session_ctx = SessionContext::new();
     let task_ctx = session_ctx.task_ctx();

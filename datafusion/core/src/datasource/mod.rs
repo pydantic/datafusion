@@ -58,7 +58,9 @@ mod tests {
         datatypes::{DataType, Field, Schema, SchemaRef},
         record_batch::RecordBatch,
     };
-    use datafusion_common::{record_batch, test_util::batches_to_sort_string};
+    use datafusion_common::{
+        config::TableParquetOptions, record_batch, test_util::batches_to_sort_string,
+    };
     use datafusion_datasource::{
         file::FileSource,
         file_scan_config::FileScanConfigBuilder,
@@ -123,18 +125,21 @@ mod tests {
         let f2 = Field::new("extra_column", DataType::Utf8, true);
 
         let schema = Arc::new(Schema::new(vec![f1.clone(), f2.clone()]));
-        let source = ParquetSource::default()
-            .with_schema_adapter_factory(Arc::new(TestSchemaAdapterFactory {}))
-            .unwrap();
-        let base_conf = FileScanConfigBuilder::new(
-            ObjectStoreUrl::local_filesystem(),
-            schema,
-            source,
-        )
-        .with_file(partitioned_file)
-        .build();
 
-        let parquet_exec = DataSourceExec::from_data_source(base_conf);
+        let base_conf =
+            FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), schema)
+                .with_file(partitioned_file)
+                .build();
+
+        let parquet_exec = DataSourceExec::from_data_source(
+            ParquetSource::new(base_conf, TableParquetOptions::default())
+                .with_schema_adapter_factory(Arc::new(TestSchemaAdapterFactory {}))
+                .unwrap()
+                .as_any()
+                .downcast_ref::<ParquetSource>()
+                .unwrap()
+                .clone(),
+        );
 
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();

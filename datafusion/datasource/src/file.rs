@@ -72,6 +72,7 @@ pub trait FileSource: Send + Sync + fmt::Debug {
     fn as_any(&self) -> &dyn Any;
     /// Initialize new type with file scan configuration
     fn with_config(&self, config: FileScanConfig) -> Arc<dyn FileSource>;
+    fn as_data_source(&self) -> Arc<dyn DataSource>;
     /// Initialize new type with batch size configuration
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource>;
     /// Initialize new instance with a new schema
@@ -266,13 +267,9 @@ impl<T: FileSource + 'static> DataSource for T {
                 .with_projection(Some(new_projections))
                 .build();
 
-            let this = self.with_config(config);
+            let this = self.with_config(config).clone().as_data_source();
 
-            // Convert Arc<dyn FileSource> to Arc<dyn DataSource>
-            // I'm not sure if this is super safe, but a file source always impls DataSource
-            let data_source: Arc<dyn DataSource> = unsafe { std::mem::transmute(this) };
-
-            Arc::new(DataSourceExec::new(data_source)) as Arc<dyn ExecutionPlan>
+            Arc::new(DataSourceExec::new(this)) as Arc<dyn ExecutionPlan>
         }))
     }
 
@@ -284,10 +281,7 @@ impl<T: FileSource + 'static> DataSource for T {
         let result = FileSource::try_pushdown_filters(self, filters, config)?;
         match result.updated_node {
             Some(new_file_source) => {
-                // Convert Arc<dyn FileSource> to Arc<dyn DataSource>
-                // I'm not sure if this is super safe, but a file source always impls DataSource
-                let data_source: Arc<dyn DataSource> =
-                    unsafe { std::mem::transmute(new_file_source) };
+                let data_source = new_file_source.clone().as_data_source();
 
                 Ok(FilterPushdownPropagation {
                     filters: result.filters,

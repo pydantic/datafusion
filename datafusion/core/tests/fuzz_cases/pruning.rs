@@ -20,6 +20,7 @@ use std::sync::{Arc, LazyLock};
 use arrow::array::{Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use bytes::{BufMut, Bytes, BytesMut};
+use datafusion::config::TableParquetOptions;
 use datafusion::{
     datasource::{listing::PartitionedFile, physical_plan::ParquetSource},
     prelude::*,
@@ -275,15 +276,9 @@ async fn execute_with_predicate(
     schema: Arc<Schema>,
     ctx: &SessionContext,
 ) -> Vec<String> {
-    let parquet_source = if prune_stats {
-        ParquetSource::default().with_predicate(predicate.clone())
-    } else {
-        ParquetSource::default()
-    };
     let config = FileScanConfigBuilder::new(
         ObjectStoreUrl::parse("memory://").unwrap(),
         schema.clone(),
-        Arc::new(parquet_source),
     )
     .with_file_group(
         files
@@ -294,7 +289,14 @@ async fn execute_with_predicate(
             .collect(),
     )
     .build();
-    let exec = DataSourceExec::from_data_source(config);
+
+    let mut parquet_source = ParquetSource::new(config, TableParquetOptions::default());
+
+    if prune_stats {
+        parquet_source = parquet_source.with_predicate(predicate.clone());
+    }
+
+    let exec = DataSourceExec::from_data_source(parquet_source);
     let exec =
         Arc::new(FilterExec::try_new(predicate, exec).unwrap()) as Arc<dyn ExecutionPlan>;
 

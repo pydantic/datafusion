@@ -49,7 +49,6 @@ use datafusion_common::{
 };
 use datafusion_common_runtime::{JoinSet, SpawnedTask};
 use datafusion_datasource::display::FileGroupDisplay;
-use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use datafusion_datasource::write::ObjectWriterBuilder;

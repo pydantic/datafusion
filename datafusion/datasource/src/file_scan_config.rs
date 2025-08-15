@@ -260,7 +260,6 @@ pub struct FileScanConfigBuilder {
     batch_size: Option<usize>,
     expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
     metrics: ExecutionPlanMetricsSet,
-    projected_statistics_inner: Option<Statistics>,
     schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
 }
 
@@ -286,7 +285,6 @@ impl FileScanConfigBuilder {
             batch_size: None,
             expr_adapter_factory: None,
             metrics: ExecutionPlanMetricsSet::default(),
-            projected_statistics_inner: None,
             schema_adapter_factory: None,
         }
     }
@@ -421,12 +419,11 @@ impl FileScanConfigBuilder {
             batch_size,
             expr_adapter_factory: expr_adapter,
             metrics,
-            projected_statistics_inner,
             schema_adapter_factory,
         } = self;
 
         let constraints = constraints.unwrap_or_default();
-        let _statistics =
+        let statistics =
             statistics.unwrap_or_else(|| Statistics::new_unknown(&file_schema));
 
         let file_compression_type =
@@ -447,7 +444,7 @@ impl FileScanConfigBuilder {
             batch_size,
             expr_adapter_factory: expr_adapter,
             metrics,
-            projected_statistics: projected_statistics_inner,
+            projected_statistics: Some(statistics),
             schema_adapter_factory,
         }
     }
@@ -459,7 +456,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             object_store_url: config.object_store_url,
             file_schema: config.file_schema,
             file_groups: config.file_groups,
-            statistics: None,
+            statistics: config.projected_statistics,
             output_ordering: config.output_ordering,
             file_compression_type: Some(config.file_compression_type),
             new_lines_in_values: Some(config.new_lines_in_values),
@@ -470,7 +467,6 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             batch_size: config.batch_size,
             expr_adapter_factory: config.expr_adapter_factory,
             metrics: config.metrics,
-            projected_statistics_inner: config.projected_statistics,
             schema_adapter_factory: config.schema_adapter_factory,
         }
     }
@@ -1219,6 +1215,7 @@ pub fn wrap_partition_value_in_dict(val: ScalarValue) -> ScalarValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file::FileSource;
     use crate::{
         generate_test_files, test_util::MockSource, tests::aggr_test_schema,
         verify_sort_integrity,
@@ -1321,7 +1318,12 @@ mod tests {
             )]),
         );
 
-        let (proj_schema, _, proj_statistics, _) = conf.project();
+        let source = MockSource {
+            config: conf.clone(),
+        };
+
+        let (proj_schema, _, proj_statistics, _) =
+            conf.project(source.projected_statistics().ok());
         assert_eq!(
             columns(&proj_schema),
             vec!["date".to_owned(), "c1".to_owned()]
@@ -1381,8 +1383,12 @@ mod tests {
             to_partition_cols(partition_cols.clone()),
         );
 
-        let source_statistics = conf.file_source.projected_statistics().unwrap();
-        let conf_stats = conf.statistics().unwrap();
+        let source = MockSource {
+            config: conf.clone(),
+        };
+
+        let source_statistics = source.projected_statistics().unwrap();
+        let conf_stats = conf.projected_stats(Some(source_statistics.clone()));
 
         // projection should be reflected in the file source statistics
         assert_eq!(conf_stats.num_rows, Precision::Inexact(3));
@@ -1889,7 +1895,6 @@ mod tests {
         FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test:///").unwrap(),
             file_schema,
-            Arc::new(MockSource::default()),
         )
         .with_projection(projection)
         .with_statistics(statistics)
@@ -1932,13 +1937,11 @@ mod tests {
     fn test_file_scan_config_builder() {
         let file_schema = aggr_test_schema();
         let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
-        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::default());
 
         // Create a builder with required parameters
         let builder = FileScanConfigBuilder::new(
             object_store_url.clone(),
             Arc::clone(&file_schema),
-            Arc::clone(&file_source),
         );
 
         // Build with various configurations
@@ -1988,15 +1991,17 @@ mod tests {
     fn test_file_scan_config_builder_defaults() {
         let file_schema = aggr_test_schema();
         let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
-        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::default());
 
         // Create a builder with only required parameters and build without any additional configurations
         let config = FileScanConfigBuilder::new(
             object_store_url.clone(),
             Arc::clone(&file_schema),
-            Arc::clone(&file_source),
         )
         .build();
+
+        let file_source: Arc<dyn FileSource> = Arc::new(MockSource {
+            config: config.clone(),
+        });
 
         // Verify default values
         assert_eq!(config.object_store_url, object_store_url);
@@ -2015,28 +2020,22 @@ mod tests {
 
         // Verify statistics are set to unknown
         assert_eq!(
-            config.file_source.projected_statistics().unwrap().num_rows,
+            file_source.projected_statistics().unwrap().num_rows,
             Precision::Absent
         );
         assert_eq!(
-            config
-                .file_source
-                .projected_statistics()
-                .unwrap()
-                .total_byte_size,
+            file_source.projected_statistics().unwrap().total_byte_size,
             Precision::Absent
         );
         assert_eq!(
-            config
-                .file_source
+            file_source
                 .projected_statistics()
                 .unwrap()
                 .column_statistics
                 .len(),
             file_schema.fields().len()
         );
-        for stat in config
-            .file_source
+        for stat in file_source
             .projected_statistics()
             .unwrap()
             .column_statistics
@@ -2052,7 +2051,6 @@ mod tests {
     fn test_file_scan_config_builder_new_from() {
         let schema = aggr_test_schema();
         let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
-        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::default());
         let partition_cols = vec![Field::new(
             "date",
             wrap_partition_type_in_dict(DataType::Utf8),
@@ -2061,18 +2059,15 @@ mod tests {
         let file = PartitionedFile::new("test_file.parquet", 100);
 
         // Create a config with non-default values
-        let original_config = FileScanConfigBuilder::new(
-            object_store_url.clone(),
-            Arc::clone(&schema),
-            Arc::clone(&file_source),
-        )
-        .with_projection(Some(vec![0, 2]))
-        .with_limit(Some(10))
-        .with_table_partition_cols(partition_cols.clone())
-        .with_file(file.clone())
-        .with_constraints(Constraints::default())
-        .with_newlines_in_values(true)
-        .build();
+        let original_config =
+            FileScanConfigBuilder::new(object_store_url.clone(), Arc::clone(&schema))
+                .with_projection(Some(vec![0, 2]))
+                .with_limit(Some(10))
+                .with_table_partition_cols(partition_cols.clone())
+                .with_file(file.clone())
+                .with_constraints(Constraints::default())
+                .with_newlines_in_values(true)
+                .build();
 
         // Create a new builder from the config
         let new_builder = FileScanConfigBuilder::from(original_config);
