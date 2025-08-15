@@ -104,7 +104,7 @@ struct SharedBoundsAccumulator {
     bounds: Mutex<std::collections::HashMap<usize, Vec<(ScalarValue, ScalarValue)>>>,
     /// Counter of completed partitions
     completed_partitions: AtomicUsize,
-    /// Total number of partitions (will be updated when known)
+    /// Total number of partitions (needed to know when we are doing building the build-side)
     total_partitions: AtomicUsize,
 }
 
@@ -114,6 +114,35 @@ impl SharedBoundsAccumulator {
             bounds: Mutex::new(std::collections::HashMap::new()),
             completed_partitions: AtomicUsize::new(0),
             total_partitions: AtomicUsize::new(total_partitions),
+        }
+    }
+
+    /// Calculate how many times collect_build_side will be called.
+    /// This is used to know when we've finished building the build-side for all partitions
+    /// and can thus build a dynamic filter to push down into subsequent scans.
+    /// We cannot build a filter per partition so we must wait until we have the full information from the build side
+    /// before we can start filtering out rows on the probe side during scans.
+    fn new_from_partition_mode(
+        partition_mode: PartitionMode,
+        left_child: &dyn ExecutionPlan,
+        right_child: &dyn ExecutionPlan,
+    ) -> Self {
+        let expected_calls = match partition_mode {
+            // Each output partition accesses shared build data
+            PartitionMode::CollectLeft => {
+                right_child.output_partitioning().partition_count()
+            }
+            // Each partition builds its own data
+            PartitionMode::Partitioned => {
+                left_child.output_partitioning().partition_count()
+            }
+            // Default value, will be resolved during optimization (does not exist once `execute()` is called; will be replaced by one of the other two)
+            PartitionMode::Auto => 1,
+        };
+        Self {
+            bounds: Mutex::new(std::collections::HashMap::new()),
+            completed_partitions: AtomicUsize::new(0),
+            total_partitions: AtomicUsize::new(expected_calls),
         }
     }
 
@@ -495,9 +524,13 @@ impl HashJoinExec {
         )?;
 
         let dynamic_filter = Self::create_dynamic_filter(&on);
-        let output_partitions = cache.output_partitioning().partition_count();
+
         let bounds_accumulator =
-            Arc::new(SharedBoundsAccumulator::new(output_partitions));
+            Arc::new(SharedBoundsAccumulator::new_from_partition_mode(
+                partition_mode,
+                left.as_ref(),
+                right.as_ref(),
+            ));
 
         Ok(HashJoinExec {
             left,
@@ -889,9 +922,8 @@ impl ExecutionPlan for HashJoinExec {
             self.mode,
             self.null_equality,
         )?;
-        // Preserve the dynamic filter and bounds accumulator if they exist
+        // Preserve the dynamic filter state
         new_join.dynamic_filter = Arc::clone(&self.dynamic_filter);
-        new_join.bounds_accumulator = Arc::clone(&self.bounds_accumulator);
         Ok(Arc::new(new_join))
     }
 
@@ -913,7 +945,15 @@ impl ExecutionPlan for HashJoinExec {
             null_equality: self.null_equality,
             cache: self.cache.clone(),
             dynamic_filter: Self::create_dynamic_filter(&self.on),
-            bounds_accumulator: Arc::clone(&self.bounds_accumulator),
+            bounds_accumulator: Arc::new(SharedBoundsAccumulator::new(match self.mode {
+                PartitionMode::CollectLeft => {
+                    self.right.output_partitioning().partition_count()
+                }
+                PartitionMode::Partitioned => {
+                    self.left.output_partitioning().partition_count()
+                }
+                PartitionMode::Auto => 1, // Should not happen, but safe default
+            })),
         }))
     }
 
@@ -972,9 +1012,7 @@ impl ExecutionPlan for HashJoinExec {
                     reservation,
                     need_produce_result_in_final(self.join_type),
                     self.right().output_partitioning().partition_count(),
-                    enable_dynamic_filter_pushdown
-                        .then_some(Arc::clone(&self.dynamic_filter)),
-                    on_right.clone(),
+                    enable_dynamic_filter_pushdown,
                 ))
             })?,
             PartitionMode::Partitioned => {
@@ -992,9 +1030,7 @@ impl ExecutionPlan for HashJoinExec {
                     reservation,
                     need_produce_result_in_final(self.join_type),
                     1,
-                    enable_dynamic_filter_pushdown
-                        .then_some(Arc::clone(&self.dynamic_filter)),
-                    on_right.clone(),
+                    enable_dynamic_filter_pushdown,
                 ))
             }
             PartitionMode::Auto => {
@@ -1206,8 +1242,7 @@ async fn collect_left_input(
     reservation: MemoryReservation,
     with_visited_indices_bitmap: bool,
     probe_threads_count: usize,
-    dynamic_filter: Option<Arc<DynamicFilterPhysicalExpr>>,
-    _on_right: Vec<PhysicalExprRef>,
+    should_compute_bounds: bool,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
 
@@ -1298,7 +1333,7 @@ async fn collect_left_input(
         .collect::<Result<Vec<_>>>()?;
 
     // Compute bounds for dynamic filter if enabled
-    let bounds = if dynamic_filter.is_some() && num_rows > 0 {
+    let bounds = if should_compute_bounds && num_rows > 0 {
         Some(compute_bounds(&left_values)?)
     } else {
         None
@@ -1724,6 +1759,7 @@ impl HashJoinStream {
                 .load(Ordering::SeqCst);
 
             // If this is the last partition to complete, update the filter
+            println!("Completed partition {completed}/{total_partitions}");
             if completed == total_partitions {
                 if let Some(merged_bounds) = self.bounds_accumulator.merge_bounds() {
                     let filter_expr = self.create_filter_from_bounds(merged_bounds)?;
