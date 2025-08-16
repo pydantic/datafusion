@@ -122,10 +122,14 @@ const HASH_JOIN_SEED: RandomState =
 /// All fields use atomic operations or mutexes to ensure correct coordination between concurrent
 /// partition executions.
 struct SharedBoundsAccumulator {
-    /// Bounds from completed partitions
+    /// Bounds from completed partitions.
     bounds: Mutex<Vec<Vec<(ScalarValue, ScalarValue)>>>,
-    /// Total number of partitions (needed to know when we are doing building the build-side)
-    total_partitions: AtomicUsize,
+    /// Number of partitions that have reported completion.
+    completed_partitions: AtomicUsize,
+    /// Total number of partitions.
+    /// Need to know this so that we can update the dynamic filter once we are done
+    /// building *all* of the hash tables.
+    total_partitions: usize,
 }
 
 impl SharedBoundsAccumulator {
@@ -173,7 +177,8 @@ impl SharedBoundsAccumulator {
         };
         Self {
             bounds: Mutex::new(Vec::new()),
-            total_partitions: AtomicUsize::new(expected_calls),
+            completed_partitions: AtomicUsize::new(0),
+            total_partitions: expected_calls,
         }
     }
 
@@ -1821,25 +1826,29 @@ impl HashJoinStream {
         // Note: In CollectLeft mode, multiple partitions may access the SAME build data
         // (shared via OnceFut), but each partition must report separately to ensure proper
         // coordination across all output partitions.
-        if let (Some(dynamic_filter), Some(bounds)) =
-            (&self.dynamic_filter, &left_data.bounds)
-        {
+        //
+        // The consequences of not doing this syncronization properly would be that a filter
+        // with incomplete bounds would be pushed down resulting in incorrect results (missing rows).
+        if let Some(dynamic_filter) = &self.dynamic_filter {
             // Store bounds in the accumulator - this runs once per partition
-            // Troubleshooting: If bounds are empty/None, check collect_left_input
-            // was called with should_compute_bounds=true
-            let mut bounds_guard = self.bounds_accumulator.bounds.lock();
-            bounds_guard.push(bounds.clone());
-            let completed = bounds_guard.len();
-            let total_partitions = self
+            if let Some(bounds) = &left_data.bounds {
+                // Only push actual bounds if they exist
+                self.bounds_accumulator.bounds.lock().push(bounds.clone());
+            }
+
+            // Atomically increment the completion counter
+            // Even empty partitions must report to ensure proper termination
+            let completed = self
                 .bounds_accumulator
-                .total_partitions
-                .load(Ordering::SeqCst);
+                .completed_partitions
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+            let total_partitions = self.bounds_accumulator.total_partitions;
 
             // Critical synchronization point: Only the last partition updates the filter
             // Troubleshooting: If you see "completed > total_partitions", check partition
             // count calculation in try_new() - it may not match actual execution calls
             if completed == total_partitions {
-                drop(bounds_guard); // Release lock before merging
                 if let Some(merged_bounds) = self.bounds_accumulator.merge_bounds() {
                     let filter_expr = self.create_filter_from_bounds(merged_bounds)?;
                     dynamic_filter.update(filter_expr)?;
