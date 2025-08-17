@@ -587,11 +587,12 @@ impl HashJoinExec {
 
         let dynamic_filter = Some(Self::create_dynamic_filter(&on));
 
-        let bounds_accumulator = Some(Arc::new(SharedBoundsAccumulator::new_from_partition_mode(
-            partition_mode,
-            left.as_ref(),
-            right.as_ref(),
-        )));
+        let bounds_accumulator =
+            Some(Arc::new(SharedBoundsAccumulator::new_from_partition_mode(
+                partition_mode,
+                left.as_ref(),
+                right.as_ref(),
+            )));
         Ok(HashJoinExec {
             left,
             right,
