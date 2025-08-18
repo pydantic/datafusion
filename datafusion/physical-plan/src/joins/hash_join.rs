@@ -19,8 +19,9 @@
 
 use std::fmt;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::task::Waker;
 use std::task::Poll;
 use std::{any::Any, vec};
 
@@ -130,6 +131,10 @@ struct SharedBoundsAccumulator {
     /// Need to know this so that we can update the dynamic filter once we are done
     /// building *all* of the hash tables.
     total_partitions: usize,
+    /// Signaled when filter has been updated by the last partition
+    filter_ready: Arc<AtomicBool>,
+    /// Wakers for partitions waiting for filter to be ready
+    waiters: Mutex<Vec<Waker>>,
 }
 
 impl SharedBoundsAccumulator {
@@ -179,6 +184,8 @@ impl SharedBoundsAccumulator {
             bounds: Mutex::new(Vec::new()),
             completed_partitions: AtomicUsize::new(0),
             total_partitions: expected_calls,
+            filter_ready: Arc::new(AtomicBool::new(false)),
+            waiters: Mutex::new(Vec::new()),
         }
     }
 
@@ -233,6 +240,30 @@ impl SharedBoundsAccumulator {
             None
         } else {
             Some(merged)
+        }
+    }
+
+    /// Wake all partitions waiting for filter to be ready
+    fn wake_waiters(&self) {
+        let mut waiters = self.waiters.lock();
+        for waker in waiters.drain(..) {
+            waker.wake();
+        }
+    }
+
+    /// Register a waker to be notified when filter is ready
+    fn register_waiter(&self, waker: Waker) {
+        // Check if filter is already ready to avoid race condition
+        if self.filter_ready.load(Ordering::SeqCst) {
+            waker.wake();
+            return;
+        }
+        
+        self.waiters.lock().push(waker);
+        
+        // Double-check in case filter became ready while we were acquiring the lock
+        if self.filter_ready.load(Ordering::SeqCst) {
+            self.wake_waiters();
         }
     }
 }
@@ -1522,6 +1553,9 @@ impl BuildSide {
 ///       WaitBuildSide
 ///             │
 ///             ▼
+///      WaitFilterReady
+///             │
+///             ▼
 ///  ┌─► FetchProbeBatch ───► ExhaustedProbeSide ───► Completed
 ///  │          │
 ///  │          ▼
@@ -1532,6 +1566,8 @@ impl BuildSide {
 enum HashJoinStreamState {
     /// Initial state for HashJoinStream indicating that build-side data not collected yet
     WaitBuildSide,
+    /// Indicates that build-side has been collected, but waiting for dynamic filter to be ready
+    WaitFilterReady,
     /// Indicates that build-side has been collected, and stream is ready for fetching probe-side
     FetchProbeBatch,
     /// Indicates that non-empty batch has been fetched from probe-side, and is ready to be processed
@@ -1773,6 +1809,9 @@ impl HashJoinStream {
                 HashJoinStreamState::WaitBuildSide => {
                     handle_state!(ready!(self.collect_build_side(cx)))
                 }
+                HashJoinStreamState::WaitFilterReady => {
+                    handle_state!(ready!(self.wait_filter_ready(cx)))
+                }
                 HashJoinStreamState::FetchProbeBatch => {
                     handle_state!(ready!(self.fetch_probe_batch(cx)))
                 }
@@ -1845,13 +1884,59 @@ impl HashJoinStream {
                     let filter_expr = self.create_filter_from_bounds(merged_bounds)?;
                     dynamic_filter.update(filter_expr)?;
                 }
+                // Always signal that filter is ready, even if there were no bounds
+                // This ensures other partitions don't wait indefinitely
+                self.bounds_accumulator.filter_ready.store(true, Ordering::SeqCst);
+                // Wake all partitions waiting for filter to be ready
+                self.bounds_accumulator.wake_waiters();
             }
+            
         }
-
-        self.state = HashJoinStreamState::FetchProbeBatch;
+        
+        self.state = if let Some(_dynamic_filter) = &self.dynamic_filter {
+            let total_partitions = self.bounds_accumulator.total_partitions;
+            if total_partitions > 1 {
+                let completed = self.bounds_accumulator.completed_partitions.load(Ordering::SeqCst);
+                if completed == total_partitions {
+                    // I'm the last partition - filter is ready, proceed directly
+                    HashJoinStreamState::FetchProbeBatch
+                } else {
+                    // Not the last partition - wait for filter to be ready
+                    HashJoinStreamState::WaitFilterReady
+                }
+            } else {
+                // Single partition case - ensure filter is ready
+                self.bounds_accumulator.filter_ready.store(true, Ordering::SeqCst);
+                HashJoinStreamState::FetchProbeBatch
+            }
+        } else {
+            // No dynamic filter
+            HashJoinStreamState::FetchProbeBatch
+        };
         self.build_side = BuildSide::Ready(BuildSideReadyState { left_data });
 
         Poll::Ready(Ok(StatefulStreamResult::Continue))
+    }
+
+    /// Waits for dynamic filter to be ready before proceeding to probe phase
+    ///
+    /// This ensures all partitions synchronize before starting probe-side reads,
+    /// preventing race conditions where some partitions read data before the
+    /// complete filter is constructed.
+    fn wait_filter_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
+        // Check if filter is ready (set by the last partition to complete build)
+        if self.bounds_accumulator.filter_ready.load(Ordering::SeqCst) {
+            // Filter is ready, transition to probe phase
+            self.state = HashJoinStreamState::FetchProbeBatch;
+            Poll::Ready(Ok(StatefulStreamResult::Continue))
+        } else {
+            // Filter not ready yet - register waker and return Pending
+            self.bounds_accumulator.register_waiter(cx.waker().clone());
+            Poll::Pending
+        }
     }
 
     /// Create a filter expression from merged bounds
