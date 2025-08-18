@@ -1819,7 +1819,7 @@ impl HashJoinStream {
         // (shared via OnceFut), but each partition must report separately to ensure proper
         // coordination across all output partitions.
         //
-        // The consequences of not doing this syncronization properly would be that a filter
+        // The consequences of not doing this synchronization properly would be that a filter
         // with incomplete bounds would be pushed down resulting in incorrect results (missing rows).
         if let Some(dynamic_filter) = &self.dynamic_filter {
             // Store bounds in the accumulator - this runs once per partition
