@@ -80,7 +80,6 @@ fn csv_exec_sorted(
     let mut builder = FileScanConfigBuilder::new(
         ObjectStoreUrl::parse("test:///").unwrap(),
         schema.clone(),
-        Arc::new(CsvSource::new(false, 0, 0)),
     )
     .with_file(PartitionedFile::new("x".to_string(), 100));
     if let Some(ordering) = LexOrdering::new(sort_exprs) {
@@ -88,7 +87,10 @@ fn csv_exec_sorted(
     }
 
     let config = builder.build();
-    DataSourceExec::from_data_source(config)
+
+    let source = CsvSource::new(false, 0, 0, config);
+
+    DataSourceExec::from_data_source(source)
 }
 
 /// Runs the sort enforcement optimizer and asserts the plan

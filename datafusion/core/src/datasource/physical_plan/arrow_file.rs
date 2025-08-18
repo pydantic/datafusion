@@ -29,8 +29,8 @@ use arrow_ipc::reader::FileDecoder;
 use datafusion_common::Statistics;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::source::DataSource;
 use datafusion_datasource::PartitionedFile;
-use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 
 use futures::StreamExt;
 use itertools::Itertools;
@@ -38,11 +38,16 @@ use object_store::{GetOptions, GetRange, GetResultPayload, ObjectStore};
 
 /// Arrow configuration struct that is given to DataSourceExec
 /// Does not hold anything special, since [`FileScanConfig`] is sufficient for arrow
-#[derive(Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ArrowSource {
-    metrics: ExecutionPlanMetricsSet,
-    projected_statistics: Option<Statistics>,
-    schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
+    config: FileScanConfig,
+}
+
+impl ArrowSource {
+    /// Create a new ArrowSource with the given configuration
+    pub fn new(config: FileScanConfig) -> Self {
+        Self { config }
+    }
 }
 
 impl From<ArrowSource> for Arc<dyn FileSource> {
@@ -52,15 +57,25 @@ impl From<ArrowSource> for Arc<dyn FileSource> {
 }
 
 impl FileSource for ArrowSource {
+    fn config(&self) -> &FileScanConfig {
+        &self.config
+    }
+
+    fn with_config(&self, config: FileScanConfig) -> Arc<dyn FileSource> {
+        let mut this = self.clone();
+        this.config = config;
+
+        Arc::new(this)
+    }
+
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
-        base_config: &FileScanConfig,
         _partition: usize,
     ) -> Arc<dyn FileOpener> {
         Arc::new(ArrowOpener {
             object_store,
-            projection: base_config.file_column_projection_indices(),
+            projection: self.config.file_column_projection_indices(),
         })
     }
 
@@ -75,25 +90,11 @@ impl FileSource for ArrowSource {
     fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
         Arc::new(Self { ..self.clone() })
     }
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.projected_statistics = Some(statistics);
-        Arc::new(conf)
-    }
+    fn with_projected_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
+        let mut this = self.clone();
+        this.config.projected_statistics = statistics;
 
-    fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
-    }
-
-    fn metrics(&self) -> &ExecutionPlanMetricsSet {
-        &self.metrics
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        let statistics = &self.projected_statistics;
-        Ok(statistics
-            .clone()
-            .expect("projected_statistics must be set"))
+        Arc::new(this)
     }
 
     fn file_type(&self) -> &str {
@@ -104,14 +105,18 @@ impl FileSource for ArrowSource {
         &self,
         schema_adapter_factory: Arc<dyn SchemaAdapterFactory>,
     ) -> Result<Arc<dyn FileSource>> {
-        Ok(Arc::new(Self {
-            schema_adapter_factory: Some(schema_adapter_factory),
-            ..self.clone()
-        }))
+        let mut this = self.clone();
+        this.config.schema_adapter_factory = Some(schema_adapter_factory);
+
+        Ok(Arc::new(this))
     }
 
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
-        self.schema_adapter_factory.clone()
+        self.config.schema_adapter_factory.clone()
+    }
+
+    fn as_data_source(&self) -> Arc<dyn DataSource> {
+        Arc::new(self.clone())
     }
 }
 

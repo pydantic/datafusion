@@ -35,7 +35,7 @@ use datafusion_physical_plan::{
 };
 use itertools::Itertools;
 
-use crate::file_scan_config::FileScanConfig;
+use crate::file::FileSource;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Constraints, Result, Statistics};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
@@ -128,6 +128,9 @@ pub trait DataSource: Send + Sync + Debug {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream>;
     fn as_any(&self) -> &dyn Any;
+
+    fn as_file_source(&self) -> Option<Arc<dyn FileSource>>;
+
     /// Format this source for display in explain plans
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result;
 
@@ -291,10 +294,9 @@ impl ExecutionPlan for DataSourceExec {
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
         if let Some(partition) = partition {
             let mut statistics = Statistics::new_unknown(&self.schema());
-            if let Some(file_config) =
-                self.data_source.as_any().downcast_ref::<FileScanConfig>()
-            {
-                if let Some(file_group) = file_config.file_groups.get(partition) {
+            if let Some(file_source) = self.data_source.as_file_source() {
+                if let Some(file_group) = file_source.config().file_groups.get(partition)
+                {
                     if let Some(stat) = file_group.file_statistics(None) {
                         statistics = stat.clone();
                     }
@@ -459,24 +461,6 @@ impl DataSourceExec {
             Boundedness::Bounded,
         )
         .with_scheduling_type(data_source.scheduling_type())
-    }
-
-    /// Downcast the `DataSourceExec`'s `data_source` to a specific file source
-    ///
-    /// Returns `None` if
-    /// 1. the datasource is not scanning files (`FileScanConfig`)
-    /// 2. The [`FileScanConfig::file_source`] is not of type `T`
-    pub fn downcast_to_file_source<T: 'static>(&self) -> Option<(&FileScanConfig, &T)> {
-        self.data_source()
-            .as_any()
-            .downcast_ref::<FileScanConfig>()
-            .and_then(|file_scan_conf| {
-                file_scan_conf
-                    .file_source()
-                    .as_any()
-                    .downcast_ref::<T>()
-                    .map(|source| (file_scan_conf, source))
-            })
     }
 }
 

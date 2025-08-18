@@ -27,6 +27,7 @@ use datafusion::catalog::Session;
 use datafusion::common::{
     internal_datafusion_err, DFSchema, DataFusionError, Result, ScalarValue,
 };
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
 use datafusion::datasource::physical_plan::{
@@ -491,23 +492,22 @@ impl TableProvider for IndexTableProvider {
             CachedParquetFileReaderFactory::new(Arc::clone(&self.object_store))
                 .with_file(indexed_file);
 
-        let file_source = Arc::new(
-            ParquetSource::default()
+        let file_scan_config = FileScanConfigBuilder::new(object_store_url, schema)
+            .with_limit(limit)
+            .with_projection(projection.cloned())
+            .with_file(partitioned_file)
+            .build();
+
+        let file_source =
+            ParquetSource::new(TableParquetOptions::default(), file_scan_config)
                 // provide the predicate so the DataSourceExec can try and prune
                 // row groups internally
                 .with_predicate(predicate)
                 // provide the factory to create parquet reader without re-reading metadata
-                .with_parquet_file_reader_factory(Arc::new(reader_factory)),
-        );
-        let file_scan_config =
-            FileScanConfigBuilder::new(object_store_url, schema, file_source)
-                .with_limit(limit)
-                .with_projection(projection.cloned())
-                .with_file(partitioned_file)
-                .build();
+                .with_parquet_file_reader_factory(Arc::new(reader_factory));
 
         // Finally, put it all together into a DataSourceExec
-        Ok(DataSourceExec::from_data_source(file_scan_config))
+        Ok(DataSourceExec::from_data_source(file_source))
     }
 
     /// Tell DataFusion to push filters down to the scan method

@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::file::FileSource;
 use crate::file_compression_type::FileCompressionType;
 use crate::file_scan_config::FileScanConfig;
 use crate::file_sink_config::FileSinkConfig;
@@ -109,9 +108,6 @@ pub trait FileFormat: Send + Sync + fmt::Debug {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         not_impl_err!("Writer not implemented for this format")
     }
-
-    /// Return the related FileSource such as `CsvSource`, `JsonSource`, etc.
-    fn file_source(&self) -> Arc<dyn FileSource>;
 }
 
 /// Factory for creating [`FileFormat`] instances based on session and command level options

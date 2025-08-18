@@ -81,17 +81,14 @@ mod tests {
             .infer_schema(&state, &store, std::slice::from_ref(&meta))
             .await?;
 
-        let source = Arc::new(AvroSource::new());
-        let conf = FileScanConfigBuilder::new(
-            ObjectStoreUrl::local_filesystem(),
-            file_schema,
-            source,
-        )
-        .with_file(meta.into())
-        .with_projection(Some(vec![0, 1, 2]))
-        .build();
+        let conf =
+            FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), file_schema)
+                .with_file(meta.into())
+                .with_projection(Some(vec![0, 1, 2]))
+                .build();
 
-        let source_exec = DataSourceExec::from_data_source(conf);
+        let source = AvroSource::new(conf);
+        let source_exec = DataSourceExec::from_data_source(source);
         assert_eq!(
             source_exec
                 .properties()
@@ -157,13 +154,14 @@ mod tests {
         // Include the missing column in the projection
         let projection = Some(vec![0, 1, 2, actual_schema.fields().len()]);
 
-        let source = Arc::new(AvroSource::new());
-        let conf = FileScanConfigBuilder::new(object_store_url, file_schema, source)
+        let conf = FileScanConfigBuilder::new(object_store_url, file_schema)
             .with_file(meta.into())
             .with_projection(projection)
             .build();
 
-        let source_exec = DataSourceExec::from_data_source(conf);
+        let source = AvroSource::new(conf);
+
+        let source_exec = DataSourceExec::from_data_source(source);
         assert_eq!(
             source_exec
                 .properties()
@@ -227,8 +225,7 @@ mod tests {
         partitioned_file.partition_values = vec![ScalarValue::from("2021-10-26")];
 
         let projection = Some(vec![0, 1, file_schema.fields().len(), 2]);
-        let source = Arc::new(AvroSource::new());
-        let conf = FileScanConfigBuilder::new(object_store_url, file_schema, source)
+        let conf = FileScanConfigBuilder::new(object_store_url, file_schema)
             // select specific columns of the files as well as the partitioning
             // column which is supposed to be the last column in the table schema.
             .with_projection(projection)
@@ -236,7 +233,9 @@ mod tests {
             .with_table_partition_cols(vec![Field::new("date", DataType::Utf8, false)])
             .build();
 
-        let source_exec = DataSourceExec::from_data_source(conf);
+        let source = AvroSource::new(conf);
+
+        let source_exec = DataSourceExec::from_data_source(source);
 
         assert_eq!(
             source_exec

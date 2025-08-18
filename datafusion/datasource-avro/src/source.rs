@@ -22,50 +22,54 @@ use std::sync::Arc;
 
 use crate::avro_to_arrow::Reader as AvroReader;
 
-use arrow::datatypes::SchemaRef;
 use datafusion_common::error::Result;
-use datafusion_common::Statistics;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::file_stream::FileOpener;
-use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
+use datafusion_datasource::source::DataSource;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
-use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 
 use object_store::ObjectStore;
 
 /// AvroSource holds the extra configuration that is necessary for opening avro files
-#[derive(Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AvroSource {
-    schema: Option<SchemaRef>,
-    batch_size: Option<usize>,
-    projection: Option<Vec<String>>,
-    metrics: ExecutionPlanMetricsSet,
-    projected_statistics: Option<Statistics>,
-    schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
+    config: FileScanConfig,
 }
 
 impl AvroSource {
     /// Initialize an AvroSource with default values
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(config: FileScanConfig) -> Self {
+        Self { config }
     }
 
     fn open<R: std::io::Read>(&self, reader: R) -> Result<AvroReader<'static, R>> {
         AvroReader::try_new(
             reader,
-            Arc::clone(self.schema.as_ref().expect("Schema must set before open")),
-            self.batch_size.expect("Batch size must set before open"),
-            self.projection.clone(),
+            self.config.file_schema.clone(),
+            self.config
+                .batch_size
+                .expect("Batch size must set before open"),
+            self.config.projected_file_column_names(),
         )
     }
 }
 
 impl FileSource for AvroSource {
+    fn config(&self) -> &FileScanConfig {
+        &self.config
+    }
+
+    fn with_config(&self, config: FileScanConfig) -> Arc<dyn FileSource> {
+        let mut this = self.clone();
+        this.config = config;
+
+        Arc::new(this)
+    }
+
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
-        _base_config: &FileScanConfig,
         _partition: usize,
     ) -> Arc<dyn FileOpener> {
         Arc::new(private::AvroOpener {
@@ -78,40 +82,6 @@ impl FileSource for AvroSource {
         self
     }
 
-    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.batch_size = Some(batch_size);
-        Arc::new(conf)
-    }
-
-    fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.schema = Some(schema);
-        Arc::new(conf)
-    }
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.projected_statistics = Some(statistics);
-        Arc::new(conf)
-    }
-
-    fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.projection = config.projected_file_column_names();
-        Arc::new(conf)
-    }
-
-    fn metrics(&self) -> &ExecutionPlanMetricsSet {
-        &self.metrics
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        let statistics = &self.projected_statistics;
-        Ok(statistics
-            .clone()
-            .expect("projected_statistics must be set"))
-    }
-
     fn file_type(&self) -> &str {
         "avro"
     }
@@ -121,23 +91,12 @@ impl FileSource for AvroSource {
         _target_partitions: usize,
         _repartition_file_min_size: usize,
         _output_ordering: Option<LexOrdering>,
-        _config: &FileScanConfig,
     ) -> Result<Option<FileScanConfig>> {
         Ok(None)
     }
 
-    fn with_schema_adapter_factory(
-        &self,
-        schema_adapter_factory: Arc<dyn SchemaAdapterFactory>,
-    ) -> Result<Arc<dyn FileSource>> {
-        Ok(Arc::new(Self {
-            schema_adapter_factory: Some(schema_adapter_factory),
-            ..self.clone()
-        }))
-    }
-
-    fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
-        self.schema_adapter_factory.clone()
+    fn as_data_source(&self) -> Arc<dyn DataSource> {
+        Arc::new(self.clone())
     }
 }
 

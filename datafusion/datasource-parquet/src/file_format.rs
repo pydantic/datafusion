@@ -52,8 +52,7 @@ use datafusion_common::{
 use datafusion_common::{HashMap, Statistics};
 use datafusion_common_runtime::{JoinSet, SpawnedTask};
 use datafusion_datasource::display::FileGroupDisplay;
-use datafusion_datasource::file::FileSource;
-use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
+use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
@@ -483,7 +482,7 @@ impl FileFormat for ParquetFormat {
             metadata_size_hint = Some(metadata);
         }
 
-        let mut source = ParquetSource::new(self.options.clone());
+        let mut source = ParquetSource::new(self.options.clone(), conf.clone());
 
         // Use the CachedParquetFileReaderFactory
         let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
@@ -501,12 +500,9 @@ impl FileFormat for ParquetFormat {
         source = self.set_source_encryption_factory(source, state)?;
 
         // Apply schema adapter factory before building the new config
-        let file_source = source.apply_schema_adapter(&conf)?;
+        let file_source = source.apply_schema_adapter()?.as_data_source();
 
-        let conf = FileScanConfigBuilder::from(conf)
-            .with_source(file_source)
-            .build();
-        Ok(DataSourceExec::from_data_source(conf))
+        Ok(Arc::new(DataSourceExec::new(file_source)) as Arc<dyn ExecutionPlan>)
     }
 
     async fn create_writer_physical_plan(
@@ -523,10 +519,6 @@ impl FileFormat for ParquetFormat {
         let sink = Arc::new(ParquetSink::new(conf, self.options.clone()));
 
         Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)
-    }
-
-    fn file_source(&self) -> Arc<dyn FileSource> {
-        Arc::new(ParquetSource::default())
     }
 }
 

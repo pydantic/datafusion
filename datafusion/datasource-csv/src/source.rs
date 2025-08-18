@@ -17,7 +17,6 @@
 
 //! Execution plan for reading CSV files
 
-use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use std::any::Any;
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
@@ -28,19 +27,18 @@ use datafusion_datasource::decoder::{deserialize_stream, DecoderDeserializer};
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_meta::FileMeta;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
+use datafusion_datasource::source::DataSource;
 use datafusion_datasource::{
     as_file_source, calculate_range, FileRange, ListingTableUrl, PartitionedFile,
     RangeCalculation,
 };
 
 use arrow::csv;
-use arrow::datatypes::SchemaRef;
-use datafusion_common::{DataFusionError, Result, Statistics};
+use datafusion_common::{DataFusionError, Result};
 use datafusion_common_runtime::JoinSet;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_execution::TaskContext;
-use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::{
     DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
 };
@@ -80,30 +78,34 @@ use tokio::io::AsyncWriteExt;
 ///     .build();
 /// let exec = (DataSourceExec::from_data_source(config));
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CsvSource {
-    batch_size: Option<usize>,
-    file_schema: Option<SchemaRef>,
-    file_projection: Option<Vec<usize>>,
     pub(crate) has_header: bool,
     delimiter: u8,
     quote: u8,
     terminator: Option<u8>,
     escape: Option<u8>,
     comment: Option<u8>,
-    metrics: ExecutionPlanMetricsSet,
-    projected_statistics: Option<Statistics>,
-    schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
+
+    config: FileScanConfig,
 }
 
 impl CsvSource {
     /// Returns a [`CsvSource`]
-    pub fn new(has_header: bool, delimiter: u8, quote: u8) -> Self {
+    pub fn new(
+        has_header: bool,
+        delimiter: u8,
+        quote: u8,
+        config: FileScanConfig,
+    ) -> Self {
         Self {
             has_header,
             delimiter,
             quote,
-            ..Self::default()
+            terminator: Default::default(),
+            escape: Default::default(),
+            comment: Default::default(),
+            config,
         }
     }
 
@@ -164,23 +166,20 @@ impl CsvSource {
     }
 
     fn builder(&self) -> csv::ReaderBuilder {
-        let mut builder = csv::ReaderBuilder::new(Arc::clone(
-            self.file_schema
-                .as_ref()
-                .expect("Schema must be set before initializing builder"),
-        ))
-        .with_delimiter(self.delimiter)
-        .with_batch_size(
-            self.batch_size
-                .expect("Batch size must be set before initializing builder"),
-        )
-        .with_header(self.has_header)
-        .with_quote(self.quote);
+        let mut builder = csv::ReaderBuilder::new(self.config.file_schema.clone())
+            .with_delimiter(self.delimiter)
+            .with_batch_size(
+                self.config
+                    .batch_size
+                    .expect("Batch size must be set before initializing builder"),
+            )
+            .with_header(self.has_header)
+            .with_quote(self.quote);
         if let Some(terminator) = self.terminator {
             builder = builder.with_terminator(terminator);
         }
-        if let Some(proj) = &self.file_projection {
-            builder = builder.with_projection(proj.clone());
+        if let Some(proj) = self.config.file_column_projection_indices() {
+            builder = builder.with_projection(proj);
         }
         if let Some(escape) = self.escape {
             builder = builder.with_escape(escape)
@@ -222,15 +221,25 @@ impl From<CsvSource> for Arc<dyn FileSource> {
 }
 
 impl FileSource for CsvSource {
+    fn config(&self) -> &FileScanConfig {
+        &self.config
+    }
+
+    fn with_config(&self, config: FileScanConfig) -> Arc<dyn FileSource> {
+        let mut this = self.clone();
+        this.config = config;
+
+        Arc::new(this)
+    }
+
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
-        base_config: &FileScanConfig,
         _partition: usize,
     ) -> Arc<dyn FileOpener> {
         Arc::new(CsvOpener {
             config: Arc::new(self.clone()),
-            file_compression_type: base_config.file_compression_type,
+            file_compression_type: self.config.file_compression_type,
             object_store,
         })
     }
@@ -239,39 +248,6 @@ impl FileSource for CsvSource {
         self
     }
 
-    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.batch_size = Some(batch_size);
-        Arc::new(conf)
-    }
-
-    fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.file_schema = Some(schema);
-        Arc::new(conf)
-    }
-
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.projected_statistics = Some(statistics);
-        Arc::new(conf)
-    }
-
-    fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.file_projection = config.file_column_projection_indices();
-        Arc::new(conf)
-    }
-
-    fn metrics(&self) -> &ExecutionPlanMetricsSet {
-        &self.metrics
-    }
-    fn statistics(&self) -> Result<Statistics> {
-        let statistics = &self.projected_statistics;
-        Ok(statistics
-            .clone()
-            .expect("projected_statistics must be set"))
-    }
     fn file_type(&self) -> &str {
         "csv"
     }
@@ -284,18 +260,8 @@ impl FileSource for CsvSource {
         }
     }
 
-    fn with_schema_adapter_factory(
-        &self,
-        schema_adapter_factory: Arc<dyn SchemaAdapterFactory>,
-    ) -> Result<Arc<dyn FileSource>> {
-        Ok(Arc::new(Self {
-            schema_adapter_factory: Some(schema_adapter_factory),
-            ..self.clone()
-        }))
-    }
-
-    fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
-        self.schema_adapter_factory.clone()
+    fn as_data_source(&self) -> Arc<dyn DataSource> {
+        Arc::new(self.clone())
     }
 }
 

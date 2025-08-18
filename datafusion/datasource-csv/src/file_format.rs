@@ -422,20 +422,20 @@ impl FileFormat for CsvFormat {
             .newlines_in_values
             .unwrap_or_else(|| state.config_options().catalog.newlines_in_values);
 
-        let conf_builder = FileScanConfigBuilder::from(conf)
+        let conf = FileScanConfigBuilder::from(conf)
             .with_file_compression_type(self.options.compression.into())
-            .with_newlines_in_values(newlines_in_values);
+            .with_newlines_in_values(newlines_in_values)
+            .build();
 
         let source = Arc::new(
-            CsvSource::new(has_header, self.options.delimiter, self.options.quote)
+            CsvSource::new(has_header, self.options.delimiter, self.options.quote, conf)
                 .with_escape(self.options.escape)
                 .with_terminator(self.options.terminator)
                 .with_comment(self.options.comment),
-        );
+        )
+        .as_data_source();
 
-        let config = conf_builder.with_source(source).build();
-
-        Ok(DataSourceExec::from_data_source(config))
+        Ok(Arc::new(DataSourceExec::new(source)) as Arc<dyn ExecutionPlan>)
     }
 
     async fn create_writer_physical_plan(
@@ -473,10 +473,6 @@ impl FileFormat for CsvFormat {
         let sink = Arc::new(CsvSink::new(conf, writer_options));
 
         Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)
-    }
-
-    fn file_source(&self) -> Arc<dyn FileSource> {
-        Arc::new(CsvSource::default())
     }
 }
 

@@ -36,7 +36,6 @@ use datafusion_common::{
 };
 use datafusion_datasource::{
     compute_all_files_statistics,
-    file::FileSource,
     file_groups::FileGroup,
     file_scan_config::{FileScanConfig, FileScanConfigBuilder},
     schema_adapter::{DefaultSchemaAdapterFactory, SchemaAdapter, SchemaAdapterFactory},
@@ -1112,19 +1111,6 @@ impl ListingTable {
         }
     }
 
-    /// Creates a file source and applies schema adapter factory if available
-    fn create_file_source_with_schema_adapter(&self) -> Result<Arc<dyn FileSource>> {
-        let mut source = self.options.format.file_source();
-        // Apply schema adapter to source if available
-        //
-        // The source will use this SchemaAdapter to adapt data batches as they flow up the plan.
-        // Note: ListingTable also creates a SchemaAdapter in `scan()` but that is only used to adapt collected statistics.
-        if let Some(factory) = &self.schema_adapter_factory {
-            source = source.with_schema_adapter_factory(Arc::clone(factory))?;
-        }
-        Ok(source)
-    }
-
     /// If file_sort_order is specified, creates the appropriate physical expressions
     fn try_create_output_ordering(&self) -> Result<Vec<LexOrdering>> {
         create_ordering(&self.table_schema, &self.options.file_sort_order)
@@ -1233,18 +1219,8 @@ impl TableProvider for ListingTable {
             return Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty()))));
         };
 
-        let file_source = self.create_file_source_with_schema_adapter()?;
-
-        // create the execution plan
-        self.options
-            .format
-            .create_physical_plan(
-                state,
-                FileScanConfigBuilder::new(
-                    object_store_url,
-                    Arc::clone(&self.file_schema),
-                    file_source,
-                )
+        let mut config =
+            FileScanConfigBuilder::new(object_store_url, Arc::clone(&self.file_schema))
                 .with_file_groups(partitioned_file_lists)
                 .with_constraints(self.constraints.clone())
                 .with_statistics(statistics)
@@ -1252,9 +1228,16 @@ impl TableProvider for ListingTable {
                 .with_limit(limit)
                 .with_output_ordering(output_ordering)
                 .with_table_partition_cols(table_partition_cols)
-                .with_expr_adapter(self.expr_adapter_factory.clone())
-                .build(),
-            )
+                .with_expr_adapter(self.expr_adapter_factory.clone());
+
+        if let Some(factory) = &self.schema_adapter_factory {
+            config = config.with_schema_adapter(Some(Arc::clone(factory)));
+        }
+
+        // create the execution plan
+        self.options
+            .format
+            .create_physical_plan(state, config.build())
             .await
     }
 
