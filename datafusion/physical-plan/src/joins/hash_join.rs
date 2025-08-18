@@ -20,7 +20,7 @@
 use std::fmt;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::Poll;
 use std::{any::Any, vec};
 
@@ -517,7 +517,8 @@ pub struct HashJoinExec {
     /// Dynamic filter for pushing down to the probe side
     dynamic_filter: Arc<DynamicFilterPhysicalExpr>,
     /// Shared bounds accumulator for coordinating dynamic filter updates across partitions
-    bounds_accumulator: Arc<SharedBoundsAccumulator>,
+    /// Lazily initialized at execution time to use actual runtime partition counts
+    bounds_accumulator: Arc<OnceLock<Arc<SharedBoundsAccumulator>>>,
 }
 
 impl HashJoinExec {
@@ -566,12 +567,7 @@ impl HashJoinExec {
 
         let dynamic_filter = Self::create_dynamic_filter(&on);
 
-        let bounds_accumulator =
-            Arc::new(SharedBoundsAccumulator::new_from_partition_mode(
-                partition_mode,
-                left.as_ref(),
-                right.as_ref(),
-            ));
+        let bounds_accumulator = Arc::new(OnceLock::new());
 
         Ok(HashJoinExec {
             left,
@@ -953,14 +949,7 @@ impl ExecutionPlan for HashJoinExec {
     ///
     /// This method is called during query optimization when the optimizer creates new
     /// plan nodes. Importantly, it creates a fresh bounds_accumulator via `try_new`
-    /// rather than cloning the existing one, because:
-    ///
-    /// 1. The new child plans may have different partition counts, requiring a new
-    ///    bounds_accumulator with the correct total_partitions count
-    /// 2. The accumulator contains execution state (completed_partitions, bounds)
-    ///    that should be reset for the new execution context
-    /// 3. The dynamic_filter is preserved separately to maintain filter state
-    ///    across plan transformations
+    /// rather than cloning the existing one because partitioning may have changed.
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -998,13 +987,7 @@ impl ExecutionPlan for HashJoinExec {
             null_equality: self.null_equality,
             cache: self.cache.clone(),
             dynamic_filter: Self::create_dynamic_filter(&self.on),
-            bounds_accumulator: Arc::new(
-                SharedBoundsAccumulator::new_from_partition_mode(
-                    self.mode,
-                    self.left.as_ref(),
-                    self.right.as_ref(),
-                ),
-            ),
+            bounds_accumulator: Arc::new(OnceLock::new()),
         }))
     }
 
@@ -1094,6 +1077,15 @@ impl ExecutionPlan for HashJoinExec {
 
         let batch_size = context.session_config().batch_size();
 
+        // Initialize bounds_accumulator lazily with runtime partition counts
+        let bounds_accumulator = Arc::clone(self.bounds_accumulator.get_or_init(|| {
+            Arc::new(SharedBoundsAccumulator::new_from_partition_mode(
+                self.mode,
+                self.left.as_ref(),
+                self.right.as_ref(),
+            ))
+        }));
+
         // we have the batches and the hash map with their keys. We can how create a stream
         // over the right that uses this information to issue new batches.
         let right_stream = self.right.execute(partition, context)?;
@@ -1122,7 +1114,7 @@ impl ExecutionPlan for HashJoinExec {
             batch_size,
             hashes_buffer: vec![],
             right_side_ordered: self.right.output_ordering().is_some(),
-            bounds_accumulator: Arc::clone(&self.bounds_accumulator),
+            bounds_accumulator,
             dynamic_filter: enable_dynamic_filter_pushdown
                 .then_some(Arc::clone(&self.dynamic_filter)),
         }))
