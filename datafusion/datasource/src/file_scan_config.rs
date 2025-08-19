@@ -183,11 +183,10 @@ pub struct FileScanConfig {
     /// Expression adapter used to adapt filters and projections that are pushed down into the scan
     /// from the logical schema to the physical schema of the file.
     pub expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
-
+    /// Optional metrics
     pub metrics: ExecutionPlanMetricsSet,
+    /// Optional user defined schema adapter
     pub schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
-
-    ///
     pub projected_statistics: Statistics,
 }
 

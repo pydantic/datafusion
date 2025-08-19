@@ -760,7 +760,7 @@ impl protobuf::PhysicalPlanNode {
             )?;
 
             let source = AvroSource::new(conf);
-            Ok(DataSourceExec::from_data_source(conf))
+            Ok(DataSourceExec::from_data_source(source))
         }
         #[cfg(not(feature = "avro"))]
         panic!("Unable to process a Avro PhysicalPlan when `avro` feature is not enabled")
