@@ -17,30 +17,32 @@
 
 use crate::{
     file::FileSource, file_scan_config::FileScanConfig, file_stream::FileOpener,
-    schema_adapter::SchemaAdapterFactory,
+    source::DataSource,
 };
 
 use std::sync::Arc;
 
-use arrow::datatypes::{Schema, SchemaRef};
-use datafusion_common::{Result, Statistics};
+use arrow::datatypes::Schema;
+use datafusion_common::Result;
 use datafusion_physical_expr::{expressions::Column, PhysicalExpr};
-use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use object_store::ObjectStore;
 
 /// Minimal [`crate::file::FileSource`] implementation for use in tests.
-#[derive(Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct MockSource {
-    metrics: ExecutionPlanMetricsSet,
-    projected_statistics: Option<Statistics>,
-    schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
+    config: FileScanConfig,
+}
+
+impl MockSource {
+    pub fn new(config: FileScanConfig) -> Self {
+        Self { config }
+    }
 }
 
 impl FileSource for MockSource {
     fn create_file_opener(
         &self,
         _object_store: Arc<dyn ObjectStore>,
-        _base_config: &FileScanConfig,
         _partition: usize,
     ) -> Arc<dyn FileOpener> {
         unimplemented!()
@@ -50,52 +52,23 @@ impl FileSource for MockSource {
         self
     }
 
-    fn with_batch_size(&self, _batch_size: usize) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
-    }
-
-    fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
-    }
-
-    fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
-    }
-
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
-        let mut source = self.clone();
-        source.projected_statistics = Some(statistics);
-        Arc::new(source)
-    }
-
-    fn metrics(&self) -> &ExecutionPlanMetricsSet {
-        &self.metrics
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(self
-            .projected_statistics
-            .as_ref()
-            .expect("projected_statistics must be set")
-            .clone())
-    }
-
     fn file_type(&self) -> &str {
         "mock"
     }
 
-    fn with_schema_adapter_factory(
-        &self,
-        schema_adapter_factory: Arc<dyn SchemaAdapterFactory>,
-    ) -> Result<Arc<dyn FileSource>> {
-        Ok(Arc::new(Self {
-            schema_adapter_factory: Some(schema_adapter_factory),
-            ..self.clone()
-        }))
+    fn config(&self) -> &FileScanConfig {
+        &self.config
     }
 
-    fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
-        self.schema_adapter_factory.clone()
+    fn with_config(&self, config: FileScanConfig) -> Arc<dyn FileSource> {
+        let mut this = self.clone();
+        this.config = config;
+
+        Arc::new(this)
+    }
+
+    fn as_data_source(&self) -> Arc<dyn DataSource> {
+        Arc::new(self.clone())
     }
 }
 

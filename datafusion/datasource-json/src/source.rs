@@ -30,7 +30,7 @@ use datafusion_datasource::decoder::{deserialize_stream, DecoderDeserializer};
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_meta::FileMeta;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
-use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
+use datafusion_datasource::source::DataSource;
 use datafusion_datasource::{
     as_file_source, calculate_range, ListingTableUrl, PartitionedFile, RangeCalculation,
 };
@@ -38,11 +38,9 @@ use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 use arrow::json::ReaderBuilder;
 use arrow::{datatypes::SchemaRef, json};
-use datafusion_common::Statistics;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_execution::TaskContext;
-use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 
 use futures::{StreamExt, TryStreamExt};
 use object_store::buffered::BufWriter;
@@ -75,18 +73,15 @@ impl JsonOpener {
 }
 
 /// JsonSource holds the extra configuration that is necessary for [`JsonOpener`]
-#[derive(Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct JsonSource {
-    batch_size: Option<usize>,
-    metrics: ExecutionPlanMetricsSet,
-    projected_statistics: Option<Statistics>,
-    schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
+    config: FileScanConfig,
 }
 
 impl JsonSource {
     /// Initialize a JsonSource with default values
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(config: FileScanConfig) -> Self {
+        Self { config }
     }
 }
 
@@ -97,18 +92,29 @@ impl From<JsonSource> for Arc<dyn FileSource> {
 }
 
 impl FileSource for JsonSource {
+    fn config(&self) -> &FileScanConfig {
+        &self.config
+    }
+
+    fn with_config(&self, config: FileScanConfig) -> Arc<dyn FileSource> {
+        let mut this = self.clone();
+        this.config = config;
+
+        Arc::new(this)
+    }
+
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
-        base_config: &FileScanConfig,
         _partition: usize,
     ) -> Arc<dyn FileOpener> {
         Arc::new(JsonOpener {
             batch_size: self
+                .config
                 .batch_size
                 .expect("Batch size must set before creating opener"),
-            projected_schema: base_config.projected_file_schema(),
-            file_compression_type: base_config.file_compression_type,
+            projected_schema: self.config.projected_file_schema(),
+            file_compression_type: self.config.file_compression_type,
             object_store,
         })
     }
@@ -117,52 +123,17 @@ impl FileSource for JsonSource {
         self
     }
 
-    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.batch_size = Some(batch_size);
-        Arc::new(conf)
-    }
-
+    // why is this a no op?
     fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
         Arc::new(Self { ..self.clone() })
-    }
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.projected_statistics = Some(statistics);
-        Arc::new(conf)
-    }
-
-    fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
-    }
-
-    fn metrics(&self) -> &ExecutionPlanMetricsSet {
-        &self.metrics
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        let statistics = &self.projected_statistics;
-        Ok(statistics
-            .clone()
-            .expect("projected_statistics must be set to call"))
     }
 
     fn file_type(&self) -> &str {
         "json"
     }
 
-    fn with_schema_adapter_factory(
-        &self,
-        schema_adapter_factory: Arc<dyn SchemaAdapterFactory>,
-    ) -> Result<Arc<dyn FileSource>> {
-        Ok(Arc::new(Self {
-            schema_adapter_factory: Some(schema_adapter_factory),
-            ..self.clone()
-        }))
-    }
-
-    fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
-        self.schema_adapter_factory.clone()
+    fn as_data_source(&self) -> Arc<dyn DataSource> {
+        Arc::new(self.clone())
     }
 }
 

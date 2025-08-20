@@ -92,12 +92,13 @@ pub fn scan_partitioned_csv(
         FileCompressionType::UNCOMPRESSED,
         work_dir,
     )?;
-    let source = Arc::new(CsvSource::new(true, b'"', b'"'));
-    let config =
-        FileScanConfigBuilder::from(partitioned_csv_config(schema, file_groups, source))
-            .with_file_compression_type(FileCompressionType::UNCOMPRESSED)
-            .build();
-    Ok(DataSourceExec::from_data_source(config))
+    let config = FileScanConfigBuilder::from(partitioned_csv_config(schema, file_groups))
+        .with_file_compression_type(FileCompressionType::UNCOMPRESSED)
+        .build();
+
+    Ok(DataSourceExec::from_data_source(CsvSource::new(
+        true, b'"', b'"', config,
+    )))
 }
 
 /// Returns file groups [`Vec<FileGroup>`] for scanning `partitions` of `filename`

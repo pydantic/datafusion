@@ -157,6 +157,8 @@ impl SchemaMapper for UppercaseSchemaMapper {
 #[cfg(feature = "parquet")]
 #[tokio::test]
 async fn test_parquet_integration_with_schema_adapter() -> Result<()> {
+    use datafusion::config::TableParquetOptions;
+
     // Create test data
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
@@ -182,22 +184,23 @@ async fn test_parquet_integration_with_schema_adapter() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_object_store(store_url.as_ref(), Arc::clone(&store));
 
-    // Create a ParquetSource with the adapter factory
-    let file_source = ParquetSource::default()
-        .with_schema_adapter_factory(Arc::new(UppercaseAdapterFactory {}))?;
-
     // Create a table schema with uppercase column names
     let table_schema = Arc::new(Schema::new(vec![
         Field::new("ID", DataType::Int32, false),
         Field::new("NAME", DataType::Utf8, true),
     ]));
 
-    let config = FileScanConfigBuilder::new(store_url, table_schema.clone(), file_source)
+    let config = FileScanConfigBuilder::new(store_url, table_schema.clone())
         .with_file(PartitionedFile::new(path, file_size))
         .build();
 
+    // Create a ParquetSource with the adapter factory
+    let file_source = ParquetSource::new(TableParquetOptions::default(), config)
+        .with_schema_adapter_factory(Arc::new(UppercaseAdapterFactory {}))?
+        .as_data_source();
+
     // Create a data source executor
-    let exec = DataSourceExec::from_data_source(config);
+    let exec = Arc::new(DataSourceExec::new(file_source));
 
     // Collect results
     let task_ctx = ctx.task_ctx();
@@ -220,6 +223,8 @@ async fn test_parquet_integration_with_schema_adapter() -> Result<()> {
 async fn test_parquet_integration_with_schema_adapter_and_expression_rewriter(
 ) -> Result<()> {
     // Create test data
+
+    use datafusion::config::TableParquetOptions;
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -244,16 +249,16 @@ async fn test_parquet_integration_with_schema_adapter_and_expression_rewriter(
     let ctx = SessionContext::new();
     ctx.register_object_store(store_url.as_ref(), Arc::clone(&store));
 
-    // Create a ParquetSource with the adapter factory
-    let file_source = ParquetSource::default()
-        .with_schema_adapter_factory(Arc::new(UppercaseAdapterFactory {}))?;
-
-    let config = FileScanConfigBuilder::new(store_url, batch.schema(), file_source)
+    let config = FileScanConfigBuilder::new(store_url, batch.schema())
         .with_file(PartitionedFile::new(path, file_size))
         .build();
 
+    // Create a ParquetSource with the adapter factory
+    let file_source = ParquetSource::new(TableParquetOptions::default(), config)
+        .with_schema_adapter_factory(Arc::new(UppercaseAdapterFactory {}))?;
+
     // Create a data source executor
-    let exec = DataSourceExec::from_data_source(config);
+    let exec = Arc::new(DataSourceExec::new(file_source.as_data_source()));
 
     // Collect results
     let task_ctx = ctx.task_ctx();
@@ -273,6 +278,11 @@ async fn test_parquet_integration_with_schema_adapter_and_expression_rewriter(
 
 #[tokio::test]
 async fn test_multi_source_schema_adapter_reuse() -> Result<()> {
+    let config = FileScanConfigBuilder::new(
+        ObjectStoreUrl::local_filesystem(),
+        Arc::new(Schema::empty()),
+    );
+
     // This test verifies that the same schema adapter factory can be reused
     // across different file source types. This is important for ensuring that:
     // 1. The schema adapter factory interface works uniformly across all source types
@@ -284,7 +294,7 @@ async fn test_multi_source_schema_adapter_reuse() -> Result<()> {
 
     // Test ArrowSource
     {
-        let source = ArrowSource::default();
+        let source = ArrowSource::new(config.clone().build());
         let source_with_adapter = source
             .clone()
             .with_schema_adapter_factory(factory.clone())
@@ -304,7 +314,10 @@ async fn test_multi_source_schema_adapter_reuse() -> Result<()> {
     // Test ParquetSource
     #[cfg(feature = "parquet")]
     {
-        let source = ParquetSource::default();
+        use datafusion::config::TableParquetOptions;
+
+        let source =
+            ParquetSource::new(TableParquetOptions::default(), config.clone().build());
         let source_with_adapter = source
             .clone()
             .with_schema_adapter_factory(factory.clone())
@@ -323,7 +336,7 @@ async fn test_multi_source_schema_adapter_reuse() -> Result<()> {
 
     // Test CsvSource
     {
-        let source = CsvSource::default();
+        let source = CsvSource::new(false, 0, 0, config.clone().build());
         let source_with_adapter = source
             .clone()
             .with_schema_adapter_factory(factory.clone())
@@ -342,7 +355,7 @@ async fn test_multi_source_schema_adapter_reuse() -> Result<()> {
 
     // Test JsonSource
     {
-        let source = JsonSource::default();
+        let source = JsonSource::new(config.clone().build());
         let source_with_adapter = source
             .clone()
             .with_schema_adapter_factory(factory.clone())

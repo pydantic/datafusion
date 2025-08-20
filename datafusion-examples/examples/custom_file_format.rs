@@ -29,7 +29,7 @@ use datafusion::{
             csv::CsvFormatFactory, file_compression_type::FileCompressionType,
             FileFormat, FileFormatFactory,
         },
-        physical_plan::{FileScanConfig, FileSinkConfig, FileSource},
+        physical_plan::{FileScanConfig, FileSinkConfig},
         MemTable,
     },
     error::Result,
@@ -126,10 +126,6 @@ impl FileFormat for TSVFileFormat {
         self.csv_file_format
             .create_writer_physical_plan(input, state, conf, order_requirements)
             .await
-    }
-
-    fn file_source(&self) -> Arc<dyn FileSource> {
-        self.csv_file_format.file_source()
     }
 }
 
