@@ -20,12 +20,6 @@
 //! of a projection on table `t1` where the expressions `a`, `b`, and `a+b` are the
 //! projection expressions. `SELECT` without `FROM` will only evaluate expressions.
 
-use std::any::Any;
-use std::collections::HashMap;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-
 use super::expressions::{Column, Literal};
 use super::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use super::{
@@ -39,6 +33,11 @@ use crate::filter_pushdown::{
 };
 use crate::joins::utils::{ColumnIndex, JoinFilter, JoinOn, JoinOnRef};
 use crate::{ColumnStatistics, DisplayFormatType, ExecutionPlan, PhysicalExpr};
+use std::any::Any;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -74,11 +73,14 @@ pub struct ProjectionExec {
 
 impl ProjectionExec {
     /// Create a projection on an input
-    pub fn try_new(
-        expr: Vec<ProjectionExpr>,
-        input: Arc<dyn ExecutionPlan>,
-    ) -> Result<Self> {
+    pub fn try_new<I, E>(expr: I, input: Arc<dyn ExecutionPlan>) -> Result<Self>
+    where
+        I: IntoIterator<Item = E>,
+        E: Into<ProjectionExpr>,
+    {
         let input_schema = input.schema();
+        // convert argument to Vec<ProjectionExpr>
+        let expr = expr.into_iter().map(Into::into).collect::<Vec<_>>();
 
         let fields: Result<Vec<Field>> = expr
             .iter()
@@ -154,6 +156,14 @@ impl ProjectionExec {
     }
 }
 
+/// A projection expression that is created by [`ProjectionExec`]
+///
+/// The expression is evaluated and the result is stored in a column
+/// with the name specified by `alias`.
+///
+/// For example, the SQL expression `a + b AS sum_ab` would be represented
+/// as a `ProjectionExpr` where `expr` is the expression `a + b`
+/// and `alias` is the string `sum_ab`.
 #[derive(Debug, Clone)]
 pub struct ProjectionExpr {
     /// The expression that will be evaluated.
@@ -166,6 +176,12 @@ impl ProjectionExpr {
     /// Create a new projection expression
     pub fn new(expr: Arc<dyn PhysicalExpr>, alias: String) -> Self {
         Self { expr, alias }
+    }
+}
+
+impl From<(Arc<dyn PhysicalExpr>, String)> for ProjectionExpr {
+    fn from(value: (Arc<dyn PhysicalExpr>, String)) -> Self {
+        Self::new(value.0, value.1)
     }
 }
 
@@ -789,8 +805,7 @@ pub fn new_join_children(
             .map(|(col, alias)| ProjectionExpr {
                 expr: Arc::new(Column::new(col.name(), col.index())) as _,
                 alias: alias.clone(),
-            })
-            .collect(),
+            }),
         Arc::clone(left_child),
     )?;
     let left_size = left_child.schema().fields().len() as i32;
@@ -807,8 +822,7 @@ pub fn new_join_children(
                     )) as _,
                     alias: alias.clone(),
                 }
-            })
-            .collect(),
+            }),
         Arc::clone(right_child),
     )?;
 
@@ -1182,7 +1196,7 @@ mod tests {
         let exec = test::scan_partitioned(1);
         let expected = collect(exec.execute(0, Arc::clone(&task_ctx))?).await?;
 
-        let projection = ProjectionExec::try_new(vec![], exec)?;
+        let projection = ProjectionExec::try_new(vec![] as Vec<ProjectionExpr>, exec)?;
         let stream = projection.execute(0, Arc::clone(&task_ctx))?;
         let output = collect(stream).await?;
         assert_eq!(output.len(), expected.len());
