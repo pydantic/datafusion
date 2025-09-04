@@ -56,7 +56,10 @@ use datafusion_physical_expr_common::sort_expr::{LexOrdering, LexRequirement};
 use futures::stream::{Stream, StreamExt};
 use log::trace;
 
-/// Execution plan for a projection
+/// [`ExecutionPlan`] for a projection
+///
+/// Computes a set of scalar value expressions for each input row, producing one
+/// output row for each input row.
 #[derive(Debug, Clone)]
 pub struct ProjectionExec {
     /// The projection expressions stored as tuples of (expression, output column name)
@@ -73,6 +76,50 @@ pub struct ProjectionExec {
 
 impl ProjectionExec {
     /// Create a projection on an input
+    ///
+    /// # Example:
+    /// Create a `ProjectionExec` to crate `SELECT a, a+b AS sum_ab FROM t1`:
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_schema::{Schema, Field, DataType};
+    /// # use datafusion_expr::Operator;
+    /// # use datafusion_physical_plan::ExecutionPlan;
+    /// # use datafusion_physical_expr::expressions::{col, binary};
+    /// # use datafusion_physical_plan::empty::EmptyExec;
+    /// # use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
+    /// # fn schema() -> Arc<Schema> {
+    /// #  Arc::new(Schema::new(vec![
+    /// #   Field::new("a", DataType::Int32, false),
+    /// #   Field::new("b", DataType::Int32, false),
+    /// # ]))
+    /// # }
+    /// #
+    /// # fn input() -> Arc<dyn ExecutionPlan> {
+    /// #  Arc::new(EmptyExec::new(schema()))
+    /// # }
+    /// #
+    /// # fn main() {
+    /// let schema = schema();
+    /// // Create PhysicalExprs
+    /// let a = col("a", &schema).unwrap();
+    /// let b = col("b", &schema).unwrap();
+    /// let a_plus_b = binary(Arc::clone(&a), Operator::Plus, b, &schema).unwrap();
+    /// // create ProjectionExec
+    /// let proj = ProjectionExec::try_new([
+    ///     ProjectionExpr {
+    ///       // expr a produces the column named "a"
+    ///       expr: a,
+    ///       alias: "a".to_string(),
+    ///     },
+    ///     ProjectionExpr {
+    ///       // expr: a + b produces the column named "sum_ab"
+    ///       expr: a_plus_b,
+    ///       alias: "sum_ab".to_string(),
+    ///     }
+    ///   ], input()).unwrap();
+    /// # }
+    /// ```
     pub fn try_new<I, E>(expr: I, input: Arc<dyn ExecutionPlan>) -> Result<Self>
     where
         I: IntoIterator<Item = E>,
@@ -1113,7 +1160,7 @@ mod tests {
     use datafusion_common::ScalarValue;
 
     use datafusion_expr::Operator;
-    use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
+    use datafusion_physical_expr::expressions::{col, BinaryExpr, Column, Literal};
 
     #[test]
     fn test_collect_column_indices() -> Result<()> {
@@ -1202,6 +1249,23 @@ mod tests {
         assert_eq!(output.len(), expected.len());
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_old_syntax() {
+        let exec = test::scan_partitioned(1);
+        let schema = exec.schema();
+        let expr = col("i", &schema).unwrap();
+        ProjectionExec::try_new(
+            vec![
+                // use From impl of ProjectionExpr to create ProjectionExpr
+                // to test old syntax
+                (expr, "c".to_string()),
+            ],
+            exec,
+        )
+        // expect this to succeed
+        .unwrap();
     }
 
     fn get_stats() -> Statistics {
