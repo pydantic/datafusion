@@ -32,6 +32,7 @@ use datafusion_common::{not_impl_err, Result, Statistics};
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_physical_plan::projection::ProjectionExpr;
 use datafusion_physical_plan::DisplayFormatType;
 
 use object_store::ObjectStore;
@@ -66,13 +67,15 @@ pub trait FileSource: Send + Sync {
     /// Initialize new instance with a new schema
     fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource>;
     /// Initialize new instance with projection information
-    fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource>;
+    fn with_projection(&self, projection: &[ProjectionExpr]) -> Option<Arc<dyn FileSource>>;
     /// Initialize new instance with projected statistics
     fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource>;
     /// Returns the filter expression that will be applied during the file scan.
     fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
         None
     }
+    /// Get the current projection that applied to the *table schema* represents the output of this file scan.
+    fn projection(&self) -> Option<&[ProjectionExpr]>;
     /// Return execution plan metrics
     fn metrics(&self) -> &ExecutionPlanMetricsSet;
     /// Return projected statistics
