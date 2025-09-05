@@ -24,9 +24,9 @@ use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 
 use datafusion_common::tree_node::Transformed;
-use datafusion_common::Result;
-use datafusion_expr::logical_plan::{LogicalPlan, TableScan};
-use datafusion_expr::{Expr, SortExpr};
+use datafusion_common::{internal_err, Result};
+use datafusion_expr::logical_plan::LogicalPlan;
+use datafusion_expr::{Expr, Sort, SortExpr};
 
 /// Optimization rule that pushes sort expressions down to table scans
 /// when the sort can potentially be optimized by the table provider.
@@ -110,46 +110,47 @@ impl OptimizerRule for PushDownSort {
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         // Look for Sort -> TableScan pattern
-        let LogicalPlan::Sort(sort) = &plan else {
+        let LogicalPlan::Sort(sort) = plan else {
             return Ok(Transformed::no(plan));
         };
 
-        let LogicalPlan::TableScan(table_scan) = sort.input.as_ref() else {
-            return Ok(Transformed::no(plan));
+        let Sort { expr, input, fetch } = sort;
+
+        let LogicalPlan::TableScan(table_scan) = input.as_ref() else {
+            return Ok(Transformed::no(LogicalPlan::Sort(Sort {
+                expr,
+                input,
+                fetch,
+            })));
         };
 
-        // Check if we can push down the sort expressions
-        if !Self::can_pushdown_sort_exprs(&sort.expr) {
-            return Ok(Transformed::no(plan));
+        // Check if
+        // 1. we can push down the sort expressions
+        // 2. The TableScan doesn't already have a preferred ordering (This preserves any existing sort preferences from other optimizations)
+        if !Self::can_pushdown_sort_exprs(&expr)
+            || table_scan.preferred_ordering.is_some()
+        {
+            return Ok(Transformed::no(LogicalPlan::Sort(Sort {
+                expr,
+                input,
+                fetch,
+            })));
         }
 
-        // If the table scan already has preferred ordering, don't overwrite it
-        // This preserves any existing sort preferences from other optimizations
-        if table_scan.preferred_ordering.is_some() {
-            return Ok(Transformed::no(plan));
-        }
-
-        // Create new TableScan with preferred ordering
-        let new_table_scan = TableScan {
-            table_name: table_scan.table_name.clone(),
-            source: Arc::clone(&table_scan.source),
-            projection: table_scan.projection.clone(),
-            projected_schema: Arc::clone(&table_scan.projected_schema),
-            filters: table_scan.filters.clone(),
-            fetch: table_scan.fetch,
-            preferred_ordering: Some(sort.expr.clone()),
+        // Update TableScan with preferred ordering
+        // Safe to unwrap because we just checked the variant. Clone to modify.
+        let LogicalPlan::TableScan(mut table_scan) = Arc::unwrap_or_clone(input) else {
+            return internal_err!("Failed to unwrap TableScan input in PushDownSort");
         };
+        table_scan.preferred_ordering = Some(expr.clone());
 
         // Preserve the Sort node as a fallback while passing the ordering
         // preference to the TableScan as an optimization hint
-        let new_sort = datafusion_expr::logical_plan::Sort {
-            expr: sort.expr.clone(),
-            input: Arc::new(LogicalPlan::TableScan(new_table_scan)),
-            fetch: sort.fetch,
-        };
-        let new_plan = LogicalPlan::Sort(new_sort);
-
-        Ok(Transformed::yes(new_plan))
+        Ok(Transformed::yes(LogicalPlan::Sort(Sort {
+            expr,
+            input: Arc::new(LogicalPlan::TableScan(table_scan)),
+            fetch,
+        })))
     }
 
     fn name(&self) -> &str {
