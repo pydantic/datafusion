@@ -244,7 +244,7 @@ impl Optimizer {
             // Filters can't be pushed down past Limits, we should do PushDownFilter after PushDownLimit
             Arc::new(PushDownLimit::new()),
             // Sort pushdown should happen before filter pushdown to maximize optimization opportunities
-            Arc::new(PushDownSort::new()),
+            Arc::new(PushDownSort::default()),
             Arc::new(PushDownFilter::new()),
             Arc::new(SingleDistinctToGroupBy::new()),
             // The previous optimizations added expressions and projections,
