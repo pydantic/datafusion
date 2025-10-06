@@ -495,6 +495,13 @@ config_namespace! {
         /// tables with a highly-selective join filter, but is also slightly slower.
         pub enforce_batch_size_in_joins: bool, default = false
 
+        /// Number of batches to prefetch and buffer in PrefetchExec.
+        /// Higher values can improve performance by pipelining data fetching,
+        /// but consume more memory.
+        /// Set to 1 to disable prefetching.
+        /// By default prefetching is disabled.
+        pub prefetch_depth: usize, default = 1
+
         /// Size (bytes) of data buffer DataFusion uses when writing output files.
         /// This affects the size of the data chunks that are uploaded to remote
         /// object stores (e.g. AWS S3). If very large (>= 100 GiB) output files are being
