@@ -1290,6 +1290,11 @@ impl TableProvider for ListingTable {
             )
             .await?;
 
+        // Wrap with PrefetchExec for async prefetching with memory-aware spilling
+        let plan = Arc::new(datafusion_physical_plan::prefetch::PrefetchExec::try_new(
+            plan,
+        )?);
+
         Ok(ScanResult::new(plan))
     }
 
