@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Execution plan for prefetching RecordBatches with memory-aware spilling
+//! Execution plan for prefetching RecordBatches
 
 use std::any::Any;
 use std::fmt;
@@ -25,30 +25,18 @@ use std::task::{Context, Poll};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{exec_datafusion_err, internal_err, Result};
+use datafusion_common::{internal_err, Result};
 use datafusion_common_runtime::SpawnedTask;
-use datafusion_execution::disk_manager::RefCountedTempFile;
-use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use futures::stream::{Stream, StreamExt};
 
-use crate::common::SharedMemoryReservation;
 use crate::execution_plan::ExecutionPlanProperties;
+use crate::filter_pushdown::{FilterDescription, FilterPushdownPropagation};
 use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
-use crate::spill::get_record_batch_memory_size;
-use crate::spill::spill_manager::SpillManager;
 use crate::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics};
 
 /// Number of batches to prefetch
 const PREFETCH_BUFFER_SIZE: usize = 3;
-
-/// Represents a buffered item - either in memory or spilled to disk
-enum BufferedBatch {
-    /// Batch is in memory (with its memory size for tracking)
-    InMemory { batch: RecordBatch, size: usize },
-    /// Batch was spilled to disk
-    Spilled { file: RefCountedTempFile },
-}
 
 /// Execution plan that prefetches RecordBatches from its child with memory-aware spilling
 ///
@@ -142,51 +130,30 @@ impl ExecutionPlan for PrefetchExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        eprintln!("[PrefetchExec] execute() partition {}", partition);
-        log::trace!("PrefetchExec: execute partition {}", partition);
+            // eprintln!("[PrefetchExec] execute() partition {}", partition);
+            // log::trace!("PrefetchExec: execute partition {}", partition);
 
         // Get input stream
         let input_stream = self.input.execute(partition, Arc::clone(&context))?;
         let schema = input_stream.schema();
-        eprintln!("[PrefetchExec] Got input stream for partition {}", partition);
-
-        // Create memory reservation for this partition
-        let reservation = MemoryConsumer::new(format!("PrefetchExec[{partition}]"))
-            .with_can_spill(true)
-            .register(context.memory_pool());
-
-        // Create spill manager for this partition
-        let spill_metrics = crate::metrics::SpillMetrics::new(&self.metrics, partition);
-        let spill_manager = Arc::new(SpillManager::new(
-            context.runtime_env(),
-            spill_metrics,
-            Arc::clone(&schema),
-        ));
+        // eprintln!("[PrefetchExec] Got input stream for partition {}", partition);
 
         // Create channel for communication between background task and stream
         let (tx, rx) = tokio::sync::mpsc::channel(PREFETCH_BUFFER_SIZE);
 
-        // Wrap reservation in Arc<Mutex<>> for thread-safe sharing
-        let shared_reservation = Arc::new(parking_lot::Mutex::new(reservation));
-
-        eprintln!("[PrefetchExec] About to spawn background task for partition {}", partition);
+        // eprintln!("[PrefetchExec] About to spawn background task for partition {}", partition);
         // Spawn background prefetch task
         let task = SpawnedTask::spawn(prefetch_task(
             partition,
             input_stream,
             tx,
-            Arc::clone(&shared_reservation),
-            Arc::clone(&spill_manager),
         ));
-        eprintln!("[PrefetchExec] Spawned background task for partition {}", partition);
+        // eprintln!("[PrefetchExec] Spawned background task for partition {}", partition);
 
         // Return stream that reads from channel
         Ok(Box::pin(PrefetchStream {
             schema,
             receiver: rx,
-            spill_manager,
-            spill_stream: None,
-            reservation: shared_reservation,
             _task: task,
             partition_id: partition,
         }))
@@ -196,12 +163,75 @@ impl ExecutionPlan for PrefetchExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        self.input.partition_statistics(None)
-    }
-
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
         self.input.partition_statistics(partition)
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn cardinality_effect(&self) -> crate::execution_plan::CardinalityEffect {
+        self.input.cardinality_effect()
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: crate::filter_pushdown::FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn datafusion_physical_expr::PhysicalExpr>>,
+        _config: &datafusion_common::config::ConfigOptions,
+    ) -> Result<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: crate::filter_pushdown::FilterPushdownPhase,
+        child_pushdown_result: crate::filter_pushdown::ChildPushdownResult,
+        _config: &datafusion_common::config::ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.input.fetch()
+    }
+
+    fn repartitioned(
+        &self,
+        target_partitions: usize,
+        config: &datafusion_common::config::ConfigOptions,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        self.input.repartitioned(target_partitions, config).map(|opt| {
+            opt.map(|new_input| {
+                Arc::new(PrefetchExec::try_new(new_input).unwrap())
+                    as Arc<dyn ExecutionPlan>
+            })
+        })
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        self.input.supports_limit_pushdown()
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        projection: &crate::projection::ProjectionExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        self.input
+            .try_swapping_with_projection(projection)
+            .map(|opt| {
+                opt.map(|new_input| {
+                    Arc::new(PrefetchExec::try_new(new_input).unwrap())
+                        as Arc<dyn ExecutionPlan>
+                })
+            })
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        self.input.with_fetch(limit).map(|new_input| {
+            Arc::new(PrefetchExec::try_new(new_input).unwrap()) as Arc<dyn ExecutionPlan>
+        })
     }
 }
 
@@ -209,85 +239,29 @@ impl ExecutionPlan for PrefetchExec {
 async fn prefetch_task(
     partition: usize,
     mut input: SendableRecordBatchStream,
-    tx: tokio::sync::mpsc::Sender<Result<BufferedBatch>>,
-    reservation: SharedMemoryReservation,
-    spill_manager: Arc<SpillManager>,
+    tx: tokio::sync::mpsc::Sender<Result<RecordBatch>>,
 ) -> Result<()> {
-    eprintln!("[PrefetchTask partition {}] Task started, waiting for batches...", partition);
-    log::trace!("PrefetchTask: starting background task");
+    // eprintln!("[PrefetchTask partition {}] Task started, waiting for batches...", partition);
+    // log::trace!("PrefetchTask: starting background task");
     let mut batch_count = 0;
 
     while let Some(batch_result) = input.next().await {
         batch_count += 1;
-        eprintln!("[PrefetchTask partition {}] Received batch #{}", partition, batch_count);
+        // eprintln!("[PrefetchTask partition {}] Received batch #{}", partition, batch_count);
 
-        match batch_result {
-            Ok(batch) => {
-                let batch_size = get_record_batch_memory_size(&batch);
-                log::trace!(
-                    "PrefetchTask: received batch #{} ({} bytes)",
-                    batch_count,
-                    batch_size
-                );
-
-                // Try to allocate memory for this batch
-                let in_memory = reservation.lock().try_grow(batch_size).is_ok();
-
-                let to_send = if in_memory {
-                    log::trace!("PrefetchTask: keeping batch #{} in memory", batch_count);
-                    // Successfully allocated - send in memory with size for consumer to free
-                    BufferedBatch::InMemory {
-                        batch,
-                        size: batch_size,
-                    }
-                } else {
-                    log::debug!(
-                        "PrefetchTask: spilling batch #{} ({} bytes) to disk",
-                        batch_count,
-                        batch_size
-                    );
-                    // Can't allocate - spill THIS batch (not an old one) to disk
-                    match spill_manager.spill_record_batch_and_finish(
-                        std::slice::from_ref(&batch),
-                        "PrefetchExec",
-                    )? {
-                        Some(spill_file) => BufferedBatch::Spilled { file: spill_file },
-                        None => {
-                            return Err(exec_datafusion_err!(
-                                "PrefetchExec: Failed to spill batch to disk"
-                            ));
-                        }
-                    }
-                };
-
-                eprintln!("[PrefetchTask partition {}] Sending batch to channel...", partition);
-                // Send to channel - blocks if channel is full (natural backpressure!)
-                if tx.send(Ok(to_send)).await.is_err() {
-                    eprintln!("[PrefetchTask partition {}] Receiver dropped, stopping", partition);
-                    log::trace!("PrefetchTask: receiver dropped, stopping");
-                    // Receiver dropped (e.g., LIMIT reached)
-                    // Batch won't be consumed, so free the memory now
-                    if in_memory {
-                        reservation.lock().shrink(batch_size);
-                    }
-                    return Ok(());
-                }
-
-                eprintln!("[PrefetchTask partition {}] Successfully sent batch", partition);
-                // Successfully sent - DON'T free yet!
-                // Consumer will free when it receives the batch
-            }
-            Err(e) => {
-                log::debug!("PrefetchTask: error from input: {}", e);
-                // Propagate error downstream
-                let _ = tx.send(Err(e)).await;
-                return Ok(());
-            }
+        // Send batch to channel - blocks if channel is full (natural backpressure!)
+        if tx.send(batch_result).await.is_err() {
+            // eprintln!("[PrefetchTask partition {}] Receiver dropped, stopping", partition);
+            // log::trace!("PrefetchTask: receiver dropped, stopping");
+            // Receiver dropped (e.g., LIMIT reached)
+            return Ok(());
         }
+
+        // eprintln!("[PrefetchTask partition {}] Successfully sent batch", partition);
     }
 
-    eprintln!("[PrefetchTask partition {}] Input stream exhausted after {} batches", partition, batch_count);
-    log::trace!("PrefetchTask: input stream exhausted after {} batches", batch_count);
+    // eprintln!("[PrefetchTask partition {}] Input stream exhausted after {} batches", partition, batch_count);
+    // log::trace!("PrefetchTask: input stream exhausted after {} batches", batch_count);
     Ok(())
 }
 
@@ -295,14 +269,8 @@ async fn prefetch_task(
 struct PrefetchStream {
     /// Schema of the stream
     schema: SchemaRef,
-    /// Channel receiver for batches (in-memory or spilled)
-    receiver: tokio::sync::mpsc::Receiver<Result<BufferedBatch>>,
-    /// Spill manager for reading spilled batches
-    spill_manager: Arc<SpillManager>,
-    /// Currently reading from a spilled batch
-    spill_stream: Option<SendableRecordBatchStream>,
-    /// Memory reservation (to free when consuming batches)
-    reservation: SharedMemoryReservation,
+    /// Channel receiver for batches
+    receiver: tokio::sync::mpsc::Receiver<Result<RecordBatch>>,
     /// Background task handle (keeps task alive)
     _task: SpawnedTask<Result<()>>,
     /// For debugging
@@ -311,10 +279,10 @@ struct PrefetchStream {
 
 impl Drop for PrefetchStream {
     fn drop(&mut self) {
-        eprintln!("[PrefetchStream partition {}] DROP CALLED - closing channel and aborting task", self.partition_id);
+        // eprintln!("[PrefetchStream partition {}] DROP CALLED - closing channel and aborting task", self.partition_id);
         // Close the receiver to signal the background task to stop
         self.receiver.close();
-        eprintln!("[PrefetchStream partition {}] Channel closed, task will be aborted when _task drops", self.partition_id);
+        // eprintln!("[PrefetchStream partition {}] Channel closed, task will be aborted when _task drops", self.partition_id);
     }
 }
 
@@ -325,65 +293,24 @@ impl Stream for PrefetchStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        eprintln!("[PrefetchStream partition {}] poll_next called", self.partition_id);
-
-        // If we're currently reading from a spilled stream, continue with that
-        if let Some(spill_stream) = &mut self.spill_stream {
-            match spill_stream.poll_next_unpin(cx) {
-                Poll::Ready(Some(batch)) => {
-                    log::trace!("PrefetchStream: got batch from spill stream");
-                    eprintln!("[PrefetchStream partition {}] Returning batch from spill", self.partition_id);
-                    return Poll::Ready(Some(batch));
-                }
-                Poll::Ready(None) => {
-                    log::trace!("PrefetchStream: spill stream exhausted");
-                    eprintln!("[PrefetchStream partition {}] Spill stream exhausted", self.partition_id);
-                    // Finished reading this spilled stream
-                    self.spill_stream = None;
-                    // Fall through to get next item from channel
-                }
-                Poll::Pending => {
-                    eprintln!("[PrefetchStream partition {}] Spill stream pending", self.partition_id);
-                    return Poll::Pending;
-                }
-            }
-        }
+        // eprintln!("[PrefetchStream partition {}] poll_next called", self.partition_id);
 
         // Poll channel for next buffered batch
         match self.receiver.poll_recv(cx) {
-            Poll::Ready(Some(Ok(BufferedBatch::InMemory { batch, size }))) => {
-                log::trace!("PrefetchStream: received in-memory batch ({} bytes)", size);
-                eprintln!("[PrefetchStream partition {}] Returning in-memory batch ({} bytes)", self.partition_id, size);
-                // Free the memory now that consumer is receiving it
-                self.reservation.lock().shrink(size);
-                Poll::Ready(Some(Ok(batch)))
-            }
-            Poll::Ready(Some(Ok(BufferedBatch::Spilled { file }))) => {
-                log::debug!("PrefetchStream: received spilled batch, starting read");
-                eprintln!("[PrefetchStream partition {}] Starting spill read", self.partition_id);
-                // Start reading from spilled file
-                match self.spill_manager.read_spill_as_stream(file, None) {
-                    Ok(stream) => {
-                        self.spill_stream = Some(stream);
-                        // Recursively poll to read first batch from spill stream
-                        self.poll_next(cx)
-                    }
-                    Err(e) => {
-                        eprintln!("[PrefetchStream partition {}] Spill read error: {:?}", self.partition_id, e);
-                        Poll::Ready(Some(Err(e)))
-                    }
+            Poll::Ready(Some(batch_result)) => {
+                if batch_result.is_ok() {
+                    // eprintln!("[PrefetchStream partition {}] Returning batch", self.partition_id);
+                } else {
+                    // eprintln!("[PrefetchStream partition {}] Returning error", self.partition_id);
                 }
-            }
-            Poll::Ready(Some(Err(e))) => {
-                eprintln!("[PrefetchStream partition {}] Channel error: {:?}", self.partition_id, e);
-                Poll::Ready(Some(Err(e)))
+                Poll::Ready(Some(batch_result))
             }
             Poll::Ready(None) => {
-                eprintln!("[PrefetchStream partition {}] Channel closed, stream complete", self.partition_id);
+                // eprintln!("[PrefetchStream partition {}] Channel closed, stream complete", self.partition_id);
                 Poll::Ready(None)
             }
             Poll::Pending => {
-                eprintln!("[PrefetchStream partition {}] Channel pending", self.partition_id);
+                // eprintln!("[PrefetchStream partition {}] Channel pending", self.partition_id);
                 Poll::Pending
             }
         }
