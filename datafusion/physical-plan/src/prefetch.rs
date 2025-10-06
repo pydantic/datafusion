@@ -180,7 +180,6 @@ impl ExecutionPlan for PrefetchExec {
             schema: Arc::clone(&schema),
             receiver: rx,
             _task: task,
-            partition_id: partition,
             spill_manager: (*spill_manager).clone(),
             state: PrefetchStreamState::Idle,
             wait_start: None,
@@ -347,8 +346,6 @@ struct PrefetchStream {
     receiver: tokio::sync::mpsc::Receiver<Result<PrefetchedBatch>>,
     /// Background task handle (keeps task alive)
     _task: SpawnedTask<Result<()>>,
-    /// Partition ID for debugging
-    partition_id: usize,
     /// SpillManager for reading spilled batches
     spill_manager: SpillManager,
     /// Current state of the stream
