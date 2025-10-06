@@ -36,7 +36,7 @@ use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use crate::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics};
 
 /// Number of batches to prefetch
-const PREFETCH_BUFFER_SIZE: usize = 3;
+const PREFETCH_BUFFER_SIZE: usize = 15;
 
 /// Execution plan that prefetches RecordBatches from its child with memory-aware spilling
 ///
