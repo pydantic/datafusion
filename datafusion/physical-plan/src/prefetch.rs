@@ -35,7 +35,7 @@ use futures::stream::{Stream, StreamExt};
 use crate::execution_plan::ExecutionPlanProperties;
 use crate::filter_pushdown::{FilterDescription, FilterPushdownPropagation};
 use crate::metrics::{
-    ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, SpillMetrics, Time,
+    ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricsSet, SpillMetrics, Time,
 };
 use crate::spill::get_record_batch_memory_size;
 use crate::spill::spill_manager::SpillManager;
@@ -161,6 +161,10 @@ impl ExecutionPlan for PrefetchExec {
         // Create channel for communication between background task and stream
         let (tx, rx) = tokio::sync::mpsc::channel(prefetch_depth);
 
+        // Create metric for tracking max queue depth
+        let max_queue_depth =
+            MetricBuilder::new(&self.metrics).gauge("max_queue_depth", partition);
+
         // Spawn background prefetch task
         let task = SpawnedTask::spawn(prefetch_task(
             partition,
@@ -169,6 +173,7 @@ impl ExecutionPlan for PrefetchExec {
             context,
             Arc::clone(&spill_manager),
             prefetch_depth,
+            max_queue_depth,
         ));
 
         // Create metric for tracking batch wait time
@@ -274,6 +279,7 @@ async fn prefetch_task(
     context: Arc<TaskContext>,
     spill_manager: Arc<SpillManager>,
     prefetch_depth: usize,
+    max_queue_depth: Gauge,
 ) -> Result<()> {
     // Only create memory reservation if prefetching is enabled (depth > 1)
     // With depth=1, there's no buffering so spilling is unnecessary
@@ -333,6 +339,10 @@ async fn prefetch_task(
             // Receiver dropped (e.g., LIMIT reached)
             return Ok(());
         }
+
+        // Update max queue depth metric
+        let current_depth = (prefetch_depth - tx.capacity()) as usize;
+        max_queue_depth.set_max(current_depth);
     }
 
     Ok(())
