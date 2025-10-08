@@ -247,6 +247,7 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
     #[cfg(feature = "parquet_encryption")]
     #[tokio::test]
     async fn roundtrip_parquet_with_encryption() -> Result<()> {
