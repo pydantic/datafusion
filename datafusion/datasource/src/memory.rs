@@ -192,7 +192,19 @@ impl DataSource for MemorySourceConfig {
         SchedulingType::Cooperative
     }
 
-    fn statistics(&self) -> Result<Statistics> {
+    fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
+        None
+    }
+
+    fn projection(&self) -> Option<Vec<ProjectionExpr>> {
+        None
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.projected_schema)
+    }
+
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
         Ok(common::compute_record_batch_statistics(
             &self.partitions,
             &self.schema,
@@ -212,14 +224,14 @@ impl DataSource for MemorySourceConfig {
     fn try_swapping_with_projection(
         &self,
         projection: &[ProjectionExpr],
-    ) -> Result<(Option<Arc<dyn DataSource>>, Vec<ProjectionExpr>)> {
+    ) -> Result<Option<(Arc<dyn DataSource>, Option<Vec<ProjectionExpr>>)>> {
         // If there is any non-column or alias-carrier expression, Projection should not be removed.
         // This process can be moved into MemoryExec, but it would be an overlap of their responsibility.
         if all_alias_free_columns(projection) {
             let all_projections = (0..self.schema.fields().len()).collect();
             let new_projections = new_projections_for_columns(
                 projection,
-                self.projection().as_ref().unwrap_or(&all_projections),
+                self.projection.as_ref().unwrap_or(&all_projections),
             );
 
             MemorySourceConfig::try_new(
@@ -227,9 +239,9 @@ impl DataSource for MemorySourceConfig {
                 self.original_schema(),
                 Some(new_projections),
             )
-            .map(|s| (Some(Arc::new(s) as Arc<dyn DataSource>), vec![]))
+            .map(|s| Some((Arc::new(s) as Arc<dyn DataSource>, vec![])))
         } else {
-            Ok((None, vec![]))
+            Ok(None)
         }
     }
 }

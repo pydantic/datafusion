@@ -481,7 +481,7 @@ impl FileFormat for ParquetFormat {
         source = self.set_source_encryption_factory(source, state)?;
 
         // Apply schema adapter factory before building the new config
-        let file_source = source.apply_schema_adapter(&conf)?;
+        let file_source = Arc::new(source);
 
         let conf = FileScanConfigBuilder::from(conf)
             .with_source(file_source)

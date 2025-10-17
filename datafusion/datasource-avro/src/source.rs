@@ -41,8 +41,6 @@ pub struct AvroSource {
     batch_size: Option<usize>,
     projection: Option<Vec<String>>,
     metrics: ExecutionPlanMetricsSet,
-    projected_statistics: Option<Statistics>,
-    schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
 }
 
 impl AvroSource {
@@ -78,10 +76,16 @@ impl FileSource for AvroSource {
         self
     }
 
-    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.batch_size = Some(batch_size);
-        Arc::new(conf)
+    fn projection(&self) -> Option<Vec<datafusion_physical_plan::projection::ProjectionExpr>> {
+        todo!();
+    }
+    
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(self.schema.as_ref().expect("Schema must be set"))
+    }
+
+    fn filter(&self) -> Option<Arc<dyn datafusion_physical_plan::PhysicalExpr>> {
+        todo!();
     }
 
     fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource> {
@@ -89,27 +93,9 @@ impl FileSource for AvroSource {
         conf.schema = Some(schema);
         Arc::new(conf)
     }
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.projected_statistics = Some(statistics);
-        Arc::new(conf)
-    }
-
-    fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.projection = config.projected_file_column_names();
-        Arc::new(conf)
-    }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
         &self.metrics
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        let statistics = &self.projected_statistics;
-        Ok(statistics
-            .clone()
-            .expect("projected_statistics must be set"))
     }
 
     fn file_type(&self) -> &str {
@@ -124,20 +110,6 @@ impl FileSource for AvroSource {
         _config: &FileScanConfig,
     ) -> Result<Option<FileScanConfig>> {
         Ok(None)
-    }
-
-    fn with_schema_adapter_factory(
-        &self,
-        schema_adapter_factory: Arc<dyn SchemaAdapterFactory>,
-    ) -> Result<Arc<dyn FileSource>> {
-        Ok(Arc::new(Self {
-            schema_adapter_factory: Some(schema_adapter_factory),
-            ..self.clone()
-        }))
-    }
-
-    fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
-        self.schema_adapter_factory.clone()
     }
 }
 

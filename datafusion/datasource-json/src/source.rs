@@ -102,66 +102,43 @@ impl FileSource for JsonSource {
         base_config: &FileScanConfig,
         _partition: usize,
     ) -> Arc<dyn FileOpener> {
-        Arc::new(JsonOpener {
-            batch_size: self
-                .batch_size
-                .expect("Batch size must set before creating opener"),
-            projected_schema: base_config.projected_file_schema(),
-            file_compression_type: base_config.file_compression_type,
-            object_store,
-        })
+        todo!();
+        // Arc::new(JsonOpener {
+        //     batch_size: self
+        //         .batch_size
+        //         .expect("Batch size must set before creating opener"),
+        //     projected_schema: base_config.projected_file_schema(),
+        //     file_compression_type: base_config.file_compression_type,
+        //     object_store,
+        // })
     }
 
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.batch_size = Some(batch_size);
-        Arc::new(conf)
-    }
-
     fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
         Arc::new(Self { ..self.clone() })
     }
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.projected_statistics = Some(statistics);
-        Arc::new(conf)
+
+    fn filter(&self) -> Option<Arc<dyn datafusion_physical_plan::PhysicalExpr>> {
+        None
     }
 
-    fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
+    fn projection(&self) -> Option<Vec<datafusion_physical_plan::projection::ProjectionExpr>> {
+        None
+    }
+
+    fn schema(&self) -> SchemaRef {
+        unimplemented!("schema must be set before use")
     }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
         &self.metrics
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        let statistics = &self.projected_statistics;
-        Ok(statistics
-            .clone()
-            .expect("projected_statistics must be set to call"))
-    }
-
     fn file_type(&self) -> &str {
         "json"
-    }
-
-    fn with_schema_adapter_factory(
-        &self,
-        schema_adapter_factory: Arc<dyn SchemaAdapterFactory>,
-    ) -> Result<Arc<dyn FileSource>> {
-        Ok(Arc::new(Self {
-            schema_adapter_factory: Some(schema_adapter_factory),
-            ..self.clone()
-        }))
-    }
-
-    fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
-        self.schema_adapter_factory.clone()
     }
 }
 

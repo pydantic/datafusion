@@ -38,20 +38,19 @@ use arrow::{
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{
-    exec_datafusion_err, exec_err, internal_datafusion_err, ColumnStatistics,
+    exec_datafusion_err, exec_err, internal_datafusion_err,
     Constraints, Result, ScalarValue, Statistics,
 };
 use datafusion_execution::{
     object_store::ObjectStoreUrl, SendableRecordBatchStream, TaskContext,
 };
-use datafusion_expr::{statistics, Operator};
-use datafusion_physical_expr::expressions::BinaryExpr;
-use datafusion_physical_expr::{expressions::Column, utils::reassign_expr_columns};
-use datafusion_physical_expr::{split_conjunction, EquivalenceProperties, Partitioning};
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::Partitioning;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
-use datafusion_physical_plan::projection::{self, update_ordering, ProjectionExpr};
+use datafusion_physical_plan::projection::{self, ProjectionExpr};
 use datafusion_physical_plan::{
     display::{display_orderings, ProjectSchemaDisplay},
     filter_pushdown::FilterPushdownPropagation,
@@ -64,10 +63,10 @@ use std::{
     fmt::Result as FmtResult, marker::PhantomData, sync::Arc,
 };
 
-use datafusion_physical_expr::equivalence::{project_orderings, ProjectionMapping};
+use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_plan::coop::cooperative;
 use datafusion_physical_plan::execution_plan::SchedulingType;
-use log::{debug, warn};
+use log::warn;
 
 /// The base configurations for a [`DataSourceExec`], the a physical plan for
 /// any given file format.
@@ -649,7 +648,7 @@ impl DataSource for FileScanConfig {
     fn try_swapping_with_projection(
         &self,
         projection: &[ProjectionExpr],
-    ) -> Result<Option<(Arc<dyn DataSource>, Vec<ProjectionExpr>)>> {
+    ) -> Result<Option<(Arc<dyn DataSource>, Option<Vec<ProjectionExpr>>)>> {
         // Try to push down the projection into the FileSource
         match self.file_source.try_projection_pushdown(projection, self)? {
             Some((new_file_source, remainder)) => {
@@ -1342,7 +1341,7 @@ mod tests {
 
     use arrow::array::{Int32Array, RecordBatch};
     use datafusion_common::stats::Precision;
-    use datafusion_common::{assert_batches_eq, internal_err};
+    use datafusion_common::{assert_batches_eq, internal_err, ColumnStatistics};
     use datafusion_expr::{Operator, SortExpr};
     use datafusion_physical_expr::create_physical_sort_expr;
     use datafusion_physical_expr::expressions::{BinaryExpr, Literal};

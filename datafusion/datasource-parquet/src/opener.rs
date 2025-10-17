@@ -24,12 +24,17 @@ use crate::{
     ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
 };
 use arrow::array::RecordBatch;
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_datasource::file_scan_config::take_column_projections;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
-use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
+use datafusion_datasource::schema_adapter::{DefaultSchemaAdapterFactory, SchemaAdapterFactory};
+use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_plan::projection::{
     project_schema, ProjectionExpr, ProjectionStream,
 };
+use futures::stream::BoxStream;
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -275,7 +280,7 @@ impl FileOpener for ParquetOpener {
                     )
                     .with_partition_values(partition_values)
             });
-            let expr_simplifier = PhysicalExprSimplifier::new(&physical_file_schema);
+            let mut expr_simplifier = PhysicalExprSimplifier::new(&physical_file_schema);
 
             if let Some(expr_adapter) = expr_adapter {
                 // Adapt the predicate to the physical file schema.
@@ -285,7 +290,7 @@ impl FileOpener for ParquetOpener {
                         // After rewriting to the file schema, further simplifications may be possible.
                         // For example, if `'a' = col_that_is_missing` becomes `'a' = NULL` that can then be simplified to `FALSE`
                         // and we can avoid doing any more work on the file (bloom filters, loading the page index, etc.).
-                        expr_simplifier.simplify(expr_adapter.rewrite(p.as_ref())?)
+                        expr_simplifier.simplify(expr_adapter.rewrite(p)?)
                     })
                     .transpose()?;
                 // Adapt the projection to the physical file schema
@@ -293,7 +298,7 @@ impl FileOpener for ParquetOpener {
                     projection
                         .iter()
                         .map(|p| {
-                            expr_simplifier.simplify(expr_adapter.rewrite(p.as_ref())?)
+                            expr_simplifier.simplify(expr_adapter.rewrite(Arc::clone(p))?)
                         })
                         .collect::<Result<Vec<_>>>()?,
                 );
@@ -332,7 +337,7 @@ impl FileOpener for ParquetOpener {
             // 2) A Vec<ProjectionExpr> to apply on top of that. For example, this might have partition column literals.
             // For now we only handle column references, e.g. if there is a struct field access we apply the projection after reading the entire struct.
             let (adapted_projections, remaining_exprs) =
-                take_column_projections(projection);
+                take_column_projections(projection.into_iter().cloned());
             let projected_schema =
                 Arc::new(physical_file_schema.project(&adapted_projections)?);
             let projection_exprs = remaining_exprs
@@ -359,7 +364,7 @@ impl FileOpener for ParquetOpener {
                     builder.metadata(),
                     reorder_predicates,
                     &file_metrics,
-                    &schema_adapter_factory,
+                    &(Arc::new(DefaultSchemaAdapterFactory {}) as Arc<dyn SchemaAdapterFactory>),
                 );
 
                 match row_filter {
@@ -467,10 +472,10 @@ impl FileOpener for ParquetOpener {
                         &predicate_cache_inner_records,
                         &predicate_cache_records,
                     );
-                    schema_mapping.map_batch(b)
+                    Ok(b)
                 })
             });
-
+        
             let stream = if let Some(file_pruner) = file_pruner {
                 EarlyStoppingStream::new(
                     stream,
@@ -481,14 +486,44 @@ impl FileOpener for ParquetOpener {
             } else {
                 stream.boxed()
             };
+            let stream = Box::pin(WrappedStream::new(stream, projected_schema));
             let stream = ProjectionStream::new(
                 output_schema,
                 projection_exprs.into_iter().map(|e| e.expr).collect(),
                 stream,
                 baseline_metrics,
             );
+
             Ok(stream.boxed())
         }))
+    }
+}
+
+struct WrappedStream {
+    inner: BoxStream<'static, Result<RecordBatch>>,
+    schema: SchemaRef,
+}
+
+impl WrappedStream {
+    fn new(inner: BoxStream<'static, Result<RecordBatch>>, schema: SchemaRef) -> Self {
+        Self { inner, schema }
+    }
+}
+
+impl Stream for WrappedStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl RecordBatchStream for WrappedStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
     }
 }
 
@@ -499,26 +534,20 @@ fn take_column_indices(
     let mut remainder_exprs: Vec<Arc<dyn PhysicalExpr>> = vec![];
 
     for expr in projection {
-        match expr.expr.as_any().downcast_ref::<Column>() {
+        match expr.as_any().downcast_ref::<Column>() {
             Some(col) => {
                 // Check if we already have a remapped version of this column
                 if let Some(remapped_col) = column_index_map.get(&col.index()) {
-                    remainder_exprs.push(ProjectionExpr::new(
-                        Arc::clone(remapped_col),
-                        expr.alias.clone(),
-                    ));
+                    remainder_exprs.push(Arc::clone(remapped_col));
                     continue;
                 }
-                let new_index = column_index_map.len() - 1; // New index in the projected schema
-                let remapped_column = Column::new(col.name(), new_index);
-                remainder_exprs.push(ProjectionExpr::new(
-                    Arc::new(remapped_column),
-                    expr.alias.clone(),
-                ));
+                let new_index = column_index_map.len(); // New index in the projected schema
+                let remapped_col = Column::new(col.name(), new_index);
+                remainder_exprs.push(Arc::new(remapped_col));
             }
             None => {
                 // We need to remap any Column references in the expression to match the projected schema
-                let new_expr = Arc::clone(&expr.expr)
+                let new_expr = Arc::clone(&expr)
                     .transform(|e| {
                         if let Some(col) = e.as_any().downcast_ref::<Column>() {
                             // Check if we already have a remapped version of this column
@@ -526,7 +555,7 @@ fn take_column_indices(
                             {
                                 return Ok(Transformed::yes(Arc::clone(remapped_col)));
                             }
-                            let new_index = column_index_map.len() - 1; // New index in the projected schema
+                            let new_index = column_index_map.len(); // New index in the projected schema
                             let remapped_column = Column::new(col.name(), new_index);
                             column_index_map
                                 .insert(col.index(), Arc::new(remapped_column));
@@ -540,7 +569,7 @@ fn take_column_indices(
                     })
                     .data()
                     .expect("infallible transform");
-                remainder_exprs.push(ProjectionExpr::new(new_expr, expr.alias.clone()));
+                remainder_exprs.push(new_expr);
             }
         }
     }
@@ -842,7 +871,7 @@ mod test {
     };
     use datafusion_expr::{col, lit};
     use datafusion_physical_expr::{
-        expressions::DynamicFilterPhysicalExpr, planner::logical2physical, PhysicalExpr,
+        expressions::{self, DynamicFilterPhysicalExpr}, planner::logical2physical, PhysicalExpr,
     };
     use datafusion_physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
     use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
@@ -941,7 +970,10 @@ mod test {
         let make_opener = |predicate| {
             ParquetOpener {
                 partition_index: 0,
-                projection: Arc::new([0, 1]),
+                projection: Arc::new([
+                    expressions::col("a", &schema).unwrap(),
+                    expressions::col("b", &schema).unwrap(),
+                ]),
                 batch_size: 1024,
                 limit: None,
                 predicate: Some(predicate),
@@ -1009,7 +1041,9 @@ mod test {
         let make_opener = |predicate| {
             ParquetOpener {
                 partition_index: 0,
-                projection: Arc::new([0]),
+                projection: Arc::new([
+                    expressions::col("a", &table_schema).unwrap(),
+                ]),
                 batch_size: 1024,
                 limit: None,
                 predicate: Some(predicate),
@@ -1097,7 +1131,9 @@ mod test {
         let make_opener = |predicate| {
             ParquetOpener {
                 partition_index: 0,
-                projection: Arc::new([0]),
+                projection: Arc::new([
+                    expressions::col("a", &table_schema).unwrap(),
+                ]),
                 batch_size: 1024,
                 limit: None,
                 predicate: Some(predicate),
@@ -1188,7 +1224,9 @@ mod test {
         let make_opener = |predicate| {
             ParquetOpener {
                 partition_index: 0,
-                projection: Arc::new([0]),
+                projection: Arc::new([
+                    expressions::col("a", &table_schema).unwrap(),
+                ]),
                 batch_size: 1024,
                 limit: None,
                 predicate: Some(predicate),
@@ -1279,7 +1317,9 @@ mod test {
         let make_opener = |predicate| {
             ParquetOpener {
                 partition_index: 0,
-                projection: Arc::new([0]),
+                projection: Arc::new([
+                    expressions::col("a", &table_schema).unwrap(),
+                ]),
                 batch_size: 1024,
                 limit: None,
                 predicate: Some(predicate),

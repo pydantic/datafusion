@@ -180,7 +180,7 @@ pub trait DataSource: Send + Sync + Debug {
     fn try_swapping_with_projection(
         &self,
         _projection: &[ProjectionExpr],
-    ) -> Result<Option<(Arc<dyn DataSource>, Vec<ProjectionExpr>)>> {
+    ) -> Result<Option<(Arc<dyn DataSource>, Option<Vec<ProjectionExpr>>)>> {
         Ok(None)
     }
 
@@ -331,7 +331,7 @@ impl ExecutionPlan for DataSourceExec {
             Some((new_data_source, remainder)) => {
                 let new_exec = Arc::new(DataSourceExec::new(new_data_source));
                 // If there are remainder projections, wrap the exec in a ProjectionExec
-                if !remainder.is_empty() {
+                if let Some(remainder) = remainder {
                     let new_projection = ProjectionExec::try_new(remainder, new_exec)?;
                     Ok(Some(Arc::new(new_projection)))
                 } else {

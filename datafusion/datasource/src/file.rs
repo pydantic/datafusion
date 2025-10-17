@@ -27,7 +27,7 @@ use crate::file_scan_config::FileScanConfig;
 use crate::file_stream::FileOpener;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::{Result, Statistics};
+use datafusion_common::Result;
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -155,7 +155,7 @@ pub trait FileSource: Send + Sync {
         &self,
         _projection: &[ProjectionExpr],
         _config: &FileScanConfig,
-    ) -> Result<Option<(Arc<dyn FileSource>, Vec<ProjectionExpr>)>> {
+    ) -> Result<Option<(Arc<dyn FileSource>, Option<Vec<ProjectionExpr>>)>> {
         Ok(None)
     }
 }
