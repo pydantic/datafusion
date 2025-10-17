@@ -73,6 +73,12 @@ pub trait FileSource: Send + Sync {
     fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
         None
     }
+    /// Return the projected statistics.
+    fn projected_statistics(&self) -> Option<&Statistics> {
+        None
+    }
+    /// Return the projected schema
+    fn projected_schema(&self);
     /// Return execution plan metrics
     fn metrics(&self) -> &ExecutionPlanMetricsSet;
     /// Return projected statistics

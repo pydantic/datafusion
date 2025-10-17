@@ -172,8 +172,8 @@ pub trait DataSource: Send + Sync + Debug {
     fn try_swapping_with_projection(
         &self,
         _projection: &[ProjectionExpr],
-    ) -> Result<(Option<Arc<dyn DataSource>>, Vec<ProjectionExpr>)> {
-        Ok((None, vec![]))
+    ) -> Result<Option<(Arc<dyn DataSource>, Vec<ProjectionExpr>)>> {
+        Ok(None)
     }
 
     /// Try to push down filters into this DataSource.
