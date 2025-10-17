@@ -22,6 +22,10 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use arrow::datatypes::{Schema, SchemaRef};
+use datafusion_expr::Operator;
+use datafusion_physical_expr::expressions::BinaryExpr;
+use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_plan::execution_plan::{
     Boundedness, EmissionType, SchedulingType,
 };
@@ -38,7 +42,7 @@ use crate::file_scan_config::FileScanConfig;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Constraints, Result, Statistics};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{split_conjunction, EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use datafusion_physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
@@ -126,7 +130,13 @@ pub trait DataSource: Send + Sync + Debug {
     fn as_any(&self) -> &dyn Any;
     /// Format this source for display in explain plans
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result;
-
+    /// Filter that this source will apply during the scan.
+    fn filter(&self) -> Option<Arc<dyn PhysicalExpr>>;
+    /// Projection that this source will apply during the scan.
+    fn projection(&self) -> Option<Vec<ProjectionExpr>>;
+    /// Projected schema for this source, including any table partition columns.
+    fn schema(&self) -> SchemaRef;
+    fn eq_properties(&self) -> EquivalenceProperties;
     /// Return a copy of this DataSource with a new partitioning scheme.
     ///
     /// Returns `Ok(None)` (the default) if the partitioning cannot be changed.
@@ -145,13 +155,11 @@ pub trait DataSource: Send + Sync + Debug {
     ) -> Result<Option<Arc<dyn DataSource>>> {
         Ok(None)
     }
-
     fn output_partitioning(&self) -> Partitioning;
-    fn eq_properties(&self) -> EquivalenceProperties;
     fn scheduling_type(&self) -> SchedulingType {
         SchedulingType::NonCooperative
     }
-    fn statistics(&self) -> Result<Statistics>;
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics>;
     /// Return a copy of this DataSource with a new fetch limit
     fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn DataSource>>;
     fn fetch(&self) -> Option<usize>;
@@ -299,21 +307,7 @@ impl ExecutionPlan for DataSourceExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        if let Some(partition) = partition {
-            let mut statistics = Statistics::new_unknown(&self.schema());
-            if let Some(file_config) =
-                self.data_source.as_any().downcast_ref::<FileScanConfig>()
-            {
-                if let Some(file_group) = file_config.file_groups.get(partition) {
-                    if let Some(stat) = file_group.file_statistics(None) {
-                        statistics = stat.clone();
-                    }
-                }
-            }
-            Ok(statistics)
-        } else {
-            Ok(self.data_source.statistics()?)
-        }
+        self.data_source.partition_statistics(partition)
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -331,14 +325,11 @@ impl ExecutionPlan for DataSourceExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let (new_data_source_opt, remainder) = self
+        match self
             .data_source
-            .try_swapping_with_projection(projection.expr())?;
-
-        match new_data_source_opt {
-            Some(new_data_source) => {
+            .try_swapping_with_projection(projection.expr())? {
+            Some((new_data_source, remainder)) => {
                 let new_exec = Arc::new(DataSourceExec::new(new_data_source));
-
                 // If there are remainder projections, wrap the exec in a ProjectionExec
                 if !remainder.is_empty() {
                     let new_projection = ProjectionExec::try_new(remainder, new_exec)?;
@@ -458,4 +449,31 @@ where
     fn from(source: S) -> Self {
         Self::new(Arc::new(source))
     }
+}
+
+
+fn add_filter_equivalence_info(
+    filter: Arc<dyn PhysicalExpr>,
+    eq_properties: &mut EquivalenceProperties,
+    projected_schema: &Schema,
+) -> Result<()> {
+    // Gather valid equality pairs from the filter expression
+    let equal_pairs = split_conjunction(&filter).into_iter().filter_map(|expr| {
+        // Ignore any binary expressions that reference non-existent columns in the current schema
+        // (e.g. due to unnecessary projections being removed)
+        reassign_expr_columns(Arc::clone(expr), projected_schema)
+            .ok()
+            .and_then(|expr| match expr.as_any().downcast_ref::<BinaryExpr>() {
+                Some(expr) if expr.op() == &Operator::Eq => {
+                    Some((Arc::clone(expr.left()), Arc::clone(expr.right())))
+                }
+                _ => None,
+            })
+    });
+
+    for (lhs, rhs) in equal_pairs {
+        eq_properties.add_equal_conditions(lhs, rhs)?
+    }
+
+    Ok(())
 }

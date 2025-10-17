@@ -25,13 +25,13 @@ use std::sync::Arc;
 use crate::file_groups::FileGroupPartitioner;
 use crate::file_scan_config::FileScanConfig;
 use crate::file_stream::FileOpener;
-use crate::schema_adapter::SchemaAdapterFactory;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::{not_impl_err, Result, Statistics};
+use datafusion_common::{Result, Statistics};
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_physical_plan::projection::ProjectionExpr;
 use datafusion_physical_plan::DisplayFormatType;
 
 use object_store::ObjectStore;
@@ -61,28 +61,20 @@ pub trait FileSource: Send + Sync {
     ) -> Arc<dyn FileOpener>;
     /// Any
     fn as_any(&self) -> &dyn Any;
-    /// Initialize new type with batch size configuration
-    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource>;
     /// Initialize new instance with a new schema
     fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource>;
-    /// Initialize new instance with projection information
-    fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource>;
-    /// Initialize new instance with projected statistics
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource>;
     /// Returns the filter expression that will be applied during the file scan.
-    fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
-        None
-    }
-    /// Return the projected statistics.
-    fn projected_statistics(&self) -> Option<&Statistics> {
-        None
-    }
-    /// Return the projected schema
-    fn projected_schema(&self);
+    /// This is used to derive known orderings and equality properties.
+    /// E.g. if there is a filter `col_a = 5`, then we know that `col_a` is constant and thus ordered.
+    /// If there is a filter `col_a = col_b`, then we know that `col_a` and `col_b` are equal.
+    fn filter(&self) -> Option<Arc<dyn PhysicalExpr>>;
+    /// Return unprojected schema for this file source, excluding any table partition columns.
+    fn schema(&self) -> SchemaRef;
+    /// Return the projection that will be applied during the file scan.
+    /// This projection may reference table partition columns.
+    fn projection(&self) -> Option<Vec<ProjectionExpr>>;
     /// Return execution plan metrics
     fn metrics(&self) -> &ExecutionPlanMetricsSet;
-    /// Return projected statistics
-    fn statistics(&self) -> Result<Statistics>;
     /// String representation of file source such as "csv", "json", "parquet"
     fn file_type(&self) -> &str;
     /// Format FileType specific information
@@ -161,52 +153,9 @@ pub trait FileSource: Send + Sync {
     /// [`with_projection`]: Self::with_projection
     fn try_projection_pushdown(
         &self,
-        projection: &[datafusion_physical_plan::projection::ProjectionExpr],
-        config: &FileScanConfig,
-    ) -> Result<Option<(Arc<dyn FileSource>, Vec<datafusion_physical_plan::projection::ProjectionExpr>)>> {
-        use crate::file_scan_config::split_projection_into_simple_column_indices;
-
-        let (column_indices, remainder) = split_projection_into_simple_column_indices(projection);
-
-        // If we have simple column indices, we can handle them
-        if !column_indices.is_empty() {
-            // Create a new config with the simple column projection
-            let mut new_config = config.clone();
-            new_config.projection = Some(column_indices);
-
-            // Apply the projection to get a new FileSource
-            let new_source = self.with_projection(&new_config);
-
-            Ok(Some((new_source, remainder)))
-        } else {
-            // No simple columns to push down
-            Ok(None)
-        }
-    }
-
-    /// Set optional schema adapter factory.
-    ///
-    /// [`SchemaAdapterFactory`] allows user to specify how fields from the
-    /// file get mapped to that of the table schema.  If you implement this
-    /// method, you should also implement [`schema_adapter_factory`].
-    ///
-    /// The default implementation returns a not implemented error.
-    ///
-    /// [`schema_adapter_factory`]: Self::schema_adapter_factory
-    fn with_schema_adapter_factory(
-        &self,
-        _factory: Arc<dyn SchemaAdapterFactory>,
-    ) -> Result<Arc<dyn FileSource>> {
-        not_impl_err!(
-            "FileSource {} does not support schema adapter factory",
-            self.file_type()
-        )
-    }
-
-    /// Returns the current schema adapter factory if set
-    ///
-    /// Default implementation returns `None`.
-    fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
-        None
+        _projection: &[ProjectionExpr],
+        _config: &FileScanConfig,
+    ) -> Result<Option<(Arc<dyn FileSource>, Vec<ProjectionExpr>)>> {
+        Ok(None)
     }
 }

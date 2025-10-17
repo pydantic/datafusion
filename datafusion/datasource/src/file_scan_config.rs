@@ -26,7 +26,7 @@ use crate::{
     file_compression_type::FileCompressionType, file_stream::FileStream,
     source::DataSource, statistics::MinMaxStatistics, PartitionedFile,
 };
-use arrow::datatypes::FieldRef;
+use arrow::datatypes::{FieldRef, SchemaBuilder};
 use arrow::{
     array::{
         ArrayData, ArrayRef, BufferBuilder, DictionaryArray, RecordBatch,
@@ -44,14 +44,14 @@ use datafusion_common::{
 use datafusion_execution::{
     object_store::ObjectStoreUrl, SendableRecordBatchStream, TaskContext,
 };
-use datafusion_expr::Operator;
+use datafusion_expr::{statistics, Operator};
 use datafusion_physical_expr::expressions::BinaryExpr;
 use datafusion_physical_expr::{expressions::Column, utils::reassign_expr_columns};
 use datafusion_physical_expr::{split_conjunction, EquivalenceProperties, Partitioning};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
-use datafusion_physical_plan::projection::ProjectionExpr;
+use datafusion_physical_plan::projection::{self, update_ordering, ProjectionExpr};
 use datafusion_physical_plan::{
     display::{display_orderings, ProjectSchemaDisplay},
     filter_pushdown::FilterPushdownPropagation,
@@ -64,7 +64,7 @@ use std::{
     fmt::Result as FmtResult, marker::PhantomData, sync::Arc,
 };
 
-use datafusion_physical_expr::equivalence::project_orderings;
+use datafusion_physical_expr::equivalence::{project_orderings, ProjectionMapping};
 use datafusion_physical_plan::coop::cooperative;
 use datafusion_physical_plan::execution_plan::SchedulingType;
 use log::{debug, warn};
@@ -266,7 +266,6 @@ pub struct FileScanConfigBuilder {
     table_partition_cols: Vec<FieldRef>,
     constraints: Option<Constraints>,
     file_groups: Vec<FileGroup>,
-    statistics: Option<Statistics>,
     output_ordering: Vec<LexOrdering>,
     file_compression_type: Option<FileCompressionType>,
     new_lines_in_values: Option<bool>,
@@ -291,7 +290,6 @@ impl FileScanConfigBuilder {
             file_schema,
             file_source,
             file_groups: vec![],
-            statistics: None,
             output_ordering: vec![],
             file_compression_type: None,
             new_lines_in_values: None,
@@ -315,6 +313,7 @@ impl FileScanConfigBuilder {
     /// This method allows you to change the file source implementation (e.g. ParquetSource, CsvSource, etc.)
     /// after the builder has been created.
     pub fn with_source(mut self, file_source: Arc<dyn FileSource>) -> Self {
+        let file_source = file_source.with_schema(Arc::clone(&self.file_schema));
         self.file_source = file_source;
         self
     }
@@ -331,13 +330,6 @@ impl FileScanConfigBuilder {
     /// Set the table constraints
     pub fn with_constraints(mut self, constraints: Constraints) -> Self {
         self.constraints = Some(constraints);
-        self
-    }
-
-    /// Set the estimated overall statistics of the files, taking `filters` into account.
-    /// Defaults to [`Statistics::new_unknown`].
-    pub fn with_statistics(mut self, statistics: Statistics) -> Self {
-        self.statistics = Some(statistics);
         self
     }
 
@@ -428,7 +420,6 @@ impl FileScanConfigBuilder {
             table_partition_cols,
             constraints,
             file_groups,
-            statistics,
             output_ordering,
             file_compression_type,
             new_lines_in_values,
@@ -437,12 +428,8 @@ impl FileScanConfigBuilder {
         } = self;
 
         let constraints = constraints.unwrap_or_default();
-        let statistics =
-            statistics.unwrap_or_else(|| Statistics::new_unknown(&file_schema));
 
-        let file_source = file_source
-            .with_statistics(statistics.clone())
-            .with_schema(Arc::clone(&file_schema));
+        let file_source = file_source.with_schema(Arc::clone(&file_schema));
         let file_compression_type =
             file_compression_type.unwrap_or(FileCompressionType::UNCOMPRESSED);
         let new_lines_in_values = new_lines_in_values.unwrap_or(false);
@@ -471,7 +458,6 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             file_schema: config.file_schema,
             file_source: Arc::<dyn FileSource>::clone(&config.file_source),
             file_groups: config.file_groups,
-            statistics: config.file_source.statistics().ok(),
             output_ordering: config.output_ordering,
             file_compression_type: Some(config.file_compression_type),
             new_lines_in_values: Some(config.new_lines_in_values),
@@ -495,14 +481,12 @@ impl DataSource for FileScanConfig {
             .batch_size
             .unwrap_or_else(|| context.session_config().batch_size());
 
-        let source = self
+        let opener = self
             .file_source
-            .with_batch_size(batch_size)
-            .with_projection(self);
+            .create_file_opener(object_store, self, partition);
 
-        let opener = source.create_file_opener(object_store, self, partition);
-
-        let stream = FileStream::new(self, partition, opener, source.metrics())?;
+        let stream =
+            FileStream::new(self, partition, opener, self.file_source.metrics())?;
         Ok(Box::pin(cooperative(stream)))
     }
 
@@ -510,11 +494,62 @@ impl DataSource for FileScanConfig {
         self
     }
 
+    fn projection(&self) -> Option<Vec<ProjectionExpr>> {
+        self.file_source.projection()
+    }
+
+    fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
+        self.file_source.filter()
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.projected_schema()
+    }
+
+    fn eq_properties(&self) -> EquivalenceProperties {
+        let mut eq_props = EquivalenceProperties::new_with_orderings(
+            Arc::clone(&self.file_schema),
+            self.output_ordering.clone(),
+        )
+        .with_constraints(self.constraints.clone());
+        let projected_schema = self.projected_schema();
+        if let Some(projection) = self.projection() {
+            let expr = projection.into_iter().map(Into::into).collect::<Vec<_>>();
+            let mapping = ProjectionMapping::try_new(expr, &self.file_schema)
+                .expect("need to handle error");
+            eq_props = eq_props.project(&mapping, projected_schema);
+        }
+        eq_props
+    }
+
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> FmtResult {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let schema = self.file_source.projected_schema();
-                let orderings = get_projected_output_ordering(self, &schema);
+                let schema = self.file_source.schema();
+                let projection = self.file_source.projection();
+                let schema = match &projection {
+                    Some(projection) => Arc::new(
+                        projection::project_schema(projection, &schema).map_err(|e| {
+                            log::error!("Failed to project schema for display: {}", e);
+                            std::fmt::Error
+                        })?,
+                    ),
+                    None => schema,
+                };
+                let orderings = match &projection {
+                    Some(projection) => self
+                        .output_ordering
+                        .iter()
+                        .filter_map(|o| {
+                            projection::update_ordering(o.clone(), projection).transpose()
+                        })
+                        .collect::<Result<Vec<_>, _>>(),
+                    None => Ok(self.output_ordering.clone()),
+                }
+                .map_err(|e| {
+                    log::error!("Failed to update ordering for display: {}", e);
+                    std::fmt::Error
+                })?;
 
                 write!(f, "file_groups=")?;
                 FileGroupsDisplay(&self.file_groups).fmt_as(t, f)?;
@@ -566,32 +601,34 @@ impl DataSource for FileScanConfig {
         Partitioning::UnknownPartitioning(self.file_groups.len())
     }
 
-    fn eq_properties(&self) -> EquivalenceProperties {
-        let (schema, constraints, _, orderings) = self.project();
-        let mut eq_properties =
-            EquivalenceProperties::new_with_orderings(Arc::clone(&schema), orderings)
-                .with_constraints(constraints);
-        if let Some(filter) = self.file_source.filter() {
-            // We need to remap column indexes to match the projected schema since that's what the equivalence properties deal with.
-            // Note that this will *ignore* any non-projected columns: these don't factor into ordering / equivalence.
-            match Self::add_filter_equivalence_info(filter, &mut eq_properties, &schema) {
-                Ok(()) => {}
-                Err(e) => {
-                    warn!("Failed to add filter equivalence info: {e}");
-                    #[cfg(debug_assertions)]
-                    panic!("Failed to add filter equivalence info: {e}");
-                }
-            }
-        }
-        eq_properties
-    }
-
     fn scheduling_type(&self) -> SchedulingType {
         SchedulingType::Cooperative
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(self.projected_stats())
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        if let Some(partition) = partition {
+            if let Some(file_group) = self.file_groups.get(partition) {
+                if let Some(stat) = file_group.file_statistics(None) {
+                    Ok(stat.clone())
+                } else {
+                    Ok(Statistics::new_unknown(&self.file_schema))
+                }
+            } else {
+                Err(
+                    internal_datafusion_err!(
+                        "Requested statistics for non-existent partition {partition}"
+                    )
+                )
+            }
+        } else {
+            // Aggregate statistics across all partitions
+            Statistics::try_merge_iter(
+                self.file_groups
+                    .iter()
+                    .filter_map(|fg| fg.file_statistics(None)),
+                    &self.file_schema
+            )
+        }
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
@@ -660,91 +697,20 @@ impl DataSource for FileScanConfig {
 }
 
 impl FileScanConfig {
-    // fn projection_indices(&self) -> Vec<usize> {
-    //     match &self.projection {
-    //         Some(proj) => proj.clone(),
-    //         None => (0..self.file_schema.fields().len()
-    //             + self.table_partition_cols.len())
-    //             .collect(),
-    //     }
-    // }
-
-    // pub fn projected_stats(&self) -> Statistics {
-    //     let statistics = self.file_source.statistics().unwrap();
-
-    //     let table_cols_stats = self
-    //         .projection_indices()
-    //         .into_iter()
-    //         .map(|idx| {
-    //             if idx < self.file_schema.fields().len() {
-    //                 statistics.column_statistics[idx].clone()
-    //             } else {
-    //                 // TODO provide accurate stat for partition column (#1186)
-    //                 ColumnStatistics::new_unknown()
-    //             }
-    //         })
-    //         .collect();
-
-    //     Statistics {
-    //         num_rows: statistics.num_rows,
-    //         // TODO correct byte size: https://github.com/apache/datafusion/issues/14936
-    //         total_byte_size: statistics.total_byte_size,
-    //         column_statistics: table_cols_stats,
-    //     }
-    // }
-
-    // pub fn projected_schema(&self) -> Arc<Schema> {
-    //     let table_fields: Vec<_> = self
-    //         .projection_indices()
-    //         .into_iter()
-    //         .map(|idx| {
-    //             if idx < self.file_schema.fields().len() {
-    //                 self.file_schema.field(idx).clone()
-    //             } else {
-    //                 let partition_idx = idx - self.file_schema.fields().len();
-    //                 Arc::unwrap_or_clone(Arc::clone(
-    //                     &self.table_partition_cols[partition_idx],
-    //                 ))
-    //             }
-    //         })
-    //         .collect();
-
-    //     Arc::new(Schema::new_with_metadata(
-    //         table_fields,
-    //         self.file_schema.metadata().clone(),
-    //     ))
-    // }
-
-    fn add_filter_equivalence_info(
-        filter: Arc<dyn PhysicalExpr>,
-        eq_properties: &mut EquivalenceProperties,
-        schema: &Schema,
-    ) -> Result<()> {
-        // Gather valid equality pairs from the filter expression
-        let equal_pairs = split_conjunction(&filter).into_iter().filter_map(|expr| {
-            // Ignore any binary expressions that reference non-existent columns in the current schema
-            // (e.g. due to unnecessary projections being removed)
-            reassign_expr_columns(Arc::clone(expr), schema)
-                .ok()
-                .and_then(|expr| match expr.as_any().downcast_ref::<BinaryExpr>() {
-                    Some(expr) if expr.op() == &Operator::Eq => {
-                        Some((Arc::clone(expr.left()), Arc::clone(expr.right())))
-                    }
-                    _ => None,
-                })
-        });
-
-        for (lhs, rhs) in equal_pairs {
-            eq_properties.add_equal_conditions(lhs, rhs)?
+    pub fn projected_schema(&self) -> Arc<Schema> {
+        let file_schema = self.file_source.schema();
+        let mut builder = SchemaBuilder::from(file_schema.as_ref());
+        for field in &self.table_partition_cols {
+            builder.push(Arc::clone(field));
         }
-
-        Ok(())
+        let table_schema = builder.finish();
+        let projected_schema = match &self.file_source.projection() {
+            Some(projection) => projection::project_schema(projection, &table_schema)
+                .expect("need to handle error"),
+            None => table_schema,
+        };
+        Arc::new(projected_schema)
     }
-
-    // pub fn projected_constraints(&self) -> Constraints {
-    //     let indexes = self.projection_indices();
-    //     self.constraints.project(&indexes).unwrap_or_default()
-    // }
 
     /// Specifies whether newlines in (quoted) values are supported.
     ///
@@ -992,11 +958,9 @@ impl Debug for FileScanConfig {
         write!(f, "FileScanConfig {{")?;
         write!(f, "object_store_url={:?}, ", self.object_store_url)?;
 
-        write!(
-            f,
-            "statistics={:?}, ",
-            self.file_source.statistics().unwrap()
-        )?;
+        if let Ok(statistics) = self.partition_statistics(None) {
+            write!(f, "statistics={:?}, ", statistics)?;
+        }
 
         DisplayAs::fmt_as(self, DisplayFormatType::Verbose, f)?;
         write!(f, "}}")
@@ -1005,8 +969,29 @@ impl Debug for FileScanConfig {
 
 impl DisplayAs for FileScanConfig {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> FmtResult {
-        let schema = self.projected_schema();
-        let orderings = get_projected_output_ordering(self, &schema);
+        let schema = self.file_schema.clone();
+        let projection = self.file_source.projection();
+        let schema = match &projection {
+            Some(proj) => {
+                Arc::new(projection::project_schema(proj, &schema).map_err(|e| {
+                    log::error!("Failed to project schema for display: {}", e);
+                    std::fmt::Error
+                })?)
+            }
+            None => schema,
+        };
+        let orderings = match &projection {
+            Some(proj) => self
+                .output_ordering
+                .iter()
+                .filter_map(|o| projection::update_ordering(o.clone(), proj).transpose())
+                .collect::<Result<Vec<_>, _>>(),
+            None => Ok(self.output_ordering.clone()),
+        }
+        .map_err(|e| {
+            log::error!("Failed to update ordering for display: {}", e);
+            std::fmt::Error
+        })?;
 
         write!(f, "file_groups=")?;
         FileGroupsDisplay(&self.file_groups).fmt_as(t, f)?;
@@ -1021,10 +1006,6 @@ impl DisplayAs for FileScanConfig {
 
         display_orderings(f, &orderings)?;
 
-        if !self.constraints.is_empty() {
-            write!(f, ", {}", self.constraints)?;
-        }
-
         Ok(())
     }
 }
@@ -1035,29 +1016,26 @@ impl DisplayAs for FileScanConfig {
 /// The fiddly bit is that the remaining projections need to reference the output schema after applying the column projections,
 /// so we need to remap the column indices accordingly.
 pub fn take_column_projections(
-    projection: &[ProjectionExpr],
-) -> (Vec<usize>, Vec<ProjectionExpr>) {
+    projection: impl Iterator<Item = Arc<dyn PhysicalExpr>>,
+) -> (Vec<usize>, Vec<Arc<dyn PhysicalExpr>>) {
     let mut column_index_map: BTreeMap<usize, Arc<dyn PhysicalExpr>> = BTreeMap::new();
-    let mut remainder_exprs: Vec<ProjectionExpr> = vec![];
+    let mut remainder_exprs: Vec<Arc<dyn PhysicalExpr>> = vec![];
 
     for expr in projection {
-        match expr.expr.as_any().downcast_ref::<Column>() {
+        match expr.as_any().downcast_ref::<Column>() {
             Some(col) => {
                 // Check if we already have a remapped version of this column
                 if let Some(remapped_col) = column_index_map.get(&col.index()) {
-                    remainder_exprs.push(ProjectionExpr::new(
-                        Arc::clone(remapped_col),
-                        expr.alias.clone(),
-                    ));
+                    remainder_exprs.push(Arc::clone(remapped_col));
                     continue;
                 }
                 let new_index = column_index_map.len() - 1; // New index in the projected schema
                 let remapped_column = Column::new(col.name(), new_index);
-                remainder_exprs.push(ProjectionExpr::new(Arc::new(remapped_column), expr.alias.clone()));
+                remainder_exprs.push(Arc::new(remapped_column));
             }
             None => {
                 // We need to remap any Column references in the expression to match the projected schema
-                let new_expr = Arc::clone(&expr.expr)
+                let new_expr = Arc::clone(&expr)
                     .transform(|e| {
                         if let Some(col) = e.as_any().downcast_ref::<Column>() {
                             // Check if we already have a remapped version of this column
@@ -1079,7 +1057,7 @@ pub fn take_column_projections(
                     })
                     .data()
                     .expect("infallible transform");
-                remainder_exprs.push(ProjectionExpr::new(new_expr, expr.alias.clone()));
+                remainder_exprs.push(new_expr);
             }
         }
     }
@@ -1332,110 +1310,6 @@ fn create_output_array(
     val.to_array_of_size(len)
 }
 
-/// The various listing tables does not attempt to read all files
-/// concurrently, instead they will read files in sequence within a
-/// partition.  This is an important property as it allows plans to
-/// run against 1000s of files and not try to open them all
-/// concurrently.
-///
-/// However, it means if we assign more than one file to a partition
-/// the output sort order will not be preserved as illustrated in the
-/// following diagrams:
-///
-/// When only 1 file is assigned to each partition, each partition is
-/// correctly sorted on `(A, B, C)`
-///
-/// ```text
-///┏ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ┓
-///  ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐ ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─  ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─  ┌ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-///┃   ┌───────────────┐     ┌──────────────┐ │   ┌──────────────┐ │   ┌─────────────┐   ┃
-///  │ │   1.parquet   │ │ │ │  2.parquet   │   │ │  3.parquet   │   │ │  4.parquet  │ │
-///┃   │ Sort: A, B, C │     │Sort: A, B, C │ │   │Sort: A, B, C │ │   │Sort: A, B, C│   ┃
-///  │ └───────────────┘ │ │ └──────────────┘   │ └──────────────┘   │ └─────────────┘ │
-///┃                                          │                    │                     ┃
-///  │                   │ │                    │                    │                 │
-///┃                                          │                    │                     ┃
-///  │                   │ │                    │                    │                 │
-///┃                                          │                    │                     ┃
-///  │                   │ │                    │                    │                 │
-///┃  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─   ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘  ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘  ─ ─ ─ ─ ─ ─ ─ ─ ─  ┃
-///     DataFusion           DataFusion           DataFusion           DataFusion
-///┃    Partition 1          Partition 2          Partition 3          Partition 4       ┃
-/// ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
-///
-///                                      DataSourceExec
-///```
-///
-/// However, when more than 1 file is assigned to each partition, each
-/// partition is NOT correctly sorted on `(A, B, C)`. Once the second
-/// file is scanned, the same values for A, B and C can be repeated in
-/// the same sorted stream
-///
-///```text
-///┏ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
-///  ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐ ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─  ┃
-///┃   ┌───────────────┐     ┌──────────────┐ │
-///  │ │   1.parquet   │ │ │ │  2.parquet   │   ┃
-///┃   │ Sort: A, B, C │     │Sort: A, B, C │ │
-///  │ └───────────────┘ │ │ └──────────────┘   ┃
-///┃   ┌───────────────┐     ┌──────────────┐ │
-///  │ │   3.parquet   │ │ │ │  4.parquet   │   ┃
-///┃   │ Sort: A, B, C │     │Sort: A, B, C │ │
-///  │ └───────────────┘ │ │ └──────────────┘   ┃
-///┃                                          │
-///  │                   │ │                    ┃
-///┃  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─   ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
-///     DataFusion           DataFusion         ┃
-///┃    Partition 1          Partition 2
-/// ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ┛
-///
-///              DataSourceExec
-///```
-fn get_projected_output_ordering(
-    base_config: &FileScanConfig,
-    projected_schema: &SchemaRef,
-) -> Vec<LexOrdering> {
-    let projected_orderings =
-        project_orderings(&base_config.output_ordering, projected_schema);
-
-    let mut all_orderings = vec![];
-    for new_ordering in projected_orderings {
-        // Check if any file groups are not sorted
-        if base_config.file_groups.iter().any(|group| {
-            if group.len() <= 1 {
-                // File groups with <= 1 files are always sorted
-                return false;
-            }
-
-            let statistics = match MinMaxStatistics::new_from_files(
-                &new_ordering,
-                projected_schema,
-                base_config.projection.as_deref(),
-                group.iter(),
-            ) {
-                Ok(statistics) => statistics,
-                Err(e) => {
-                    log::trace!("Error fetching statistics for file group: {e}");
-                    // we can't prove that it's ordered, so we have to reject it
-                    return true;
-                }
-            };
-
-            !statistics.is_sorted()
-        }) {
-            debug!(
-                "Skipping specified output ordering {:?}. \
-                Some file groups couldn't be determined to be sorted: {:?}",
-                base_config.output_ordering[0], base_config.file_groups
-            );
-            continue;
-        }
-
-        all_orderings.push(new_ordering);
-    }
-    all_orderings
-}
-
 /// Convert type to a type suitable for use as a `ListingTable`
 /// partition column. Returns `Dictionary(UInt16, val_type)`, which is
 /// a reasonable trade off between a reasonable number of partition
@@ -1477,345 +1351,6 @@ mod tests {
     /// Returns the column names on the schema
     pub fn columns(schema: &Schema) -> Vec<String> {
         schema.fields().iter().map(|f| f.name().clone()).collect()
-    }
-
-    #[test]
-    fn physical_plan_config_no_projection() {
-        let file_schema = aggr_test_schema();
-        let conf = config_for_projection(
-            Arc::clone(&file_schema),
-            None,
-            Statistics::new_unknown(&file_schema),
-            to_partition_cols(vec![(
-                "date".to_owned(),
-                wrap_partition_type_in_dict(DataType::Utf8),
-            )]),
-        );
-
-        let (proj_schema, _, proj_statistics, _) = conf.project();
-        assert_eq!(proj_schema.fields().len(), file_schema.fields().len() + 1);
-        assert_eq!(
-            proj_schema.field(file_schema.fields().len()).name(),
-            "date",
-            "partition columns are the last columns"
-        );
-        assert_eq!(
-            proj_statistics.column_statistics.len(),
-            file_schema.fields().len() + 1
-        );
-        // TODO implement tests for partition column statistics once implemented
-
-        let col_names = conf.projected_file_column_names();
-        assert_eq!(col_names, None);
-
-        let col_indices = conf.file_column_projection_indices();
-        assert_eq!(col_indices, None);
-    }
-
-    #[test]
-    fn physical_plan_config_no_projection_tab_cols_as_field() {
-        let file_schema = aggr_test_schema();
-
-        // make a table_partition_col as a field
-        let table_partition_col =
-            Field::new("date", wrap_partition_type_in_dict(DataType::Utf8), true)
-                .with_metadata(HashMap::from_iter(vec![(
-                    "key_whatever".to_owned(),
-                    "value_whatever".to_owned(),
-                )]));
-
-        let conf = config_for_projection(
-            Arc::clone(&file_schema),
-            None,
-            Statistics::new_unknown(&file_schema),
-            vec![table_partition_col.clone()],
-        );
-
-        // verify the proj_schema includes the last column and exactly the same the field it is defined
-        let proj_schema = conf.projected_schema();
-        assert_eq!(proj_schema.fields().len(), file_schema.fields().len() + 1);
-        assert_eq!(
-            *proj_schema.field(file_schema.fields().len()),
-            table_partition_col,
-            "partition columns are the last columns and ust have all values defined in created field"
-        );
-    }
-
-    #[test]
-    fn physical_plan_config_with_projection() {
-        let file_schema = aggr_test_schema();
-        let conf = config_for_projection(
-            Arc::clone(&file_schema),
-            Some(vec![file_schema.fields().len(), 0]),
-            Statistics {
-                num_rows: Precision::Inexact(10),
-                // assign the column index to distinct_count to help assert
-                // the source statistic after the projection
-                column_statistics: (0..file_schema.fields().len())
-                    .map(|i| ColumnStatistics {
-                        distinct_count: Precision::Inexact(i),
-                        ..Default::default()
-                    })
-                    .collect(),
-                total_byte_size: Precision::Absent,
-            },
-            to_partition_cols(vec![(
-                "date".to_owned(),
-                wrap_partition_type_in_dict(DataType::Utf8),
-            )]),
-        );
-
-        let (proj_schema, _, proj_statistics, _) = conf.project();
-        assert_eq!(
-            columns(&proj_schema),
-            vec!["date".to_owned(), "c1".to_owned()]
-        );
-        let proj_stat_cols = proj_statistics.column_statistics;
-        assert_eq!(proj_stat_cols.len(), 2);
-        // TODO implement tests for proj_stat_cols[0] once partition column
-        // statistics are implemented
-        assert_eq!(proj_stat_cols[1].distinct_count, Precision::Inexact(0));
-
-        let col_names = conf.projected_file_column_names();
-        assert_eq!(col_names, Some(vec!["c1".to_owned()]));
-
-        let col_indices = conf.file_column_projection_indices();
-        assert_eq!(col_indices, Some(vec![0]));
-    }
-
-    #[test]
-    fn partition_column_projector() {
-        let file_batch = build_table_i32(
-            ("a", &vec![0, 1, 2]),
-            ("b", &vec![-2, -1, 0]),
-            ("c", &vec![10, 11, 12]),
-        );
-        let partition_cols = vec![
-            (
-                "year".to_owned(),
-                wrap_partition_type_in_dict(DataType::Utf8),
-            ),
-            (
-                "month".to_owned(),
-                wrap_partition_type_in_dict(DataType::Utf8),
-            ),
-            (
-                "day".to_owned(),
-                wrap_partition_type_in_dict(DataType::Utf8),
-            ),
-        ];
-        // create a projected schema
-        let statistics = Statistics {
-            num_rows: Precision::Inexact(3),
-            total_byte_size: Precision::Absent,
-            column_statistics: Statistics::unknown_column(&file_batch.schema()),
-        };
-
-        let conf = config_for_projection(
-            file_batch.schema(),
-            // keep all cols from file and 2 from partitioning
-            Some(vec![
-                0,
-                1,
-                2,
-                file_batch.schema().fields().len(),
-                file_batch.schema().fields().len() + 2,
-            ]),
-            statistics.clone(),
-            to_partition_cols(partition_cols.clone()),
-        );
-
-        let source_statistics = conf.file_source.statistics().unwrap();
-        let conf_stats = conf.statistics().unwrap();
-
-        // projection should be reflected in the file source statistics
-        assert_eq!(conf_stats.num_rows, Precision::Inexact(3));
-
-        // 3 original statistics + 2 partition statistics
-        assert_eq!(conf_stats.column_statistics.len(), 5);
-
-        // file statics should not be modified
-        assert_eq!(source_statistics, statistics);
-        assert_eq!(source_statistics.column_statistics.len(), 3);
-
-        let proj_schema = conf.projected_schema();
-        // created a projector for that projected schema
-        let mut proj = PartitionColumnProjector::new(
-            proj_schema,
-            &partition_cols
-                .iter()
-                .map(|x| x.0.clone())
-                .collect::<Vec<_>>(),
-        );
-
-        // project first batch
-        let projected_batch = proj
-            .project(
-                // file_batch is ok here because we kept all the file cols in the projection
-                file_batch,
-                &[
-                    wrap_partition_value_in_dict(ScalarValue::from("2021")),
-                    wrap_partition_value_in_dict(ScalarValue::from("10")),
-                    wrap_partition_value_in_dict(ScalarValue::from("26")),
-                ],
-            )
-            .expect("Projection of partition columns into record batch failed");
-        let expected = [
-            "+---+----+----+------+-----+",
-            "| a | b  | c  | year | day |",
-            "+---+----+----+------+-----+",
-            "| 0 | -2 | 10 | 2021 | 26  |",
-            "| 1 | -1 | 11 | 2021 | 26  |",
-            "| 2 | 0  | 12 | 2021 | 26  |",
-            "+---+----+----+------+-----+",
-        ];
-        assert_batches_eq!(expected, &[projected_batch]);
-
-        // project another batch that is larger than the previous one
-        let file_batch = build_table_i32(
-            ("a", &vec![5, 6, 7, 8, 9]),
-            ("b", &vec![-10, -9, -8, -7, -6]),
-            ("c", &vec![12, 13, 14, 15, 16]),
-        );
-        let projected_batch = proj
-            .project(
-                // file_batch is ok here because we kept all the file cols in the projection
-                file_batch,
-                &[
-                    wrap_partition_value_in_dict(ScalarValue::from("2021")),
-                    wrap_partition_value_in_dict(ScalarValue::from("10")),
-                    wrap_partition_value_in_dict(ScalarValue::from("27")),
-                ],
-            )
-            .expect("Projection of partition columns into record batch failed");
-        let expected = [
-            "+---+-----+----+------+-----+",
-            "| a | b   | c  | year | day |",
-            "+---+-----+----+------+-----+",
-            "| 5 | -10 | 12 | 2021 | 27  |",
-            "| 6 | -9  | 13 | 2021 | 27  |",
-            "| 7 | -8  | 14 | 2021 | 27  |",
-            "| 8 | -7  | 15 | 2021 | 27  |",
-            "| 9 | -6  | 16 | 2021 | 27  |",
-            "+---+-----+----+------+-----+",
-        ];
-        assert_batches_eq!(expected, &[projected_batch]);
-
-        // project another batch that is smaller than the previous one
-        let file_batch = build_table_i32(
-            ("a", &vec![0, 1, 3]),
-            ("b", &vec![2, 3, 4]),
-            ("c", &vec![4, 5, 6]),
-        );
-        let projected_batch = proj
-            .project(
-                // file_batch is ok here because we kept all the file cols in the projection
-                file_batch,
-                &[
-                    wrap_partition_value_in_dict(ScalarValue::from("2021")),
-                    wrap_partition_value_in_dict(ScalarValue::from("10")),
-                    wrap_partition_value_in_dict(ScalarValue::from("28")),
-                ],
-            )
-            .expect("Projection of partition columns into record batch failed");
-        let expected = [
-            "+---+---+---+------+-----+",
-            "| a | b | c | year | day |",
-            "+---+---+---+------+-----+",
-            "| 0 | 2 | 4 | 2021 | 28  |",
-            "| 1 | 3 | 5 | 2021 | 28  |",
-            "| 3 | 4 | 6 | 2021 | 28  |",
-            "+---+---+---+------+-----+",
-        ];
-        assert_batches_eq!(expected, &[projected_batch]);
-
-        // forgot to dictionary-wrap the scalar value
-        let file_batch = build_table_i32(
-            ("a", &vec![0, 1, 2]),
-            ("b", &vec![-2, -1, 0]),
-            ("c", &vec![10, 11, 12]),
-        );
-        let projected_batch = proj
-            .project(
-                // file_batch is ok here because we kept all the file cols in the projection
-                file_batch,
-                &[
-                    ScalarValue::from("2021"),
-                    ScalarValue::from("10"),
-                    ScalarValue::from("26"),
-                ],
-            )
-            .expect("Projection of partition columns into record batch failed");
-        let expected = [
-            "+---+----+----+------+-----+",
-            "| a | b  | c  | year | day |",
-            "+---+----+----+------+-----+",
-            "| 0 | -2 | 10 | 2021 | 26  |",
-            "| 1 | -1 | 11 | 2021 | 26  |",
-            "| 2 | 0  | 12 | 2021 | 26  |",
-            "+---+----+----+------+-----+",
-        ];
-        assert_batches_eq!(expected, &[projected_batch]);
-    }
-
-    #[test]
-    fn test_projected_file_schema_with_partition_col() {
-        let schema = aggr_test_schema();
-        let partition_cols = vec![
-            (
-                "part1".to_owned(),
-                wrap_partition_type_in_dict(DataType::Utf8),
-            ),
-            (
-                "part2".to_owned(),
-                wrap_partition_type_in_dict(DataType::Utf8),
-            ),
-        ];
-
-        // Projected file schema for config with projection including partition column
-        let projection = config_for_projection(
-            schema.clone(),
-            Some(vec![0, 3, 5, schema.fields().len()]),
-            Statistics::new_unknown(&schema),
-            to_partition_cols(partition_cols),
-        )
-        .projected_file_schema();
-
-        // Assert partition column filtered out in projected file schema
-        let expected_columns = vec!["c1", "c4", "c6"];
-        let actual_columns = projection
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect::<Vec<_>>();
-        assert_eq!(expected_columns, actual_columns);
-    }
-
-    #[test]
-    fn test_projected_file_schema_without_projection() {
-        let schema = aggr_test_schema();
-        let partition_cols = vec![
-            (
-                "part1".to_owned(),
-                wrap_partition_type_in_dict(DataType::Utf8),
-            ),
-            (
-                "part2".to_owned(),
-                wrap_partition_type_in_dict(DataType::Utf8),
-            ),
-        ];
-
-        // Projected file schema for config without projection
-        let projection = config_for_projection(
-            schema.clone(),
-            None,
-            Statistics::new_unknown(&schema),
-            to_partition_cols(partition_cols),
-        )
-        .projected_file_schema();
-
-        // Assert projected file schema is equal to file schema
-        assert_eq!(projection.fields(), schema.fields());
     }
 
     #[test]
@@ -2123,24 +1658,6 @@ mod tests {
         }
     }
 
-    // sets default for configs that play no role in projections
-    fn config_for_projection(
-        file_schema: SchemaRef,
-        projection: Option<Vec<usize>>,
-        statistics: Statistics,
-        table_partition_cols: Vec<Field>,
-    ) -> FileScanConfig {
-        FileScanConfigBuilder::new(
-            ObjectStoreUrl::parse("test:///").unwrap(),
-            file_schema,
-            Arc::new(MockSource::default()),
-        )
-        .with_projection(projection)
-        .with_statistics(statistics)
-        .with_table_partition_cols(table_partition_cols)
-        .build()
-    }
-
     /// Convert partition columns from Vec<String DataType> to Vec<Field>
     fn to_partition_cols(table_partition_cols: Vec<(String, DataType)>) -> Vec<Field> {
         table_partition_cols
@@ -2170,215 +1687,6 @@ mod tests {
             ],
         )
         .unwrap()
-    }
-
-    #[test]
-    fn test_file_scan_config_builder() {
-        let file_schema = aggr_test_schema();
-        let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
-        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::default());
-
-        // Create a builder with required parameters
-        let builder = FileScanConfigBuilder::new(
-            object_store_url.clone(),
-            Arc::clone(&file_schema),
-            Arc::clone(&file_source),
-        );
-
-        // Build with various configurations
-        let config = builder
-            .with_limit(Some(1000))
-            .with_projection(Some(vec![0, 1]))
-            .with_table_partition_cols(vec![Field::new(
-                "date",
-                wrap_partition_type_in_dict(DataType::Utf8),
-                false,
-            )])
-            .with_statistics(Statistics::new_unknown(&file_schema))
-            .with_file_groups(vec![FileGroup::new(vec![PartitionedFile::new(
-                "test.parquet".to_string(),
-                1024,
-            )])])
-            .with_output_ordering(vec![[PhysicalSortExpr::new_default(Arc::new(
-                Column::new("date", 0),
-            ))]
-            .into()])
-            .with_file_compression_type(FileCompressionType::UNCOMPRESSED)
-            .with_newlines_in_values(true)
-            .build();
-
-        // Verify the built config has all the expected values
-        assert_eq!(config.object_store_url, object_store_url);
-        assert_eq!(config.file_schema, file_schema);
-        assert_eq!(config.limit, Some(1000));
-        assert_eq!(config.projection, Some(vec![0, 1]));
-        assert_eq!(config.table_partition_cols.len(), 1);
-        assert_eq!(config.table_partition_cols[0].name(), "date");
-        assert_eq!(config.file_groups.len(), 1);
-        assert_eq!(config.file_groups[0].len(), 1);
-        assert_eq!(
-            config.file_groups[0][0].object_meta.location.as_ref(),
-            "test.parquet"
-        );
-        assert_eq!(
-            config.file_compression_type,
-            FileCompressionType::UNCOMPRESSED
-        );
-        assert!(config.new_lines_in_values);
-        assert_eq!(config.output_ordering.len(), 1);
-    }
-
-    #[test]
-    fn equivalence_properties_after_schema_change() {
-        let file_schema = aggr_test_schema();
-        let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
-        // Create a file source with a filter
-        let file_source: Arc<dyn FileSource> =
-            Arc::new(MockSource::default().with_filter(Arc::new(BinaryExpr::new(
-                col("c2", &file_schema).unwrap(),
-                Operator::Eq,
-                Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
-            ))));
-
-        let config = FileScanConfigBuilder::new(
-            object_store_url.clone(),
-            Arc::clone(&file_schema),
-            Arc::clone(&file_source),
-        )
-        .with_projection(Some(vec![0, 1, 2]))
-        .build();
-
-        // Simulate projection being updated. Since the filter has already been pushed down,
-        // the new projection won't include the filtered column.
-        let (data_source, remainder) = config
-            .try_swapping_with_projection(&[ProjectionExpr::new(
-                col("c3", &file_schema).unwrap(),
-                "c3".to_string(),
-            )])
-            .unwrap();
-        let data_source = data_source.unwrap();
-        assert!(remainder.is_empty(), "Expected no remainder projections");
-
-        // Gather the equivalence properties from the new data source. There should
-        // be no equivalence class for column c2 since it was removed by the projection.
-        let eq_properties = data_source.eq_properties();
-        let eq_group = eq_properties.eq_group();
-
-        for class in eq_group.iter() {
-            for expr in class.iter() {
-                if let Some(col) = expr.as_any().downcast_ref::<Column>() {
-                    assert_ne!(
-                        col.name(),
-                        "c2",
-                        "c2 should not be present in any equivalence class"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_file_scan_config_builder_defaults() {
-        let file_schema = aggr_test_schema();
-        let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
-        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::default());
-
-        // Create a builder with only required parameters and build without any additional configurations
-        let config = FileScanConfigBuilder::new(
-            object_store_url.clone(),
-            Arc::clone(&file_schema),
-            Arc::clone(&file_source),
-        )
-        .build();
-
-        // Verify default values
-        assert_eq!(config.object_store_url, object_store_url);
-        assert_eq!(config.file_schema, file_schema);
-        assert_eq!(config.limit, None);
-        assert_eq!(config.projection, None);
-        assert!(config.table_partition_cols.is_empty());
-        assert!(config.file_groups.is_empty());
-        assert_eq!(
-            config.file_compression_type,
-            FileCompressionType::UNCOMPRESSED
-        );
-        assert!(!config.new_lines_in_values);
-        assert!(config.output_ordering.is_empty());
-        assert!(config.constraints.is_empty());
-
-        // Verify statistics are set to unknown
-        assert_eq!(
-            config.file_source.statistics().unwrap().num_rows,
-            Precision::Absent
-        );
-        assert_eq!(
-            config.file_source.statistics().unwrap().total_byte_size,
-            Precision::Absent
-        );
-        assert_eq!(
-            config
-                .file_source
-                .statistics()
-                .unwrap()
-                .column_statistics
-                .len(),
-            file_schema.fields().len()
-        );
-        for stat in config.file_source.statistics().unwrap().column_statistics {
-            assert_eq!(stat.distinct_count, Precision::Absent);
-            assert_eq!(stat.min_value, Precision::Absent);
-            assert_eq!(stat.max_value, Precision::Absent);
-            assert_eq!(stat.null_count, Precision::Absent);
-        }
-    }
-
-    #[test]
-    fn test_file_scan_config_builder_new_from() {
-        let schema = aggr_test_schema();
-        let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
-        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::default());
-        let partition_cols = vec![Field::new(
-            "date",
-            wrap_partition_type_in_dict(DataType::Utf8),
-            false,
-        )];
-        let file = PartitionedFile::new("test_file.parquet", 100);
-
-        // Create a config with non-default values
-        let original_config = FileScanConfigBuilder::new(
-            object_store_url.clone(),
-            Arc::clone(&schema),
-            Arc::clone(&file_source),
-        )
-        .with_projection(Some(vec![0, 2]))
-        .with_limit(Some(10))
-        .with_table_partition_cols(partition_cols.clone())
-        .with_file(file.clone())
-        .with_constraints(Constraints::default())
-        .with_newlines_in_values(true)
-        .build();
-
-        // Create a new builder from the config
-        let new_builder = FileScanConfigBuilder::from(original_config);
-
-        // Build a new config from this builder
-        let new_config = new_builder.build();
-
-        // Verify properties match
-        let partition_cols = partition_cols.into_iter().map(Arc::new).collect::<Vec<_>>();
-        assert_eq!(new_config.object_store_url, object_store_url);
-        assert_eq!(new_config.file_schema, schema);
-        assert_eq!(new_config.projection, Some(vec![0, 2]));
-        assert_eq!(new_config.limit, Some(10));
-        assert_eq!(new_config.table_partition_cols, partition_cols);
-        assert_eq!(new_config.file_groups.len(), 1);
-        assert_eq!(new_config.file_groups[0].len(), 1);
-        assert_eq!(
-            new_config.file_groups[0][0].object_meta.location.as_ref(),
-            "test_file.parquet"
-        );
-        assert_eq!(new_config.constraints, Constraints::default());
-        assert!(new_config.new_lines_in_values);
     }
 
     #[test]

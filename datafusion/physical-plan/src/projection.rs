@@ -129,30 +129,7 @@ impl ProjectionExec {
         // convert argument to Vec<ProjectionExpr>
         let expr = expr.into_iter().map(Into::into).collect::<Vec<_>>();
 
-        let fields: Result<Vec<Field>> = expr
-            .iter()
-            .map(|proj_expr| {
-                let metadata = proj_expr
-                    .expr
-                    .return_field(&input_schema)?
-                    .metadata()
-                    .clone();
-
-                let field = Field::new(
-                    &proj_expr.alias,
-                    proj_expr.expr.data_type(&input_schema)?,
-                    proj_expr.expr.nullable(&input_schema)?,
-                )
-                .with_metadata(metadata);
-
-                Ok(field)
-            })
-            .collect();
-
-        let schema = Arc::new(Schema::new_with_metadata(
-            fields?,
-            input_schema.metadata().clone(),
-        ));
+        let schema = Arc::new(project_schema(&expr, &input_schema)?);
 
         // Construct a map from the input expressions to the output expression of the Projection
         let projection_mapping = ProjectionMapping::try_new(
@@ -203,6 +180,36 @@ impl ProjectionExec {
     }
 }
 
+pub fn project_schema(
+    expr: &[ProjectionExpr],
+    input_schema: &Schema,
+) -> Result<Schema> {
+    let fields: Result<Vec<Field>> = expr
+        .iter()
+        .map(|proj_expr| {
+            let metadata = proj_expr
+                .expr
+                .return_field(input_schema)?
+                .metadata()
+                .clone();
+
+            let field = Field::new(
+                &proj_expr.alias,
+                proj_expr.expr.data_type(input_schema)?,
+                proj_expr.expr.nullable(input_schema)?,
+            )
+            .with_metadata(metadata);
+
+            Ok(field)
+        })
+        .collect();
+
+    Ok(Schema::new_with_metadata(
+        fields?,
+        input_schema.metadata().clone(),
+    ))
+}
+
 /// A projection expression that is created by [`ProjectionExec`]
 ///
 /// The expression is evaluated and the result is stored in a column
@@ -229,6 +236,12 @@ impl ProjectionExpr {
 impl From<(Arc<dyn PhysicalExpr>, String)> for ProjectionExpr {
     fn from(value: (Arc<dyn PhysicalExpr>, String)) -> Self {
         Self::new(value.0, value.1)
+    }
+}
+
+impl From<ProjectionExpr> for (Arc<dyn PhysicalExpr>, String) {
+    fn from(value: ProjectionExpr) -> Self {
+        (value.expr, value.alias)
     }
 }
 
@@ -446,11 +459,28 @@ impl ProjectionStream {
 }
 
 /// Projection iterator
-struct ProjectionStream {
+pub struct ProjectionStream {
     schema: SchemaRef,
     expr: Vec<Arc<dyn PhysicalExpr>>,
     input: SendableRecordBatchStream,
     baseline_metrics: BaselineMetrics,
+}
+
+impl ProjectionStream {
+    /// Create a new projection stream
+    pub fn new(
+        schema: SchemaRef,
+        expr: Vec<Arc<dyn PhysicalExpr>>,
+        input: SendableRecordBatchStream,
+        baseline_metrics: BaselineMetrics,
+    ) -> Self {
+        Self {
+            schema,
+            expr,
+            input,
+            baseline_metrics,
+        }
+    }
 }
 
 impl Stream for ProjectionStream {
