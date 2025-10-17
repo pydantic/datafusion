@@ -55,7 +55,6 @@ use datafusion_physical_plan::{
     display::{display_orderings, ProjectSchemaDisplay},
     filter_pushdown::FilterPushdownPropagation,
     metrics::ExecutionPlanMetricsSet,
-    projection::{all_alias_free_columns, new_projections_for_columns},
     DisplayAs, DisplayFormatType,
 };
 use std::{
@@ -67,6 +66,40 @@ use datafusion_physical_expr::equivalence::project_orderings;
 use datafusion_physical_plan::coop::cooperative;
 use datafusion_physical_plan::execution_plan::SchedulingType;
 use log::{debug, warn};
+
+/// Split projection expressions into simple column indices and unsupported remainder expressions.
+///
+/// This helper function analyzes a list of projection expressions and separates them into:
+/// - Simple column references that can be represented as indices
+/// - Complex expressions that need to be evaluated by a ProjectionExec
+///
+/// # Returns
+/// A tuple of `(column_indices, remainder_expressions)` where:
+/// - `column_indices`: Vec of column indices for simple column references
+/// - `remainder_expressions`: Vec of expressions that couldn't be represented as simple indices
+pub fn split_projection_into_simple_column_indices(
+    projection: &[ProjectionExpr],
+) -> (Vec<usize>, Vec<ProjectionExpr>) {
+    let mut column_indices = Vec::with_capacity(projection.len());
+    let mut remainder_expressions = Vec::new();
+
+    for proj_expr in projection {
+        // Check if this is a simple column reference
+        if let Some(col) = proj_expr.expr.as_any().downcast_ref::<Column>() {
+            // It's a simple column if:
+            // 1. The alias is empty, OR
+            // 2. The alias matches the column name (no renaming)
+            if proj_expr.alias.is_empty() || proj_expr.alias == col.name() {
+                column_indices.push(col.index());
+                continue;
+            }
+        }
+        // If we get here, it's not a simple column reference, so add to remainder
+        remainder_expressions.push(proj_expr.clone());
+    }
+
+    (column_indices, remainder_expressions)
+}
 
 /// The base configurations for a [`DataSourceExec`], the a physical plan for
 /// any given file format.
@@ -626,41 +659,66 @@ impl DataSource for FileScanConfig {
     fn try_swapping_with_projection(
         &self,
         projection: &[ProjectionExpr],
-    ) -> Result<Option<Arc<dyn DataSource>>> {
-        // This process can be moved into CsvExec, but it would be an overlap of their responsibility.
+    ) -> Result<(Option<Arc<dyn DataSource>>, Vec<ProjectionExpr>)> {
+        // Get the current projection indices (includes partition columns if any)
+        let current_projection_indices = self.projection_indices();
+        let num_file_columns = self.file_schema.fields().len();
 
-        // Must be all column references, with no table partition columns (which can not be projected)
-        let partitioned_columns_in_proj = projection.iter().any(|proj_expr| {
+        // Check if after translating to file schema indices, we'd have partition columns
+        let has_partition_columns = projection.iter().any(|proj_expr| {
             proj_expr
                 .expr
                 .as_any()
                 .downcast_ref::<Column>()
-                .map(|expr| expr.index() >= self.file_schema.fields().len())
+                .map(|col| {
+                    let idx = col.index();
+                    // Translate to file schema index
+                    idx < current_projection_indices.len()
+                        && current_projection_indices[idx] >= num_file_columns
+                })
                 .unwrap_or(false)
         });
 
-        // If there is any non-column or alias-carrier expression, Projection should not be removed.
-        let no_aliases = all_alias_free_columns(projection);
+        // If there are partition columns, we can't push down the projection
+        if has_partition_columns {
+            return Ok((None, vec![]));
+        }
 
-        Ok((no_aliases && !partitioned_columns_in_proj).then(|| {
-            let file_scan = self.clone();
-            let source = Arc::clone(&file_scan.file_source);
-            let new_projections = new_projections_for_columns(
-                projection,
-                &file_scan
-                    .projection
-                    .clone()
-                    .unwrap_or_else(|| (0..self.file_schema.fields().len()).collect()),
-            );
+        // Try to push down the projection into the FileSource
+        match self.file_source.try_projection_pushdown(projection, self)? {
+            Some((new_file_source, remainder)) => {
+                // For now, only support full pushdown (no remainders)
+                // Supporting partial pushdown with remainders requires remapping
+                // the remainder expressions to the new schema, which is complex
+                if !remainder.is_empty() {
+                    return Ok((None, vec![]));
+                }
 
-            Arc::new(
-                FileScanConfigBuilder::from(file_scan)
-                    // Assign projected statistics to source
-                    .with_projection(Some(new_projections))
-                    .with_source(source)
-                    .build(),
-            ) as _
-        }))
+                // Extract the column indices that were pushed down
+                // These indices are relative to the current projected schema
+                let (column_indices_in_current_schema, _) = split_projection_into_simple_column_indices(projection);
+
+                // Translate indices from current projected schema to file schema
+                let column_indices_in_file_schema: Vec<usize> = column_indices_in_current_schema
+                    .iter()
+                    .map(|&idx| current_projection_indices[idx])
+                    .collect();
+
+                // Create a new FileScanConfig with the updated file source and projection
+                let new_config = Arc::new(
+                    FileScanConfigBuilder::from(self.clone())
+                        .with_source(new_file_source)
+                        .with_projection(Some(column_indices_in_file_schema))
+                        .build(),
+                ) as Arc<dyn DataSource>;
+
+                Ok((Some(new_config), vec![]))
+            }
+            None => {
+                // FileSource couldn't handle the projection
+                Ok((None, vec![]))
+            }
+        }
     }
 
     fn try_pushdown_filters(
@@ -2223,13 +2281,14 @@ mod tests {
 
         // Simulate projection being updated. Since the filter has already been pushed down,
         // the new projection won't include the filtered column.
-        let data_source = config
+        let (data_source, remainder) = config
             .try_swapping_with_projection(&[ProjectionExpr::new(
                 col("c3", &file_schema).unwrap(),
                 "c3".to_string(),
             )])
-            .unwrap()
             .unwrap();
+        let data_source = data_source.unwrap();
+        assert!(remainder.is_empty(), "Expected no remainder projections");
 
         // Gather the equivalence properties from the new data source. There should
         // be no equivalence class for column c2 since it was removed by the projection.

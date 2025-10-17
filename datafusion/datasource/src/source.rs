@@ -158,10 +158,24 @@ pub trait DataSource: Send + Sync + Debug {
     fn metrics(&self) -> ExecutionPlanMetricsSet {
         ExecutionPlanMetricsSet::new()
     }
+    /// Attempts to push down the given projection into this `DataSource`.
+    ///
+    /// If the data source supports this optimization, it returns a tuple of:
+    /// - `Some(new_data_source)`: An updated DataSource with the pushable projections applied
+    /// - `remainder_projections`: Projection expressions that couldn't be pushed down and need
+    ///   to be evaluated by a ProjectionExec above the scan
+    ///
+    /// If no pushdown is possible, returns `Ok((None, vec![]))`.
+    ///
+    /// The remainder projections will be used by `DataSourceExec` to wrap the scan
+    /// in a `ProjectionExec` if needed.
     fn try_swapping_with_projection(
         &self,
         _projection: &[ProjectionExpr],
-    ) -> Result<Option<Arc<dyn DataSource>>>;
+    ) -> Result<(Option<Arc<dyn DataSource>>, Vec<ProjectionExpr>)> {
+        Ok((None, vec![]))
+    }
+
     /// Try to push down filters into this DataSource.
     /// See [`ExecutionPlan::handle_child_pushdown_result`] for more details.
     ///
@@ -317,12 +331,21 @@ impl ExecutionPlan for DataSourceExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        match self
+        let (new_data_source_opt, remainder) = self
             .data_source
-            .try_swapping_with_projection(projection.expr())?
-        {
+            .try_swapping_with_projection(projection.expr())?;
+
+        match new_data_source_opt {
             Some(new_data_source) => {
-                Ok(Some(Arc::new(DataSourceExec::new(new_data_source))))
+                let new_exec = Arc::new(DataSourceExec::new(new_data_source));
+
+                // If there are remainder projections, wrap the exec in a ProjectionExec
+                if !remainder.is_empty() {
+                    let new_projection = ProjectionExec::try_new(remainder, new_exec)?;
+                    Ok(Some(Arc::new(new_projection)))
+                } else {
+                    Ok(Some(new_exec))
+                }
             }
             None => Ok(None),
         }

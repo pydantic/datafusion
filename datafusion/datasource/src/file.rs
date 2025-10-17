@@ -129,6 +129,55 @@ pub trait FileSource: Send + Sync {
         ))
     }
 
+    /// Try to push down projections into this FileSource.
+    ///
+    /// This method allows file sources to optimize projection operations by:
+    /// - Accepting simple column projections they can handle efficiently
+    /// - Returning complex expressions that need to be evaluated by a ProjectionExec
+    ///
+    /// # Arguments
+    /// * `projection` - The projection expressions to consider pushing down
+    /// * `config` - The current file scan configuration
+    ///
+    /// # Returns
+    /// `Ok(Some((new_file_source, remainder_projections)))` if pushdown is possible, where:
+    /// - `new_file_source` is an updated FileSource with the projection applied
+    /// - `remainder_projections` are expressions that couldn't be pushed down and need
+    ///   to be evaluated by a ProjectionExec above the scan
+    ///
+    /// `Ok(None)` if no projection pushdown is applicable
+    ///
+    /// The default implementation uses [`split_projection_into_simple_column_indices`]
+    /// to separate simple column references from complex expressions, then delegates
+    /// to [`with_projection`] if simple columns can be pushed down.
+    ///
+    /// [`split_projection_into_simple_column_indices`]: crate::file_scan_config::split_projection_into_simple_column_indices
+    /// [`with_projection`]: Self::with_projection
+    fn try_projection_pushdown(
+        &self,
+        projection: &[datafusion_physical_plan::projection::ProjectionExpr],
+        config: &FileScanConfig,
+    ) -> Result<Option<(Arc<dyn FileSource>, Vec<datafusion_physical_plan::projection::ProjectionExpr>)>> {
+        use crate::file_scan_config::split_projection_into_simple_column_indices;
+
+        let (column_indices, remainder) = split_projection_into_simple_column_indices(projection);
+
+        // If we have simple column indices, we can handle them
+        if !column_indices.is_empty() {
+            // Create a new config with the simple column projection
+            let mut new_config = config.clone();
+            new_config.projection = Some(column_indices);
+
+            // Apply the projection to get a new FileSource
+            let new_source = self.with_projection(&new_config);
+
+            Ok(Some((new_source, remainder)))
+        } else {
+            // No simple columns to push down
+            Ok(None)
+        }
+    }
+
     /// Set optional schema adapter factory.
     ///
     /// [`SchemaAdapterFactory`] allows user to specify how fields from the
