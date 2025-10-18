@@ -196,8 +196,6 @@ impl FilterExec {
 
         let num_rows = input_stats.num_rows;
         let total_byte_size = input_stats.total_byte_size;
-        println!("Input stats: {:?}", input_stats);
-        println!("Schema: {:?}", schema);
         let input_analysis_ctx = AnalysisContext::try_from_statistics(
             &schema,
             &input_stats.column_statistics,

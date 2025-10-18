@@ -473,6 +473,54 @@ impl From<ParquetSource> for Arc<dyn FileSource> {
     }
 }
 
+/// Rewrites a physical expression by replacing column references with expressions
+/// from an existing projection. This is used when composing two projections.
+///
+/// For example, if `expr` is `Column(index=0) + 1` and `existing_projection`
+/// contains `[Column(index=9)]`, this will rewrite it to `Column(index=9) + 1`.
+fn rewrite_projection_expr(
+    expr: &Arc<dyn PhysicalExpr>,
+    existing_projection: &[ProjectionExpr],
+) -> datafusion_common::Result<Arc<dyn PhysicalExpr>> {
+    use datafusion_physical_expr::expressions::{BinaryExpr, Column};
+
+    // If this is a column reference, replace it with the expression from existing_projection
+    if let Some(col) = expr.as_any().downcast_ref::<Column>() {
+        let idx = col.index();
+        if idx >= existing_projection.len() {
+            return datafusion_common::internal_err!(
+                "Column index {} out of bounds for existing projection of length {}",
+                idx,
+                existing_projection.len()
+            );
+        }
+        return Ok(Arc::clone(&existing_projection[idx].expr));
+    }
+
+    // If this is a binary expression, recursively rewrite both sides
+    if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
+        let left = rewrite_projection_expr(binary.left(), existing_projection)?;
+        let right = rewrite_projection_expr(binary.right(), existing_projection)?;
+        return Ok(Arc::new(BinaryExpr::new(left, *binary.op(), right)));
+    }
+
+    // For other expression types, recursively rewrite children
+    let children = expr.children();
+    if children.is_empty() {
+        // No children, return as-is (e.g., literals)
+        return Ok(Arc::clone(expr));
+    }
+
+    // Rewrite all children
+    let new_children = children
+        .into_iter()
+        .map(|child| rewrite_projection_expr(&child, existing_projection))
+        .collect::<datafusion_common::Result<Vec<_>>>()?;
+
+    // Create a new expression with rewritten children
+    Arc::clone(expr).with_new_children(new_children)
+}
+
 impl FileSource for ParquetSource {
     fn schema(&self) -> SchemaRef {
         Arc::clone(
@@ -712,10 +760,31 @@ impl FileSource for ParquetSource {
     ) -> datafusion_common::Result<
         Option<(Arc<dyn FileSource>, Option<Vec<ProjectionExpr>>)>,
     > {
-        // If there's already a projection, don't allow another one to be pushed down.
-        // This prevents double-projection bugs where indices get mismatched.
-        if self.projection.is_some() {
-            return Ok(None);
+        // If there's already a projection, we need to compose them
+        if let Some(existing_projection) = &self.projection {
+            // Compose the projections by replacing column references in the new projection
+            // with the expressions from the existing projection.
+            //
+            // For example:
+            // - Existing: [UserID@9]
+            // - New: [UserID@0 + 1]
+            // - Composed: [UserID@9 + 1]
+            let mut composed_projection = Vec::new();
+
+            for proj_expr in projection {
+                let rewritten_expr = rewrite_projection_expr(
+                    &proj_expr.expr,
+                    existing_projection,
+                )?;
+                composed_projection.push(ProjectionExpr {
+                    expr: rewritten_expr,
+                    alias: proj_expr.alias.clone(),
+                });
+            }
+
+            let mut conf = self.clone();
+            conf.projection = Some(composed_projection);
+            return Ok(Some((Arc::new(conf), None)));
         }
 
         let mut conf = self.clone();
