@@ -24,11 +24,9 @@ use crate::avro_to_arrow::Reader as AvroReader;
 
 use arrow::datatypes::SchemaRef;
 use datafusion_common::error::Result;
-use datafusion_common::Statistics;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::file_stream::FileOpener;
-use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 
@@ -79,7 +77,7 @@ impl FileSource for AvroSource {
     fn projection(
         &self,
     ) -> Option<Vec<datafusion_physical_plan::projection::ProjectionExpr>> {
-        todo!();
+        None // TODO: implement projection support in refactor
     }
 
     fn schema(&self) -> SchemaRef {
@@ -87,7 +85,7 @@ impl FileSource for AvroSource {
     }
 
     fn filter(&self) -> Option<Arc<dyn datafusion_physical_plan::PhysicalExpr>> {
-        todo!();
+        None // TODO: implement filter support in refactor
     }
 
     fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource> {

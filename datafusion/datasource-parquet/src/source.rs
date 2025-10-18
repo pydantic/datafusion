@@ -536,9 +536,7 @@ impl FileSource for ParquetSource {
         Arc::new(ParquetOpener {
             partition_index: partition,
             projection,
-            batch_size: self
-                .batch_size
-                .expect("Batch size must set before creating ParquetOpener"),
+            batch_size: 8096, // default batch size TODO pipe in somehow
             limit: base_config.limit,
             predicate: self.predicate.clone(),
             logical_file_schema: Arc::clone(&base_config.file_schema),

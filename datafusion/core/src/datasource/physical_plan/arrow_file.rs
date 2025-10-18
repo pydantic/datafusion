@@ -21,12 +21,11 @@ use std::sync::Arc;
 use crate::datasource::physical_plan::{FileOpenFuture, FileOpener};
 use crate::error::Result;
 use datafusion_datasource::as_file_source;
-use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 
 use arrow::buffer::Buffer;
 use arrow::datatypes::SchemaRef;
 use arrow_ipc::reader::FileDecoder;
-use datafusion_common::{exec_datafusion_err, Statistics};
+use datafusion_common::exec_datafusion_err;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::PartitionedFile;
@@ -41,8 +40,6 @@ use object_store::{GetOptions, GetRange, GetResultPayload, ObjectStore};
 #[derive(Clone, Default)]
 pub struct ArrowSource {
     metrics: ExecutionPlanMetricsSet,
-    projected_statistics: Option<Statistics>,
-    schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
 }
 
 impl From<ArrowSource> for Arc<dyn FileSource> {
@@ -55,12 +52,12 @@ impl FileSource for ArrowSource {
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
-        base_config: &FileScanConfig,
+        _base_config: &FileScanConfig,
         _partition: usize,
     ) -> Arc<dyn FileOpener> {
         Arc::new(ArrowOpener {
             object_store,
-            projection: base_config.file_column_projection_indices(),
+            projection: None, // TODO: implement projection support in refactor
         })
     }
 
@@ -68,20 +65,19 @@ impl FileSource for ArrowSource {
         self
     }
 
-    fn with_batch_size(&self, _batch_size: usize) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
+    fn schema(&self) -> SchemaRef {
+        todo!("ArrowSource needs full refactor - use ParquetSource for now")
+    }
+
+    fn projection(&self) -> Option<Vec<datafusion_physical_plan::projection::ProjectionExpr>> {
+        None // TODO: implement projection support in refactor
+    }
+
+    fn filter(&self) -> Option<Arc<dyn datafusion_physical_expr_common::physical_expr::PhysicalExpr>> {
+        None // TODO: implement filter support in refactor
     }
 
     fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
-    }
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.projected_statistics = Some(statistics);
-        Arc::new(conf)
-    }
-
-    fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
         Arc::new(Self { ..self.clone() })
     }
 
@@ -89,29 +85,8 @@ impl FileSource for ArrowSource {
         &self.metrics
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        let statistics = &self.projected_statistics;
-        Ok(statistics
-            .clone()
-            .expect("projected_statistics must be set"))
-    }
-
     fn file_type(&self) -> &str {
         "arrow"
-    }
-
-    fn with_schema_adapter_factory(
-        &self,
-        schema_adapter_factory: Arc<dyn SchemaAdapterFactory>,
-    ) -> Result<Arc<dyn FileSource>> {
-        Ok(Arc::new(Self {
-            schema_adapter_factory: Some(schema_adapter_factory),
-            ..self.clone()
-        }))
-    }
-
-    fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
-        self.schema_adapter_factory.clone()
     }
 }
 

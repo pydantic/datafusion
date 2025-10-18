@@ -43,7 +43,7 @@ use datafusion::{
     physical_plan::expressions::LikeExpr,
 };
 use datafusion_common::{
-    internal_datafusion_err, internal_err, not_impl_err, DataFusionError, Result,
+    internal_datafusion_err, internal_err, not_impl_err, DataFusionError, Result, Statistics,
 };
 use datafusion_expr::WindowFrame;
 
@@ -531,14 +531,12 @@ pub fn serialize_file_scan_config(
 
     Ok(protobuf::FileScanExecConf {
         file_groups,
-        statistics: Some((&conf.file_source.statistics().unwrap()).into()),
+        // TODO: statistics are now stored in PartitionedFile, need to aggregate them
+        statistics: Some((&Statistics::new_unknown(&conf.file_schema)).into()),
         limit: conf.limit.map(|l| protobuf::ScanLimit { limit: l as u32 }),
-        projection: conf
-            .projection
-            .as_ref()
-            .unwrap_or(&(0..schema.fields().len()).collect::<Vec<_>>())
-            .iter()
-            .map(|n| *n as u32)
+        // TODO: projection is now in FileSource, need to refactor
+        projection: (0..schema.fields().len())
+            .map(|n| n as u32)
             .collect(),
         schema: Some(schema.as_ref().try_into()?),
         table_partition_cols: conf

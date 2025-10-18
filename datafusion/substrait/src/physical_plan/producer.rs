@@ -92,7 +92,9 @@ pub fn to_substrait_rel(
             };
 
             let mut select_struct = None;
-            if let Some(projection) = file_config.projection.as_ref() {
+            // TODO: projection is now in FileSource, need to refactor this code
+            let projection = None::<Vec<usize>>;
+            if let Some(projection) = projection.as_ref() {
                 let struct_items = projection
                     .iter()
                     .map(|index| StructItem {

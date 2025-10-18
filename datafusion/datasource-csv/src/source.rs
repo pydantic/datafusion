@@ -17,7 +17,6 @@
 
 //! Execution plan for reading CSV files
 
-use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use std::any::Any;
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
@@ -91,8 +90,6 @@ pub struct CsvSource {
     escape: Option<u8>,
     comment: Option<u8>,
     metrics: ExecutionPlanMetricsSet,
-    projected_statistics: Option<Statistics>,
-    schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
     truncate_rows: bool,
 }
 
@@ -255,7 +252,7 @@ impl FileSource for CsvSource {
     fn projection(
         &self,
     ) -> Option<Vec<datafusion_physical_plan::projection::ProjectionExpr>> {
-        todo!();
+        None // TODO: implement projection support in refactor
     }
 
     fn schema(&self) -> SchemaRef {

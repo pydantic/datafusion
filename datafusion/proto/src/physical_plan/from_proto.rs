@@ -494,7 +494,8 @@ pub fn parse_protobuf_file_scan_config(
         .collect::<Vec<_>>();
 
     let constraints = convert_required!(proto.constraints)?;
-    let statistics = convert_required!(proto.statistics)?;
+    // TODO: statistics are now stored in PartitionedFile, not at the config level
+    // let statistics = convert_required!(proto.statistics)?;
 
     let file_groups = proto
         .file_groups
@@ -543,8 +544,8 @@ pub fn parse_protobuf_file_scan_config(
     let config = FileScanConfigBuilder::new(object_store_url, file_schema, file_source)
         .with_file_groups(file_groups)
         .with_constraints(constraints)
-        .with_statistics(statistics)
-        .with_projection(Some(projection))
+        // TODO: statistics are now stored in PartitionedFile, need to refactor
+        .with_projection(Some(projection))?
         .with_limit(proto.limit.as_ref().map(|sl| sl.limit as usize))
         .with_table_partition_cols(table_partition_cols)
         .with_output_ordering(output_ordering)
