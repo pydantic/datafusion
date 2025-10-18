@@ -712,6 +712,12 @@ impl FileSource for ParquetSource {
     ) -> datafusion_common::Result<
         Option<(Arc<dyn FileSource>, Option<Vec<ProjectionExpr>>)>,
     > {
+        // If there's already a projection, don't allow another one to be pushed down.
+        // This prevents double-projection bugs where indices get mismatched.
+        if self.projection.is_some() {
+            return Ok(None);
+        }
+
         let mut conf = self.clone();
         conf.projection = Some(projection.to_vec());
         Ok(Some((Arc::new(conf), None)))

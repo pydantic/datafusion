@@ -320,12 +320,11 @@ impl FileScanConfigBuilder {
         let file_source = match (self.file_source.projection(), file_source.projection()) {
             (Some(old_proj), None) => {
                 // Old source had projection but new one doesn't - preserve it
-                eprintln!("DEBUG with_source: preserving projection from old source");
                 match file_source.try_projection_pushdown(&old_proj) {
                     Ok(Some((new_source_with_proj, _))) => new_source_with_proj,
                     Ok(None) | Err(_) => {
-                        eprintln!("WARN: Could not preserve projection when updating file source");
-                        file_source // Couldn't pushdown, use as-is
+                        // Couldn't pushdown, use as-is
+                        file_source
                     }
                 }
             }
@@ -372,24 +371,21 @@ impl FileScanConfigBuilder {
                 // Projection indices >= file_schema.len() refer to partition columns which are appended
                 // after file columns in the table schema.
                 //
-                // IMPORTANT: We need to REMAP the indices! The projection coming in has indices
-                // based on table_schema (e.g., UserID at index 9). But after projection, the
-                // output schema will only have the projected columns, so we need to renumber them
-                // starting from 0.
+                // Filter projection to include only file columns (not partition columns).
+                // Projection indices >= file_schema.len() refer to partition columns.
+                // Keep the indices as-is (referencing positions in file_schema).
                 let file_projection: Vec<ProjectionExpr> = projection
                     .into_iter()
                     .filter_map(|table_idx| {
                         if table_idx < file_schema_len {
-                            // This is a file column. Use the table_idx (as in table_schema).
+                            // This is a file column. Keep the table_idx to reference file_schema.
                             let field_name = file_schema.field(table_idx).name();
-                            eprintln!("DEBUG with_projection: table_idx={}, field_name={}", table_idx, field_name);
                             Some(ProjectionExpr::new(
-                                Arc::new(Column::new(field_name, table_idx)),  // Use table_idx!
+                                Arc::new(Column::new(field_name, table_idx)),
                                 field_name.to_string(),
                             ))
                         } else {
                             // This is a partition column, skip it for file source projection
-                            eprintln!("DEBUG with_projection: skipping partition column at table_idx={}", table_idx);
                             None
                         }
                     })
@@ -397,10 +393,8 @@ impl FileScanConfigBuilder {
 
                 // Only push down if there are file columns to project
                 if file_projection.is_empty() {
-                    eprintln!("DEBUG with_projection: file_projection is empty, returning unchanged file_source");
                     self.file_source.clone()
                 } else {
-                    eprintln!("DEBUG with_projection: file_projection has {} exprs", file_projection.len());
                     match self.file_source.try_projection_pushdown(&file_projection)? {
                         Some((new_file_source, remainder)) => {
                             if remainder.is_some() {
@@ -408,9 +402,6 @@ impl FileScanConfigBuilder {
                                     "File source could not fully handle projection pushdown"
                                 );
                             }
-                            eprintln!("DEBUG with_projection: got new_file_source, checking projection...");
-                            eprintln!("DEBUG with_projection: new_file_source.projection() = {:?}",
-                                new_file_source.projection().as_ref().map(|p| p.len()));
                             new_file_source
                         }
                         None => {
@@ -523,9 +514,7 @@ impl FileScanConfigBuilder {
 
         let constraints = constraints.unwrap_or_default();
 
-        eprintln!("DEBUG build: file_source.projection() BEFORE with_schema = {:?}", file_source.projection().as_ref().map(|p| p.len()));
         let file_source = file_source.with_schema(Arc::clone(&file_schema));
-        eprintln!("DEBUG build: file_source.projection() AFTER with_schema = {:?}", file_source.projection().as_ref().map(|p| p.len()));
         let file_compression_type =
             file_compression_type.unwrap_or(FileCompressionType::UNCOMPRESSED);
         let new_lines_in_values = new_lines_in_values.unwrap_or(false);
@@ -591,9 +580,7 @@ impl DataSource for FileScanConfig {
     }
 
     fn projection(&self) -> Option<Vec<ProjectionExpr>> {
-        let proj = self.file_source.projection();
-        eprintln!("DEBUG FileScanConfig.projection() returning: {:?}", proj.as_ref().map(|p| p.len()));
-        proj
+        self.file_source.projection()
     }
 
     fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
@@ -615,7 +602,7 @@ impl DataSource for FileScanConfig {
         .with_constraints(self.constraints.clone());
         if let Some(projection) = self.file_source.projection() {
             let mapping = ProjectionMapping::try_new(projection.into_iter().map(Into::into), &table_schema)
-                .expect("need to handle error");
+                .expect("BUG: projection expressions should match the table schema");
             let projected_schema = self.projected_schema();
             eq_props = eq_props.project(&mapping, projected_schema);
         }
@@ -811,7 +798,7 @@ impl FileScanConfig {
         let table_schema = builder.finish();
         let projected_schema = match &self.file_source.projection() {
             Some(projection) => projection::project_schema(projection, &table_schema)
-                .expect("need to handle error"),
+                .expect("BUG: projection expressions should match the table schema"),
             None => table_schema,
         };
         Arc::new(projected_schema)
