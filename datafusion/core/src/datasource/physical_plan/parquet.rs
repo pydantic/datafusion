@@ -61,10 +61,12 @@ mod tests {
     };
     use datafusion_execution::object_store::ObjectStoreUrl;
     use datafusion_expr::{col, lit, when, Expr};
+    use datafusion_physical_expr::expressions;
     use datafusion_physical_expr::planner::logical2physical;
     use datafusion_physical_plan::analyze::AnalyzeExec;
     use datafusion_physical_plan::collect;
     use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+    use datafusion_physical_plan::projection::ProjectionExpr;
     use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
     use chrono::{TimeZone, Utc};
@@ -94,7 +96,7 @@ mod tests {
     /// options.
     #[derive(Debug, Default)]
     struct RoundTrip {
-        projection: Option<Vec<usize>>,
+        projection: Option<Vec<ProjectionExpr>>,
         /// Optional logical table schema to use when reading the parquet files
         ///
         /// If None, the logical schema to use will be inferred from the
@@ -112,6 +114,21 @@ mod tests {
         }
 
         fn with_projection(mut self, projection: Vec<usize>) -> Self {
+            let projection = projection
+                .into_iter()
+                .map(|i| {
+                    let field = self
+                        .table_schema
+                        .as_ref()
+                        .expect("Table schema must be set before projection")
+                        .field(i)
+                        .clone();
+                    ProjectionExpr::new(
+                        Arc::new(expressions::Column::new(field.name(), i)),
+                        field.name().to_string(),
+                    )
+                })
+                .collect();
             self.projection = Some(projection);
             self
         }
@@ -200,6 +217,7 @@ mod tests {
             )
             .with_file_group(file_group)
             .with_projection(self.projection.clone())
+            .unwrap()
             .build();
             DataSourceExec::from_data_source(base_config)
         }
@@ -1653,6 +1671,7 @@ mod tests {
             .with_file(partitioned_file)
             // file has 10 cols so index 12 should be month and 13 should be day
             .with_projection(Some(vec![0, 1, 2, 12, 13]))
+            .unwrap()
             .with_table_partition_cols(vec![
                 Field::new("year", DataType::Utf8, false),
                 Field::new("month", DataType::UInt8, false),

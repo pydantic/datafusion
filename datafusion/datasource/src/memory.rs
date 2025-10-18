@@ -225,24 +225,7 @@ impl DataSource for MemorySourceConfig {
         &self,
         projection: &[ProjectionExpr],
     ) -> Result<Option<(Arc<dyn DataSource>, Option<Vec<ProjectionExpr>>)>> {
-        // If there is any non-column or alias-carrier expression, Projection should not be removed.
-        // This process can be moved into MemoryExec, but it would be an overlap of their responsibility.
-        if all_alias_free_columns(projection) {
-            let all_projections = (0..self.schema.fields().len()).collect();
-            let new_projections = new_projections_for_columns(
-                projection,
-                self.projection.as_ref().unwrap_or(&all_projections),
-            );
-
-            MemorySourceConfig::try_new(
-                self.partitions(),
-                self.original_schema(),
-                Some(new_projections),
-            )
-            .map(|s| Some((Arc::new(s) as Arc<dyn DataSource>, vec![])))
-        } else {
-            Ok(None)
-        }
+        todo!();
     }
 }
 

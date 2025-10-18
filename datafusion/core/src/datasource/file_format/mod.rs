@@ -74,7 +74,7 @@ pub(crate) mod test_util {
             object_meta: meta,
             partition_values: vec![],
             range: None,
-            statistics: None,
+            statistics: Some(Arc::new(statistics)),
             extensions: None,
             metadata_size_hint: None,
         }]
@@ -89,8 +89,6 @@ pub(crate) mod test_util {
                     format.file_source(),
                 )
                 .with_file_groups(file_groups)
-                .with_statistics(statistics)
-                .with_projection(projection)
                 .with_limit(limit)
                 .build(),
             )

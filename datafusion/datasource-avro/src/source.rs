@@ -76,10 +76,12 @@ impl FileSource for AvroSource {
         self
     }
 
-    fn projection(&self) -> Option<Vec<datafusion_physical_plan::projection::ProjectionExpr>> {
+    fn projection(
+        &self,
+    ) -> Option<Vec<datafusion_physical_plan::projection::ProjectionExpr>> {
         todo!();
     }
-    
+
     fn schema(&self) -> SchemaRef {
         Arc::clone(self.schema.as_ref().expect("Schema must be set"))
     }

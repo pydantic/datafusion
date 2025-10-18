@@ -1272,7 +1272,7 @@ pub trait SchemaExt {
     fn logically_equivalent_names_and_types(&self, other: &Self) -> Result<()>;
 
     /// Returns a new schema with the specified partition columns appended to the schema.
-    /// 
+    ///
     /// Partition columns are expected to not already exist in the schema and are always appended to the end.
     fn with_table_partition_columns(&self, partition_fields: &[FieldRef]) -> Schema;
 }
@@ -1328,7 +1328,7 @@ impl SchemaExt for Schema {
     }
 
     /// Returns a new schema with the specified partition columns appended to the schema.
-    /// 
+    ///
     /// Partition columns are expected to not already exist in the schema and are always appended to the end.
     fn with_table_partition_columns(&self, partition_fields: &[FieldRef]) -> Self {
         let mut builder = SchemaBuilder::from(self);

@@ -42,7 +42,9 @@ use crate::file_scan_config::FileScanConfig;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Constraints, Result, Statistics};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_physical_expr::{split_conjunction, EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{
+    split_conjunction, EquivalenceProperties, Partitioning, PhysicalExpr,
+};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use datafusion_physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
@@ -327,7 +329,8 @@ impl ExecutionPlan for DataSourceExec {
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         match self
             .data_source
-            .try_swapping_with_projection(projection.expr())? {
+            .try_swapping_with_projection(projection.expr())?
+        {
             Some((new_data_source, remainder)) => {
                 let new_exec = Arc::new(DataSourceExec::new(new_data_source));
                 // If there are remainder projections, wrap the exec in a ProjectionExec
@@ -450,7 +453,6 @@ where
         Self::new(Arc::new(source))
     }
 }
-
 
 fn add_filter_equivalence_info(
     filter: Arc<dyn PhysicalExpr>,

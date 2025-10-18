@@ -154,7 +154,6 @@ pub trait FileSource: Send + Sync {
     fn try_projection_pushdown(
         &self,
         _projection: &[ProjectionExpr],
-        _config: &FileScanConfig,
     ) -> Result<Option<(Arc<dyn FileSource>, Option<Vec<ProjectionExpr>>)>> {
         Ok(None)
     }

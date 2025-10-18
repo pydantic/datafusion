@@ -460,8 +460,7 @@ pub fn compute_all_files_statistics(
     file_groups: Vec<FileGroup>,
     table_schema: SchemaRef,
     collect_stats: bool,
-    inexact_stats: bool,
-) -> Result<(Vec<FileGroup>, Statistics)> {
+) -> Result<Vec<FileGroup>> {
     let file_groups_with_stats = file_groups
         .into_iter()
         .map(|file_group| {
@@ -473,19 +472,7 @@ pub fn compute_all_files_statistics(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Then summary statistics across all file groups
-    let file_groups_statistics = file_groups_with_stats
-        .iter()
-        .filter_map(|file_group| file_group.file_statistics(None));
-
-    let mut statistics =
-        Statistics::try_merge_iter(file_groups_statistics, &table_schema)?;
-
-    if inexact_stats {
-        statistics = statistics.to_inexact()
-    }
-
-    Ok((file_groups_with_stats, statistics))
+    Ok(file_groups_with_stats)
 }
 
 #[deprecated(since = "47.0.0", note = "Use Statistics::add")]

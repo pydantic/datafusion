@@ -58,7 +58,9 @@ impl FileSource for MockSource {
         Arc::new(Schema::empty())
     }
 
-    fn projection(&self) -> Option<Vec<datafusion_physical_plan::projection::ProjectionExpr>> {
+    fn projection(
+        &self,
+    ) -> Option<Vec<datafusion_physical_plan::projection::ProjectionExpr>> {
         None
     }
 
@@ -73,7 +75,6 @@ impl FileSource for MockSource {
     fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
         Arc::new(Self { ..self.clone() })
     }
-
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
         &self.metrics

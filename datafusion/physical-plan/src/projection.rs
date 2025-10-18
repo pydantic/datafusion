@@ -180,10 +180,7 @@ impl ProjectionExec {
     }
 }
 
-pub fn project_schema(
-    expr: &[ProjectionExpr],
-    input_schema: &Schema,
-) -> Result<Schema> {
+pub fn project_schema(expr: &[ProjectionExpr], input_schema: &Schema) -> Result<Schema> {
     let fields: Result<Vec<Field>> = expr
         .iter()
         .map(|proj_expr| {

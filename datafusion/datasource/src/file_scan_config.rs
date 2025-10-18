@@ -38,8 +38,8 @@ use arrow::{
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{
-    exec_datafusion_err, exec_err, internal_datafusion_err,
-    Constraints, Result, ScalarValue, Statistics,
+    exec_datafusion_err, exec_err, internal_datafusion_err, plan_err, Constraints,
+    Result, ScalarValue, Statistics,
 };
 use datafusion_execution::{
     object_store::ObjectStoreUrl, SendableRecordBatchStream, TaskContext,
@@ -332,6 +332,45 @@ impl FileScanConfigBuilder {
         self
     }
 
+    /// Push a projection down into the file source.
+    ///
+    /// This shouldn't be called directly, it is only useful for testing.
+    /// Actual queries go through [`FileScanConfig::try_swapping_with_projection`].
+    pub fn with_projection(mut self, projection: Option<Vec<usize>>) -> Result<Self> {
+        let file_source = match projection {
+            Some(projection) => {
+                let schema = self.file_schema.clone();
+                let projection = projection
+                    .into_iter()
+                    .map(|i| {
+                        ProjectionExpr::new(
+                            Arc::new(Column::new(schema.field(i).name(), i)),
+                            schema.field(i).name().to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                match self.file_source.try_projection_pushdown(&projection)? {
+                    Some((new_file_source, remainder)) => {
+                        if remainder.is_some() {
+                            return plan_err!(
+                                "File source could not fully handle projection pushdown"
+                            );
+                        }
+                        new_file_source
+                    }
+                    None => {
+                        return plan_err!(
+                            "File source does not support projection pushdown"
+                        )
+                    }
+                }
+            }
+            None => self.file_source.clone(),
+        };
+        self.file_source = file_source;
+        Ok(self)
+    }
+
     /// Set the list of files to be processed, grouped into partitions.
     ///
     /// Each file must have a schema of `file_schema` or a subset. If
@@ -613,11 +652,9 @@ impl DataSource for FileScanConfig {
                     Ok(Statistics::new_unknown(&self.file_schema))
                 }
             } else {
-                Err(
-                    internal_datafusion_err!(
-                        "Requested statistics for non-existent partition {partition}"
-                    )
-                )
+                Err(internal_datafusion_err!(
+                    "Requested statistics for non-existent partition {partition}"
+                ))
             }
         } else {
             // Aggregate statistics across all partitions
@@ -625,7 +662,7 @@ impl DataSource for FileScanConfig {
                 self.file_groups
                     .iter()
                     .filter_map(|fg| fg.file_statistics(None)),
-                    &self.file_schema
+                &self.file_schema,
             )
         }
     }
@@ -650,9 +687,9 @@ impl DataSource for FileScanConfig {
         projection: &[ProjectionExpr],
     ) -> Result<Option<(Arc<dyn DataSource>, Option<Vec<ProjectionExpr>>)>> {
         // Try to push down the projection into the FileSource
-        match self.file_source.try_projection_pushdown(projection, self)? {
+        match self.file_source.try_projection_pushdown(projection)? {
             Some((new_file_source, remainder)) => {
-                // Create a new FileScanConfig with the updated file source and projection
+                // Create a new FileScanConfig with the updated file source and pass the remainder up to the caller
                 let new_config = Arc::new(
                     FileScanConfigBuilder::from(self.clone())
                         .with_source(new_file_source)

@@ -475,9 +475,11 @@ impl From<ParquetSource> for Arc<dyn FileSource> {
 
 impl FileSource for ParquetSource {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(self.file_schema
-            .as_ref()
-            .expect("projected_schema must be set"))
+        Arc::clone(
+            self.file_schema
+                .as_ref()
+                .expect("projected_schema must be set"),
+        )
     }
 
     fn projection(&self) -> Option<Vec<ProjectionExpr>> {
@@ -490,16 +492,25 @@ impl FileSource for ParquetSource {
         base_config: &FileScanConfig,
         partition: usize,
     ) -> Arc<dyn FileOpener> {
-        let projection = self.projection.clone().map(|p| p.iter().map(|e| e.expr.clone()).collect()).unwrap_or_else(|| {
-            // Get all fields in the table schema
-            self.file_schema.as_ref().expect("file_schema must be set")
-                .with_table_partition_columns(&base_config.table_partition_cols)
-                .fields()
-                .iter()
-                .enumerate()
-                .map(|(i, f)| Arc::new(expressions::Column::new(f.name(), i)))
-                .collect_vec()
-        });
+        let projection = self
+            .projection
+            .clone()
+            .map(|p| p.iter().map(|e| e.expr.clone()).collect())
+            .unwrap_or_else(|| {
+                // Get all fields in the table schema
+                self.file_schema
+                    .as_ref()
+                    .expect("file_schema must be set")
+                    .with_table_partition_columns(&base_config.table_partition_cols)
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        Arc::new(expressions::Column::new(f.name(), i))
+                            as Arc<dyn PhysicalExpr>
+                    })
+                    .collect_vec()
+            });
 
         let parquet_file_reader_factory =
             self.parquet_file_reader_factory.clone().unwrap_or_else(|| {
@@ -700,14 +711,14 @@ impl FileSource for ParquetSource {
     fn try_projection_pushdown(
         &self,
         projection: &[ProjectionExpr],
-        config: &FileScanConfig,
-    ) -> datafusion_common::Result<Option<(Arc<dyn FileSource>, Option<Vec<ProjectionExpr>>)>> {
+    ) -> datafusion_common::Result<
+        Option<(Arc<dyn FileSource>, Option<Vec<ProjectionExpr>>)>,
+    > {
         let mut conf = self.clone();
         conf.projection = Some(projection.to_vec());
         Ok(Some((Arc::new(conf), None)))
     }
 }
-
 
 #[cfg(test)]
 mod tests {

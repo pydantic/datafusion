@@ -27,7 +27,9 @@ use arrow::array::RecordBatch;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_datasource::file_scan_config::take_column_projections;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
-use datafusion_datasource::schema_adapter::{DefaultSchemaAdapterFactory, SchemaAdapterFactory};
+use datafusion_datasource::schema_adapter::{
+    DefaultSchemaAdapterFactory, SchemaAdapterFactory,
+};
 use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_plan::projection::{
@@ -75,7 +77,7 @@ pub(super) struct ParquetOpener {
     /// This projection is relative to the logical file schema and may need to be adjusted to be applied to the physical
     /// file schema.
     /// It may reference table partition columns, which should be filled in with partition values.
-    pub projection: Arc<[Arc<dyn PhysicalExpr>]>,
+    pub projection: Vec<Arc<dyn PhysicalExpr>>,
     /// Target number of rows in each output RecordBatch
     pub batch_size: usize,
     /// Optional limit on the number of rows to read
@@ -294,14 +296,12 @@ impl FileOpener for ParquetOpener {
                     })
                     .transpose()?;
                 // Adapt the projection to the physical file schema
-                projection = Arc::from(
-                    projection
-                        .iter()
-                        .map(|p| {
-                            expr_simplifier.simplify(expr_adapter.rewrite(Arc::clone(p))?)
-                        })
-                        .collect::<Result<Vec<_>>>()?,
-                );
+                projection = projection
+                    .iter()
+                    .map(|p| {
+                        expr_simplifier.simplify(expr_adapter.rewrite(Arc::clone(p))?)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 predicate_file_schema = Arc::clone(&physical_file_schema);
             }
 
@@ -337,7 +337,7 @@ impl FileOpener for ParquetOpener {
             // 2) A Vec<ProjectionExpr> to apply on top of that. For example, this might have partition column literals.
             // For now we only handle column references, e.g. if there is a struct field access we apply the projection after reading the entire struct.
             let (adapted_projections, remaining_exprs) =
-                take_column_projections(projection.into_iter().cloned());
+                take_column_projections(projection.iter().cloned());
             let projected_schema =
                 Arc::new(physical_file_schema.project(&adapted_projections)?);
             let projection_exprs = remaining_exprs
@@ -364,7 +364,8 @@ impl FileOpener for ParquetOpener {
                     builder.metadata(),
                     reorder_predicates,
                     &file_metrics,
-                    &(Arc::new(DefaultSchemaAdapterFactory {}) as Arc<dyn SchemaAdapterFactory>),
+                    &(Arc::new(DefaultSchemaAdapterFactory {})
+                        as Arc<dyn SchemaAdapterFactory>),
                 );
 
                 match row_filter {
@@ -475,7 +476,7 @@ impl FileOpener for ParquetOpener {
                     Ok(b)
                 })
             });
-        
+
             let stream = if let Some(file_pruner) = file_pruner {
                 EarlyStoppingStream::new(
                     stream,
@@ -871,7 +872,9 @@ mod test {
     };
     use datafusion_expr::{col, lit};
     use datafusion_physical_expr::{
-        expressions::{self, DynamicFilterPhysicalExpr}, planner::logical2physical, PhysicalExpr,
+        expressions::{self, DynamicFilterPhysicalExpr},
+        planner::logical2physical,
+        PhysicalExpr,
     };
     use datafusion_physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
     use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
@@ -970,10 +973,10 @@ mod test {
         let make_opener = |predicate| {
             ParquetOpener {
                 partition_index: 0,
-                projection: Arc::new([
+                projection: vec![
                     expressions::col("a", &schema).unwrap(),
                     expressions::col("b", &schema).unwrap(),
-                ]),
+                ],
                 batch_size: 1024,
                 limit: None,
                 predicate: Some(predicate),
@@ -1041,9 +1044,7 @@ mod test {
         let make_opener = |predicate| {
             ParquetOpener {
                 partition_index: 0,
-                projection: Arc::new([
-                    expressions::col("a", &table_schema).unwrap(),
-                ]),
+                projection: vec![expressions::col("a", &table_schema).unwrap()],
                 batch_size: 1024,
                 limit: None,
                 predicate: Some(predicate),
@@ -1131,9 +1132,7 @@ mod test {
         let make_opener = |predicate| {
             ParquetOpener {
                 partition_index: 0,
-                projection: Arc::new([
-                    expressions::col("a", &table_schema).unwrap(),
-                ]),
+                projection: vec![expressions::col("a", &table_schema).unwrap()],
                 batch_size: 1024,
                 limit: None,
                 predicate: Some(predicate),
@@ -1224,9 +1223,7 @@ mod test {
         let make_opener = |predicate| {
             ParquetOpener {
                 partition_index: 0,
-                projection: Arc::new([
-                    expressions::col("a", &table_schema).unwrap(),
-                ]),
+                projection: vec![expressions::col("a", &table_schema).unwrap()],
                 batch_size: 1024,
                 limit: None,
                 predicate: Some(predicate),
@@ -1317,9 +1314,7 @@ mod test {
         let make_opener = |predicate| {
             ParquetOpener {
                 partition_index: 0,
-                projection: Arc::new([
-                    expressions::col("a", &table_schema).unwrap(),
-                ]),
+                projection: vec![expressions::col("a", &table_schema).unwrap()],
                 batch_size: 1024,
                 limit: None,
                 predicate: Some(predicate),

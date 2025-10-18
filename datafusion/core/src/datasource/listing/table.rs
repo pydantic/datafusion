@@ -1118,19 +1118,6 @@ impl ListingTable {
         }
     }
 
-    /// Creates a file source and applies schema adapter factory if available
-    fn create_file_source_with_schema_adapter(&self) -> Result<Arc<dyn FileSource>> {
-        let mut source = self.options.format.file_source();
-        // Apply schema adapter to source if available
-        //
-        // The source will use this SchemaAdapter to adapt data batches as they flow up the plan.
-        // Note: ListingTable also creates a SchemaAdapter in `scan()` but that is only used to adapt collected statistics.
-        if let Some(factory) = &self.schema_adapter_factory {
-            source = source.with_schema_adapter_factory(Arc::clone(factory))?;
-        }
-        Ok(source)
-    }
-
     /// If file_sort_order is specified, creates the appropriate physical expressions
     fn try_create_output_ordering(
         &self,
@@ -1219,7 +1206,7 @@ impl TableProvider for ListingTable {
         // at the same time. This is because the limit should be applied after the filters are applied.
         let statistic_file_limit = if filters.is_empty() { limit } else { None };
 
-        let (mut partitioned_file_lists, statistics) = self
+        let mut partitioned_file_lists = self
             .list_files_for_scan(state, &partition_filters, statistic_file_limit)
             .await?;
 
@@ -1265,7 +1252,7 @@ impl TableProvider for ListingTable {
             )))));
         };
 
-        let file_source = self.create_file_source_with_schema_adapter()?;
+        let mut file_source = self.options.format.file_source();
 
         // create the execution plan
         let plan = self
@@ -1280,8 +1267,6 @@ impl TableProvider for ListingTable {
                 )
                 .with_file_groups(partitioned_file_lists)
                 .with_constraints(self.constraints.clone())
-                .with_statistics(statistics)
-                .with_projection(projection)
                 .with_limit(limit)
                 .with_output_ordering(output_ordering)
                 .with_table_partition_cols(table_partition_cols)
@@ -1393,11 +1378,11 @@ impl ListingTable {
         ctx: &'a dyn Session,
         filters: &'a [Expr],
         limit: Option<usize>,
-    ) -> Result<(Vec<FileGroup>, Statistics)> {
+    ) -> Result<Vec<FileGroup>> {
         let store = if let Some(url) = self.table_paths.first() {
             ctx.runtime_env().object_store(url)?
         } else {
-            return Ok((vec![], Statistics::new_unknown(&self.file_schema)));
+            return Ok(vec![]);
         };
         // list files (with partitions)
         let file_list = future::try_join_all(self.table_paths.iter().map(|table_path| {
@@ -1428,22 +1413,20 @@ impl ListingTable {
             .boxed()
             .buffer_unordered(ctx.config_options().execution.meta_fetch_concurrency);
 
-        let (file_group, inexact_stats) =
+        let file_group =
             get_files_with_limit(files, limit, self.options.collect_stat).await?;
 
         let file_groups = file_group.split_files(self.options.target_partitions);
-        let (mut file_groups, mut stats) = compute_all_files_statistics(
+        let mut file_groups = compute_all_files_statistics(
             file_groups,
             self.schema(),
             self.options.collect_stat,
-            inexact_stats,
         )?;
 
         let schema_adapter = self.create_schema_adapter();
         let (schema_mapper, _) = schema_adapter.map_schema(self.file_schema.as_ref())?;
 
-        stats.column_statistics =
-            schema_mapper.map_column_statistics(&stats.column_statistics)?;
+        // TODO: we should
         file_groups.iter_mut().try_for_each(|file_group| {
             if let Some(stat) = file_group.statistics_mut() {
                 stat.column_statistics =
@@ -1451,7 +1434,7 @@ impl ListingTable {
             }
             Ok::<_, DataFusionError>(())
         })?;
-        Ok((file_groups, stats))
+        Ok(file_groups)
     }
 
     /// Collects statistics for a given partitioned file.
@@ -1517,7 +1500,7 @@ async fn get_files_with_limit(
     files: impl Stream<Item = Result<PartitionedFile>>,
     limit: Option<usize>,
     collect_stats: bool,
-) -> Result<(FileGroup, bool)> {
+) -> Result<FileGroup> {
     let mut file_group = FileGroup::default();
     // Fusing the stream allows us to call next safely even once it is finished.
     let mut all_files = Box::pin(files.fuse());
@@ -1562,11 +1545,8 @@ async fn get_files_with_limit(
             }
         }
     }
-    // If we still have files in the stream, it means that the limit kicked
-    // in, and the statistic could have been different had we processed the
-    // files in a different order.
-    let inexact_stats = all_files.next().await.is_some();
-    Ok((file_group, inexact_stats))
+
+    Ok(file_group)
 }
 
 #[cfg(test)]
@@ -1906,7 +1886,7 @@ mod tests {
 
         let table = ListingTable::try_new(config)?;
 
-        let (file_list, _) = table.list_files_for_scan(&ctx.state(), &[], None).await?;
+        let file_list = table.list_files_for_scan(&ctx.state(), &[], None).await?;
 
         assert_eq!(file_list.len(), output_partitioning);
 
@@ -1941,7 +1921,7 @@ mod tests {
 
         let table = ListingTable::try_new(config)?;
 
-        let (file_list, _) = table.list_files_for_scan(&ctx.state(), &[], None).await?;
+        let file_list = table.list_files_for_scan(&ctx.state(), &[], None).await?;
 
         assert_eq!(file_list.len(), output_partitioning);
 
@@ -1991,7 +1971,7 @@ mod tests {
 
         let table = ListingTable::try_new(config)?;
 
-        let (file_list, _) = table.list_files_for_scan(&ctx.state(), &[], None).await?;
+        let file_list = table.list_files_for_scan(&ctx.state(), &[], None).await?;
 
         assert_eq!(file_list.len(), output_partitioning);
 
@@ -2757,7 +2737,7 @@ mod tests {
 
         let table = ListingTable::try_new(config)?;
 
-        let (file_list, _) = table.list_files_for_scan(&ctx.state(), &[], None).await?;
+        let file_list = table.list_files_for_scan(&ctx.state(), &[], None).await?;
         assert_eq!(file_list.len(), 1);
 
         let files = file_list[0].clone();
@@ -2908,9 +2888,8 @@ mod tests {
             Arc::new(NullStatsAdapterFactory {}),
         )?;
 
-        let (groups, stats) = table.list_files_for_scan(&ctx.state(), &[], None).await?;
+        let groups = table.list_files_for_scan(&ctx.state(), &[], None).await?;
 
-        assert_eq!(stats.column_statistics[0].null_count, DUMMY_NULL_COUNT);
         for g in groups {
             if let Some(s) = g.file_statistics(None) {
                 assert_eq!(s.column_statistics[0].null_count, DUMMY_NULL_COUNT);
@@ -2952,7 +2931,7 @@ mod tests {
         );
 
         // Verify that the default adapter handles basic schema compatibility
-        let (groups, _stats) = table.list_files_for_scan(&ctx.state(), &[], None).await?;
+        let groups = table.list_files_for_scan(&ctx.state(), &[], None).await?;
         assert!(
             !groups.is_empty(),
             "Should list files successfully with default adapter"

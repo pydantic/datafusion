@@ -252,7 +252,9 @@ impl FileSource for CsvSource {
         None
     }
 
-    fn projection(&self) -> Option<Vec<datafusion_physical_plan::projection::ProjectionExpr>> {
+    fn projection(
+        &self,
+    ) -> Option<Vec<datafusion_physical_plan::projection::ProjectionExpr>> {
         todo!();
     }
 
