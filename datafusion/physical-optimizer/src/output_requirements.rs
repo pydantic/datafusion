@@ -391,7 +391,8 @@ fn require_top_ordering_helper(
             )) as _,
             true,
         ))
-    } else if plan.maintains_input_order()[0]
+    } else if !children.is_empty()
+        && plan.maintains_input_order()[0]
         && (plan.required_input_ordering()[0]
             .as_ref()
             .is_none_or(|o| matches!(o, OrderingRequirements::Soft(_))))

@@ -398,7 +398,7 @@ impl ExecutionPlan for ProjectionExec {
     }
 }
 
-fn stats_projection(
+pub fn stats_projection(
     mut stats: Statistics,
     exprs: impl Iterator<Item = Arc<dyn PhysicalExpr>>,
     schema: SchemaRef,

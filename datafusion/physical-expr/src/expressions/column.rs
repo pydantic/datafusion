@@ -153,6 +153,13 @@ impl Column {
         if self.index < input_schema.fields.len() {
             Ok(())
         } else {
+            panic!(
+                "PhysicalExpr Column references column '{}' at index {} (zero-based) but input schema only has {} columns: {:?}",
+                self.name,
+                self.index,
+                input_schema.fields.len(),
+                input_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+            );
             internal_err!(
                 "PhysicalExpr Column references column '{}' at index {} (zero-based) but input schema only has {} columns: {:?}",
                 self.name,

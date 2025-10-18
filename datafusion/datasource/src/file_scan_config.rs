@@ -38,8 +38,7 @@ use arrow::{
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{
-    exec_datafusion_err, exec_err, internal_datafusion_err, plan_err, Constraints,
-    Result, ScalarValue, Statistics,
+    exec_datafusion_err, exec_err, internal_datafusion_err, plan_err, Constraints, Result, ScalarValue, SchemaExt, Statistics
 };
 use datafusion_execution::{
     object_store::ObjectStoreUrl, SendableRecordBatchStream, TaskContext,
@@ -50,7 +49,7 @@ use datafusion_physical_expr::Partitioning;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
-use datafusion_physical_plan::projection::{self, ProjectionExpr};
+use datafusion_physical_plan::projection::{self, stats_projection, ProjectionExpr};
 use datafusion_physical_plan::{
     display::{display_orderings, ProjectSchemaDisplay},
     filter_pushdown::FilterPushdownPropagation,
@@ -311,8 +310,28 @@ impl FileScanConfigBuilder {
     ///
     /// This method allows you to change the file source implementation (e.g. ParquetSource, CsvSource, etc.)
     /// after the builder has been created.
+    ///
+    /// IMPORTANT: If the new file_source doesn't have a projection but the old one does,
+    /// the projection is preserved by copying it from the old source to the new one.
     pub fn with_source(mut self, file_source: Arc<dyn FileSource>) -> Self {
         let file_source = file_source.with_schema(Arc::clone(&self.file_schema));
+
+        // Preserve projection from old file_source if new one doesn't have it
+        let file_source = match (self.file_source.projection(), file_source.projection()) {
+            (Some(old_proj), None) => {
+                // Old source had projection but new one doesn't - preserve it
+                eprintln!("DEBUG with_source: preserving projection from old source");
+                match file_source.try_projection_pushdown(&old_proj) {
+                    Ok(Some((new_source_with_proj, _))) => new_source_with_proj,
+                    Ok(None) | Err(_) => {
+                        eprintln!("WARN: Could not preserve projection when updating file source");
+                        file_source // Couldn't pushdown, use as-is
+                    }
+                }
+            }
+            _ => file_source,
+        };
+
         self.file_source = file_source;
         self
     }
@@ -334,34 +353,71 @@ impl FileScanConfigBuilder {
 
     /// Push a projection down into the file source.
     ///
+    /// The projection indices are based on the combined table schema (file_schema + partition columns).
+    /// This method filters out partition columns and maps the remaining indices to file_schema positions.
+    ///
+    /// Note: Partition columns come AFTER file columns in the combined schema.
+    /// For example, if file has columns [A, B, C] and partitions are [year, month],
+    /// the table schema is [A, B, C, year, month] with indices 0-2 for file and 3-4 for partitions.
+    ///
     /// This shouldn't be called directly, it is only useful for testing.
     /// Actual queries go through [`FileScanConfig::try_swapping_with_projection`].
     pub fn with_projection(mut self, projection: Option<Vec<usize>>) -> Result<Self> {
         let file_source = match projection {
             Some(projection) => {
-                let schema = self.file_schema.clone();
-                let projection = projection
+                let file_schema = self.file_schema.clone();
+                let file_schema_len = file_schema.fields().len();
+
+                // Filter projection to only include file columns (not partition columns).
+                // Projection indices >= file_schema.len() refer to partition columns which are appended
+                // after file columns in the table schema.
+                //
+                // IMPORTANT: We need to REMAP the indices! The projection coming in has indices
+                // based on table_schema (e.g., UserID at index 9). But after projection, the
+                // output schema will only have the projected columns, so we need to renumber them
+                // starting from 0.
+                let file_projection: Vec<ProjectionExpr> = projection
                     .into_iter()
-                    .map(|i| {
-                        ProjectionExpr::new(
-                            Arc::new(Column::new(schema.field(i).name(), i)),
-                            schema.field(i).name().to_string(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                match self.file_source.try_projection_pushdown(&projection)? {
-                    Some((new_file_source, remainder)) => {
-                        if remainder.is_some() {
-                            return plan_err!(
-                                "File source could not fully handle projection pushdown"
-                            );
+                    .filter_map(|table_idx| {
+                        if table_idx < file_schema_len {
+                            // This is a file column. Use the table_idx (as in table_schema).
+                            let field_name = file_schema.field(table_idx).name();
+                            eprintln!("DEBUG with_projection: table_idx={}, field_name={}", table_idx, field_name);
+                            Some(ProjectionExpr::new(
+                                Arc::new(Column::new(field_name, table_idx)),  // Use table_idx!
+                                field_name.to_string(),
+                            ))
+                        } else {
+                            // This is a partition column, skip it for file source projection
+                            eprintln!("DEBUG with_projection: skipping partition column at table_idx={}", table_idx);
+                            None
                         }
-                        new_file_source
-                    }
-                    None => {
-                        return plan_err!(
-                            "File source does not support projection pushdown"
-                        )
+                    })
+                    .collect();
+
+                // Only push down if there are file columns to project
+                if file_projection.is_empty() {
+                    eprintln!("DEBUG with_projection: file_projection is empty, returning unchanged file_source");
+                    self.file_source.clone()
+                } else {
+                    eprintln!("DEBUG with_projection: file_projection has {} exprs", file_projection.len());
+                    match self.file_source.try_projection_pushdown(&file_projection)? {
+                        Some((new_file_source, remainder)) => {
+                            if remainder.is_some() {
+                                return plan_err!(
+                                    "File source could not fully handle projection pushdown"
+                                );
+                            }
+                            eprintln!("DEBUG with_projection: got new_file_source, checking projection...");
+                            eprintln!("DEBUG with_projection: new_file_source.projection() = {:?}",
+                                new_file_source.projection().as_ref().map(|p| p.len()));
+                            new_file_source
+                        }
+                        None => {
+                            return plan_err!(
+                                "File source does not support projection pushdown"
+                            )
+                        }
                     }
                 }
             }
@@ -467,7 +523,9 @@ impl FileScanConfigBuilder {
 
         let constraints = constraints.unwrap_or_default();
 
+        eprintln!("DEBUG build: file_source.projection() BEFORE with_schema = {:?}", file_source.projection().as_ref().map(|p| p.len()));
         let file_source = file_source.with_schema(Arc::clone(&file_schema));
+        eprintln!("DEBUG build: file_source.projection() AFTER with_schema = {:?}", file_source.projection().as_ref().map(|p| p.len()));
         let file_compression_type =
             file_compression_type.unwrap_or(FileCompressionType::UNCOMPRESSED);
         let new_lines_in_values = new_lines_in_values.unwrap_or(false);
@@ -533,7 +591,9 @@ impl DataSource for FileScanConfig {
     }
 
     fn projection(&self) -> Option<Vec<ProjectionExpr>> {
-        self.file_source.projection()
+        let proj = self.file_source.projection();
+        eprintln!("DEBUG FileScanConfig.projection() returning: {:?}", proj.as_ref().map(|p| p.len()));
+        proj
     }
 
     fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
@@ -545,16 +605,18 @@ impl DataSource for FileScanConfig {
     }
 
     fn eq_properties(&self) -> EquivalenceProperties {
+        // Build the table schema (file + partition columns) to match what projected_schema uses
+        let table_schema = Arc::new(self.file_schema.with_table_partition_columns(&self.table_partition_cols));
+
         let mut eq_props = EquivalenceProperties::new_with_orderings(
-            Arc::clone(&self.file_schema),
+            Arc::clone(&table_schema),
             self.output_ordering.clone(),
         )
         .with_constraints(self.constraints.clone());
-        let projected_schema = self.projected_schema();
-        if let Some(projection) = self.projection() {
-            let expr = projection.into_iter().map(Into::into).collect::<Vec<_>>();
-            let mapping = ProjectionMapping::try_new(expr, &self.file_schema)
+        if let Some(projection) = self.file_source.projection() {
+            let mapping = ProjectionMapping::try_new(projection.into_iter().map(Into::into), &table_schema)
                 .expect("need to handle error");
+            let projected_schema = self.projected_schema();
             eq_props = eq_props.project(&mapping, projected_schema);
         }
         eq_props
@@ -644,7 +706,7 @@ impl DataSource for FileScanConfig {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        if let Some(partition) = partition {
+        let stats = if let Some(partition) = partition {
             if let Some(file_group) = self.file_groups.get(partition) {
                 if let Some(stat) = file_group.file_statistics(None) {
                     Ok(stat.clone())
@@ -664,7 +726,14 @@ impl DataSource for FileScanConfig {
                     .filter_map(|fg| fg.file_statistics(None)),
                 &self.file_schema,
             )
-        }
+        }?;
+
+        // Project statistics if there is a projection
+        let stats = match self.file_source.projection() {
+            Some(projection) => stats_projection(stats, projection.iter().map(|e| Arc::clone(&e.expr)), Arc::new(self.file_schema.with_table_partition_columns(&self.table_partition_cols)))?,
+            None => stats,
+        };
+        Ok(stats)
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
@@ -1065,9 +1134,10 @@ pub fn take_column_projections(
                     remainder_exprs.push(Arc::clone(remapped_col));
                     continue;
                 }
-                let new_index = column_index_map.len() - 1; // New index in the projected schema
-                let remapped_column = Column::new(col.name(), new_index);
-                remainder_exprs.push(Arc::new(remapped_column));
+                let new_index = column_index_map.len(); // New index in the projected schema
+                let remapped_column = Arc::new(Column::new(col.name(), new_index)) as Arc<dyn PhysicalExpr>;
+                column_index_map.insert(col.index(), Arc::clone(&remapped_column));
+                remainder_exprs.push(remapped_column);
             }
             None => {
                 // We need to remap any Column references in the expression to match the projected schema
@@ -1079,14 +1149,11 @@ pub fn take_column_projections(
                             {
                                 return Ok(Transformed::yes(Arc::clone(remapped_col)));
                             }
-                            let new_index = column_index_map.len() - 1; // New index in the projected schema
-                            let remapped_column = Column::new(col.name(), new_index);
+                            let new_index = column_index_map.len(); // New index in the projected schema
+                            let remapped_column = Arc::new(Column::new(col.name(), new_index)) as Arc<dyn PhysicalExpr>;
                             column_index_map
-                                .insert(col.index(), Arc::new(remapped_column));
-                            return Ok(Transformed::yes(Arc::new(Column::new(
-                                col.name(),
-                                new_index,
-                            ))));
+                                .insert(col.index(), Arc::clone(&remapped_column));
+                            return Ok(Transformed::yes(remapped_column));
                         } else {
                             Ok(Transformed::no(e))
                         }
@@ -1877,5 +1944,194 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_take_column_projections_simple_columns() {
+        // Test with simple column references
+        let col0 = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let col1 = Arc::new(Column::new("b", 1)) as Arc<dyn PhysicalExpr>;
+        let col2 = Arc::new(Column::new("c", 2)) as Arc<dyn PhysicalExpr>;
+
+        let projection = vec![col0, col1, col2];
+        let (indices, remainder) = take_column_projections(projection.into_iter());
+
+        assert_eq!(indices, vec![0, 1, 2]);
+        assert_eq!(remainder.len(), 3);
+
+        // Check that columns are remapped to 0, 1, 2
+        let r0 = remainder[0].as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(r0.name(), "a");
+        assert_eq!(r0.index(), 0);
+
+        let r1 = remainder[1].as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(r1.name(), "b");
+        assert_eq!(r1.index(), 1);
+
+        let r2 = remainder[2].as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(r2.name(), "c");
+        assert_eq!(r2.index(), 2);
+    }
+
+    #[test]
+    fn test_take_column_projections_duplicate_columns() {
+        // Test with duplicate column references
+        let col0 = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let col0_dup = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let col1 = Arc::new(Column::new("b", 1)) as Arc<dyn PhysicalExpr>;
+
+        let projection = vec![col0, col0_dup, col1];
+        let (indices, remainder) = take_column_projections(projection.into_iter());
+
+        // Should only read column 0 and 1 once
+        assert_eq!(indices, vec![0, 1]);
+        assert_eq!(remainder.len(), 3);
+
+        // All references to column 0 should point to index 0 in the projected schema
+        let r0 = remainder[0].as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(r0.index(), 0);
+
+        let r0_dup = remainder[1].as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(r0_dup.index(), 0);
+
+        let r1 = remainder[2].as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(r1.index(), 1);
+    }
+
+    #[test]
+    fn test_take_column_projections_with_expressions() {
+        use datafusion_expr::Operator;
+
+        // Test with complex expressions containing columns
+        let col0 = Arc::new(Column::new("a", 0));
+        let col1 = Arc::new(Column::new("b", 1));
+        let literal = Arc::new(Literal::new(ScalarValue::Int32(Some(10))));
+
+        // Create expression: a + 10
+        let expr = Arc::new(BinaryExpr::new(
+            Arc::clone(&col0) as Arc<dyn PhysicalExpr>,
+            Operator::Plus,
+            Arc::clone(&literal) as Arc<dyn PhysicalExpr>,
+        )) as Arc<dyn PhysicalExpr>;
+
+        let projection = vec![
+            Arc::clone(&col0) as Arc<dyn PhysicalExpr>,
+            expr,
+            Arc::clone(&col1) as Arc<dyn PhysicalExpr>,
+        ];
+        let (indices, remainder) = take_column_projections(projection.into_iter());
+
+        // Should read columns 0 and 1
+        assert_eq!(indices, vec![0, 1]);
+        assert_eq!(remainder.len(), 3);
+
+        // First remainder should be column 0 remapped to index 0
+        let r0 = remainder[0].as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(r0.index(), 0);
+
+        // Second remainder should be the binary expression with remapped column
+        let binary_expr = remainder[1].as_any().downcast_ref::<BinaryExpr>().unwrap();
+        let left_col = binary_expr
+            .left()
+            .as_any()
+            .downcast_ref::<Column>()
+            .unwrap();
+        assert_eq!(left_col.index(), 0); // Column 0 remapped to index 0
+
+        // Third remainder should be column 1 remapped to index 1
+        let r1 = remainder[2].as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(r1.index(), 1);
+    }
+
+    #[test]
+    fn test_take_column_projections_non_sequential_columns() {
+        // Test with non-sequential column indices
+        let col2 = Arc::new(Column::new("c", 2)) as Arc<dyn PhysicalExpr>;
+        let col0 = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let col5 = Arc::new(Column::new("f", 5)) as Arc<dyn PhysicalExpr>;
+
+        let projection = vec![col2, col0, col5];
+        let (indices, remainder) = take_column_projections(projection.into_iter());
+
+        // Should read columns 2, 0, 5 in order encountered
+        assert_eq!(indices, vec![0, 2, 5]);
+        assert_eq!(remainder.len(), 3);
+
+        // Columns should be remapped sequentially
+        let r0 = remainder[0].as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(r0.name(), "c");
+        assert_eq!(r0.index(), 0); // First column encountered gets index 0
+
+        let r1 = remainder[1].as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(r1.name(), "a");
+        assert_eq!(r1.index(), 1); // Second column encountered gets index 1
+
+        let r2 = remainder[2].as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(r2.name(), "f");
+        assert_eq!(r2.index(), 2); // Third column encountered gets index 2
+    }
+
+    #[test]
+    fn test_take_column_projections_empty() {
+        // Test with empty projection
+        let projection: Vec<Arc<dyn PhysicalExpr>> = vec![];
+        let (indices, remainder) = take_column_projections(projection.into_iter());
+
+        assert_eq!(indices.len(), 0);
+        assert_eq!(remainder.len(), 0);
+    }
+
+    #[test]
+    fn test_take_column_projections_mixed_duplicates_and_expressions() {
+        use datafusion_expr::Operator;
+
+        // Test with a mix of duplicates and expressions
+        let col0 = Arc::new(Column::new("a", 0));
+        let col1 = Arc::new(Column::new("b", 1));
+        let literal = Arc::new(Literal::new(ScalarValue::Int32(Some(5))));
+
+        // Expression: a + 5
+        let expr1 = Arc::new(BinaryExpr::new(
+            Arc::clone(&col0) as Arc<dyn PhysicalExpr>,
+            Operator::Plus,
+            Arc::clone(&literal) as Arc<dyn PhysicalExpr>,
+        )) as Arc<dyn PhysicalExpr>;
+
+        // Expression: b + 5
+        let expr2 = Arc::new(BinaryExpr::new(
+            Arc::clone(&col1) as Arc<dyn PhysicalExpr>,
+            Operator::Plus,
+            Arc::clone(&literal) as Arc<dyn PhysicalExpr>,
+        )) as Arc<dyn PhysicalExpr>;
+
+        let projection = vec![
+            Arc::clone(&col0) as Arc<dyn PhysicalExpr>,
+            expr1,
+            Arc::clone(&col0) as Arc<dyn PhysicalExpr>, // Duplicate
+            Arc::clone(&col1) as Arc<dyn PhysicalExpr>,
+            expr2,
+        ];
+        let (indices, remainder) = take_column_projections(projection.into_iter());
+
+        // Should read columns 0 and 1 only once
+        assert_eq!(indices, vec![0, 1]);
+        assert_eq!(remainder.len(), 5);
+
+        // Check all column references are properly remapped
+        for (i, r) in remainder.iter().enumerate() {
+            if let Some(col) = r.as_any().downcast_ref::<Column>() {
+                // Direct column references
+                if i == 0 || i == 2 {
+                    assert_eq!(col.index(), 0, "Column at position {} should map to 0", i);
+                } else if i == 3 {
+                    assert_eq!(
+                        col.index(),
+                        1,
+                        "Column at position {} should map to 1",
+                        i
+                    );
+                }
+            }
+        }
     }
 }

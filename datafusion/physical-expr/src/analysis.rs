@@ -99,6 +99,7 @@ impl ExprBoundaries {
         col_index: usize,
     ) -> Result<Self> {
         let field = schema.fields().get(col_index).ok_or_else(|| {
+            panic!();
             internal_datafusion_err!(
                 "Could not create `ExprBoundaries`: in `try_from_column` `col_index`
                 has gone out of bounds with a value of {col_index}, the schema has {} columns.",
