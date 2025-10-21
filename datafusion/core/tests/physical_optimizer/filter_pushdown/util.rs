@@ -145,6 +145,10 @@ impl FileSource for TestSource {
         self.predicate.clone()
     }
 
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone().expect("expected schema")
+    }
+
     fn as_any(&self) -> &dyn Any {
         todo!("should not be called")
     }

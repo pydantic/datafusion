@@ -41,6 +41,7 @@ use object_store::{GetOptions, GetRange, GetResultPayload, ObjectStore};
 /// Does not hold anything special, since [`FileScanConfig`] is sufficient for arrow
 #[derive(Clone, Default)]
 pub struct ArrowSource {
+    schema: SchemaRef,
     metrics: ExecutionPlanMetricsSet,
     projected_statistics: Option<Statistics>,
     schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
@@ -73,8 +74,11 @@ impl FileSource for ArrowSource {
         Arc::new(Self { ..self.clone() })
     }
 
-    fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
+    fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource> {
+        Arc::new(Self {
+            schema,
+            ..self.clone()
+        })
     }
     fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
         let mut conf = self.clone();
@@ -95,6 +99,10 @@ impl FileSource for ArrowSource {
         Ok(statistics
             .clone()
             .expect("projected_statistics must be set"))
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone().expect("file_schema must be set")
     }
 
     fn file_type(&self) -> &str {

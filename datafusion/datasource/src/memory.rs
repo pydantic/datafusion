@@ -192,12 +192,37 @@ impl DataSource for MemorySourceConfig {
         SchedulingType::Cooperative
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(common::compute_record_batch_statistics(
-            &self.partitions,
-            &self.schema,
-            self.projection.clone(),
-        ))
+    fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
+        None
+    }
+
+    fn projection(&self) -> Option<Vec<ProjectionExpr>> {
+        // Memory source doesn't support projection expressions, only indices
+        None
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.projected_schema)
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        if let Some(partition_idx) = partition {
+            if let Some(partition_data) = self.partitions.get(partition_idx) {
+                Ok(common::compute_record_batch_statistics(
+                    &[partition_data.clone()],
+                    &self.schema,
+                    self.projection.clone(),
+                ))
+            } else {
+                Ok(Statistics::new_unknown(&self.projected_schema))
+            }
+        } else {
+            Ok(common::compute_record_batch_statistics(
+                &self.partitions,
+                &self.schema,
+                self.projection.clone(),
+            ))
+        }
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
@@ -212,7 +237,7 @@ impl DataSource for MemorySourceConfig {
     fn try_swapping_with_projection(
         &self,
         projection: &[ProjectionExpr],
-    ) -> Result<Option<Arc<dyn DataSource>>> {
+    ) -> Result<Option<(Arc<dyn DataSource>, Option<Vec<ProjectionExpr>>)>> {
         // If there is any non-column or alias-carrier expression, Projection should not be removed.
         // This process can be moved into MemoryExec, but it would be an overlap of their responsibility.
         all_alias_free_columns(projection)
@@ -220,7 +245,7 @@ impl DataSource for MemorySourceConfig {
                 let all_projections = (0..self.schema.fields().len()).collect();
                 let new_projections = new_projections_for_columns(
                     projection,
-                    self.projection().as_ref().unwrap_or(&all_projections),
+                    self.projection.as_ref().unwrap_or(&all_projections),
                 );
 
                 MemorySourceConfig::try_new(
@@ -228,7 +253,7 @@ impl DataSource for MemorySourceConfig {
                     self.original_schema(),
                     Some(new_projections),
                 )
-                .map(|s| Arc::new(s) as Arc<dyn DataSource>)
+                .map(|s| (Arc::new(s) as Arc<dyn DataSource>, None))
             })
             .transpose()
     }

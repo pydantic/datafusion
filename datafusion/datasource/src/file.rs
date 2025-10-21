@@ -32,6 +32,7 @@ use datafusion_common::{not_impl_err, Result, Statistics};
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_physical_plan::projection::ProjectionExpr;
 use datafusion_physical_plan::DisplayFormatType;
 
 use object_store::ObjectStore;
@@ -73,6 +74,12 @@ pub trait FileSource: Send + Sync {
     fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
         None
     }
+    /// Returns the projection expressions that will be applied during the file scan.
+    fn projection(&self) -> Option<Vec<ProjectionExpr>> {
+        None
+    }
+    /// Returns the schema this file source will produce, after applying any projections
+    fn schema(&self) -> SchemaRef;
     /// Return execution plan metrics
     fn metrics(&self) -> &ExecutionPlanMetricsSet;
     /// Return projected statistics
@@ -112,6 +119,22 @@ pub trait FileSource: Send + Sync {
             source.file_groups = repartitioned_file_groups;
             return Ok(Some(source));
         }
+        Ok(None)
+    }
+
+    /// Try to push down projection into this FileSource.
+    ///
+    /// Returns `Ok(Some((new_source, remainder)))` if projection pushdown is supported:
+    /// - `new_source`: A new FileSource with the projection applied
+    /// - `remainder`: Any projection expressions that couldn't be pushed down
+    ///
+    /// Returns `Ok(None)` if projection pushdown is not supported by this FileSource.
+    ///
+    /// The default implementation returns `Ok(None)`.
+    fn try_projection_pushdown(
+        &self,
+        _projection: &[ProjectionExpr],
+    ) -> Result<Option<(Arc<dyn FileSource>, Option<Vec<ProjectionExpr>>)>> {
         Ok(None)
     }
 

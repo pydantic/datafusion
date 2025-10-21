@@ -76,6 +76,7 @@ impl JsonOpener {
 /// JsonSource holds the extra configuration that is necessary for [`JsonOpener`]
 #[derive(Clone, Default)]
 pub struct JsonSource {
+    file_schema: SchemaRef,
     batch_size: Option<usize>,
     metrics: ExecutionPlanMetricsSet,
     projected_statistics: Option<Statistics>,
@@ -122,8 +123,11 @@ impl FileSource for JsonSource {
         Arc::new(conf)
     }
 
-    fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
+    fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource> {
+        Arc::new(Self {
+            file_schema: schema,
+            ..self.clone()
+        })
     }
     fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
         let mut conf = self.clone();
@@ -144,6 +148,10 @@ impl FileSource for JsonSource {
         Ok(statistics
             .clone()
             .expect("projected_statistics must be set to call"))
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.file_schema.clone().expect("file_schema must be set")
     }
 
     fn file_type(&self) -> &str {

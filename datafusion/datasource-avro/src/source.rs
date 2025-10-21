@@ -112,6 +112,10 @@ impl FileSource for AvroSource {
             .expect("projected_statistics must be set"))
     }
 
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone().expect("file_schema must be set")
+    }
+
     fn file_type(&self) -> &str {
         "avro"
     }

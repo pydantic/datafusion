@@ -22,6 +22,7 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
 use datafusion_physical_plan::execution_plan::{
     Boundedness, EmissionType, SchedulingType,
 };
@@ -126,6 +127,12 @@ pub trait DataSource: Send + Sync + Debug {
     fn as_any(&self) -> &dyn Any;
     /// Format this source for display in explain plans
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result;
+    /// Filter that this source will apply during the scan.
+    fn filter(&self) -> Option<Arc<dyn PhysicalExpr>>;
+    /// Projection that this source will apply during the scan.
+    fn projection(&self) -> Option<Vec<ProjectionExpr>>;
+    /// Projected schema for this source, including any table partition columns.
+    fn schema(&self) -> SchemaRef;
 
     /// Return a copy of this DataSource with a new partitioning scheme.
     ///
@@ -151,17 +158,32 @@ pub trait DataSource: Send + Sync + Debug {
     fn scheduling_type(&self) -> SchedulingType {
         SchedulingType::NonCooperative
     }
-    fn statistics(&self) -> Result<Statistics>;
+    /// Get statistics for this data source. If partition is Some(i), get statistics for partition i.
+    /// Otherwise, get overall statistics across all partitions.
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics>;
     /// Return a copy of this DataSource with a new fetch limit
     fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn DataSource>>;
     fn fetch(&self) -> Option<usize>;
     fn metrics(&self) -> ExecutionPlanMetricsSet {
         ExecutionPlanMetricsSet::new()
     }
+    /// Attempts to push down the given projection into this `DataSource`.
+    ///
+    /// If the data source supports this optimization, it returns a tuple of:
+    /// - `Some(new_data_source)`: An updated DataSource with the pushable projections applied
+    /// - `remainder_projections`: Projection expressions that couldn't be pushed down and need
+    ///   to be evaluated by a ProjectionExec above the scan
+    ///
+    /// If no pushdown is possible, returns `Ok(None)`.
+    ///
+    /// The remainder projections will be used by `DataSourceExec` to wrap the scan
+    /// in a `ProjectionExec` if needed.
     fn try_swapping_with_projection(
         &self,
         _projection: &[ProjectionExpr],
-    ) -> Result<Option<Arc<dyn DataSource>>>;
+    ) -> Result<Option<(Arc<dyn DataSource>, Option<Vec<ProjectionExpr>>)>> {
+        Ok(None)
+    }
     /// Try to push down filters into this DataSource.
     /// See [`ExecutionPlan::handle_child_pushdown_result`] for more details.
     ///
@@ -285,21 +307,11 @@ impl ExecutionPlan for DataSourceExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        if let Some(partition) = partition {
-            let mut statistics = Statistics::new_unknown(&self.schema());
-            if let Some(file_config) =
-                self.data_source.as_any().downcast_ref::<FileScanConfig>()
-            {
-                if let Some(file_group) = file_config.file_groups.get(partition) {
-                    if let Some(stat) = file_group.file_statistics(None) {
-                        statistics = stat.clone();
-                    }
-                }
-            }
-            Ok(statistics)
-        } else {
-            Ok(self.data_source.statistics()?)
-        }
+        self.data_source.partition_statistics(partition)
+    }
+
+    fn statistics(&self) -> Result<Statistics> {
+        self.partition_statistics(None)
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -321,8 +333,15 @@ impl ExecutionPlan for DataSourceExec {
             .data_source
             .try_swapping_with_projection(projection.expr())?
         {
-            Some(new_data_source) => {
-                Ok(Some(Arc::new(DataSourceExec::new(new_data_source))))
+            Some((new_data_source, remainder)) => {
+                let new_exec = Arc::new(DataSourceExec::new(new_data_source));
+                // If there are remainder projections, wrap the exec in a ProjectionExec
+                if let Some(remainder) = remainder {
+                    let new_projection = ProjectionExec::try_new(remainder, new_exec)?;
+                    Ok(Some(Arc::new(new_projection)))
+                } else {
+                    Ok(Some(new_exec))
+                }
             }
             None => Ok(None),
         }

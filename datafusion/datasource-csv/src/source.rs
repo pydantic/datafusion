@@ -285,6 +285,13 @@ impl FileSource for CsvSource {
             .clone()
             .expect("projected_statistics must be set"))
     }
+
+    fn schema(&self) -> SchemaRef {
+        self.file_schema
+            .clone()
+            .expect("file_schema must be set")
+    }
+
     fn file_type(&self) -> &str {
         "csv"
     }

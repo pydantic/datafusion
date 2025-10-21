@@ -22,7 +22,7 @@ use crate::{
 
 use std::sync::Arc;
 
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion_common::{Result, Statistics};
 use datafusion_physical_expr::{expressions::Column, PhysicalExpr};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -35,6 +35,8 @@ pub(crate) struct MockSource {
     projected_statistics: Option<Statistics>,
     schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
     filter: Option<Arc<dyn PhysicalExpr>>,
+    file_schema: Option<SchemaRef>,
+    projection: Option<Vec<datafusion_physical_plan::projection::ProjectionExpr>>,
 }
 
 impl MockSource {
@@ -66,8 +68,10 @@ impl FileSource for MockSource {
         Arc::new(Self { ..self.clone() })
     }
 
-    fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
+    fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource> {
+        let mut source = self.clone();
+        source.file_schema = Some(schema);
+        Arc::new(source)
     }
 
     fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
@@ -92,6 +96,16 @@ impl FileSource for MockSource {
             .clone())
     }
 
+    fn projection(&self) -> Option<Vec<datafusion_physical_plan::projection::ProjectionExpr>> {
+        self.projection.clone()
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.file_schema
+            .clone()
+            .expect("file_schema must be set")
+    }
+
     fn file_type(&self) -> &str {
         "mock"
     }
@@ -108,6 +122,42 @@ impl FileSource for MockSource {
 
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
         self.schema_adapter_factory.clone()
+    }
+
+    fn try_projection_pushdown(
+        &self,
+        projection: &[datafusion_physical_plan::projection::ProjectionExpr],
+    ) -> Result<Option<(Arc<dyn FileSource>, Option<Vec<datafusion_physical_plan::projection::ProjectionExpr>>)>> {
+        // MockSource accepts all projections (pushes them all down, no remainder)
+        let mut new_source = self.clone();
+        new_source.projection = Some(projection.to_vec());
+
+        // Compute and store the projected schema
+        let file_schema = self.file_schema.as_ref().expect("file_schema must be set");
+        let projected_fields: Vec<_> = projection
+            .iter()
+            .map(|p| {
+                let field = p.expr.return_field(file_schema).unwrap();
+                Field::new(&p.alias, field.data_type().clone(), field.is_nullable())
+            })
+            .collect();
+        let projected_schema = Arc::new(Schema::new(projected_fields));
+        new_source.file_schema = Some(Arc::clone(&projected_schema));
+
+        // If we have a filter, check if it references columns not in the projected schema
+        // If so, remove the filter (this is a simplified behavior for testing)
+        if let Some(filter) = &new_source.filter {
+            use datafusion_physical_expr::utils::collect_columns;
+            let filter_columns = collect_columns(filter);
+            let all_columns_present = filter_columns.iter().all(|col| {
+                projected_schema.fields().iter().any(|f| f.name() == col.name())
+            });
+            if !all_columns_present {
+                new_source.filter = None;
+            }
+        }
+
+        Ok(Some((Arc::new(new_source), None)))
     }
 }
 

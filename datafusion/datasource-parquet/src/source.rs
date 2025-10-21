@@ -639,6 +639,12 @@ impl FileSource for ParquetSource {
         }
     }
 
+    fn schema(&self) -> SchemaRef {
+        self.file_schema
+            .clone()
+            .expect("file_schema must be set")
+    }
+
     fn file_type(&self) -> &str {
         "parquet"
     }

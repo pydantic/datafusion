@@ -45,7 +45,7 @@ use datafusion_execution::{
 };
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::BinaryExpr;
-use datafusion_physical_expr::{expressions::Column, utils::reassign_expr_columns};
+use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr::{split_conjunction, EquivalenceProperties, Partitioning};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
@@ -55,7 +55,6 @@ use datafusion_physical_plan::{
     display::{display_orderings, ProjectSchemaDisplay},
     filter_pushdown::FilterPushdownPropagation,
     metrics::ExecutionPlanMetricsSet,
-    projection::{all_alias_free_columns, new_projections_for_columns},
     DisplayAs, DisplayFormatType,
 };
 use std::{
@@ -600,8 +599,30 @@ impl DataSource for FileScanConfig {
         SchedulingType::Cooperative
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(self.projected_stats())
+    fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
+        self.file_source.filter()
+    }
+
+    fn projection(&self) -> Option<Vec<ProjectionExpr>> {
+        self.file_source.projection()
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.projected_schema()
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        if let Some(partition) = partition {
+            let mut statistics = Statistics::new_unknown(&self.schema());
+            if let Some(file_group) = self.file_groups.get(partition) {
+                if let Some(stat) = file_group.file_statistics(None) {
+                    statistics = stat.clone();
+                }
+            }
+            Ok(statistics)
+        } else {
+            Ok(self.projected_stats())
+        }
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
@@ -622,41 +643,18 @@ impl DataSource for FileScanConfig {
     fn try_swapping_with_projection(
         &self,
         projection: &[ProjectionExpr],
-    ) -> Result<Option<Arc<dyn DataSource>>> {
-        // This process can be moved into CsvExec, but it would be an overlap of their responsibility.
-
-        // Must be all column references, with no table partition columns (which can not be projected)
-        let partitioned_columns_in_proj = projection.iter().any(|proj_expr| {
-            proj_expr
-                .expr
-                .as_any()
-                .downcast_ref::<Column>()
-                .map(|expr| expr.index() >= self.file_schema().fields().len())
-                .unwrap_or(false)
-        });
-
-        // If there is any non-column or alias-carrier expression, Projection should not be removed.
-        let no_aliases = all_alias_free_columns(projection);
-
-        Ok((no_aliases && !partitioned_columns_in_proj).then(|| {
-            let file_scan = self.clone();
-            let source = Arc::clone(&file_scan.file_source);
-            let new_projections = new_projections_for_columns(
-                projection,
-                &file_scan
-                    .projection
-                    .clone()
-                    .unwrap_or_else(|| (0..self.file_schema().fields().len()).collect()),
-            );
-
-            Arc::new(
-                FileScanConfigBuilder::from(file_scan)
-                    // Assign projected statistics to source
-                    .with_projection(Some(new_projections))
-                    .with_source(source)
-                    .build(),
-            ) as _
-        }))
+    ) -> Result<Option<(Arc<dyn DataSource>, Option<Vec<ProjectionExpr>>)>> {
+        // Try to push the projection down into the file source
+        match self.file_source.try_projection_pushdown(projection)? {
+            Some((new_file_source, remainder)) => {
+                // Create a new FileScanConfig with the updated file source
+                let new_config = FileScanConfigBuilder::from(self.clone())
+                    .with_source(new_file_source)
+                    .build();
+                Ok(Some((Arc::new(new_config) as _, remainder)))
+            }
+            None => Ok(None),
+        }
     }
 
     fn try_pushdown_filters(
@@ -1450,7 +1448,7 @@ mod tests {
     use datafusion_common::{assert_batches_eq, internal_err};
     use datafusion_expr::{Operator, SortExpr};
     use datafusion_physical_expr::create_physical_sort_expr;
-    use datafusion_physical_expr::expressions::{BinaryExpr, Literal};
+    use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
     use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 
     /// Returns the column names on the schema
@@ -1605,7 +1603,7 @@ mod tests {
         );
 
         let source_statistics = conf.file_source.statistics().unwrap();
-        let conf_stats = conf.statistics().unwrap();
+        let conf_stats = conf.partition_statistics(None).unwrap();
 
         // projection should be reflected in the file source statistics
         assert_eq!(conf_stats.num_rows, Precision::Inexact(3));
@@ -2229,7 +2227,7 @@ mod tests {
 
         // Simulate projection being updated. Since the filter has already been pushed down,
         // the new projection won't include the filtered column.
-        let data_source = config
+        let (data_source, _remainder) = config
             .try_swapping_with_projection(&[ProjectionExpr::new(
                 col("c3", &file_schema).unwrap(),
                 "c3".to_string(),
