@@ -69,18 +69,27 @@ impl From<&protobuf::PhysicalColumn> for Column {
 /// # Arguments
 ///
 /// * `proto` - Input proto with physical sort expression node
-/// * `registry` - A registry knows how to build logical expressions out of user-defined function names
+/// * `ctx` - Either a `&TaskContext` or `DecodeContext` for decoding. When passing `&TaskContext`,
+///   a new `DecodeContext` is created without caching. For optimal performance with expression
+///   deduplication, create and pass a `DecodeContext` directly.
 /// * `input_schema` - The Arrow schema for the input, used for determining expression data types
 ///   when performing type coercion.
 /// * `codec` - An extension codec used to decode custom UDFs.
-pub fn parse_physical_sort_expr(
+///
+/// # Backwards Compatibility
+///
+/// This function accepts either `&TaskContext` or `DecodeContext` for backwards compatibility.
+/// In future versions, passing `DecodeContext` directly will be required.
+pub fn parse_physical_sort_expr<'a>(
     proto: &protobuf::PhysicalSortExprNode,
-    decode_ctx: &DecodeContext,
+    ctx: impl Into<DecodeContext<'a>>,
     input_schema: &Schema,
     codec: &dyn PhysicalExtensionCodec,
 ) -> Result<PhysicalSortExpr> {
+    let decode_ctx = ctx.into();
     if let Some(expr) = &proto.expr {
-        let expr = parse_physical_expr(expr.as_ref(), decode_ctx, input_schema, codec)?;
+        let expr =
+            parse_physical_expr(expr.as_ref(), decode_ctx.clone(), input_schema, codec)?;
         let options = SortOptions {
             descending: !proto.asc,
             nulls_first: proto.nulls_first,
@@ -96,20 +105,28 @@ pub fn parse_physical_sort_expr(
 /// # Arguments
 ///
 /// * `proto` - Input proto with vector of physical sort expression node
-/// * `registry` - A registry knows how to build logical expressions out of user-defined function names
+/// * `ctx` - Either a `&TaskContext` or `DecodeContext` for decoding. When passing `&TaskContext`,
+///   a new `DecodeContext` is created without caching. For optimal performance with expression
+///   deduplication, create and pass a `DecodeContext` directly.
 /// * `input_schema` - The Arrow schema for the input, used for determining expression data types
 ///   when performing type coercion.
 /// * `codec` - An extension codec used to decode custom UDFs.
-pub fn parse_physical_sort_exprs(
+///
+/// # Backwards Compatibility
+///
+/// This function accepts either `&TaskContext` or `DecodeContext` for backwards compatibility.
+/// In future versions, passing `DecodeContext` directly will be required.
+pub fn parse_physical_sort_exprs<'a>(
     proto: &[protobuf::PhysicalSortExprNode],
-    decode_ctx: &DecodeContext,
+    ctx: impl Into<DecodeContext<'a>>,
     input_schema: &Schema,
     codec: &dyn PhysicalExtensionCodec,
 ) -> Result<Vec<PhysicalSortExpr>> {
+    let decode_ctx = ctx.into();
     proto
         .iter()
         .map(|sort_expr| {
-            parse_physical_sort_expr(sort_expr, decode_ctx, input_schema, codec)
+            parse_physical_sort_expr(sort_expr, decode_ctx.clone(), input_schema, codec)
         })
         .collect()
 }
@@ -119,25 +136,40 @@ pub fn parse_physical_sort_exprs(
 /// # Arguments
 ///
 /// * `proto` - Input proto with physical window expression node.
-/// * `name` - Name of the window expression.
-/// * `registry` - A registry knows how to build logical expressions out of user-defined function names
+/// * `ctx` - Either a `&TaskContext` or `DecodeContext` for decoding. When passing `&TaskContext`,
+///   a new `DecodeContext` is created without caching. For optimal performance with expression
+///   deduplication, create and pass a `DecodeContext` directly.
 /// * `input_schema` - The Arrow schema for the input, used for determining expression data types
 ///   when performing type coercion.
 /// * `codec` - An extension codec used to decode custom UDFs.
-pub fn parse_physical_window_expr(
+///
+/// # Backwards Compatibility
+///
+/// This function accepts either `&TaskContext` or `DecodeContext` for backwards compatibility.
+/// In future versions, passing `DecodeContext` directly will be required.
+pub fn parse_physical_window_expr<'a>(
     proto: &protobuf::PhysicalWindowExprNode,
-    decode_ctx: &DecodeContext,
+    ctx: impl Into<DecodeContext<'a>>,
     input_schema: &Schema,
     codec: &dyn PhysicalExtensionCodec,
 ) -> Result<Arc<dyn WindowExpr>> {
-    let ctx = decode_ctx.task_context();
+    let decode_ctx: DecodeContext<'a> = ctx.into();
+    let task_ctx = decode_ctx.task_context();
     let window_node_expr =
-        parse_physical_exprs(&proto.args, decode_ctx, input_schema, codec)?;
-    let partition_by =
-        parse_physical_exprs(&proto.partition_by, decode_ctx, input_schema, codec)?;
+        parse_physical_exprs(&proto.args, decode_ctx.clone(), input_schema, codec)?;
+    let partition_by = parse_physical_exprs(
+        &proto.partition_by,
+        decode_ctx.clone(),
+        input_schema,
+        codec,
+    )?;
 
-    let order_by =
-        parse_physical_sort_exprs(&proto.order_by, decode_ctx, input_schema, codec)?;
+    let order_by = parse_physical_sort_exprs(
+        &proto.order_by,
+        decode_ctx.clone(),
+        input_schema,
+        codec,
+    )?;
 
     let window_frame = proto
         .window_frame
@@ -154,13 +186,13 @@ pub fn parse_physical_window_expr(
             protobuf::physical_window_expr_node::WindowFunction::UserDefinedAggrFunction(udaf_name) => {
                 WindowFunctionDefinition::AggregateUDF(match &proto.fun_definition {
                     Some(buf) => codec.try_decode_udaf(udaf_name, buf)?,
-                    None => ctx.udaf(udaf_name).or_else(|_| codec.try_decode_udaf(udaf_name, &[]))?,
+                    None => task_ctx.udaf(udaf_name).or_else(|_| codec.try_decode_udaf(udaf_name, &[]))?,
                 })
             }
             protobuf::physical_window_expr_node::WindowFunction::UserDefinedWindowFunction(udwf_name) => {
                 WindowFunctionDefinition::WindowUDF(match &proto.fun_definition {
                     Some(buf) => codec.try_decode_udwf(udwf_name, buf)?,
-                    None => ctx.udwf(udwf_name).or_else(|_| codec.try_decode_udwf(udwf_name, &[]))?
+                    None => task_ctx.udwf(udwf_name).or_else(|_| codec.try_decode_udwf(udwf_name, &[]))?
                 })
             }
         }
@@ -186,18 +218,34 @@ pub fn parse_physical_window_expr(
     )
 }
 
-pub fn parse_physical_exprs<'a, I>(
+/// Parses multiple physical expressions from protobufs.
+///
+/// # Arguments
+///
+/// * `protos` - Iterator of proto physical expression nodes
+/// * `ctx` - Either a `&TaskContext` or `DecodeContext` for decoding. When passing `&TaskContext`,
+///   a new `DecodeContext` is created without caching. For optimal performance with expression
+///   deduplication, create and pass a `DecodeContext` directly.
+/// * `input_schema` - The Arrow schema for the input
+/// * `codec` - An extension codec used to decode custom UDFs.
+///
+/// # Backwards Compatibility
+///
+/// This function accepts either `&TaskContext` or `DecodeContext` for backwards compatibility.
+/// In future versions, passing `DecodeContext` directly will be required.
+pub fn parse_physical_exprs<'a, 'b, I>(
     protos: I,
-    decode_ctx: &DecodeContext,
+    ctx: impl Into<DecodeContext<'b>>,
     input_schema: &Schema,
     codec: &dyn PhysicalExtensionCodec,
 ) -> Result<Vec<Arc<dyn PhysicalExpr>>>
 where
     I: IntoIterator<Item = &'a protobuf::PhysicalExprNode>,
 {
+    let decode_ctx = ctx.into();
     protos
         .into_iter()
-        .map(|p| parse_physical_expr(p, decode_ctx, input_schema, codec))
+        .map(|p| parse_physical_expr(p, decode_ctx.clone(), input_schema, codec))
         .collect::<Result<Vec<_>>>()
 }
 
@@ -206,16 +254,25 @@ where
 /// # Arguments
 ///
 /// * `proto` - Input proto with physical expression node
-/// * `registry` - A registry knows how to build logical expressions out of user-defined function names
+/// * `ctx` - Either a `&TaskContext` or `DecodeContext` for decoding. When passing `&TaskContext`,
+///   a new `DecodeContext` is created without caching. For optimal performance with expression
+///   deduplication, create and pass a `DecodeContext` directly.
 /// * `input_schema` - The Arrow schema for the input, used for determining expression data types
 ///   when performing type coercion.
 /// * `codec` - An extension codec used to decode custom UDFs.
-pub fn parse_physical_expr(
+///
+/// # Backwards Compatibility
+///
+/// This function accepts either `&TaskContext` or `DecodeContext` for backwards compatibility.
+/// In future versions, passing `DecodeContext` directly will be required.
+pub fn parse_physical_expr<'a>(
     proto: &protobuf::PhysicalExprNode,
-    decode_ctx: &DecodeContext,
+    ctx: impl Into<DecodeContext<'a>>,
     input_schema: &Schema,
     codec: &dyn PhysicalExtensionCodec,
 ) -> Result<Arc<dyn PhysicalExpr>> {
+    let decode_ctx = ctx.into();
+
     // Check cache first if an ID is present
     if let Some(id) = proto.id {
         if let Some(cached) = decode_ctx.get_cached_expr(id) {
@@ -240,7 +297,7 @@ pub fn parse_physical_expr(
         ExprType::BinaryExpr(binary_expr) => Arc::new(BinaryExpr::new(
             parse_required_physical_expr(
                 binary_expr.l.as_deref(),
-                decode_ctx,
+                &decode_ctx,
                 "left",
                 input_schema,
                 codec,
@@ -248,7 +305,7 @@ pub fn parse_physical_expr(
             logical_plan::from_proto::from_proto_binary_op(&binary_expr.op)?,
             parse_required_physical_expr(
                 binary_expr.r.as_deref(),
-                decode_ctx,
+                &decode_ctx,
                 "right",
                 input_schema,
                 codec,
@@ -270,7 +327,7 @@ pub fn parse_physical_expr(
         ExprType::IsNullExpr(e) => {
             Arc::new(IsNullExpr::new(parse_required_physical_expr(
                 e.expr.as_deref(),
-                decode_ctx,
+                &decode_ctx,
                 "expr",
                 input_schema,
                 codec,
@@ -279,7 +336,7 @@ pub fn parse_physical_expr(
         ExprType::IsNotNullExpr(e) => {
             Arc::new(IsNotNullExpr::new(parse_required_physical_expr(
                 e.expr.as_deref(),
-                decode_ctx,
+                &decode_ctx,
                 "expr",
                 input_schema,
                 codec,
@@ -287,7 +344,7 @@ pub fn parse_physical_expr(
         }
         ExprType::NotExpr(e) => Arc::new(NotExpr::new(parse_required_physical_expr(
             e.expr.as_deref(),
-            decode_ctx,
+            &decode_ctx,
             "expr",
             input_schema,
             codec,
@@ -295,7 +352,7 @@ pub fn parse_physical_expr(
         ExprType::Negative(e) => {
             Arc::new(NegativeExpr::new(parse_required_physical_expr(
                 e.expr.as_deref(),
-                decode_ctx,
+                &decode_ctx,
                 "expr",
                 input_schema,
                 codec,
@@ -304,19 +361,26 @@ pub fn parse_physical_expr(
         ExprType::InList(e) => in_list(
             parse_required_physical_expr(
                 e.expr.as_deref(),
-                decode_ctx,
+                &decode_ctx,
                 "expr",
                 input_schema,
                 codec,
             )?,
-            parse_physical_exprs(&e.list, decode_ctx, input_schema, codec)?,
+            parse_physical_exprs(&e.list, decode_ctx.clone(), input_schema, codec)?,
             &e.negated,
             input_schema,
         )?,
         ExprType::Case(e) => Arc::new(CaseExpr::try_new(
             e.expr
                 .as_ref()
-                .map(|e| parse_physical_expr(e.as_ref(), decode_ctx, input_schema, codec))
+                .map(|e| {
+                    parse_physical_expr(
+                        e.as_ref(),
+                        decode_ctx.clone(),
+                        input_schema,
+                        codec,
+                    )
+                })
                 .transpose()?,
             e.when_then_expr
                 .iter()
@@ -324,14 +388,14 @@ pub fn parse_physical_expr(
                     Ok((
                         parse_required_physical_expr(
                             e.when_expr.as_ref(),
-                            decode_ctx,
+                            &decode_ctx,
                             "when_expr",
                             input_schema,
                             codec,
                         )?,
                         parse_required_physical_expr(
                             e.then_expr.as_ref(),
-                            decode_ctx,
+                            &decode_ctx,
                             "then_expr",
                             input_schema,
                             codec,
@@ -341,13 +405,20 @@ pub fn parse_physical_expr(
                 .collect::<Result<Vec<_>>>()?,
             e.else_expr
                 .as_ref()
-                .map(|e| parse_physical_expr(e.as_ref(), decode_ctx, input_schema, codec))
+                .map(|e| {
+                    parse_physical_expr(
+                        e.as_ref(),
+                        decode_ctx.clone(),
+                        input_schema,
+                        codec,
+                    )
+                })
                 .transpose()?,
         )?),
         ExprType::Cast(e) => Arc::new(CastExpr::new(
             parse_required_physical_expr(
                 e.expr.as_deref(),
-                decode_ctx,
+                &decode_ctx,
                 "expr",
                 input_schema,
                 codec,
@@ -358,7 +429,7 @@ pub fn parse_physical_expr(
         ExprType::TryCast(e) => Arc::new(TryCastExpr::new(
             parse_required_physical_expr(
                 e.expr.as_deref(),
-                decode_ctx,
+                &decode_ctx,
                 "expr",
                 input_schema,
                 codec,
@@ -374,7 +445,8 @@ pub fn parse_physical_expr(
             };
             let scalar_fun_def = Arc::clone(&udf);
 
-            let args = parse_physical_exprs(&e.args, decode_ctx, input_schema, codec)?;
+            let args =
+                parse_physical_exprs(&e.args, decode_ctx.clone(), input_schema, codec)?;
 
             let config_options = Arc::clone(ctx.session_config().options());
 
@@ -399,14 +471,14 @@ pub fn parse_physical_expr(
             like_expr.case_insensitive,
             parse_required_physical_expr(
                 like_expr.expr.as_deref(),
-                decode_ctx,
+                &decode_ctx,
                 "expr",
                 input_schema,
                 codec,
             )?,
             parse_required_physical_expr(
                 like_expr.pattern.as_deref(),
-                decode_ctx,
+                &decode_ctx,
                 "pattern",
                 input_schema,
                 codec,
@@ -416,7 +488,7 @@ pub fn parse_physical_expr(
             let inputs: Vec<Arc<dyn PhysicalExpr>> = extension
                 .inputs
                 .iter()
-                .map(|e| parse_physical_expr(e, decode_ctx, input_schema, codec))
+                .map(|e| parse_physical_expr(e, decode_ctx.clone(), input_schema, codec))
                 .collect::<Result<_>>()?;
             (codec.try_decode_expr(extension.expr.as_slice(), &inputs)?) as _
         }
@@ -437,22 +509,29 @@ fn parse_required_physical_expr(
     input_schema: &Schema,
     codec: &dyn PhysicalExtensionCodec,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    expr.map(|e| parse_physical_expr(e, decode_ctx, input_schema, codec))
+    expr.map(|e| parse_physical_expr(e, decode_ctx.clone(), input_schema, codec))
         .transpose()?
         .ok_or_else(|| internal_datafusion_err!("Missing required field {field:?}"))
 }
 
-pub fn parse_protobuf_hash_partitioning(
+/// Parses protobuf hash partitioning.
+///
+/// # Backwards Compatibility
+///
+/// This function accepts either `&TaskContext` or `DecodeContext` for backwards compatibility.
+/// In future versions, passing `DecodeContext` directly will be required.
+pub fn parse_protobuf_hash_partitioning<'a>(
     partitioning: Option<&protobuf::PhysicalHashRepartition>,
-    decode_ctx: &DecodeContext,
+    ctx: impl Into<DecodeContext<'a>>,
     input_schema: &Schema,
     codec: &dyn PhysicalExtensionCodec,
 ) -> Result<Option<Partitioning>> {
+    let decode_ctx = ctx.into();
     match partitioning {
         Some(hash_part) => {
             let expr = parse_physical_exprs(
                 &hash_part.hash_expr,
-                decode_ctx,
+                decode_ctx.clone(),
                 input_schema,
                 codec,
             )?;
@@ -466,12 +545,19 @@ pub fn parse_protobuf_hash_partitioning(
     }
 }
 
-pub fn parse_protobuf_partitioning(
+/// Parses protobuf partitioning.
+///
+/// # Backwards Compatibility
+///
+/// This function accepts either `&TaskContext` or `DecodeContext` for backwards compatibility.
+/// In future versions, passing `DecodeContext` directly will be required.
+pub fn parse_protobuf_partitioning<'a>(
     partitioning: Option<&protobuf::Partitioning>,
-    decode_ctx: &DecodeContext,
+    ctx: impl Into<DecodeContext<'a>>,
     input_schema: &Schema,
     codec: &dyn PhysicalExtensionCodec,
 ) -> Result<Option<Partitioning>> {
+    let decode_ctx = ctx.into();
     match partitioning {
         Some(protobuf::Partitioning { partition_method }) => match partition_method {
             Some(protobuf::partitioning::PartitionMethod::RoundRobin(
@@ -482,7 +568,7 @@ pub fn parse_protobuf_partitioning(
             Some(protobuf::partitioning::PartitionMethod::Hash(hash_repartition)) => {
                 parse_protobuf_hash_partitioning(
                     Some(hash_repartition),
-                    decode_ctx,
+                    decode_ctx.clone(),
                     input_schema,
                     codec,
                 )
@@ -504,12 +590,19 @@ pub fn parse_protobuf_file_scan_schema(
     Ok(Arc::new(convert_required!(proto.schema)?))
 }
 
-pub fn parse_protobuf_file_scan_config(
+/// Parses protobuf file scan config.
+///
+/// # Backwards Compatibility
+///
+/// This function accepts either `&TaskContext` or `DecodeContext` for backwards compatibility.
+/// In future versions, passing `DecodeContext` directly will be required.
+pub fn parse_protobuf_file_scan_config<'a>(
     proto: &protobuf::FileScanExecConf,
-    decode_ctx: &DecodeContext,
+    ctx: impl Into<DecodeContext<'a>>,
     codec: &dyn PhysicalExtensionCodec,
     file_source: Arc<dyn FileSource>,
 ) -> Result<FileScanConfig> {
+    let decode_ctx = ctx.into();
     let schema: Arc<Schema> = parse_protobuf_file_scan_schema(proto)?;
     let projection = proto
         .projection
@@ -557,7 +650,7 @@ pub fn parse_protobuf_file_scan_config(
     for node_collection in &proto.output_ordering {
         let sort_exprs = parse_physical_sort_exprs(
             &node_collection.physical_sort_expr_nodes,
-            decode_ctx,
+            decode_ctx.clone(),
             &schema,
             codec,
         )?;

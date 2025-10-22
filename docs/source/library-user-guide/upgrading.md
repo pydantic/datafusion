@@ -50,37 +50,81 @@ impl FunctionRegistry for FunctionRegistryImpl {
 }
 ```
 
-### `datafusion-proto` use `TaskContext` rather than `SessionContext` in physical plan serde methods
+### `datafusion-proto` introduces `DecodeContext` with backwards compatibility for `TaskContext`
 
-There have been changes in the public API methods of `datafusion-proto` which handle physical plan serde.
+The `datafusion-proto` crate has introduced a new `DecodeContext` type to improve performance through expression caching during physical plan deserialization. This change affects public API methods that handle physical plan serialization/deserialization.
 
-Methods like `physical_plan_from_bytes`, `parse_physical_expr` and similar, expect `TaskContext` instead of `SessionContext`
+#### Backwards Compatibility
 
-```diff
-- let plan2 = physical_plan_from_bytes(&bytes, &ctx)?;
-+ let plan2 = physical_plan_from_bytes(&bytes, &ctx.task_ctx())?;
+For backwards compatibility, most public functions now accept either `&TaskContext` or `DecodeContext`:
+
+```rust
+// Both of these work:
+let expr1 = parse_physical_expr(proto, &task_ctx, schema, codec)?;  // Old way - still works
+let expr2 = parse_physical_expr(proto, DecodeContext::new(&task_ctx), schema, codec)?;  // New way - recommended
 ```
 
-as `TaskContext` contains `RuntimeEnv` methods such as `try_into_physical_plan` will not have explicit `RuntimeEnv` parameter.
+Functions with backwards compatibility support include:
+- `parse_physical_expr`
+- `parse_physical_exprs`
+- `parse_physical_sort_expr` / `parse_physical_sort_exprs`
+- `parse_physical_window_expr`
+- `parse_protobuf_partitioning` / `parse_protobuf_hash_partitioning`
+- `parse_protobuf_file_scan_config`
 
+#### Why use `DecodeContext` directly?
+
+When passing `&TaskContext`, a new `DecodeContext` is created internally without caching. For optimal performance with expression deduplication (when the same physical expression appears multiple times in a plan), create and reuse a `DecodeContext`:
+
+```rust
+let decode_ctx = DecodeContext::new(&task_ctx);
+let expr1 = parse_physical_expr(proto1, decode_ctx.clone(), schema, codec)?;
+let expr2 = parse_physical_expr(proto2, decode_ctx.clone(), schema, codec)?;
+// Expressions are deduplicated via the shared cache
+```
+
+#### Breaking Changes in Traits
+
+The following trait methods now require `&DecodeContext` (no automatic conversion):
+
+**`AsExecutionPlan::try_into_physical_plan`:**
 ```diff
 let result_exec_plan: Arc<dyn ExecutionPlan> = proto
--   .try_into_physical_plan(&ctx, runtime.deref(), &composed_codec)
-+.  .try_into_physical_plan(&ctx.task_ctx(), &composed_codec)
+-   .try_into_physical_plan(&ctx.task_ctx(), &composed_codec)
++   .try_into_physical_plan(&DecodeContext::new(&ctx.task_ctx()), &composed_codec)
 ```
 
-`PhysicalExtensionCodec::try_decode()` expects `TaskContext` instead of `FunctionRegistry`:
-
+**`PhysicalExtensionCodec::try_decode`:**
 ```diff
 pub trait PhysicalExtensionCodec {
     fn try_decode(
         &self,
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
--        registry: &dyn FunctionRegistry,
-+        ctx: &TaskContext,
+-        ctx: &TaskContext,
++        ctx: &DecodeContext,
     ) -> Result<Arc<dyn ExecutionPlan>>;
 ```
+
+To update your implementation:
+```rust
+impl PhysicalExtensionCodec for MyCodec {
+    fn try_decode(
+        &self,
+        buf: &[u8],
+        inputs: &[Arc<dyn ExecutionPlan>],
+        ctx: &DecodeContext,  // Changed from &TaskContext
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Access the TaskContext if needed:
+        let task_ctx = ctx.task_context();
+        // ... your implementation
+    }
+}
+```
+
+#### Future Deprecation
+
+The backwards compatibility (automatic conversion from `&TaskContext`) may be removed in future versions. It is recommended to migrate to using `DecodeContext` directly.
 
 See [issue #17601] for more details.
 

@@ -108,9 +108,10 @@ use prost::Message;
 /// physical expressions. The cache is keyed by the expression's ID (derived from the
 /// Arc pointer during serialization), allowing duplicate expressions in a plan to be
 /// deserialized only once.
+#[derive(Clone)]
 pub struct DecodeContext<'a> {
     task_context: &'a TaskContext,
-    cache: Mutex<HashMap<u64, Arc<dyn PhysicalExpr>>>,
+    cache: Arc<Mutex<HashMap<u64, Arc<dyn PhysicalExpr>>>>,
 }
 
 impl<'a> DecodeContext<'a> {
@@ -118,7 +119,7 @@ impl<'a> DecodeContext<'a> {
     pub fn new(task_context: &'a TaskContext) -> Self {
         Self {
             task_context,
-            cache: Mutex::new(HashMap::new()),
+            cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -142,6 +143,12 @@ impl<'a> DecodeContext<'a> {
     ) -> Arc<dyn PhysicalExpr> {
         let mut cache = self.cache.lock().unwrap();
         Arc::clone(cache.entry(id).or_insert(expr))
+    }
+}
+
+impl<'a> From<&'a TaskContext> for DecodeContext<'a> {
+    fn from(task_context: &'a TaskContext) -> Self {
+        Self::new(task_context)
     }
 }
 
@@ -579,7 +586,7 @@ impl protobuf::PhysicalPlanNode {
                 Ok((
                     parse_physical_expr(
                         expr,
-                        decode_ctx,
+                        decode_ctx.clone(),
                         input.schema().as_ref(),
                         extension_codec,
                     )?,
@@ -610,7 +617,7 @@ impl protobuf::PhysicalPlanNode {
             .map(|expr| {
                 parse_physical_expr(
                     expr,
-                    decode_ctx,
+                    decode_ctx.clone(),
                     input.schema().as_ref(),
                     extension_codec,
                 )
@@ -684,7 +691,7 @@ impl protobuf::PhysicalPlanNode {
 
         let conf = FileScanConfigBuilder::from(parse_protobuf_file_scan_config(
             scan.base_conf.as_ref().unwrap(),
-            decode_ctx,
+            decode_ctx.clone(),
             extension_codec,
             source,
         )?)
@@ -703,7 +710,7 @@ impl protobuf::PhysicalPlanNode {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let scan_conf = parse_protobuf_file_scan_config(
             scan.base_conf.as_ref().unwrap(),
-            decode_ctx,
+            decode_ctx.clone(),
             extension_codec,
             Arc::new(JsonSource::new()),
         )?;
@@ -744,7 +751,7 @@ impl protobuf::PhysicalPlanNode {
                 .map(|expr| {
                     parse_physical_expr(
                         expr,
-                        decode_ctx,
+                        decode_ctx.clone(),
                         predicate_schema.as_ref(),
                         extension_codec,
                     )
@@ -762,7 +769,7 @@ impl protobuf::PhysicalPlanNode {
             }
             let base_config = parse_protobuf_file_scan_config(
                 base_conf,
-                decode_ctx,
+                decode_ctx.clone(),
                 extension_codec,
                 Arc::new(source),
             )?;
@@ -784,7 +791,7 @@ impl protobuf::PhysicalPlanNode {
         {
             let conf = parse_protobuf_file_scan_config(
                 scan.base_conf.as_ref().unwrap(),
-                decode_ctx,
+                decode_ctx.clone(),
                 extension_codec,
                 Arc::new(AvroSource::new()),
             )?;
@@ -827,7 +834,7 @@ impl protobuf::PhysicalPlanNode {
         for ordering in &scan.sort_information {
             let sort_exprs = parse_physical_sort_exprs(
                 &ordering.physical_sort_expr_nodes,
-                decode_ctx,
+                decode_ctx.clone(),
                 &schema,
                 extension_codec,
             )?;
@@ -881,7 +888,7 @@ impl protobuf::PhysicalPlanNode {
             into_physical_plan(&repart.input, decode_ctx, extension_codec)?;
         let partitioning = parse_protobuf_partitioning(
             repart.partitioning.as_ref(),
-            decode_ctx,
+            decode_ctx.clone(),
             input.schema().as_ref(),
             extension_codec,
         )?;
@@ -938,7 +945,7 @@ impl protobuf::PhysicalPlanNode {
             .map(|window_expr| {
                 parse_physical_window_expr(
                     window_expr,
-                    decode_ctx,
+                    decode_ctx.clone(),
                     input_schema.as_ref(),
                     extension_codec,
                 )
@@ -951,7 +958,7 @@ impl protobuf::PhysicalPlanNode {
             .map(|expr| {
                 parse_physical_expr(
                     expr,
-                    decode_ctx,
+                    decode_ctx.clone(),
                     input.schema().as_ref(),
                     extension_codec,
                 )
@@ -1017,7 +1024,7 @@ impl protobuf::PhysicalPlanNode {
             .map(|(expr, name)| {
                 parse_physical_expr(
                     expr,
-                    decode_ctx,
+                    decode_ctx.clone(),
                     input.schema().as_ref(),
                     extension_codec,
                 )
@@ -1032,7 +1039,7 @@ impl protobuf::PhysicalPlanNode {
             .map(|(expr, name)| {
                 parse_physical_expr(
                     expr,
-                    decode_ctx,
+                    decode_ctx.clone(),
                     input.schema().as_ref(),
                     extension_codec,
                 )
@@ -1064,7 +1071,7 @@ impl protobuf::PhysicalPlanNode {
                     .map(|e| {
                         parse_physical_expr(
                             e,
-                            decode_ctx,
+                            decode_ctx.clone(),
                             &physical_schema,
                             extension_codec,
                         )
@@ -1090,7 +1097,7 @@ impl protobuf::PhysicalPlanNode {
                             .map(|e| {
                                 parse_physical_expr(
                                     e,
-                                    decode_ctx,
+                                    decode_ctx.clone(),
                                     &physical_schema,
                                     extension_codec,
                                 )
@@ -1102,7 +1109,7 @@ impl protobuf::PhysicalPlanNode {
                             .map(|e| {
                                 parse_physical_sort_expr(
                                     e,
-                                    decode_ctx,
+                                    decode_ctx.clone(),
                                     &physical_schema,
                                     extension_codec,
                                 )
@@ -1185,13 +1192,13 @@ impl protobuf::PhysicalPlanNode {
             .map(|col| {
                 let left = parse_physical_expr(
                     &col.left.clone().unwrap(),
-                    decode_ctx,
+                    decode_ctx.clone(),
                     left_schema.as_ref(),
                     extension_codec,
                 )?;
                 let right = parse_physical_expr(
                     &col.right.clone().unwrap(),
-                    decode_ctx,
+                    decode_ctx.clone(),
                     right_schema.as_ref(),
                     extension_codec,
                 )?;
@@ -1226,7 +1233,7 @@ impl protobuf::PhysicalPlanNode {
                     f.expression.as_ref().ok_or_else(|| {
                         proto_error("Unexpected empty filter expression")
                     })?,
-                    decode_ctx,
+                    decode_ctx.clone(),
                     &schema,
                     extension_codec,
                 )?;
@@ -1301,13 +1308,13 @@ impl protobuf::PhysicalPlanNode {
             .map(|col| {
                 let left = parse_physical_expr(
                     &col.left.clone().unwrap(),
-                    decode_ctx,
+                    decode_ctx.clone(),
                     left_schema.as_ref(),
                     extension_codec,
                 )?;
                 let right = parse_physical_expr(
                     &col.right.clone().unwrap(),
-                    decode_ctx,
+                    decode_ctx.clone(),
                     right_schema.as_ref(),
                     extension_codec,
                 )?;
@@ -1342,7 +1349,7 @@ impl protobuf::PhysicalPlanNode {
                     f.expression.as_ref().ok_or_else(|| {
                         proto_error("Unexpected empty filter expression")
                     })?,
-                    decode_ctx, &schema,
+                    decode_ctx.clone(), &schema,
                     extension_codec,
                 )?;
                 let column_indices = f.column_indices
@@ -1367,7 +1374,7 @@ impl protobuf::PhysicalPlanNode {
 
         let left_sort_exprs = parse_physical_sort_exprs(
             &sym_join.left_sort_exprs,
-            decode_ctx,
+            decode_ctx.clone(),
             &left_schema,
             extension_codec,
         )?;
@@ -1375,7 +1382,7 @@ impl protobuf::PhysicalPlanNode {
 
         let right_sort_exprs = parse_physical_sort_exprs(
             &sym_join.right_sort_exprs,
-            decode_ctx,
+            decode_ctx.clone(),
             &right_schema,
             extension_codec,
         )?;
@@ -1500,7 +1507,7 @@ impl protobuf::PhysicalPlanNode {
                         })?
                         .as_ref();
                     Ok(PhysicalSortExpr {
-                        expr: parse_physical_expr(expr, decode_ctx, input.schema().as_ref(), extension_codec)?,
+                        expr: parse_physical_expr(expr, decode_ctx.clone(), input.schema().as_ref(), extension_codec)?,
                         options: SortOptions {
                             descending: !sort_expr.asc,
                             nulls_first: sort_expr.nulls_first,
@@ -1553,7 +1560,7 @@ impl protobuf::PhysicalPlanNode {
                     Ok(PhysicalSortExpr {
                         expr: parse_physical_expr(
                             expr,
-                            decode_ctx,
+                            decode_ctx.clone(),
                             input.schema().as_ref(),
                             extension_codec,
                         )?,
@@ -1625,7 +1632,7 @@ impl protobuf::PhysicalPlanNode {
                             f.expression.as_ref().ok_or_else(|| {
                                 proto_error("Unexpected empty filter expression")
                             })?,
-                            decode_ctx, &schema,
+                            decode_ctx.clone(), &schema,
                             extension_codec,
                         )?;
                         let column_indices = f.column_indices
@@ -1705,7 +1712,7 @@ impl protobuf::PhysicalPlanNode {
             .map(|collection| {
                 parse_physical_sort_exprs(
                     &collection.physical_sort_expr_nodes,
-                    decode_ctx,
+                    decode_ctx.clone(),
                     &sink_schema,
                     extension_codec,
                 )
@@ -1742,7 +1749,7 @@ impl protobuf::PhysicalPlanNode {
             .map(|collection| {
                 parse_physical_sort_exprs(
                     &collection.physical_sort_expr_nodes,
-                    decode_ctx,
+                    decode_ctx.clone(),
                     &sink_schema,
                     extension_codec,
                 )
@@ -1782,7 +1789,7 @@ impl protobuf::PhysicalPlanNode {
                 .map(|collection| {
                     parse_physical_sort_exprs(
                         &collection.physical_sort_expr_nodes,
-                        decode_ctx,
+                        decode_ctx.clone(),
                         &sink_schema,
                         extension_codec,
                     )
@@ -1858,7 +1865,7 @@ impl protobuf::PhysicalPlanNode {
                     f.expression.as_ref().ok_or_else(|| {
                         proto_error("Unexpected empty filter expression")
                     })?,
-                    decode_ctx,
+                    decode_ctx.clone(),
                     &schema,
                     extension_codec,
                 )?;
@@ -1919,13 +1926,13 @@ impl protobuf::PhysicalPlanNode {
             .map(|col| {
                 let left = parse_physical_expr(
                     &col.left.clone().unwrap(),
-                    decode_ctx,
+                    decode_ctx.clone(),
                     left_schema.as_ref(),
                     extension_codec,
                 )?;
                 let right = parse_physical_expr(
                     &col.right.clone().unwrap(),
-                    decode_ctx,
+                    decode_ctx.clone(),
                     right_schema.as_ref(),
                     extension_codec,
                 )?;
