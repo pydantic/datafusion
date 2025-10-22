@@ -26,6 +26,7 @@ use crate::{
 use arrow::array::RecordBatch;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
+use datafusion_physical_expr::projection::Projection;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -61,7 +62,7 @@ pub(super) struct ParquetOpener {
     /// Execution partition index
     pub partition_index: usize,
     /// Column indexes in `table_schema` needed by the query
-    pub projection: Arc<[usize]>,
+    pub projection: Projection,
     /// Target number of rows in each output RecordBatch
     pub batch_size: usize,
     /// Optional limit on the number of rows to read
@@ -135,7 +136,8 @@ impl FileOpener for ParquetOpener {
         let batch_size = self.batch_size;
 
         let projected_schema =
-            SchemaRef::from(self.logical_file_schema.project(&self.projection)?);
+            SchemaRef::from(self.projection.project_schema(&self.logical_file_schema)?);
+
         let schema_adapter_factory = Arc::clone(&self.schema_adapter_factory);
         let schema_adapter = self
             .schema_adapter_factory

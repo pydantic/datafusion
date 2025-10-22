@@ -26,9 +26,11 @@ use crate::file_groups::FileGroupPartitioner;
 use crate::file_scan_config::FileScanConfig;
 use crate::file_stream::FileOpener;
 use crate::schema_adapter::SchemaAdapterFactory;
+use crate::source::DataSource;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{not_impl_err, Result, Statistics};
+use datafusion_physical_expr::projection::{Projection, ProjectionExpr};
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -73,6 +75,11 @@ pub trait FileSource: Send + Sync {
     fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
         None
     }
+
+    fn projection(&self) -> Option<&Projection> {
+        None
+    }
+
     /// Return execution plan metrics
     fn metrics(&self) -> &ExecutionPlanMetricsSet;
     /// Return projected statistics
@@ -129,6 +136,13 @@ pub trait FileSource: Send + Sync {
         ))
     }
 
+    fn try_projection_pushdown(
+        &self,
+        _projection: &Projection,
+    ) -> Result<ProjectionPushdownResult> {
+        Ok(ProjectionPushdownResult::None)
+    }
+
     /// Set optional schema adapter factory.
     ///
     /// [`SchemaAdapterFactory`] allows user to specify how fields from the
@@ -153,5 +167,19 @@ pub trait FileSource: Send + Sync {
     /// Default implementation returns `None`.
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
         None
+    }
+}
+
+pub enum ProjectionPushdownResult {
+    None,
+    Partial {
+        source: Arc<dyn FileSource>,
+        remaining: Vec<ProjectionExpr>,
+    },
+}
+
+impl ProjectionPushdownResult {
+    pub fn partial(source: Arc<dyn FileSource>, remaining: Vec<ProjectionExpr>) -> Self {
+        Self::Partial { source, remaining }
     }
 }

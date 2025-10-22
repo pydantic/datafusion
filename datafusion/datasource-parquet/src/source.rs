@@ -41,6 +41,9 @@ use datafusion_common::{DataFusionError, Statistics};
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_physical_expr::conjunction;
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::projection::Projection;
+use datafusion_physical_expr::projection::ProjectionExpr;
 use datafusion_physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
@@ -289,6 +292,8 @@ pub struct ParquetSource {
     pub(crate) projected_statistics: Option<Statistics>,
     #[cfg(feature = "parquet_encryption")]
     pub(crate) encryption_factory: Option<Arc<dyn EncryptionFactory>>,
+
+    pub(crate) projections: Option<Projection>,
 }
 
 impl ParquetSource {
@@ -461,6 +466,10 @@ impl ParquetSource {
             )),
         }
     }
+
+    pub fn projections(&self) -> Option<&Projection> {
+        self.projections.as_ref()
+    }
 }
 
 /// Parses datafusion.common.config.ParquetOptions.coerce_int96 String to a arrow_schema.datatype.TimeUnit
@@ -495,9 +504,12 @@ impl FileSource for ParquetSource {
         base_config: &FileScanConfig,
         partition: usize,
     ) -> Arc<dyn FileOpener> {
-        let projection = base_config
-            .file_column_projection_indices()
-            .unwrap_or_else(|| (0..base_config.file_schema().fields().len()).collect());
+        let projections = self
+            .projections()
+            .cloned()
+            .unwrap_or_else(|| Projection::all(base_config.table_schema.table_schema()));
+
+        // matthew: what does the role of expr_adapter_ and schema_adapter_factory look like here?
 
         let (expr_adapter_factory, schema_adapter_factory) = match (
             base_config.expr_adapter_factory.as_ref(),
@@ -560,7 +572,7 @@ impl FileSource for ParquetSource {
 
         Arc::new(ParquetOpener {
             partition_index: partition,
-            projection: Arc::from(projection),
+            projection: todo!("matthew: drill"),
             batch_size: self
                 .batch_size
                 .expect("Batch size must set before creating ParquetOpener"),
@@ -765,6 +777,28 @@ impl FileSource for ParquetSource {
             filters.iter().map(|f| f.discriminant).collect(),
         )
         .with_updated_node(source))
+    }
+
+    fn try_projection_pushdown(
+        &self,
+        projection: &Projection,
+    ) -> datafusion_common::Result<datafusion_datasource::file::ProjectionPushdownResult>
+    {
+        let current_projections = self.projections();
+
+        if current_projections.is_empty() {
+            let mut this = self.clone();
+            this.projections = projection.to_vec();
+
+            return Ok(
+                datafusion_datasource::file::ProjectionPushdownResult::Partial {
+                    source: Arc::new(this),
+                    remaining: vec![],
+                },
+            );
+        }
+
+        todo!()
     }
 
     fn with_schema_adapter_factory(

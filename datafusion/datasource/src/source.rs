@@ -22,6 +22,7 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use datafusion_physical_expr::projection::Projection;
 use datafusion_physical_plan::execution_plan::{
     Boundedness, EmissionType, SchedulingType,
 };
@@ -158,10 +159,12 @@ pub trait DataSource: Send + Sync + Debug {
     fn metrics(&self) -> ExecutionPlanMetricsSet {
         ExecutionPlanMetricsSet::new()
     }
+
+    // matthew: change the return type to the custom enum PartialProjectionPushdownResult
     fn try_swapping_with_projection(
         &self,
-        _projection: &[ProjectionExpr],
-    ) -> Result<Option<Arc<dyn DataSource>>>;
+        _projection: &Projection,
+    ) -> Result<Option<(Arc<dyn DataSource>, Vec<ProjectionExpr>)>>;
     /// Try to push down filters into this DataSource.
     /// See [`ExecutionPlan::handle_child_pushdown_result`] for more details.
     ///
@@ -317,12 +320,24 @@ impl ExecutionPlan for DataSourceExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        match self
-            .data_source
-            .try_swapping_with_projection(projection.expr())?
-        {
-            Some(new_data_source) => {
-                Ok(Some(Arc::new(DataSourceExec::new(new_data_source))))
+        // todo: matthew change the argument to Projection
+
+        let projection = Projection::from(projection.expr());
+
+        match self.data_source.try_swapping_with_projection(&projection)? {
+            Some((new_data_source, remaining_projections)) => {
+                let new_data_source_exec = Arc::new(DataSourceExec::new(new_data_source));
+
+                if !remaining_projections.is_empty() {
+                    let new_projection_exec = ProjectionExec::try_new(
+                        remaining_projections,
+                        new_data_source_exec,
+                    )?;
+
+                    return Ok(Some(Arc::new(new_projection_exec)));
+                }
+
+                Ok(Some(new_data_source_exec))
             }
             None => Ok(None),
         }

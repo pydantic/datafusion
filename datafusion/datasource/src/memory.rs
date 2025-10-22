@@ -31,6 +31,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use datafusion_common::{internal_err, plan_err, project_schema, Result, ScalarValue};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::project_orderings;
+use datafusion_physical_expr::projection::Projection;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{EquivalenceProperties, LexOrdering};
 use datafusion_physical_plan::memory::MemoryStream;
@@ -211,26 +212,28 @@ impl DataSource for MemorySourceConfig {
 
     fn try_swapping_with_projection(
         &self,
-        projection: &[ProjectionExpr],
-    ) -> Result<Option<Arc<dyn DataSource>>> {
-        // If there is any non-column or alias-carrier expression, Projection should not be removed.
-        // This process can be moved into MemoryExec, but it would be an overlap of their responsibility.
-        all_alias_free_columns(projection)
-            .then(|| {
-                let all_projections = (0..self.schema.fields().len()).collect();
-                let new_projections = new_projections_for_columns(
-                    projection,
-                    self.projection().as_ref().unwrap_or(&all_projections),
-                );
+        _projection: &Projection,
+    ) -> Result<Option<(Arc<dyn DataSource>, Vec<ProjectionExpr>)>> {
+        Ok(None)
+        // // matthew: fix the infections &[ProjectionExpr]
+        // // If there is any non-column or alias-carrier expression, Projection should not be removed.
+        // // This process can be moved into MemoryExec, but it would be an overlap of their responsibility.
+        // all_alias_free_columns(projection)
+        //     .then(|| {
+        //         let all_projections = (0..self.schema.fields().len()).collect();
+        //         let new_projections = new_projections_for_columns(
+        //             projection,
+        //             self.projection().as_ref().unwrap_or(&all_projections),
+        //         );
 
-                MemorySourceConfig::try_new(
-                    self.partitions(),
-                    self.original_schema(),
-                    Some(new_projections),
-                )
-                .map(|s| Arc::new(s) as Arc<dyn DataSource>)
-            })
-            .transpose()
+        //         MemorySourceConfig::try_new(
+        //             self.partitions(),
+        //             self.original_schema(),
+        //             Some(new_projections),
+        //         )
+        //         .map(|s| (Arc::new(s) as Arc<dyn DataSource>, vec![]))
+        //     })
+        //     .transpose()
     }
 }
 

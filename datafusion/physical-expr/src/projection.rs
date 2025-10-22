@@ -136,6 +136,25 @@ impl Projection {
         Self { exprs }
     }
 
+    // matthew: clean this up!
+    pub fn all(table_schema: &Schema) -> Self {
+        Self::new(
+            table_schema
+                .fields()
+                .into_iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let expr = Arc::new(Column::new(f.name(), i)) as _;
+
+                    ProjectionExpr {
+                        expr,
+                        alias: f.name().clone(),
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
     /// Returns an iterator over the projection expressions
     pub fn iter(&self) -> impl Iterator<Item = &ProjectionExpr> {
         self.exprs.iter()
