@@ -97,7 +97,8 @@ impl FileSource for AvroSource {
 
     fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource> {
         let mut conf = self.clone();
-        conf.projection = config.projected_file_column_names();
+        // conf.projection = config.projected_file_column_names();
+        todo!();
         Arc::new(conf)
     }
 

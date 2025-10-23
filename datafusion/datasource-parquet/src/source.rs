@@ -786,17 +786,22 @@ impl FileSource for ParquetSource {
     {
         let current_projections = self.projections();
 
-        if current_projections.is_empty() {
-            let mut this = self.clone();
-            this.projections = projection.to_vec();
-
-            return Ok(
-                datafusion_datasource::file::ProjectionPushdownResult::Partial {
-                    source: Arc::new(this),
-                    remaining: vec![],
-                },
-            );
+        let mut this = self.clone();
+        match current_projections {
+            None => {
+                this.projections = Some(projection.clone());
+            }
+            Some(current_projections) => {
+                this.projections = Some(current_projections.try_merge(projection)?);
+            }
         }
+
+        return Ok(
+            datafusion_datasource::file::ProjectionPushdownResult::Partial {
+                source: Arc::new(this),
+                remaining: vec![],
+            },
+        );
 
         todo!()
     }

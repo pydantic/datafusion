@@ -272,7 +272,8 @@ impl FileSource for CsvSource {
 
     fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource> {
         let mut conf = self.clone();
-        conf.file_projection = config.file_column_projection_indices();
+        // conf.file_projection = config.file_column_projection_indices();
+        todo!();
         Arc::new(conf)
     }
 

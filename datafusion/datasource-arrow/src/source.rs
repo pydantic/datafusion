@@ -61,7 +61,8 @@ impl FileSource for ArrowSource {
     ) -> Arc<dyn FileOpener> {
         Arc::new(ArrowOpener {
             object_store,
-            projection: base_config.file_column_projection_indices(),
+            projection: todo!(),
+            // projection: base_config.file_column_projection_indices(),
         })
     }
 

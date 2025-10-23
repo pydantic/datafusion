@@ -837,45 +837,45 @@ impl FileScanConfig {
         (schema, constraints, stats, output_ordering)
     }
 
-    pub fn projected_file_column_names(&self) -> Option<Vec<String>> {
-        self.projection.as_ref().map(|p| {
-            p.iter()
-                .filter(|col_idx| **col_idx < self.file_schema().fields().len())
-                .map(|col_idx| self.file_schema().field(*col_idx).name())
-                .cloned()
-                .collect()
-        })
-    }
+    // pub fn projected_file_column_names(&self) -> Option<Vec<String>> {
+    //     self.projection.as_ref().map(|p| {
+    //         p.iter()
+    //             .filter(|col_idx| **col_idx < self.file_schema().fields().len())
+    //             .map(|col_idx| self.file_schema().field(*col_idx).name())
+    //             .cloned()
+    //             .collect()
+    //     })
+    // }
 
-    /// Projects only file schema, ignoring partition columns
-    pub fn projected_file_schema(&self) -> SchemaRef {
-        let fields = self.file_column_projection_indices().map(|indices| {
-            indices
-                .iter()
-                .map(|col_idx| self.file_schema().field(*col_idx))
-                .cloned()
-                .collect::<Vec<_>>()
-        });
+    // /// Projects only file schema, ignoring partition columns
+    // pub fn projected_file_schema(&self) -> SchemaRef {
+    //     let fields = self.file_column_projection_indices().map(|indices| {
+    //         indices
+    //             .iter()
+    //             .map(|col_idx| self.file_schema().field(*col_idx))
+    //             .cloned()
+    //             .collect::<Vec<_>>()
+    //     });
 
-        fields.map_or_else(
-            || Arc::clone(self.file_schema()),
-            |f| {
-                Arc::new(Schema::new_with_metadata(
-                    f,
-                    self.file_schema().metadata.clone(),
-                ))
-            },
-        )
-    }
+    //     fields.map_or_else(
+    //         || Arc::clone(self.file_schema()),
+    //         |f| {
+    //             Arc::new(Schema::new_with_metadata(
+    //                 f,
+    //                 self.file_schema().metadata.clone(),
+    //             ))
+    //         },
+    //     )
+    // }
 
-    pub fn file_column_projection_indices(&self) -> Option<Vec<usize>> {
-        self.projection.as_ref().map(|p| {
-            p.iter()
-                .filter(|col_idx| **col_idx < self.file_schema().fields().len())
-                .copied()
-                .collect()
-        })
-    }
+    // pub fn file_column_projection_indices(&self) -> Option<Vec<usize>> {
+    //     self.projection.as_ref().map(|p| {
+    //         p.iter()
+    //             .filter(|col_idx| **col_idx < self.file_schema().fields().len())
+    //             .copied()
+    //             .collect()
+    //     })
+    // }
 
     /// Splits file groups into new groups based on statistics to enable efficient parallel processing.
     ///
