@@ -1424,9 +1424,11 @@ fn build_predicate_expression(
         }
     }
     if let Some(in_list) = expr_any.downcast_ref::<phys_expr::InListExpr>() {
-        if !in_list.list().is_empty()
-            && in_list.list().len() <= MAX_LIST_VALUE_SIZE_REWRITE
-        {
+        if !in_list.is_empty() && in_list.len() <= MAX_LIST_VALUE_SIZE_REWRITE {
+            let list = match in_list.list() {
+                Ok(list) => list,
+                Err(_) => return unhandled_hook.handle(expr),
+            };
             let eq_op = if in_list.negated() {
                 Operator::NotEq
             } else {
@@ -1437,8 +1439,7 @@ fn build_predicate_expression(
             } else {
                 Operator::Or
             };
-            let change_expr = in_list
-                .list()
+            let change_expr = list
                 .iter()
                 .map(|e| {
                     Arc::new(phys_expr::BinaryExpr::new(

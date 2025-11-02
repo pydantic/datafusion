@@ -315,7 +315,7 @@ pub fn serialize_physical_expr(
             expr_type: Some(protobuf::physical_expr_node::ExprType::InList(Box::new(
                 protobuf::PhysicalInListNode {
                     expr: Some(Box::new(serialize_physical_expr(expr.expr(), codec)?)),
-                    list: serialize_physical_exprs(expr.list(), codec)?,
+                    list: serialize_physical_exprs(&expr.list()?, codec)?,
                     negated: expr.negated(),
                 },
             ))),
