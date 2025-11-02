@@ -109,6 +109,11 @@ impl ArraySet {
 
 impl Set for ArraySet {
     fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
+        // Null type comparisons always return null (SQL three-valued logic)
+        if v.data_type() == &DataType::Null || self.array.data_type() == &DataType::Null {
+            return Ok(BooleanArray::from(vec![None; v.len()]));
+        }
+
         downcast_dictionary_array! {
             v => {
                 let values_contains = self.contains(v.values().as_ref(), negated)?;
@@ -160,6 +165,14 @@ impl Set for ArraySet {
 /// Note: This is split into a separate function as higher-rank trait bounds currently
 /// cause type inference to misbehave
 fn make_hash_set(array: &dyn Array) -> Result<ArrayHashSet> {
+    // Null type has no natural order - return empty hash set
+    if array.data_type() == &DataType::Null {
+        return Ok(ArrayHashSet {
+            state: RandomState::new(),
+            map: HashMap::with_hasher(()),
+        });
+    }
+
     let state = RandomState::new();
     let mut map: HashMap<usize, (), ()> = HashMap::with_hasher(());
     let mut hashes = vec![0; array.len()];
@@ -187,63 +200,10 @@ fn make_hash_set(array: &dyn Array) -> Result<ArrayHashSet> {
     Ok(ArrayHashSet { state, map })
 }
 
-/// Creates a `Box<dyn Set>` for the given list of `IN` expressions and `batch`.
-/// Accepts a parameter `f` which allows access to the underlying `ArrayHashSet`
-/// and is used by [`in_list_from_array`] to collect unique indices.
-fn make_set<F>(array: ArrayRef, mut f: F) -> Result<Arc<dyn Set>>
-where
-    F: FnMut(ArrayHashSet) -> Result<ArrayHashSet>,
-{
-    let hash_set = f(make_hash_set(array.as_ref())?)?;
+/// Creates a `Arc<dyn Set>` for the given array.
+fn make_set(array: ArrayRef) -> Result<Arc<dyn Set>> {
+    let hash_set = make_hash_set(array.as_ref())?;
     Ok(Arc::new(ArraySet::new(array, hash_set)))
-    // Ok(downcast_primitive_array! {
-    //     array => {
-    //         let hash_set = f(make_hash_set(array)?)?;
-    //         Arc::new(ArraySet::new(array, hash_set))
-    //     },
-    //     DataType::Boolean => {
-    //         let array = as_boolean_array(array)?;
-    //         let hash_set = f(make_hash_set(array)?)?;
-    //         Arc::new(ArraySet::new(array, hash_set))
-    //     },
-    //     DataType::Utf8 => {
-    //         let array = as_string_array(array)?;
-    //         let hash_set = f(make_hash_set(array)?)?;
-    //         Arc::new(ArraySet::new(array, hash_set))
-    //     }
-    //     DataType::LargeUtf8 => {
-    //         let array = as_largestring_array(array);
-    //         let hash_set = f(make_hash_set(array)?)?;
-    //         Arc::new(ArraySet::new(array, hash_set))
-    //     }
-    //     DataType::Utf8View => {
-    //         let array = as_string_view_array(array)?;
-    //         let hash_set = f(make_hash_set(array)?)?;
-    //         Arc::new(ArraySet::new(array, hash_set))
-    //     }
-    //     DataType::Binary => {
-    //         let array = as_generic_binary_array::<i32>(array)?;
-    //         let hash_set = f(make_hash_set(array)?)?;
-    //         Arc::new(ArraySet::new(array, hash_set))
-    //     }
-    //     DataType::LargeBinary => {
-    //         let array = as_generic_binary_array::<i64>(array)?;
-    //         let hash_set = f(make_hash_set(array)?)?;
-    //         Arc::new(ArraySet::new(array, hash_set))
-    //     }
-    //     DataType::BinaryView => {
-    //         let array = as_binary_view_array(array)?;
-    //         let hash_set = f(make_hash_set(array)?)?;
-    //         Arc::new(ArraySet::new(array, hash_set))
-    //     }
-    //     DataType::Struct(fields) => {
-    //         let array = as_struct_array(array);
-    //         let hash_set = f(make_hash_set(array)?)?;
-    //         Arc::new(ArraySet::new(array, hash_set))
-    //     }
-    //     DataType::Dictionary(_, _) => unreachable!("dictionary should have been flattened"),
-    //     d => return not_impl_err!("DataType::{d} not supported in InList")
-    // })
 }
 
 /// Evaluates the list of expressions into an array, flattening any dictionaries
@@ -625,7 +585,7 @@ pub fn in_list(
 
     // Try to convert to Array variant with static filter (optimized path)
     if let Ok(array) = try_evaluate_constant_list(&list, schema) {
-        if let Ok(static_filter) = make_set(Arc::clone(&array), Ok) {
+        if let Ok(static_filter) = make_set(Arc::clone(&array)) {
             return Ok(Arc::new(InListExpr::new_from_array(
                 expr,
                 array,
@@ -655,7 +615,7 @@ pub fn in_list_from_array(
     array: ArrayRef,
     negated: bool,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    let static_filter = make_set(Arc::clone(&array), Ok)?;
+    let static_filter = make_set(Arc::clone(&array))?;
     Ok(Arc::new(InListExpr::new_from_array(
         expr,
         array,
@@ -715,7 +675,7 @@ mod tests {
         schema: &Schema,
     ) -> Result<Arc<dyn Set>> {
         let array = try_evaluate_constant_list(list, schema)?;
-        make_set(array, Ok)
+        make_set(array)
     }
 
     // Attempts to coerce the types of `list_type` to be comparable with the
@@ -2106,6 +2066,276 @@ mod tests {
             display_string_negated.contains("(SET)"),
             "Expected negated display string to contain '(SET)' but got: {display_string_negated}",
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_in_list_null_handling_comprehensive() -> Result<()> {
+        // Comprehensive test demonstrating SQL three-valued logic for IN expressions
+        // This test explicitly shows all possible outcomes: true, false, and null
+        let schema = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
+
+        // Test data: [1, 2, 3, null]
+        // - 1 will match in both lists
+        // - 2 will not match in either list
+        // - 3 will not match in either list
+        // - null is always null
+        let a = Int64Array::from(vec![Some(1), Some(2), Some(3), None]);
+        let col_a = col("a", &schema)?;
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(a)])?;
+
+        // Case 1: List WITHOUT null - demonstrates true/false/null outcomes
+        // "a IN (1, 4)" - 1 matches, 2 and 3 don't match, null is null
+        let list = vec![lit(1i64), lit(4i64)];
+        in_list!(
+            batch,
+            list,
+            &false,
+            vec![
+                Some(true),  // 1 is in the list → true
+                Some(false), // 2 is not in the list → false
+                Some(false), // 3 is not in the list → false
+                None,        // null IN (...) → null (SQL three-valued logic)
+            ],
+            Arc::clone(&col_a),
+            &schema
+        );
+
+        // Case 2: List WITH null - demonstrates null propagation for non-matches
+        // "a IN (1, NULL)" - 1 matches (true), 2/3 don't match but list has null (null), null is null
+        let list = vec![lit(1i64), lit(ScalarValue::Int64(None))];
+        in_list!(
+            batch,
+            list,
+            &false,
+            vec![
+                Some(true), // 1 is in the list → true (found match)
+                None, // 2 is not in list, but list has NULL → null (might match NULL)
+                None, // 3 is not in list, but list has NULL → null (might match NULL)
+                None, // null IN (...) → null (SQL three-valued logic)
+            ],
+            Arc::clone(&col_a),
+            &schema
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_in_list_with_only_nulls() -> Result<()> {
+        // Edge case: IN list contains ONLY null values
+        let schema = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
+        let a = Int64Array::from(vec![Some(1), Some(2), None]);
+        let col_a = col("a", &schema)?;
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(a)])?;
+
+        // "a IN (NULL, NULL)" - list has only nulls
+        let list = vec![lit(ScalarValue::Int64(None)), lit(ScalarValue::Int64(None))];
+
+        // All results should be NULL because:
+        // - Non-null values (1, 2) can't match anything concrete, but list might contain matching value
+        // - NULL value is always NULL in IN expressions
+        in_list!(
+            batch,
+            list.clone(),
+            &false,
+            vec![None, None, None],
+            Arc::clone(&col_a),
+            &schema
+        );
+
+        // "a NOT IN (NULL, NULL)" - list has only nulls
+        // All results should still be NULL due to three-valued logic
+        in_list!(
+            batch,
+            list,
+            &true,
+            vec![None, None, None],
+            Arc::clone(&col_a),
+            &schema
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_in_list_multiple_nulls_deduplication() -> Result<()> {
+        // Test that multiple NULLs in the list are handled correctly
+        // This verifies deduplication doesn't break null handling
+        let schema = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
+        let col_a = col("a", &schema)?;
+
+        // Create array with multiple nulls: [1, 2, NULL, NULL, 3, NULL]
+        let array = Arc::new(Int64Array::from(vec![
+            Some(1),
+            Some(2),
+            None,
+            None,
+            Some(3),
+            None,
+        ])) as ArrayRef;
+
+        // Create InListExpr from array
+        let expr = in_list_from_array(Arc::clone(&col_a), array, false)?;
+
+        // Create test data: [1, 2, 3, 4, null]
+        let a = Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4), None]);
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(a)])?;
+
+        // Evaluate the expression
+        let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let result = as_boolean_array(&result);
+
+        // Expected behavior with multiple NULLs in list:
+        // - Values in the list (1,2,3) → true
+        // - Values not in the list (4) → NULL (because list contains NULL)
+        // - NULL input → NULL
+        let expected = BooleanArray::from(vec![
+            Some(true), // 1 is in list
+            Some(true), // 2 is in list
+            Some(true), // 3 is in list
+            None,       // 4 not in list, but list has NULLs
+            None,       // NULL input
+        ]);
+        assert_eq!(result, &expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_not_in_null_handling_comprehensive() -> Result<()> {
+        // Comprehensive test demonstrating SQL three-valued logic for NOT IN expressions
+        // This test explicitly shows all possible outcomes for NOT IN: true, false, and null
+        let schema = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
+
+        // Test data: [1, 2, 3, null]
+        let a = Int64Array::from(vec![Some(1), Some(2), Some(3), None]);
+        let col_a = col("a", &schema)?;
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(a)])?;
+
+        // Case 1: List WITHOUT null - demonstrates true/false/null outcomes for NOT IN
+        // "a NOT IN (1, 4)" - 1 matches (false), 2 and 3 don't match (true), null is null
+        let list = vec![lit(1i64), lit(4i64)];
+        in_list!(
+            batch,
+            list,
+            &true,
+            vec![
+                Some(false), // 1 is in the list → NOT IN returns false
+                Some(true),  // 2 is not in the list → NOT IN returns true
+                Some(true),  // 3 is not in the list → NOT IN returns true
+                None,        // null NOT IN (...) → null (SQL three-valued logic)
+            ],
+            Arc::clone(&col_a),
+            &schema
+        );
+
+        // Case 2: List WITH null - demonstrates null propagation for NOT IN
+        // "a NOT IN (1, NULL)" - 1 matches (false), 2/3 don't match but list has null (null), null is null
+        let list = vec![lit(1i64), lit(ScalarValue::Int64(None))];
+        in_list!(
+            batch,
+            list,
+            &true,
+            vec![
+                Some(false), // 1 is in the list → NOT IN returns false
+                None, // 2 is not in known values, but list has NULL → null (can't prove it's not in list)
+                None, // 3 is not in known values, but list has NULL → null (can't prove it's not in list)
+                None, // null NOT IN (...) → null (SQL three-valued logic)
+            ],
+            Arc::clone(&col_a),
+            &schema
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_in_list_null_type_column() -> Result<()> {
+        // Test with a column that has DataType::Null (not just nullable values)
+        // All values in a NullArray are null by definition
+        let schema = Schema::new(vec![Field::new("a", DataType::Null, true)]);
+        let a = NullArray::new(3);
+        let col_a = col("a", &schema)?;
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(a)])?;
+
+        // "null_column IN (1, 2)" - comparing Null type against Int64 list
+        // Note: This tests type coercion behavior between Null and Int64
+        let list = vec![lit(1i64), lit(2i64)];
+
+        // All results should be NULL because:
+        // - Every value in the column is null (DataType::Null)
+        // - null IN (anything) always returns null per SQL three-valued logic
+        in_list!(
+            batch,
+            list.clone(),
+            &false,
+            vec![None, None, None],
+            Arc::clone(&col_a),
+            &schema
+        );
+
+        // "null_column NOT IN (1, 2)"
+        // Same behavior for NOT IN - null NOT IN (anything) is still null
+        in_list!(
+            batch,
+            list,
+            &true,
+            vec![None, None, None],
+            Arc::clone(&col_a),
+            &schema
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_in_list_null_type_list() -> Result<()> {
+        // Test with a list that has DataType::Null
+        let schema = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
+        let a = Int64Array::from(vec![Some(1), Some(2), None]);
+        let col_a = col("a", &schema)?;
+
+        // Create a NullArray as the list
+        let null_array = Arc::new(NullArray::new(2)) as ArrayRef;
+
+        // Try to create InListExpr with a NullArray list
+        // This tests whether in_list_from_array can handle Null type arrays
+        let expr = in_list_from_array(Arc::clone(&col_a), null_array, false)?;
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(a)])?;
+        let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let result = as_boolean_array(&result);
+
+        // If it succeeds, all results should be NULL
+        // because the list contains only null type values
+        let expected = BooleanArray::from(vec![None, None, None]);
+        assert_eq!(result, &expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_in_list_null_type_both() -> Result<()> {
+        // Test when both column and list are DataType::Null
+        let schema = Schema::new(vec![Field::new("a", DataType::Null, true)]);
+        let a = NullArray::new(3);
+        let col_a = col("a", &schema)?;
+
+        // Create a NullArray as the list
+        let null_array = Arc::new(NullArray::new(2)) as ArrayRef;
+
+        // Try to create InListExpr with both Null types
+        let expr = in_list_from_array(Arc::clone(&col_a), null_array, false)?;
+
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(a)])?;
+        let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let result = as_boolean_array(&result);
+
+        // If successful, all results should be NULL
+        // null IN [null, null] -> null
+        let expected = BooleanArray::from(vec![None, None, None]);
+        assert_eq!(result, &expected);
 
         Ok(())
     }
