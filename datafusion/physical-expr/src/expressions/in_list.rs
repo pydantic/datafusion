@@ -28,7 +28,6 @@ use crate::PhysicalExpr;
 use arrow::array::*;
 use arrow::buffer::BooleanBuffer;
 use arrow::compute::kernels::boolean::{not, or_kleene};
-use arrow::compute::kernels::cmp::eq;
 use arrow::compute::{take, SortOptions};
 use arrow::datatypes::*;
 use arrow::downcast_dictionary_array;
@@ -36,7 +35,6 @@ use arrow::util::bit_iterator::BitIndexIterator;
 use datafusion_common::hash_utils::create_hashes_from_arrays;
 use datafusion_common::{exec_err, internal_err, DFSchema, Result, ScalarValue};
 use datafusion_expr::ColumnarValue;
-use datafusion_physical_expr_common::datum::compare_with_eq;
 
 use ahash::RandomState;
 use datafusion_common::HashMap;
@@ -405,23 +403,28 @@ impl PhysicalExpr for InListExpr {
             | InListStorage::Exprs {
                 static_filter: Some(static_filter),
                 ..
-            } => {
-                // Array variant always has a static_filter for O(1) hash-based lookups
-                static_filter
-                    .contains(value.into_array(num_rows)?.as_ref(), self.negated)?
-            }
+            } => static_filter
+                .contains(value.into_array(num_rows)?.as_ref(), self.negated)?,
             InListStorage::Exprs { list: exprs, .. } => {
                 // Exprs variant: iterate through each expression, compare, and OR results
                 let value = value.into_array(num_rows)?;
-                let is_nested = value.data_type().is_nested();
                 let found = exprs.iter().map(|expr| expr.evaluate(batch)).try_fold(
                     BooleanArray::new(BooleanBuffer::new_unset(num_rows), None),
                     |result, expr| -> Result<BooleanArray> {
-                        let rhs = compare_with_eq(
-                            &value,
-                            &expr?.into_array(num_rows)?,
-                            is_nested,
+                        let expr = expr?.into_array(num_rows)?;
+                        let cmp = make_comparator(
+                            value.as_ref(),
+                            expr.as_ref(),
+                            SortOptions::default(),
                         )?;
+                        let rhs = (0..num_rows)
+                            .map(|i| {
+                                if value.is_null(i) || expr.is_null(i) {
+                                    return None;
+                                }
+                                Some(cmp(i, i).is_eq())
+                            })
+                            .collect::<BooleanArray>();
                         Ok(or_kleene(&result, &rhs)?)
                     },
                 )?;
@@ -523,7 +526,25 @@ impl PartialEq for InListExpr {
             (
                 InListStorage::Array { array: a1, .. },
                 InListStorage::Array { array: a2, .. },
-            ) => eq(a1, a2).unwrap().false_count() == 0,
+            ) => {
+                if a1.data_type().is_null() || a2.data_type().is_null() {
+                    return a1.data_type() == a2.data_type();
+                }
+                if a1.len() != a2.len() {
+                    return false;
+                }
+                let Ok(cmp) =
+                    make_comparator(a1.as_ref(), a2.as_ref(), SortOptions::default())
+                else {
+                    return false;
+                };
+                for i in 0..a1.len() {
+                    if !cmp(i, i).is_eq() {
+                        return false;
+                    }
+                }
+                true
+            }
             (
                 InListStorage::Exprs { list: e1, .. },
                 InListStorage::Exprs { list: e2, .. },
@@ -1959,6 +1980,112 @@ mod tests {
             Arc::clone(&col_x),
             &schema
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn in_list_struct_with_exprs_not_array() -> Result<()> {
+        // Test InList using expressions (not the array constructor) with structs
+        // By using InListExpr::new directly, we bypass the array optimization
+        // and use the Exprs variant, testing the expression evaluation path
+
+        // Create schema with a struct column {x: Int32, y: Utf8}
+        let struct_fields = Fields::from(vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("y", DataType::Utf8, false),
+        ]);
+        let schema = Schema::new(vec![Field::new(
+            "a",
+            DataType::Struct(struct_fields.clone()),
+            true,
+        )]);
+
+        // Create test data: array of structs [{1, "a"}, {2, "b"}, {3, "c"}]
+        let x_array = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let y_array = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let struct_array =
+            StructArray::new(struct_fields.clone(), vec![x_array, y_array], None);
+
+        let col_a = col("a", &schema)?;
+        let batch =
+            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(struct_array)])?;
+
+        // Create struct literals with the SAME shape (so types are compatible)
+        // Struct {x: 1, y: "a"}
+        let struct1 = ScalarValue::Struct(Arc::new(StructArray::new(
+            struct_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+            None,
+        )));
+
+        // Struct {x: 3, y: "c"}
+        let struct3 = ScalarValue::Struct(Arc::new(StructArray::new(
+            struct_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3])),
+                Arc::new(StringArray::from(vec!["c"])),
+            ],
+            None,
+        )));
+
+        // Create list of struct expressions
+        let list = vec![lit(struct1), lit(struct3)];
+
+        // Use InListExpr::new directly (not in_list()) to bypass array optimization
+        // This creates InListStorage::Exprs without a static filter
+        let expr = Arc::new(InListExpr::new(Arc::clone(&col_a), list, false));
+
+        // Verify that the expression uses the Exprs variant (no static filter)
+        // by checking the display string does NOT contain "(SET)"
+        let display_string = expr.to_string();
+        assert!(
+            !display_string.contains("(SET)"),
+            "Expected display string to NOT contain '(SET)' (should use Exprs variant), but got: {display_string}",
+        );
+
+        // Evaluate the expression
+        let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let result = as_boolean_array(&result);
+
+        // Expected: first row {1, "a"} matches struct1,
+        //           second row {2, "b"} doesn't match,
+        //           third row {3, "c"} matches struct3
+        let expected = BooleanArray::from(vec![Some(true), Some(false), Some(true)]);
+        assert_eq!(result, &expected);
+
+        // Test NOT IN as well
+        let expr_not = Arc::new(InListExpr::new(
+            Arc::clone(&col_a),
+            vec![
+                lit(ScalarValue::Struct(Arc::new(StructArray::new(
+                    struct_fields.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![1])),
+                        Arc::new(StringArray::from(vec!["a"])),
+                    ],
+                    None,
+                )))),
+                lit(ScalarValue::Struct(Arc::new(StructArray::new(
+                    struct_fields.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![3])),
+                        Arc::new(StringArray::from(vec!["c"])),
+                    ],
+                    None,
+                )))),
+            ],
+            true,
+        ));
+
+        let result_not = expr_not.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let result_not = as_boolean_array(&result_not);
+
+        let expected_not = BooleanArray::from(vec![Some(false), Some(true), Some(false)]);
+        assert_eq!(result_not, &expected_not);
 
         Ok(())
     }
