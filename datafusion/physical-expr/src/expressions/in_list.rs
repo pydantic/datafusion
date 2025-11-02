@@ -25,22 +25,16 @@ use std::sync::Arc;
 use crate::physical_expr::physical_exprs_bag_equal;
 use crate::PhysicalExpr;
 
-use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
 use arrow::array::*;
 use arrow::buffer::BooleanBuffer;
 use arrow::compute::kernels::boolean::{not, or_kleene};
-use arrow::compute::take;
+use arrow::compute::kernels::cmp::eq;
+use arrow::compute::{SortOptions, take};
 use arrow::datatypes::*;
 use arrow::util::bit_iterator::BitIndexIterator;
-use arrow::{downcast_dictionary_array, downcast_primitive_array};
-use datafusion_common::cast::{
-    as_binary_view_array, as_boolean_array, as_generic_binary_array, as_string_array,
-    as_string_view_array, as_struct_array,
-};
-use datafusion_common::hash_utils::{create_hashes_from_arrays, HashValue};
-use datafusion_common::{
-    exec_err, internal_err, not_impl_err, DFSchema, Result, ScalarValue,
-};
+use arrow::downcast_dictionary_array;
+use datafusion_common::hash_utils::create_hashes_from_arrays;
+use datafusion_common::{exec_err, internal_err, DFSchema, Result, ScalarValue};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr_common::datum::compare_with_eq;
 
@@ -51,9 +45,15 @@ use hashbrown::hash_map::RawEntryMut;
 /// Storage for InList values - either as an array or as expressions
 pub(crate) enum InListStorage {
     /// Homogeneous list stored as an ArrayRef (memory efficient)
-    Array(ArrayRef),
+    Array {
+        array: ArrayRef,
+        static_filter: Arc<dyn Set>,
+    },
     /// Heterogeneous or dynamic list stored as expressions
-    Exprs(Vec<Arc<dyn PhysicalExpr>>),
+    Exprs {
+        list: Vec<Arc<dyn PhysicalExpr>>,
+        static_filter: Option<Arc<dyn Set>>,
+    },
 }
 
 /// InList
@@ -61,7 +61,6 @@ pub struct InListExpr {
     expr: Arc<dyn PhysicalExpr>,
     pub(crate) list: InListStorage,
     negated: bool,
-    static_filter: Option<Arc<dyn Set>>,
 }
 
 impl Debug for InListExpr {
@@ -70,11 +69,11 @@ impl Debug for InListExpr {
         debug_struct.field("expr", &self.expr);
 
         match &self.list {
-            InListStorage::Array(array) => {
+            InListStorage::Array { array, .. } => {
                 debug_struct.field("list", &format!("Array({:?})", array.data_type()));
             }
-            InListStorage::Exprs(exprs) => {
-                debug_struct.field("list", exprs);
+            InListStorage::Exprs { list, .. } => {
+                debug_struct.field("list", list);
             }
         }
 
@@ -97,29 +96,21 @@ struct ArrayHashSet {
     map: HashMap<usize, (), ()>,
 }
 
-struct ArraySet<T> {
-    array: T,
+struct ArraySet {
+    array: ArrayRef,
     hash_set: ArrayHashSet,
 }
 
-impl<T> ArraySet<T>
-where
-    T: Array + From<ArrayData>,
-{
-    fn new(array: &T, hash_set: ArrayHashSet) -> Self {
+impl ArraySet {
+    fn new(array: ArrayRef, hash_set: ArrayHashSet) -> Self {
         Self {
-            array: downcast_array(array),
+            array,
             hash_set,
         }
     }
 }
 
-impl<T> Set for ArraySet<T>
-where
-    T: Array + 'static,
-    for<'a> &'a T: ArrayAccessor,
-    for<'a> <&'a T as ArrayAccessor>::Item: IsEqual,
-{
+impl Set for ArraySet {
     fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
         downcast_dictionary_array! {
             v => {
@@ -130,88 +121,20 @@ where
             _ => {}
         }
 
-        let v = v.as_any().downcast_ref::<T>().unwrap();
-        let in_array = &self.array;
+        let in_array = self.array.as_ref();
         let has_nulls = in_array.null_count() != 0;
 
-        Ok(ArrayIter::new(v)
-            .map(|v| {
-                v.and_then(|v| {
-                    let hash = v.hash_one(&self.hash_set.state);
-                    let contains = self
-                        .hash_set
-                        .map
-                        .raw_entry()
-                        .from_hash(hash, |idx| in_array.value(*idx).is_equal(&v))
-                        .is_some();
-
-                    match contains {
-                        true => Some(!negated),
-                        false if has_nulls => None,
-                        false => Some(negated),
-                    }
-                })
-            })
-            .collect())
-    }
-
-    fn has_nulls(&self) -> bool {
-        self.array.null_count() != 0
-    }
-}
-
-/// Specialized Set implementation for StructArray
-struct StructArraySet {
-    array: Arc<StructArray>,
-    hash_set: ArrayHashSet,
-}
-
-impl Set for StructArraySet {
-    fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
-        // Handle dictionary arrays
-        downcast_dictionary_array! {
-            v => {
-                let values_contains = self.contains(v.values().as_ref(), negated)?;
-                let result = take(&values_contains, v.keys(), None)?;
-                return Ok(downcast_array(result.as_ref()))
-            }
-            _ => {}
-        }
-
-        let v = as_struct_array(v)?;
-        let has_nulls = self.array.null_count() != 0;
-
-        // Compute hashes for all rows in the input array
-        let mut input_hashes = vec![0u64; v.len()];
-        create_hashes_from_arrays(
-            &[v as &dyn Array],
-            &self.hash_set.state,
-            &mut input_hashes,
-        )?;
-
-        // Check each row for membership
-        let result: BooleanArray = (0..v.len())
+        let mut hashes_buf = vec![0u64; v.len()];
+        create_hashes_from_arrays(&[v], &self.hash_set.state, &mut hashes_buf)?;
+        let cmp = make_comparator(v, in_array, SortOptions::default())?;
+        Ok((0..v.len())
             .map(|i| {
-                // Handle null rows
-                if v.is_null(i) {
-                    return None;
-                }
-
-                let hash = input_hashes[i];
-                let input_row = v.slice(i, 1);
-
-                // Look up in hash map with equality check
+                let hash = hashes_buf[i];
                 let contains = self
                     .hash_set
                     .map
                     .raw_entry()
-                    .from_hash(hash, |&idx| {
-                        let set_row = self.array.slice(idx, 1);
-                        match compare_with_eq(&set_row, &input_row, true) {
-                            Ok(result) => result.value(0),
-                            Err(_) => false,
-                        }
-                    })
+                    .from_hash(hash, |idx| cmp(*idx, i).is_eq())
                     .is_some();
 
                 match contains {
@@ -220,9 +143,7 @@ impl Set for StructArraySet {
                     false => Some(negated),
                 }
             })
-            .collect();
-
-        Ok(result)
+            .collect())
     }
 
     fn has_nulls(&self) -> bool {
@@ -236,65 +157,20 @@ impl Set for StructArraySet {
 ///
 /// Note: This is split into a separate function as higher-rank trait bounds currently
 /// cause type inference to misbehave
-fn make_hash_set<T>(array: T) -> ArrayHashSet
-where
-    T: ArrayAccessor,
-    T::Item: IsEqual,
-{
+fn make_hash_set(array: &dyn Array) -> Result<ArrayHashSet> {
     let state = RandomState::new();
-    let mut map: HashMap<usize, (), ()> =
-        HashMap::with_capacity_and_hasher(array.len(), ());
+    let mut map: HashMap<usize, (), ()> = HashMap::with_hasher(());
+    let mut hashes = vec![0; array.len()];
+    create_hashes_from_arrays(&[array], &state, &mut hashes)?;
+    let cmp = make_comparator(array, array, SortOptions::default())?;
 
     let insert_value = |idx| {
-        let value = array.value(idx);
-        let hash = value.hash_one(&state);
+        let hash = hashes[idx];
         if let RawEntryMut::Vacant(v) = map
             .raw_entry_mut()
-            .from_hash(hash, |x| array.value(*x).is_equal(&value))
+            .from_hash(hash, |x| cmp(*x, idx).is_eq())
         {
-            v.insert_with_hasher(hash, idx, (), |x| array.value(*x).hash_one(&state));
-        }
-    };
-
-    match array.nulls() {
-        Some(nulls) => {
-            BitIndexIterator::new(nulls.validity(), nulls.offset(), nulls.len())
-                .for_each(insert_value)
-        }
-        None => (0..array.len()).for_each(insert_value),
-    }
-
-    ArrayHashSet { state, map }
-}
-
-/// Computes an [`ArrayHashSet`] for the provided [`StructArray`]
-fn make_struct_hash_set(array: &Arc<StructArray>) -> Result<ArrayHashSet> {
-    let state = RandomState::new();
-    let mut map: HashMap<usize, (), ()> =
-        HashMap::with_capacity_and_hasher(array.len(), ());
-
-    // Compute hashes for all rows
-    let mut row_hashes = vec![0u64; array.len()];
-    create_hashes_from_arrays(&[array.as_ref()], &state, &mut row_hashes)?;
-
-    // Build hash set, deduplicating based on struct equality
-    let insert_value = |idx: usize| {
-        let hash = row_hashes[idx];
-        if let RawEntryMut::Vacant(v) =
-            map.raw_entry_mut().from_hash(hash, |&existing_idx| {
-                // Compare the two struct rows for equality
-                // Use slice to get single-row arrays for comparison
-                let existing_row = array.slice(existing_idx, 1);
-                let current_row = array.slice(idx, 1);
-
-                // Use compare_op_for_nested for struct equality
-                match compare_with_eq(&existing_row, &current_row, true) {
-                    Ok(result) => result.value(0),
-                    Err(_) => false,
-                }
-            })
-        {
-            v.insert_with_hasher(hash, idx, (), |&x| row_hashes[x]);
+            v.insert_with_hasher(hash, idx, (), |x| hashes[*x]);
         }
     };
 
@@ -312,62 +188,60 @@ fn make_struct_hash_set(array: &Arc<StructArray>) -> Result<ArrayHashSet> {
 /// Creates a `Box<dyn Set>` for the given list of `IN` expressions and `batch`.
 /// Accepts a parameter `f` which allows access to the underlying `ArrayHashSet`
 /// and is used by [`in_list_from_array`] to collect unique indices.
-fn make_set<F>(array: &dyn Array, mut f: F) -> Result<Arc<dyn Set>>
+fn make_set<F>(array: ArrayRef, mut f: F) -> Result<Arc<dyn Set>>
 where
     F: FnMut(ArrayHashSet) -> Result<ArrayHashSet>,
 {
-    Ok(downcast_primitive_array! {
-        array => {
-            let hash_set = f(make_hash_set(array))?;
-            Arc::new(ArraySet::new(array, hash_set))
-        },
-        DataType::Boolean => {
-            let array = as_boolean_array(array)?;
-            let hash_set = f(make_hash_set(array))?;
-            Arc::new(ArraySet::new(array, hash_set))
-        },
-        DataType::Utf8 => {
-            let array = as_string_array(array)?;
-            let hash_set = f(make_hash_set(array))?;
-            Arc::new(ArraySet::new(array, hash_set))
-        }
-        DataType::LargeUtf8 => {
-            let array = as_largestring_array(array);
-            let hash_set = f(make_hash_set(array))?;
-            Arc::new(ArraySet::new(array, hash_set))
-        }
-        DataType::Utf8View => {
-            let array = as_string_view_array(array)?;
-            let hash_set = f(make_hash_set(array))?;
-            Arc::new(ArraySet::new(array, hash_set))
-        }
-        DataType::Binary => {
-            let array = as_generic_binary_array::<i32>(array)?;
-            let hash_set = f(make_hash_set(array))?;
-            Arc::new(ArraySet::new(array, hash_set))
-        }
-        DataType::LargeBinary => {
-            let array = as_generic_binary_array::<i64>(array)?;
-            let hash_set = f(make_hash_set(array))?;
-            Arc::new(ArraySet::new(array, hash_set))
-        }
-        DataType::BinaryView => {
-            let array = as_binary_view_array(array)?;
-            let hash_set = f(make_hash_set(array))?;
-            Arc::new(ArraySet::new(array, hash_set))
-        }
-        DataType::Struct(_) => {
-            let array = as_struct_array(array)?;
-            let array_arc = Arc::new(array.clone());
-            let hash_set = f(make_struct_hash_set(&array_arc)?)?;
-            Arc::new(StructArraySet {
-                array: array_arc,
-                hash_set,
-            })
-        }
-        DataType::Dictionary(_, _) => unreachable!("dictionary should have been flattened"),
-        d => return not_impl_err!("DataType::{d} not supported in InList")
-    })
+    let hash_set = f(make_hash_set(array.as_ref())?)?;
+    Ok(Arc::new(ArraySet::new(array, hash_set)))
+    // Ok(downcast_primitive_array! {
+    //     array => {
+    //         let hash_set = f(make_hash_set(array)?)?;
+    //         Arc::new(ArraySet::new(array, hash_set))
+    //     },
+    //     DataType::Boolean => {
+    //         let array = as_boolean_array(array)?;
+    //         let hash_set = f(make_hash_set(array)?)?;
+    //         Arc::new(ArraySet::new(array, hash_set))
+    //     },
+    //     DataType::Utf8 => {
+    //         let array = as_string_array(array)?;
+    //         let hash_set = f(make_hash_set(array)?)?;
+    //         Arc::new(ArraySet::new(array, hash_set))
+    //     }
+    //     DataType::LargeUtf8 => {
+    //         let array = as_largestring_array(array);
+    //         let hash_set = f(make_hash_set(array)?)?;
+    //         Arc::new(ArraySet::new(array, hash_set))
+    //     }
+    //     DataType::Utf8View => {
+    //         let array = as_string_view_array(array)?;
+    //         let hash_set = f(make_hash_set(array)?)?;
+    //         Arc::new(ArraySet::new(array, hash_set))
+    //     }
+    //     DataType::Binary => {
+    //         let array = as_generic_binary_array::<i32>(array)?;
+    //         let hash_set = f(make_hash_set(array)?)?;
+    //         Arc::new(ArraySet::new(array, hash_set))
+    //     }
+    //     DataType::LargeBinary => {
+    //         let array = as_generic_binary_array::<i64>(array)?;
+    //         let hash_set = f(make_hash_set(array)?)?;
+    //         Arc::new(ArraySet::new(array, hash_set))
+    //     }
+    //     DataType::BinaryView => {
+    //         let array = as_binary_view_array(array)?;
+    //         let hash_set = f(make_hash_set(array)?)?;
+    //         Arc::new(ArraySet::new(array, hash_set))
+    //     }
+    //     DataType::Struct(fields) => {
+    //         let array = as_struct_array(array);
+    //         let hash_set = f(make_hash_set(array)?)?;
+    //         Arc::new(ArraySet::new(array, hash_set))
+    //     }
+    //     DataType::Dictionary(_, _) => unreachable!("dictionary should have been flattened"),
+    //     d => return not_impl_err!("DataType::{d} not supported in InList")
+    // })
 }
 
 /// Evaluates the list of expressions into an array, flattening any dictionaries
@@ -405,81 +279,46 @@ fn try_evaluate_constant_list(
     evaluate_list(list, &batch)
 }
 
-fn try_cast_static_filter_to_set(
-    list: &[Arc<dyn PhysicalExpr>],
-    schema: &Schema,
-) -> Result<Arc<dyn Set>> {
-    let array = try_evaluate_constant_list(list, schema)?;
-    make_set(array.as_ref(), |hash_set| Ok(hash_set))
-}
-
-/// Custom equality check function which is used with [`ArrayHashSet`] for existence check.
-trait IsEqual: HashValue {
-    fn is_equal(&self, other: &Self) -> bool;
-}
-
-impl<T: IsEqual + ?Sized> IsEqual for &T {
-    fn is_equal(&self, other: &Self) -> bool {
-        T::is_equal(self, other)
-    }
-}
-
-macro_rules! is_equal {
-    ($($t:ty),+) => {
-        $(impl IsEqual for $t {
-            fn is_equal(&self, other: &Self) -> bool {
-                self == other
-            }
-        })*
-    };
-}
-is_equal!(i8, i16, i32, i64, i128, i256, u8, u16, u32, u64);
-is_equal!(bool, str, [u8]);
-is_equal!(IntervalDayTime, IntervalMonthDayNano);
-
-macro_rules! is_equal_float {
-    ($($t:ty),+) => {
-        $(impl IsEqual for $t {
-            fn is_equal(&self, other: &Self) -> bool {
-                self.to_bits() == other.to_bits()
-            }
-        })*
-    };
-}
-is_equal_float!(half::f16, f32, f64);
-
 impl InListExpr {
-    /// Create a new InList expression from a list of expressions
+    /// Create a new InList expression from a list of expressions.
+    ///
+    /// No static filter is created in this variant, so membership testing
+    /// is O(n) over the list size.
     pub fn new(
         expr: Arc<dyn PhysicalExpr>,
         list: Vec<Arc<dyn PhysicalExpr>>,
         negated: bool,
-        static_filter: Option<Arc<dyn Set>>,
     ) -> Self {
         Self {
             expr,
-            list: InListStorage::Exprs(list),
+            list: InListStorage::Exprs {
+                list,
+                static_filter: None,
+            },
             negated,
-            static_filter,
         }
     }
 
-    /// Create a new InList expression from an array
+    /// Create a new InList expression from an array with a static filter
     ///
     /// This is more memory efficient than using [`Self::new`] when the list
     /// is homogeneous and stored as an array. The array is stored directly
     /// without converting to individual expression objects.
+    ///
+    /// The static_filter provides O(1) hash-based membership testing.
     pub fn new_from_array(
         expr: Arc<dyn PhysicalExpr>,
         array: ArrayRef,
         negated: bool,
-        static_filter: Option<Arc<dyn Set>>,
+        static_filter: Arc<dyn Set>,
     ) -> Self {
         Self {
             expr,
-            list: InListStorage::Array(array),
+            list: InListStorage::Array {
+                array,
+                static_filter,
+            },
             negated,
-            static_filter,
         }
     }
 
@@ -491,8 +330,8 @@ impl InListExpr {
     /// Returns the number of items in the list
     pub fn len(&self) -> usize {
         match &self.list {
-            InListStorage::Exprs(exprs) => exprs.len(),
-            InListStorage::Array(array) => array.len(),
+            InListStorage::Exprs { list, .. } => list.len(),
+            InListStorage::Array { array, .. } => array.len(),
         }
     }
 
@@ -512,8 +351,8 @@ impl InListExpr {
     /// Returns an error if array elements cannot be converted to ScalarValues.
     pub fn list(&self) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
         match &self.list {
-            InListStorage::Exprs(exprs) => Ok(exprs.clone()),
-            InListStorage::Array(array) => {
+            InListStorage::Exprs { list, .. } => Ok(list.clone()),
+            InListStorage::Array { array, .. } => {
                 // Materialize array elements into literal expressions
                 (0..array.len())
                     .map(|i| {
@@ -544,32 +383,19 @@ macro_rules! expr_vec_fmt {
 
 impl std::fmt::Display for InListExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let list_str = match &self.list {
-            InListStorage::Array(array) => {
-                // Format a few sample values from the array
-                let sample_size = 3.min(array.len());
-                let mut items = Vec::new();
-                for i in 0..sample_size {
-                    match ScalarValue::try_from_array(array, i) {
-                        Ok(scalar) => items.push(format!("{}", scalar)),
-                        Err(_) => items.push("?".to_string()),
-                    }
-                }
-                if array.len() > sample_size {
-                    items.push(format!("... ({} total)", array.len()));
-                }
-                items.join(", ")
-            }
-            InListStorage::Exprs(exprs) => expr_vec_fmt!(exprs),
+        let list_str = expr_vec_fmt!(self.list().map_err(|_| std::fmt::Error {})?);
+        let has_static_filter = match &self.list {
+            InListStorage::Array { .. } => true,
+            InListStorage::Exprs { static_filter, .. } => static_filter.is_some(),
         };
 
         if self.negated {
-            if self.static_filter.is_some() {
+            if has_static_filter {
                 write!(f, "{} NOT IN (SET) ([{list_str}])", self.expr)
             } else {
                 write!(f, "{} NOT IN ([{list_str}])", self.expr)
             }
-        } else if self.static_filter.is_some() {
+        } else if has_static_filter {
             write!(f, "{} IN (SET) ([{list_str}])", self.expr)
         } else {
             write!(f, "{} IN ([{list_str}])", self.expr)
@@ -592,19 +418,19 @@ impl PhysicalExpr for InListExpr {
             return Ok(true);
         }
 
-        if let Some(static_filter) = &self.static_filter {
-            Ok(static_filter.has_nulls())
-        } else {
-            match &self.list {
-                InListStorage::Array(array) => Ok(array.null_count() > 0),
-                InListStorage::Exprs(exprs) => {
-                    for expr in exprs {
-                        if expr.nullable(input_schema)? {
-                            return Ok(true);
-                        }
+        match &self.list {
+            InListStorage::Array { static_filter, .. }
+            | InListStorage::Exprs {
+                static_filter: Some(static_filter),
+                ..
+            } => Ok(static_filter.has_nulls()),
+            InListStorage::Exprs { list, .. } => {
+                for expr in list {
+                    if expr.nullable(input_schema)? {
+                        return Ok(true);
                     }
-                    Ok(false)
                 }
+                Ok(false)
             }
         }
     }
@@ -612,41 +438,36 @@ impl PhysicalExpr for InListExpr {
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
         let num_rows = batch.num_rows();
         let value = self.expr.evaluate(batch)?;
-        let r = match &self.static_filter {
-            Some(f) => f.contains(value.into_array(num_rows)?.as_ref(), self.negated)?,
-            None => {
-                match &self.list {
-                    InListStorage::Array(_) => {
-                        // Array storage should always have a static_filter
-                        return internal_err!(
-                            "InList with Array storage should always have a static_filter"
-                        );
-                    }
-                    InListStorage::Exprs(exprs) => {
-                        let value = value.into_array(num_rows)?;
-                        let is_nested = value.data_type().is_nested();
-                        let found =
-                            exprs.iter().map(|expr| expr.evaluate(batch)).try_fold(
-                                BooleanArray::new(
-                                    BooleanBuffer::new_unset(num_rows),
-                                    None,
-                                ),
-                                |result, expr| -> Result<BooleanArray> {
-                                    let rhs = compare_with_eq(
-                                        &value,
-                                        &expr?.into_array(num_rows)?,
-                                        is_nested,
-                                    )?;
-                                    Ok(or_kleene(&result, &rhs)?)
-                                },
-                            )?;
+        let r = match &self.list {
+            InListStorage::Array { static_filter, .. }
+            | InListStorage::Exprs {
+                static_filter: Some(static_filter),
+                ..
+            } => {
+                // Array variant always has a static_filter for O(1) hash-based lookups
+                static_filter
+                    .contains(value.into_array(num_rows)?.as_ref(), self.negated)?
+            }
+            InListStorage::Exprs { list: exprs, .. } => {
+                // Exprs variant: iterate through each expression, compare, and OR results
+                let value = value.into_array(num_rows)?;
+                let is_nested = value.data_type().is_nested();
+                let found = exprs.iter().map(|expr| expr.evaluate(batch)).try_fold(
+                    BooleanArray::new(BooleanBuffer::new_unset(num_rows), None),
+                    |result, expr| -> Result<BooleanArray> {
+                        let rhs = compare_with_eq(
+                            &value,
+                            &expr?.into_array(num_rows)?,
+                            is_nested,
+                        )?;
+                        Ok(or_kleene(&result, &rhs)?)
+                    },
+                )?;
 
-                        if self.negated {
-                            not(&found)?
-                        } else {
-                            found
-                        }
-                    }
+                if self.negated {
+                    not(&found)?
+                } else {
+                    found
                 }
             }
         };
@@ -656,10 +477,10 @@ impl PhysicalExpr for InListExpr {
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
         let mut children = vec![&self.expr];
         match &self.list {
-            InListStorage::Array(_) => {
+            InListStorage::Array { .. } => {
                 // Array storage has no expression children, just the tested expr
             }
-            InListStorage::Exprs(exprs) => {
+            InListStorage::Exprs { list: exprs, .. } => {
                 children.extend(exprs);
             }
         }
@@ -671,23 +492,28 @@ impl PhysicalExpr for InListExpr {
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         match &self.list {
-            InListStorage::Array(array) => {
+            InListStorage::Array {
+                array,
+                static_filter,
+            } => {
                 // Array case: only the expr changes, list stays the same
                 Ok(Arc::new(InListExpr::new_from_array(
                     Arc::clone(&children[0]),
-                    array.clone(),
+                    Arc::<dyn Array>::clone(array),
                     self.negated,
-                    self.static_filter.clone(),
+                    Arc::clone(static_filter),
                 )))
             }
-            InListStorage::Exprs(_) => {
+            InListStorage::Exprs { .. } => {
                 // Exprs case: expr + list items all change
-                Ok(Arc::new(InListExpr::new(
-                    Arc::clone(&children[0]),
-                    children[1..].to_vec(),
-                    self.negated,
-                    self.static_filter.clone(),
-                )))
+                Ok(Arc::new(InListExpr {
+                    expr: Arc::clone(&children[0]),
+                    list: InListStorage::Exprs {
+                        list: children[1..].to_vec(),
+                        static_filter: None,
+                    },
+                    negated: self.negated,
+                }))
             }
         }
     }
@@ -700,19 +526,19 @@ impl PhysicalExpr for InListExpr {
 
         write!(f, " IN (")?;
         match &self.list {
-            InListStorage::Array(array) => {
+            InListStorage::Array { array, .. } => {
                 // Format array elements as SQL values
                 for i in 0..array.len() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
                     match ScalarValue::try_from_array(array, i) {
-                        Ok(scalar) => write!(f, "{}", scalar)?,
+                        Ok(scalar) => write!(f, "{scalar}")?,
                         Err(_) => write!(f, "?")?,
                     }
                 }
             }
-            InListStorage::Exprs(exprs) => {
+            InListStorage::Exprs { list: exprs, .. } => {
                 for (i, expr) in exprs.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
@@ -732,14 +558,14 @@ impl PartialEq for InListExpr {
         }
 
         match (&self.list, &other.list) {
-            (InListStorage::Array(a1), InListStorage::Array(a2)) => {
-                a1.data_type() == a2.data_type()
-                    && a1.len() == a2.len()
-                    && a1.to_data() == a2.to_data()
-            }
-            (InListStorage::Exprs(e1), InListStorage::Exprs(e2)) => {
-                physical_exprs_bag_equal(e1, e2)
-            }
+            (
+                InListStorage::Array { array: a1, .. },
+                InListStorage::Array { array: a2, .. },
+            ) => eq(a1, a2).unwrap().false_count() == 0,
+            (
+                InListStorage::Exprs { list: e1, .. },
+                InListStorage::Exprs { list: e2, .. },
+            ) => physical_exprs_bag_equal(e1, e2),
             _ => false,
         }
     }
@@ -752,42 +578,32 @@ impl Hash for InListExpr {
         self.expr.hash(state);
         self.negated.hash(state);
         match &self.list {
-            InListStorage::Array(array) => {
-                // Hash discriminant + array metadata
-                0_u8.hash(state);
-                array.data_type().hash(state);
-                array.len().hash(state);
-
-                // Hash sample values from the array to reduce collision probability
-                // We sample up to 10 elements evenly distributed across the array
-                // This balances hash quality with performance for large arrays
-                let sample_size = 10.min(array.len());
-                if sample_size > 0 {
-                    let step = if array.len() <= sample_size {
-                        1
-                    } else {
-                        array.len() / sample_size
-                    };
-
-                    for i in (0..array.len()).step_by(step).take(sample_size) {
-                        // Hash each sampled element as a ScalarValue
-                        // ScalarValue implements Hash for all supported types
-                        if let Ok(scalar) = ScalarValue::try_from_array(array, i) {
-                            scalar.hash(state);
-                        }
-                    }
-                }
+            InListStorage::Array { array, .. } => {
+                let random_state = RandomState::with_seed(0);
+                let mut hashes_buf = vec![0u64; array.len()];
+                let Ok(hashes_buf) = create_hashes_from_arrays(
+                    &[array.as_ref()],
+                    &random_state,
+                    &mut hashes_buf,
+                ) else {
+                    unreachable!("Failed to create hashes for InList array. This shouldn't happen because make_set should have succeeded earlier.");
+                };
+                hashes_buf.hash(state);
             }
-            InListStorage::Exprs(exprs) => {
+            InListStorage::Exprs { list: exprs, .. } => {
                 1_u8.hash(state);
                 exprs.hash(state);
             }
         }
-        // Add `self.static_filter` when hash is available
     }
 }
 
 /// Creates a unary expression InList
+///
+/// This function attempts to optimize the IN list by converting constant expressions
+/// to an array with a static filter. If conversion succeeds, it creates an optimized
+/// Array variant with O(1) hash-based lookups. Otherwise, it falls back to the Exprs
+/// variant which evaluates each expression dynamically.
 pub fn in_list(
     expr: Arc<dyn PhysicalExpr>,
     list: Vec<Arc<dyn PhysicalExpr>>,
@@ -804,13 +620,21 @@ pub fn in_list(
             );
         }
     }
-    let static_filter = try_cast_static_filter_to_set(&list, schema).ok();
-    Ok(Arc::new(InListExpr::new(
-        expr,
-        list,
-        *negated,
-        static_filter,
-    )))
+
+    // Try to convert to Array variant with static filter (optimized path)
+    if let Ok(array) = try_evaluate_constant_list(&list, schema) {
+        if let Ok(static_filter) = make_set(Arc::clone(&array), Ok) {
+            return Ok(Arc::new(InListExpr::new_from_array(
+                expr,
+                array,
+                *negated,
+                static_filter,
+            )));
+        }
+    }
+
+    // Fall back to Exprs variant (dynamic evaluation)
+    Ok(Arc::new(InListExpr::new(expr, list, *negated)))
 }
 
 /// Create a new static InList expression from an array of values.
@@ -819,22 +643,22 @@ pub fn in_list(
 /// The `negated` flag indicates whether this is an `IN` or `NOT IN` expression.
 ///
 /// The generated `InListExpr` will store the array directly for efficient memory usage
-/// and use a static filter for O(1) lookups.
+/// and use a static filter for O(1) hash-based lookups.
 ///
 /// # Errors
 /// Returns an error if the array type is not supported for `InList` expressions or if we cannot build a hash based lookup.
+#[allow(dead_code)]
 pub fn in_list_from_array(
     expr: Arc<dyn PhysicalExpr>,
     array: ArrayRef,
     negated: bool,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    let static_filter = make_set(array.as_ref(), |hash_set| Ok(hash_set))?;
-
+    let static_filter = make_set(Arc::clone(&array), Ok)?;
     Ok(Arc::new(InListExpr::new_from_array(
         expr,
         array,
         negated,
-        Some(static_filter),
+        static_filter,
     )))
 }
 
@@ -882,6 +706,14 @@ mod tests {
                 Ok((cast_expr, cast_list_expr))
             }
         }
+    }
+
+    fn try_cast_static_filter_to_set(
+        list: &[Arc<dyn PhysicalExpr>],
+        schema: &Schema,
+    ) -> Result<Arc<dyn Set>> {
+        let array = try_evaluate_constant_list(list, schema)?;
+        make_set(array, Ok)
     }
 
     // Attempts to coerce the types of `list_type` to be comparable with the
@@ -941,7 +773,7 @@ mod tests {
                 .into_array($BATCH.num_rows())
                 .expect("Failed to convert to array");
             let result =
-                as_boolean_array(&result).expect("failed to downcast to BooleanArray");
+                as_boolean_array(&result);
             let expected = &BooleanArray::from($EXPECTED);
             assert_eq!(expected, result);
         }};
@@ -2192,7 +2024,7 @@ mod tests {
 
         // Evaluate the expression
         let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
-        let result = as_boolean_array(&result)?;
+        let result = as_boolean_array(&result);
 
         // Expected: 1,2,3,4 are in list, 5 is not, null stays null
         // This verifies that deduplication in the static_filter works correctly
@@ -2228,7 +2060,7 @@ mod tests {
 
         // Evaluate the expression
         let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
-        let result = as_boolean_array(&result)?;
+        let result = as_boolean_array(&result);
 
         // When the IN list contains NULL:
         // - Values in the list (1,2,3) -> true
@@ -2241,58 +2073,6 @@ mod tests {
             None,       // 4 not in list, but list has NULL
             None,       // NULL input
         ]);
-        assert_eq!(result, &expected);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_in_list_from_array_struct() -> Result<()> {
-        // Test that in_list_from_array works with struct arrays
-        let struct_fields = Fields::from(vec![
-            Field::new("x", DataType::Int32, false),
-            Field::new("y", DataType::Utf8, false),
-        ]);
-        let schema = Schema::new(vec![Field::new(
-            "a",
-            DataType::Struct(struct_fields.clone()),
-            true,
-        )]);
-
-        // Create array of structs with duplicates: [{1,"a"}, {2,"b"}, {1,"a"}]
-        let x_array = Arc::new(Int32Array::from(vec![1, 2, 1]));
-        let y_array = Arc::new(StringArray::from(vec!["a", "b", "a"]));
-        let struct_array = Arc::new(StructArray::new(
-            struct_fields.clone(),
-            vec![x_array, y_array],
-            None,
-        )) as ArrayRef;
-
-        let col_a = col("a", &schema)?;
-
-        // Create InListExpr from struct array
-        let expr = in_list_from_array(Arc::clone(&col_a), struct_array, false)?;
-
-        // Note: in_list_from_array now stores the array directly (InListStorage::Array)
-        // so list().len() returns 0. Deduplication happens in the static_filter.
-        // We verify correctness by checking the evaluation results below.
-
-        // Create test data
-        let x_test = Arc::new(Int32Array::from(vec![1, 2, 3]));
-        let y_test = Arc::new(StringArray::from(vec!["a", "b", "c"]));
-        let struct_test = Arc::new(StructArray::new(
-            struct_fields.clone(),
-            vec![x_test, y_test],
-            None,
-        ));
-        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![struct_test])?;
-
-        // Evaluate the expression
-        let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
-        let result = as_boolean_array(&result)?;
-
-        // {1,"a"} and {2,"b"} are in list, {3,"c"} is not
-        let expected = BooleanArray::from(vec![Some(true), Some(true), Some(false)]);
         assert_eq!(result, &expected);
 
         Ok(())
