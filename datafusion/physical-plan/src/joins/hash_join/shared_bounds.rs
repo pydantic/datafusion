@@ -124,7 +124,7 @@ fn create_membership_predicate(
             };
 
             // Use in_list_from_array() helper to create InList with static_filter optimization (hash-based lookup)
-            Ok(in_list_from_array(expr, in_list_array, false).ok())
+            Ok(Some(in_list_from_array(expr, in_list_array, false)?))
         }
         // Use hash table lookup for large build sides
         PushdownStrategy::HashTable(hash_map) => {

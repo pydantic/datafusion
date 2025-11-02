@@ -757,8 +757,26 @@ impl Hash for InListExpr {
                 0_u8.hash(state);
                 array.data_type().hash(state);
                 array.len().hash(state);
-                // Note: We don't hash the actual array data for performance
-                // This means hash collisions are possible, but equality will still work correctly
+
+                // Hash sample values from the array to reduce collision probability
+                // We sample up to 10 elements evenly distributed across the array
+                // This balances hash quality with performance for large arrays
+                let sample_size = 10.min(array.len());
+                if sample_size > 0 {
+                    let step = if array.len() <= sample_size {
+                        1
+                    } else {
+                        array.len() / sample_size
+                    };
+
+                    for i in (0..array.len()).step_by(step).take(sample_size) {
+                        // Hash each sampled element as a ScalarValue
+                        // ScalarValue implements Hash for all supported types
+                        if let Ok(scalar) = ScalarValue::try_from_array(array, i) {
+                            scalar.hash(state);
+                        }
+                    }
+                }
             }
             InListStorage::Exprs(exprs) => {
                 1_u8.hash(state);
