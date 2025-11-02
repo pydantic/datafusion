@@ -17,9 +17,6 @@
 
 //! Functionality used both on logical and physical plans
 
-#[cfg(not(feature = "force_hash_collisions"))]
-use std::sync::Arc;
-
 use ahash::RandomState;
 use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
 use arrow::array::*;
@@ -215,12 +212,11 @@ fn hash_dictionary<K: ArrowDictionaryKeyType>(
     // Hash each dictionary value once, and then use that computed
     // hash for each key value to avoid a potentially expensive
     // redundant hashing for large dictionary elements (e.g. strings)
-    let dict_values = Arc::clone(array.values());
+    let dict_values = array.values();
     let mut dict_hashes = vec![0; dict_values.len()];
-    create_hashes(&[dict_values], random_state, &mut dict_hashes)?;
+    create_hashes_from_arrays(&[dict_values.as_ref()], random_state, &mut dict_hashes)?;
 
     // combine hash for each index in values
-    let dict_values = array.values();
     for (hash, key) in hashes_buffer.iter_mut().zip(array.keys().iter()) {
         if let Some(key) = key {
             let idx = key.as_usize();
@@ -308,11 +304,11 @@ fn hash_list_array<OffsetSize>(
 where
     OffsetSize: OffsetSizeTrait,
 {
-    let values = Arc::clone(array.values());
+    let values = array.values();
     let offsets = array.value_offsets();
     let nulls = array.nulls();
     let mut values_hashes = vec![0u64; values.len()];
-    create_hashes(&[values], random_state, &mut values_hashes)?;
+    create_hashes_from_arrays(&[values.as_ref()], random_state, &mut values_hashes)?;
     if let Some(nulls) = nulls {
         for (i, (start, stop)) in offsets.iter().zip(offsets.iter().skip(1)).enumerate() {
             if nulls.is_valid(i) {
@@ -339,11 +335,11 @@ fn hash_fixed_list_array(
     random_state: &RandomState,
     hashes_buffer: &mut [u64],
 ) -> Result<()> {
-    let values = Arc::clone(array.values());
+    let values = array.values();
     let value_length = array.value_length() as usize;
     let nulls = array.nulls();
     let mut values_hashes = vec![0u64; values.len()];
-    create_hashes(&[values], random_state, &mut values_hashes)?;
+    create_hashes_from_arrays(&[values.as_ref()], random_state, &mut values_hashes)?;
     if let Some(nulls) = nulls {
         for i in 0..array.len() {
             if nulls.is_valid(i) {
@@ -366,83 +362,113 @@ fn hash_fixed_list_array(
     Ok(())
 }
 
-/// Test version of `create_hashes` that produces the same value for
-/// all hashes (to test collisions)
-///
-/// See comments on `hashes_buffer` for more details
+/// Internal helper function that hashes a single array and either initializes or combines
+/// the hash values in the buffer.
+#[cfg(not(feature = "force_hash_collisions"))]
+fn hash_single_array(
+    array: &dyn Array,
+    random_state: &RandomState,
+    hashes_buffer: &mut [u64],
+    rehash: bool,
+) -> Result<()> {
+    downcast_primitive_array! {
+        array => hash_array_primitive(array, random_state, hashes_buffer, rehash),
+        DataType::Null => hash_null(random_state, hashes_buffer, rehash),
+        DataType::Boolean => hash_array(as_boolean_array(array)?, random_state, hashes_buffer, rehash),
+        DataType::Utf8 => hash_array(as_string_array(array)?, random_state, hashes_buffer, rehash),
+        DataType::Utf8View => hash_array(as_string_view_array(array)?, random_state, hashes_buffer, rehash),
+        DataType::LargeUtf8 => hash_array(as_largestring_array(array), random_state, hashes_buffer, rehash),
+        DataType::Binary => hash_array(as_generic_binary_array::<i32>(array)?, random_state, hashes_buffer, rehash),
+        DataType::BinaryView => hash_array(as_binary_view_array(array)?, random_state, hashes_buffer, rehash),
+        DataType::LargeBinary => hash_array(as_generic_binary_array::<i64>(array)?, random_state, hashes_buffer, rehash),
+        DataType::FixedSizeBinary(_) => {
+            let array: &FixedSizeBinaryArray = array.as_any().downcast_ref().unwrap();
+            hash_array(array, random_state, hashes_buffer, rehash)
+        }
+        DataType::Dictionary(_, _) => downcast_dictionary_array! {
+            array => hash_dictionary(array, random_state, hashes_buffer, rehash)?,
+            _ => unreachable!()
+        }
+        DataType::Struct(_) => {
+            let array = as_struct_array(array)?;
+            hash_struct_array(array, random_state, hashes_buffer)?;
+        }
+        DataType::List(_) => {
+            let array = as_list_array(array)?;
+            hash_list_array(array, random_state, hashes_buffer)?;
+        }
+        DataType::LargeList(_) => {
+            let array = as_large_list_array(array)?;
+            hash_list_array(array, random_state, hashes_buffer)?;
+        }
+        DataType::Map(_, _) => {
+            let array = as_map_array(array)?;
+            hash_map_array(array, random_state, hashes_buffer)?;
+        }
+        DataType::FixedSizeList(_,_) => {
+            let array = as_fixed_size_list_array(array)?;
+            hash_fixed_list_array(array, random_state, hashes_buffer)?;
+        }
+        _ => {
+            // This is internal because we should have caught this before.
+            return _internal_err!(
+                "Unsupported data type in hasher: {}",
+                array.data_type()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Test version of `hash_single_array` that forces all hashes to collide to zero.
 #[cfg(feature = "force_hash_collisions")]
-pub fn create_hashes<'a>(
-    _arrays: &[ArrayRef],
+fn hash_single_array(
+    _array: &dyn Array,
     _random_state: &RandomState,
-    hashes_buffer: &'a mut Vec<u64>,
-) -> Result<&'a mut Vec<u64>> {
+    hashes_buffer: &mut [u64],
+    _rehash: bool,
+) -> Result<()> {
     for hash in hashes_buffer.iter_mut() {
         *hash = 0
+    }
+    Ok(())
+}
+
+/// Creates hash values for every row, based on the values in the columns.
+///
+/// The number of rows to hash is determined by `hashes_buffer.len()`.
+/// `hashes_buffer` should be pre-sized appropriately
+///
+/// This is the same as [`create_hashes`] but accepts `&dyn Array`s instead of requiring
+/// `ArrayRef`s.
+pub fn create_hashes_from_arrays<'a>(
+    arrays: &[&dyn Array],
+    random_state: &RandomState,
+    hashes_buffer: &'a mut Vec<u64>,
+) -> Result<&'a mut Vec<u64>> {
+    for (i, &array) in arrays.iter().enumerate() {
+        // combine hashes with `combine_hashes` for all columns besides the first
+        let rehash = i >= 1;
+        hash_single_array(array, random_state, hashes_buffer, rehash)?;
     }
     Ok(hashes_buffer)
 }
 
-/// Creates hash values for every row, based on the values in the
-/// columns.
+/// Creates hash values for every row, based on the values in the columns.
 ///
 /// The number of rows to hash is determined by `hashes_buffer.len()`.
-/// `hashes_buffer` should be pre-sized appropriately
-#[cfg(not(feature = "force_hash_collisions"))]
+/// `hashes_buffer` should be pre-sized appropriately.
+///
+/// This is the same as [`create_hashes_from_arrays`] but accepts `ArrayRef`s.
 pub fn create_hashes<'a>(
     arrays: &[ArrayRef],
     random_state: &RandomState,
     hashes_buffer: &'a mut Vec<u64>,
 ) -> Result<&'a mut Vec<u64>> {
-    for (i, col) in arrays.iter().enumerate() {
-        let array = col.as_ref();
+    for (i, array) in arrays.iter().enumerate() {
         // combine hashes with `combine_hashes` for all columns besides the first
         let rehash = i >= 1;
-        downcast_primitive_array! {
-            array => hash_array_primitive(array, random_state, hashes_buffer, rehash),
-            DataType::Null => hash_null(random_state, hashes_buffer, rehash),
-            DataType::Boolean => hash_array(as_boolean_array(array)?, random_state, hashes_buffer, rehash),
-            DataType::Utf8 => hash_array(as_string_array(array)?, random_state, hashes_buffer, rehash),
-            DataType::Utf8View => hash_array(as_string_view_array(array)?, random_state, hashes_buffer, rehash),
-            DataType::LargeUtf8 => hash_array(as_largestring_array(array), random_state, hashes_buffer, rehash),
-            DataType::Binary => hash_array(as_generic_binary_array::<i32>(array)?, random_state, hashes_buffer, rehash),
-            DataType::BinaryView => hash_array(as_binary_view_array(array)?, random_state, hashes_buffer, rehash),
-            DataType::LargeBinary => hash_array(as_generic_binary_array::<i64>(array)?, random_state, hashes_buffer, rehash),
-            DataType::FixedSizeBinary(_) => {
-                let array: &FixedSizeBinaryArray = array.as_any().downcast_ref().unwrap();
-                hash_array(array, random_state, hashes_buffer, rehash)
-            }
-            DataType::Dictionary(_, _) => downcast_dictionary_array! {
-                array => hash_dictionary(array, random_state, hashes_buffer, rehash)?,
-                _ => unreachable!()
-            }
-            DataType::Struct(_) => {
-                let array = as_struct_array(array)?;
-                hash_struct_array(array, random_state, hashes_buffer)?;
-            }
-            DataType::List(_) => {
-                let array = as_list_array(array)?;
-                hash_list_array(array, random_state, hashes_buffer)?;
-            }
-            DataType::LargeList(_) => {
-                let array = as_large_list_array(array)?;
-                hash_list_array(array, random_state, hashes_buffer)?;
-            }
-            DataType::Map(_, _) => {
-                let array = as_map_array(array)?;
-                hash_map_array(array, random_state, hashes_buffer)?;
-            }
-            DataType::FixedSizeList(_,_) => {
-                let array = as_fixed_size_list_array(array)?;
-                hash_fixed_list_array(array, random_state, hashes_buffer)?;
-            }
-            _ => {
-                // This is internal because we should have caught this before.
-                return _internal_err!(
-                    "Unsupported data type in hasher: {}",
-                    col.data_type()
-                );
-            }
-        }
+        hash_single_array(array.as_ref(), random_state, hashes_buffer, rehash)?;
     }
     Ok(hashes_buffer)
 }
@@ -895,5 +921,21 @@ mod tests {
         assert_eq!(two_col_hashes.len(), 3);
 
         assert_ne!(one_col_hashes, two_col_hashes);
+    }
+
+    #[test]
+    fn test_create_hashes_from_arrays() {
+        let int_array = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
+        let float_array = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0]));
+
+        let random_state = RandomState::with_seeds(0, 0, 0, 0);
+        let hashes_buff = &mut vec![0; int_array.len()];
+        let hashes = create_hashes_from_arrays(
+            &[int_array.as_ref(), float_array.as_ref()],
+            &random_state,
+            hashes_buff,
+        )
+        .unwrap();
+        assert_eq!(hashes.len(), 4,);
     }
 }

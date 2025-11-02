@@ -27,7 +27,7 @@ use arrow::array::{
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::DataType;
-use datafusion_common::hash_utils::create_hashes;
+use datafusion_common::hash_utils::create_hashes_from_arrays;
 use datafusion_common::utils::proxy::{HashTableAllocExt, VecAllocExt};
 use std::any::type_name;
 use std::fmt::Debug;
@@ -349,7 +349,7 @@ where
         let batch_hashes = &mut self.hashes_buffer;
         batch_hashes.clear();
         batch_hashes.resize(values.len(), 0);
-        create_hashes(&[Arc::clone(values)], &self.random_state, batch_hashes)
+        create_hashes_from_arrays(&[values.as_ref()], &self.random_state, batch_hashes)
             // hash is supported for all types and create_hashes only
             // returns errors for unsupported types
             .unwrap();

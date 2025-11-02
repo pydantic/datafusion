@@ -1515,7 +1515,7 @@ mod tests {
     use arrow::buffer::NullBuffer;
     use arrow::datatypes::{DataType, Field};
     use arrow_schema::Schema;
-    use datafusion_common::hash_utils::create_hashes;
+    use datafusion_common::hash_utils::create_hashes_from_arrays;
     use datafusion_common::test_util::{batches_to_sort_string, batches_to_string};
     use datafusion_common::{
         assert_batches_eq, assert_batches_sorted_eq, assert_contains, exec_err,
@@ -3454,8 +3454,8 @@ mod tests {
 
         let random_state = RandomState::with_seeds(0, 0, 0, 0);
         let hashes_buff = &mut vec![0; left.num_rows()];
-        let hashes = create_hashes(
-            &[Arc::clone(&left.columns()[0])],
+        let hashes = create_hashes_from_arrays(
+            &[left.columns()[0].as_ref()],
             &random_state,
             hashes_buff,
         )?;
@@ -3487,8 +3487,8 @@ mod tests {
         let right_keys_values =
             key_column.evaluate(&right)?.into_array(right.num_rows())?;
         let mut hashes_buffer = vec![0; right.num_rows()];
-        create_hashes(
-            &[Arc::clone(&right_keys_values)],
+        create_hashes_from_arrays(
+            &[right_keys_values.as_ref()],
             &random_state,
             &mut hashes_buffer,
         )?;
@@ -3525,8 +3525,8 @@ mod tests {
 
         let random_state = RandomState::with_seeds(0, 0, 0, 0);
         let hashes_buff = &mut vec![0; left.num_rows()];
-        let hashes = create_hashes(
-            &[Arc::clone(&left.columns()[0])],
+        let hashes = create_hashes_from_arrays(
+            &[left.columns()[0].as_ref()],
             &random_state,
             hashes_buff,
         )?;
@@ -3552,8 +3552,8 @@ mod tests {
         let right_keys_values =
             key_column.evaluate(&right)?.into_array(right.num_rows())?;
         let mut hashes_buffer = vec![0; right.num_rows()];
-        create_hashes(
-            &[Arc::clone(&right_keys_values)],
+        create_hashes_from_arrays(
+            &[right_keys_values.as_ref()],
             &random_state,
             &mut hashes_buffer,
         )?;
