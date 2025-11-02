@@ -345,9 +345,9 @@ impl InListExpr {
     /// Returns the list items as expressions.
     ///
     /// For homogeneous lists stored as arrays, this materializes the array
-    /// elements into literal expressions. This is intended for external
-    /// consumers; internal code should use direct field access to avoid
-    /// materialization overhead.
+    /// elements into literal expressions, which may be expensive.
+    /// Consider checking `.len()` to check the size of the list first if you want
+    /// to avoid this cost for large lists.
     ///
     /// # Errors
     /// Returns an error if array elements cannot be converted to ScalarValues.
