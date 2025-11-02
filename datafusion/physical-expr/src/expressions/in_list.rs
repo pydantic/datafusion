@@ -129,12 +129,17 @@ impl Set for ArraySet {
         let cmp = make_comparator(v, in_array, SortOptions::default())?;
         Ok((0..v.len())
             .map(|i| {
+                // SQL three-valued logic: null IN (...) is always null
+                if v.is_null(i) {
+                    return None;
+                }
+
                 let hash = hashes_buf[i];
                 let contains = self
                     .hash_set
                     .map
                     .raw_entry()
-                    .from_hash(hash, |idx| cmp(*idx, i).is_eq())
+                    .from_hash(hash, |idx| cmp(i, *idx).is_eq())
                     .is_some();
 
                 match contains {
