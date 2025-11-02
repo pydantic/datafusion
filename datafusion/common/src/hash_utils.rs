@@ -431,7 +431,7 @@ fn hash_single_array(
     for hash in hashes_buffer.iter_mut() {
         *hash = 0
     }
-    Ok(hashes_buffer)
+    Ok(())
 }
 
 /// Creates hash values for every row, based on the values in the columns.
