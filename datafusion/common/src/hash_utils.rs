@@ -458,7 +458,7 @@ pub fn create_hashes_from_arrays<'a>(
 ///
 /// The number of rows to hash is determined by `hashes_buffer.len()`.
 /// `hashes_buffer` should be pre-sized appropriately.
-/// 
+///
 /// This is the same as [`create_hashes_from_arrays`] but accepts `ArrayRef`s.
 pub fn create_hashes<'a>(
     arrays: &[ArrayRef],

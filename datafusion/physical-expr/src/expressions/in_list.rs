@@ -29,10 +29,10 @@ use arrow::array::*;
 use arrow::buffer::BooleanBuffer;
 use arrow::compute::kernels::boolean::{not, or_kleene};
 use arrow::compute::kernels::cmp::eq;
-use arrow::compute::{SortOptions, take};
+use arrow::compute::{take, SortOptions};
 use arrow::datatypes::*;
-use arrow::util::bit_iterator::BitIndexIterator;
 use arrow::downcast_dictionary_array;
+use arrow::util::bit_iterator::BitIndexIterator;
 use datafusion_common::hash_utils::create_hashes_from_arrays;
 use datafusion_common::{exec_err, internal_err, DFSchema, Result, ScalarValue};
 use datafusion_expr::ColumnarValue;
@@ -103,10 +103,7 @@ struct ArraySet {
 
 impl ArraySet {
     fn new(array: ArrayRef, hash_set: ArrayHashSet) -> Self {
-        Self {
-            array,
-            hash_set,
-        }
+        Self { array, hash_set }
     }
 }
 
@@ -777,8 +774,7 @@ mod tests {
                 .evaluate(&$BATCH)?
                 .into_array($BATCH.num_rows())
                 .expect("Failed to convert to array");
-            let result =
-                as_boolean_array(&result);
+            let result = as_boolean_array(&result);
             let expected = &BooleanArray::from($EXPECTED);
             assert_eq!(expected, result);
         }};
