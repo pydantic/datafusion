@@ -938,4 +938,18 @@ mod tests {
         .unwrap();
         assert_eq!(hashes.len(), 4,);
     }
+    
+    #[test]
+    fn test_create_hashes_equivalence() {
+        let array = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
+        let random_state = RandomState::with_seeds(0, 0, 0, 0);
+        
+        let mut hashes1 = vec![0; array.len()];
+        create_hashes(&[Arc::clone(&array)], &random_state, &mut hashes1).unwrap();
+        
+        let mut hashes2 = vec![0; array.len()];
+        create_hashes_from_arrays(&[array.as_ref()], &random_state, &mut hashes2).unwrap();
+        
+        assert_eq!(hashes1, hashes2);
+    }
 }
