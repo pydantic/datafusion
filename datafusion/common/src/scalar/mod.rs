@@ -880,8 +880,8 @@ fn hash_nested_array<H: Hasher>(arr: ArrayRef, state: &mut H) {
     let len = arr.len();
     let hashes_buffer = &mut vec![0; len];
     let random_state = ahash::RandomState::with_seeds(0, 0, 0, 0);
-    let hashes =
-        create_hashes_from_arrays(&[arr.as_ref()], &random_state, hashes_buffer).expect("hash_nested_array: failed to create row hashes");
+    let hashes = create_hashes_from_arrays(&[arr.as_ref()], &random_state, hashes_buffer)
+        .expect("hash_nested_array: failed to create row hashes");
     // Hash back to std::hash::Hasher
     hashes.hash(state);
 }
