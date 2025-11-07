@@ -32,7 +32,7 @@ use arrow::compute::{take, SortOptions};
 use arrow::datatypes::*;
 use arrow::downcast_dictionary_array;
 use arrow::util::bit_iterator::BitIndexIterator;
-use datafusion_common::hash_utils::create_hashes_from_arrays;
+use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::{exec_err, internal_err, DFSchema, Result, ScalarValue};
 use datafusion_expr::ColumnarValue;
 
@@ -125,7 +125,7 @@ impl Set for ArraySet {
         let has_nulls = in_array.null_count() != 0;
 
         let mut hashes_buf = vec![0u64; v.len()];
-        create_hashes_from_arrays(&[v], &self.hash_set.state, &mut hashes_buf)?;
+        create_hashes([v], &self.hash_set.state, &mut hashes_buf)?;
         let cmp = make_comparator(v, in_array, SortOptions::default())?;
         Ok((0..v.len())
             .map(|i| {
@@ -174,7 +174,7 @@ fn make_hash_set(array: &dyn Array) -> Result<ArrayHashSet> {
     let state = RandomState::new();
     let mut map: HashMap<usize, (), ()> = HashMap::with_hasher(());
     let mut hashes = vec![0; array.len()];
-    create_hashes_from_arrays(&[array], &state, &mut hashes)?;
+    create_hashes([array], &state, &mut hashes)?;
     let cmp = make_comparator(array, array, SortOptions::default())?;
 
     let insert_value = |idx| {
@@ -564,11 +564,9 @@ impl Hash for InListExpr {
             InListStorage::Array { array, .. } => {
                 let random_state = RandomState::with_seed(0);
                 let mut hashes_buf = vec![0u64; array.len()];
-                let Ok(hashes_buf) = create_hashes_from_arrays(
-                    &[array.as_ref()],
-                    &random_state,
-                    &mut hashes_buf,
-                ) else {
+                let Ok(hashes_buf) =
+                    create_hashes([array], &random_state, &mut hashes_buf)
+                else {
                     unreachable!("Failed to create hashes for InList array. This shouldn't happen because make_set should have succeeded earlier.");
                 };
                 hashes_buf.hash(state);
