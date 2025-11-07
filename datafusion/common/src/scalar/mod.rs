@@ -51,7 +51,7 @@ use crate::cast::{
 };
 use crate::error::{DataFusionError, Result, _exec_err, _internal_err, _not_impl_err};
 use crate::format::DEFAULT_CAST_OPTIONS;
-use crate::hash_utils::create_hashes_from_arrays;
+use crate::hash_utils::create_hashes;
 use crate::utils::SingleRowListArrayBuilder;
 use crate::{_internal_datafusion_err, arrow_datafusion_err};
 use arrow::array::{
