@@ -434,6 +434,34 @@ fn hash_single_array(
     Ok(())
 }
 
+pub trait AsDynArray {
+    fn as_dyn_array(&self) -> &dyn Array;
+}
+
+impl AsDynArray for dyn Array {
+    fn as_dyn_array(&self) -> &dyn Array {
+        self
+    }
+}
+
+impl AsDynArray for &dyn Array {
+    fn as_dyn_array(&self) -> &dyn Array {
+        *self
+    }
+}
+
+impl AsDynArray for ArrayRef {
+    fn as_dyn_array(&self) -> &dyn Array {
+        self.as_ref()
+    }
+}   
+
+impl AsDynArray for &ArrayRef {
+    fn as_dyn_array(&self) -> &dyn Array {
+        self.as_ref()
+    }
+}
+
 /// Creates hash values for every row, based on the values in the columns.
 ///
 /// The number of rows to hash is determined by `hashes_buffer.len()`.
@@ -445,12 +473,12 @@ pub fn create_hashes<'a, I, T>(
 ) -> Result<&'a mut Vec<u64>>
 where
     I: IntoIterator<Item = T>,
-    T: AsRef<dyn Array>,
+    T: AsDynArray,
 {
     for (i, array) in arrays.into_iter().enumerate() {
         // combine hashes with `combine_hashes` for all columns besides the first
         let rehash = i >= 1;
-        hash_single_array(array.as_ref(), random_state, hashes_buffer, rehash)?;
+        hash_single_array(array.as_dyn_array(), random_state, hashes_buffer, rehash)?;
     }
     Ok(hashes_buffer)
 }
@@ -928,6 +956,24 @@ mod tests {
             create_hashes(&[int_array, float_array], &random_state, hashes_buff).unwrap();
         assert_eq!(hashes.len(), 4,);
     }
+
+    #[test]
+    fn test_create_hashes_from_dyn_arrays() {
+        let int_array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
+        let float_array: ArrayRef =
+            Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0]));
+
+        // Verify that we can call create_hashes with only &dyn Array
+        fn test(arr1: &dyn Array, arr2: &dyn Array) {
+            let random_state = RandomState::with_seeds(0, 0, 0, 0);
+            let hashes_buff = &mut vec![0; arr1.len()];
+            let hashes =
+                create_hashes([arr1, arr2], &random_state, hashes_buff).unwrap();
+            assert_eq!(hashes.len(), 4,);
+        }
+        test(&*int_array, &*float_array);
+    }
+
 
     #[test]
     fn test_create_hashes_equivalence() {
