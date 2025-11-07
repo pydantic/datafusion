@@ -454,7 +454,7 @@ impl AsDynArray for ArrayRef {
     fn as_dyn_array(&self) -> &dyn Array {
         self.as_ref()
     }
-}   
+}
 
 impl AsDynArray for &ArrayRef {
     fn as_dyn_array(&self) -> &dyn Array {
@@ -967,13 +967,11 @@ mod tests {
         fn test(arr1: &dyn Array, arr2: &dyn Array) {
             let random_state = RandomState::with_seeds(0, 0, 0, 0);
             let hashes_buff = &mut vec![0; arr1.len()];
-            let hashes =
-                create_hashes([arr1, arr2], &random_state, hashes_buff).unwrap();
+            let hashes = create_hashes([arr1, arr2], &random_state, hashes_buff).unwrap();
             assert_eq!(hashes.len(), 4,);
         }
         test(&*int_array, &*float_array);
     }
-
 
     #[test]
     fn test_create_hashes_equivalence() {
