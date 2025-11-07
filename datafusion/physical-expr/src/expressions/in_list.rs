@@ -320,11 +320,15 @@ impl InListExpr {
     pub fn list(&self) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
         match &self.list {
             InListStorage::Exprs { list, .. } => Ok(list.clone()),
-            InListStorage::Array { list: Some(list), .. } => {
+            InListStorage::Array {
+                list: Some(list), ..
+            } => {
                 // Return cached expressions (fast path)
                 Ok(list.clone())
             }
-            InListStorage::Array { array, list: None, .. } => {
+            InListStorage::Array {
+                array, list: None, ..
+            } => {
                 // Materialize array elements into literal expressions (fallback)
                 (0..array.len())
                     .map(|i| {
