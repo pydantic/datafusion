@@ -315,7 +315,10 @@ pub fn serialize_physical_expr(
             expr_type: Some(protobuf::physical_expr_node::ExprType::InList(Box::new(
                 protobuf::PhysicalInListNode {
                     expr: Some(Box::new(serialize_physical_expr(expr.expr(), codec)?)),
-                    list: serialize_physical_exprs(expr.list(), codec)?,
+                    // TODO: serialize the inner ArrayRef directly to avoid materialization into literals
+                    // by extending the protobuf definition to support both representations and adding a public
+                    // accessor method to InListExpr to get the inner ArrayRef
+                    list: serialize_physical_exprs(&expr.list()?, codec)?,
                     negated: expr.negated(),
                 },
             ))),
