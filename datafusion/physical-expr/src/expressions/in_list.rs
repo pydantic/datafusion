@@ -46,6 +46,8 @@ enum InListStorage {
     Array {
         array: ArrayRef,
         static_filter: Arc<dyn Set>,
+        /// Optional cached list of expressions to avoid materialization
+        list: Option<Vec<Arc<dyn PhysicalExpr>>>,
     },
     /// Heterogeneous or dynamic list stored as expressions
     Exprs {
@@ -266,17 +268,22 @@ impl InListExpr {
     /// without converting to individual expression objects.
     ///
     /// The static_filter provides O(1) hash-based membership testing.
+    ///
+    /// The optional `list` parameter can be provided to cache the original
+    /// expressions, avoiding expensive materialization when calling `list()`.
     pub fn new_from_array(
         expr: Arc<dyn PhysicalExpr>,
         array: ArrayRef,
         negated: bool,
         static_filter: Arc<dyn Set>,
+        list: Option<Vec<Arc<dyn PhysicalExpr>>>,
     ) -> Self {
         Self {
             expr,
             list: InListStorage::Array {
                 array,
                 static_filter,
+                list,
             },
             negated,
         }
@@ -302,18 +309,23 @@ impl InListExpr {
 
     /// Returns the list items as expressions.
     ///
-    /// For homogeneous lists stored as arrays, this materializes the array
-    /// elements into literal expressions, which may be expensive.
+    /// For homogeneous lists stored as arrays, this returns cached expressions
+    /// if available (avoiding materialization), or materializes the array
+    /// elements into literal expressions if not cached.
     /// Consider checking `.len()` to check the size of the list first if you want
-    /// to avoid this cost for large lists.
+    /// to avoid this cost for large lists without cached expressions.
     ///
     /// # Errors
     /// Returns an error if array elements cannot be converted to ScalarValues.
     pub fn list(&self) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
         match &self.list {
             InListStorage::Exprs { list, .. } => Ok(list.clone()),
-            InListStorage::Array { array, .. } => {
-                // Materialize array elements into literal expressions
+            InListStorage::Array { list: Some(list), .. } => {
+                // Return cached expressions (fast path)
+                Ok(list.clone())
+            }
+            InListStorage::Array { array, list: None, .. } => {
+                // Materialize array elements into literal expressions (fallback)
                 (0..array.len())
                     .map(|i| {
                         let scalar = ScalarValue::try_from_array(array, i)?;
@@ -460,13 +472,15 @@ impl PhysicalExpr for InListExpr {
             InListStorage::Array {
                 array,
                 static_filter,
+                list,
             } => {
-                // Array case: only the expr changes, list stays the same
+                // Array case: only the expr changes, list stays the same (cached)
                 Ok(Arc::new(InListExpr::new_from_array(
                     Arc::clone(&children[0]),
                     Arc::<dyn Array>::clone(array),
                     self.negated,
                     Arc::clone(static_filter),
+                    list.clone(), // Preserve cached list
                 )))
             }
             InListStorage::Exprs { .. } => {
@@ -610,6 +624,7 @@ pub fn in_list(
                 array,
                 *negated,
                 static_filter,
+                Some(list), // Cache the original expressions to avoid materialization
             )));
         }
     }
@@ -639,6 +654,7 @@ pub fn in_list_from_array(
         array,
         negated,
         static_filter,
+        None, // No original expressions available
     )))
 }
 
