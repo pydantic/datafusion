@@ -44,7 +44,7 @@ use hashbrown::hash_map::RawEntryMut;
 #[derive(Debug, Clone)]
 struct StaticFilter {
     array: ArrayRef,
-    hash_set: ArraySet,
+    hash_set: ArrayHashSet,
 }
 
 /// InList
@@ -66,7 +66,7 @@ impl Debug for InListExpr {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ArraySet {
+pub(crate) struct ArrayHashSet {
     state: RandomState,
     /// Used to provide a lookup from value to in list index
     ///
@@ -75,7 +75,7 @@ pub(crate) struct ArraySet {
     map: HashMap<usize, (), ()>,
 }
 
-impl ArraySet {
+impl ArrayHashSet {
     /// Checks if values in `v` are contained in the `in_array` using this hash set for lookup.
     fn contains(
         &self,
@@ -132,10 +132,10 @@ impl ArraySet {
 ///
 /// Note: This is split into a separate function as higher-rank trait bounds currently
 /// cause type inference to misbehave
-fn make_set(array: &dyn Array) -> Result<ArraySet> {
+fn make_hash_set(array: &dyn Array) -> Result<ArrayHashSet> {
     // Null type has no natural order - return empty hash set
     if array.data_type() == &DataType::Null {
-        return Ok(ArraySet {
+        return Ok(ArrayHashSet {
             state: RandomState::new(),
             map: HashMap::with_hasher(()),
         });
@@ -165,7 +165,7 @@ fn make_set(array: &dyn Array) -> Result<ArraySet> {
         None => (0..array.len()).for_each(insert_value),
     }
 
-    Ok(ArraySet { state, map })
+    Ok(ArrayHashSet { state, map })
 }
 
 /// Evaluates the list of expressions into an array, flattening any dictionaries
@@ -417,7 +417,7 @@ pub fn in_list(
     // Try to create a static filter for constant expressions
     let static_filter = try_evaluate_constant_list(&list, schema)
         .and_then(|array| {
-            make_set(array.as_ref()).map(|hash_set| StaticFilter { array, hash_set })
+            make_hash_set(array.as_ref()).map(|hash_set| StaticFilter { array, hash_set })
         })
         .ok();
 
@@ -448,7 +448,7 @@ pub fn in_list_from_array(
             Ok(crate::expressions::lit(scalar) as Arc<dyn PhysicalExpr>)
         })
         .collect::<Result<Vec<_>>>()?;
-    let hash_set = make_set(array.as_ref())?;
+    let hash_set = make_hash_set(array.as_ref())?;
     let static_filter = StaticFilter { array, hash_set };
     Ok(Arc::new(InListExpr::new(
         expr,
@@ -507,9 +507,9 @@ mod tests {
     fn try_cast_static_filter_to_set(
         list: &[Arc<dyn PhysicalExpr>],
         schema: &Schema,
-    ) -> Result<ArraySet> {
+    ) -> Result<ArrayHashSet> {
         let array = try_evaluate_constant_list(list, schema)?;
-        make_set(array.as_ref())
+        make_hash_set(array.as_ref())
     }
 
     // Attempts to coerce the types of `list_type` to be comparable with the
