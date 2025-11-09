@@ -308,7 +308,10 @@ impl PhysicalExpr for InListExpr {
                 let found = self.list.iter().map(|expr| expr.evaluate(batch)).try_fold(
                     BooleanArray::new(BooleanBuffer::new_unset(num_rows), None),
                     |result, expr| -> Result<BooleanArray> {
-                        let expr = expr?.into_array(num_rows)?;
+                        let expr = match expr? {
+                            ColumnarValue::Array(array) => array,
+                            ColumnarValue::Scalar(scalar) => scalar.to_array()?,
+                        };
                         let cmp = make_comparator(
                             value.as_ref(),
                             expr.as_ref(),
