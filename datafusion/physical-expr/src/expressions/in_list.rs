@@ -388,8 +388,9 @@ impl Eq for InListExpr {}
 impl Hash for InListExpr {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.expr.hash(state);
-        self.list.hash(state);
         self.negated.hash(state);
+        // Add `self.static_filter` when hash is available
+        self.list.hash(state);
     }
 }
 
