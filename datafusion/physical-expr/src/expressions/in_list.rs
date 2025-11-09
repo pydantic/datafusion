@@ -34,7 +34,7 @@ use arrow::downcast_dictionary_array;
 use arrow::util::bit_iterator::BitIndexIterator;
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::{exec_err, internal_err, DFSchema, Result, ScalarValue};
-use datafusion_expr::ColumnarValue;
+use datafusion_expr::{expr_vec_fmt, ColumnarValue};
 
 use ahash::RandomState;
 use datafusion_common::HashMap;
@@ -234,26 +234,20 @@ impl InListExpr {
         self.negated
     }
 }
-
 impl std::fmt::Display for InListExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let list_str = self
-            .list
-            .iter()
-            .map(|e| format!("{e}"))
-            .collect::<Vec<String>>()
-            .join(", ");
+        let list = expr_vec_fmt!(self.list);
 
         if self.negated {
             if self.static_filter.is_some() {
-                write!(f, "{} NOT IN (SET) ([{list_str}])", self.expr)
+                write!(f, "{} NOT IN (SET) ([{list}])", self.expr)
             } else {
-                write!(f, "{} NOT IN ([{list_str}])", self.expr)
+                write!(f, "{} NOT IN ([{list}])", self.expr)
             }
         } else if self.static_filter.is_some() {
-            write!(f, "{} IN (SET) ([{list_str}])", self.expr)
+            write!(f, "{} IN (SET) ([{list}])", self.expr)
         } else {
-            write!(f, "{} IN ([{list_str}])", self.expr)
+            write!(f, "{} IN ([{list}])", self.expr)
         }
     }
 }
