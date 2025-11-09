@@ -25,6 +25,7 @@ use std::sync::Arc;
 use crate::physical_expr::physical_exprs_bag_equal;
 use crate::PhysicalExpr;
 
+use super::comparator::make_comparator;
 use arrow::array::*;
 use arrow::buffer::BooleanBuffer;
 use arrow::compute::kernels::boolean::{not, or_kleene};
@@ -39,6 +40,44 @@ use datafusion_expr::{expr_vec_fmt, ColumnarValue};
 use ahash::RandomState;
 use datafusion_common::HashMap;
 use hashbrown::hash_map::RawEntryMut;
+use std::cell::RefCell;
+
+/// Maximum size for the thread-local hash buffer before truncation (4MB = 524,288 u64 elements)
+const MAX_BUFFER_SIZE: usize = 524_288;
+
+thread_local! {
+    /// Thread-local buffer for hash computations to avoid repeated allocations.
+    /// The buffer is reused across calls and truncated if it exceeds MAX_BUFFER_SIZE.
+    /// Defaults to a capacity of 8192 u64 elements which is the default batch size,
+    /// this corresponds to 64KB of memory.
+    static HASH_BUFFER: RefCell<Vec<u64>> = RefCell::new(Vec::with_capacity(8192));
+}
+
+/// Borrows the thread-local hash buffer, resizes it to the required size, and executes the callback.
+/// The buffer is automatically truncated if it exceeds MAX_BUFFER_SIZE after use.
+fn with_hash_buffer<F, R>(required_size: usize, f: F) -> R
+where
+    F: FnOnce(&mut [u64]) -> R,
+{
+    HASH_BUFFER.with(|cell| {
+        let mut buffer = cell.borrow_mut();
+
+        // Ensure buffer has sufficient length, clearing old values
+        buffer.clear();
+        buffer.resize(required_size, 0);
+
+        // Execute the callback with a slice of exactly the required size
+        let result = f(&mut buffer[..required_size]);
+
+        // Cleanup: truncate if buffer grew too large
+        if buffer.capacity() > MAX_BUFFER_SIZE {
+            buffer.truncate(MAX_BUFFER_SIZE);
+            buffer.shrink_to_fit();
+        }
+
+        result
+    })
+}
 
 /// Static filter for InList that stores the array and hash set for O(1) lookups
 #[derive(Debug, Clone)]
@@ -99,30 +138,31 @@ impl ArrayHashSet {
 
         let has_nulls = in_array.null_count() != 0;
 
-        let mut hashes_buf = vec![0u64; v.len()];
-        create_hashes([v], &self.state, &mut hashes_buf)?;
-        let cmp = make_comparator(v, in_array, SortOptions::default())?;
-        Ok((0..v.len())
-            .map(|i| {
-                // SQL three-valued logic: null IN (...) is always null
-                if v.is_null(i) {
-                    return None;
-                }
+        with_hash_buffer(v.len(), |hashes_buffer| {
+            create_hashes([v], &self.state, hashes_buffer)?;
+            let cmp = make_comparator(v, in_array, SortOptions::default())?;
+            Ok((0..v.len())
+                .map(|i| {
+                    // SQL three-valued logic: null IN (...) is always null
+                    if v.is_null(i) {
+                        return None;
+                    }
 
-                let hash = hashes_buf[i];
-                let contains = self
-                    .map
-                    .raw_entry()
-                    .from_hash(hash, |idx| cmp(i, *idx).is_eq())
-                    .is_some();
+                    let hash = hashes_buffer[i];
+                    let contains = self
+                        .map
+                        .raw_entry()
+                        .from_hash(hash, |idx| cmp.compare(i, *idx).is_eq())
+                        .is_some();
 
-                match contains {
-                    true => Some(!negated),
-                    false if has_nulls => None,
-                    false => Some(negated),
-                }
-            })
-            .collect())
+                    match contains {
+                        true => Some(!negated),
+                        false if has_nulls => None,
+                        false => Some(negated),
+                    }
+                })
+                .collect())
+        })
     }
 }
 
@@ -143,27 +183,31 @@ fn make_hash_set(array: &dyn Array) -> Result<ArrayHashSet> {
 
     let state = RandomState::new();
     let mut map: HashMap<usize, (), ()> = HashMap::with_hasher(());
-    let mut hashes = vec![0; array.len()];
-    create_hashes([array], &state, &mut hashes)?;
-    let cmp = make_comparator(array, array, SortOptions::default())?;
 
-    let insert_value = |idx| {
-        let hash = hashes[idx];
-        if let RawEntryMut::Vacant(v) = map
-            .raw_entry_mut()
-            .from_hash(hash, |x| cmp(*x, idx).is_eq())
-        {
-            v.insert_with_hasher(hash, idx, (), |x| hashes[*x]);
-        }
-    };
+    with_hash_buffer(array.len(), |hashes_buffer| -> Result<()> {
+        create_hashes([array], &state, hashes_buffer)?;
+        let cmp = make_comparator(array, array, SortOptions::default())?;
 
-    match array.nulls() {
-        Some(nulls) => {
-            BitIndexIterator::new(nulls.validity(), nulls.offset(), nulls.len())
-                .for_each(insert_value)
+        let insert_value = |idx| {
+            let hash = hashes_buffer[idx];
+            if let RawEntryMut::Vacant(v) = map
+                .raw_entry_mut()
+                .from_hash(hash, |x| cmp.compare(*x, idx).is_eq())
+            {
+                v.insert_with_hasher(hash, idx, (), |x| hashes_buffer[*x]);
+            }
+        };
+
+        match array.nulls() {
+            Some(nulls) => {
+                BitIndexIterator::new(nulls.validity(), nulls.offset(), nulls.len())
+                    .for_each(insert_value)
+            }
+            None => (0..array.len()).for_each(insert_value),
         }
-        None => (0..array.len()).for_each(insert_value),
-    }
+
+        Ok(())
+    })?;
 
     Ok(ArrayHashSet { state, map })
 }
@@ -355,7 +399,7 @@ impl PhysicalExpr for InListExpr {
                                         if value.is_null(i) || array.is_null(i) {
                                             return None;
                                         }
-                                        Some(cmp(i, i).is_eq())
+                                        Some(cmp.compare(i, i).is_eq())
                                     })
                                     .collect::<BooleanArray>()
                             }
@@ -378,7 +422,7 @@ impl PhysicalExpr for InListExpr {
                                             if value.is_null(i) {
                                                 None
                                             } else {
-                                                Some(cmp(i, 0).is_eq())
+                                                Some(cmp.compare(i, 0).is_eq())
                                             }
                                         })
                                         .collect::<BooleanArray>()

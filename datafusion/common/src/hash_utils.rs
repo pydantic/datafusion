@@ -478,8 +478,8 @@ impl AsDynArray for &ArrayRef {
 pub fn create_hashes<'a, I, T>(
     arrays: I,
     random_state: &RandomState,
-    hashes_buffer: &'a mut Vec<u64>,
-) -> Result<&'a mut Vec<u64>>
+    hashes_buffer: &'a mut [u64],
+) -> Result<&'a mut [u64]>
 where
     I: IntoIterator<Item = T>,
     T: AsDynArray,
