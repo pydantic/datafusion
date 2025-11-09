@@ -291,14 +291,25 @@ impl PhysicalExpr for InListExpr {
                         self.negated,
                     )?,
                     ColumnarValue::Scalar(scalar) => {
+                        if scalar.is_null() {
+                            // SQL three-valued logic: null IN (...) is always null
+                            // The code below would handle this correctly but this is a faster path
+                            return Ok(ColumnarValue::Array(Arc::new(
+                                BooleanArray::from(vec![None; num_rows]),
+                            )));
+                        }
                         // Use a 1 row array to avoid code duplication/branching
                         // Since all we do is compute hash and lookup this should be efficient enough
                         let array = scalar.to_array()?;
-                        filter.hash_set.contains(
+                        let array = filter.hash_set.contains(
                             array.as_ref(),
                             filter.array.as_ref(),
                             self.negated,
-                        )?
+                        )?;
+                        // Broadcast the single result to all rows
+                        BooleanArray::from_iter(
+                            std::iter::repeat(array.value(0)).take(num_rows),
+                        )
                     }
                 }
             }
@@ -308,23 +319,48 @@ impl PhysicalExpr for InListExpr {
                 let found = self.list.iter().map(|expr| expr.evaluate(batch)).try_fold(
                     BooleanArray::new(BooleanBuffer::new_unset(num_rows), None),
                     |result, expr| -> Result<BooleanArray> {
-                        let expr = match expr? {
-                            ColumnarValue::Array(array) => array,
-                            ColumnarValue::Scalar(scalar) => scalar.to_array()?,
-                        };
-                        let cmp = make_comparator(
-                            value.as_ref(),
-                            expr.as_ref(),
-                            SortOptions::default(),
-                        )?;
-                        let rhs = (0..num_rows)
-                            .map(|i| {
-                                if value.is_null(i) || expr.is_null(i) {
-                                    return None;
+                        let rhs = match expr? {
+                            ColumnarValue::Array(array) => {
+                                let cmp = make_comparator(
+                                    value.as_ref(),
+                                    array.as_ref(),
+                                    SortOptions::default(),
+                                )?;
+                                (0..num_rows)
+                                    .map(|i| {
+                                        if value.is_null(i) || array.is_null(i) {
+                                            return None;
+                                        }
+                                        Some(cmp(i, i).is_eq())
+                                    })
+                                    .collect::<BooleanArray>()
+                            }
+                            ColumnarValue::Scalar(scalar) => {
+                                // Check if scalar is null once, before the loop
+                                if scalar.is_null() {
+                                    // If scalar is null, all comparisons return null
+                                    BooleanArray::from(vec![None; num_rows])
+                                } else {
+                                    // Convert scalar to 1-element array
+                                    let array = scalar.to_array()?;
+                                    let cmp = make_comparator(
+                                        value.as_ref(),
+                                        array.as_ref(),
+                                        SortOptions::default(),
+                                    )?;
+                                    // Compare each row of value with the single scalar element
+                                    (0..num_rows)
+                                        .map(|i| {
+                                            if value.is_null(i) {
+                                                None
+                                            } else {
+                                                Some(cmp(i, 0).is_eq())
+                                            }
+                                        })
+                                        .collect::<BooleanArray>()
                                 }
-                                Some(cmp(i, i).is_eq())
-                            })
-                            .collect::<BooleanArray>();
+                            }
+                        };
                         Ok(or_kleene(&result, &rhs)?)
                     },
                 )?;
