@@ -44,7 +44,7 @@ use hashbrown::hash_map::RawEntryMut;
 #[derive(Debug, Clone)]
 struct StaticFilter {
     array: ArrayRef,
-    hash_set: ArrayHashSet,
+    hash_set: ArraySet,
 }
 
 /// InList
@@ -66,7 +66,7 @@ impl Debug for InListExpr {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ArrayHashSet {
+pub(crate) struct ArraySet {
     state: RandomState,
     /// Used to provide a lookup from value to in list index
     ///
@@ -75,7 +75,7 @@ pub(crate) struct ArrayHashSet {
     map: HashMap<usize, (), ()>,
 }
 
-impl ArrayHashSet {
+impl ArraySet {
     /// Checks if values in `v` are contained in the `in_array` using this hash set for lookup.
     fn contains(
         &self,
@@ -126,16 +126,16 @@ impl ArrayHashSet {
     }
 }
 
-/// Computes an [`ArrayHashSet`] for the provided [`Array`] if there
+/// Computes an [`ArraySet`] for the provided [`Array`] if there
 /// are nulls present or there are more than the configured number of
 /// elements.
 ///
 /// Note: This is split into a separate function as higher-rank trait bounds currently
 /// cause type inference to misbehave
-fn make_hash_set(array: &dyn Array) -> Result<ArrayHashSet> {
+fn make_set(array: &dyn Array) -> Result<ArraySet> {
     // Null type has no natural order - return empty hash set
     if array.data_type() == &DataType::Null {
-        return Ok(ArrayHashSet {
+        return Ok(ArraySet {
             state: RandomState::new(),
             map: HashMap::with_hasher(()),
         });
@@ -165,7 +165,7 @@ fn make_hash_set(array: &dyn Array) -> Result<ArrayHashSet> {
         None => (0..array.len()).for_each(insert_value),
     }
 
-    Ok(ArrayHashSet { state, map })
+    Ok(ArraySet { state, map })
 }
 
 /// Evaluates the list of expressions into an array, flattening any dictionaries
@@ -289,11 +289,25 @@ impl PhysicalExpr for InListExpr {
         let num_rows = batch.num_rows();
         let value = self.expr.evaluate(batch)?;
         let r = match &self.static_filter {
-            Some(filter) => filter.hash_set.contains(
-                value.into_array(num_rows)?.as_ref(),
-                filter.array.as_ref(),
-                self.negated,
-            )?,
+            Some(filter) => {
+                match value {
+                    ColumnarValue::Array(array) => filter.hash_set.contains(
+                        &array,
+                        filter.array.as_ref(),
+                        self.negated,
+                    )?,
+                    ColumnarValue::Scalar(scalar) => {
+                        // Use a 1 row array to avoid code duplication/branching
+                        // Since all we do is compute hash and lookup this should be efficient enough
+                        let array = scalar.to_array()?;
+                        filter.hash_set.contains(
+                            array.as_ref(),
+                            filter.array.as_ref(),
+                            self.negated,
+                        )?
+                    }
+                }
+            }
             None => {
                 // No static filter: iterate through each expression, compare, and OR results
                 let value = value.into_array(num_rows)?;
@@ -403,7 +417,7 @@ pub fn in_list(
     // Try to create a static filter for constant expressions
     let static_filter = try_evaluate_constant_list(&list, schema)
         .and_then(|array| {
-            make_hash_set(array.as_ref()).map(|hash_set| StaticFilter { array, hash_set })
+            make_set(array.as_ref()).map(|hash_set| StaticFilter { array, hash_set })
         })
         .ok();
 
@@ -418,8 +432,8 @@ pub fn in_list(
 /// Create a new InList expression directly from an array, bypassing expression evaluation.
 ///
 /// This is more efficient than `in_list()` when you already have the list as an array,
-/// as it avoids the conversion: ArrayRef -> Vec<PhysicalExpr> -> ArrayRef -> ArrayHashSet.
-/// Instead it goes directly: ArrayRef -> ArrayHashSet.
+/// as it avoids the conversion: ArrayRef -> Vec<PhysicalExpr> -> ArrayRef -> ArraySet.
+/// Instead it goes directly: ArrayRef -> ArraySet.
 ///
 /// The `list` field will be empty when using this constructor, as the array is stored
 /// directly in the static filter.
@@ -434,7 +448,7 @@ pub fn in_list_from_array(
             Ok(crate::expressions::lit(scalar) as Arc<dyn PhysicalExpr>)
         })
         .collect::<Result<Vec<_>>>()?;
-    let hash_set = make_hash_set(array.as_ref())?;
+    let hash_set = make_set(array.as_ref())?;
     let static_filter = StaticFilter { array, hash_set };
     Ok(Arc::new(InListExpr::new(
         expr,
@@ -493,9 +507,9 @@ mod tests {
     fn try_cast_static_filter_to_set(
         list: &[Arc<dyn PhysicalExpr>],
         schema: &Schema,
-    ) -> Result<ArrayHashSet> {
+    ) -> Result<ArraySet> {
         let array = try_evaluate_constant_list(list, schema)?;
-        make_hash_set(array.as_ref())
+        make_set(array.as_ref())
     }
 
     // Attempts to coerce the types of `list_type` to be comparable with the
