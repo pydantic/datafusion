@@ -16,7 +16,7 @@
 // under the License.
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -314,7 +314,11 @@ impl IndexTableProvider {
         let mut plan = self.indexed_file.scan_none_plan();
 
         // determine which row groups have the values in the guarantees
-        for value in constants {
+        for i in 0..constants.len() {
+            let value = ScalarValue::try_from_array(constants, i).map_err(|e| {
+                internal_datafusion_err!("Failed to extract scalar value: {e}")
+            })?;
+
             let ScalarValue::Int32(Some(val)) = value else {
                 // if we have unexpected type of constant, no pruning is possible
                 return Ok(self.indexed_file.scan_all_plan());
@@ -323,7 +327,7 @@ impl IndexTableProvider {
             // Since we know the values in the files are between 0..1000 and
             // evenly distributed between  in row groups, calculate in what row
             // group this value appears and tell the parquet reader to read it
-            let val = *val as usize;
+            let val = val as usize;
             let num_rows_in_row_group = 1000 / plan.len();
             let row_group_index = val / num_rows_in_row_group;
             plan.scan(row_group_index);
@@ -349,7 +353,7 @@ impl IndexTableProvider {
         Ok(plan)
     }
 
-    /// Returns the set of constants that the `"id"` column must take in order
+    /// Returns the array of constants that the `"id"` column must take in order
     /// for the predicate to be true.
     ///
     /// If `None` is returned, we can't extract the necessary information from
@@ -357,7 +361,7 @@ impl IndexTableProvider {
     fn value_constants<'a>(
         &self,
         guarantees: &'a [LiteralGuarantee],
-    ) -> Option<&'a HashSet<ScalarValue>> {
+    ) -> Option<&'a ArrayRef> {
         // only handle a single guarantee for column in this example
         if guarantees.len() != 1 {
             return None;

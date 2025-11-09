@@ -20,6 +20,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::StreamWriter;
+use datafusion_common::ScalarValue;
 use datafusion_common::{
     internal_datafusion_err, internal_err, not_impl_err, DataFusionError, Result,
 };
@@ -32,6 +33,7 @@ use datafusion_datasource_json::file_format::JsonSink;
 #[cfg(feature = "parquet")]
 use datafusion_datasource_parquet::file_format::ParquetSink;
 use datafusion_expr::WindowFrame;
+use datafusion_physical_expr::expressions::InListValues;
 use datafusion_physical_expr::window::{SlidingAggregateWindowExpr, StandardWindowExpr};
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr;
@@ -311,6 +313,25 @@ pub fn serialize_physical_expr(
             )),
         })
     } else if let Some(expr) = expr.downcast_ref::<InListExpr>() {
+        let list = match expr.list() {
+            InListValues::Array(array) => {
+                let scalars = (0..array.len())
+                    .map(|i| ScalarValue::try_from_array(array.as_ref(), i))
+                    .collect::<Result<Vec<_>>>()?;
+                serialize_physical_exprs(
+                    &scalars
+                        .iter()
+                        .map(|s| {
+                            Arc::new(Literal::new(s.clone())) as Arc<dyn PhysicalExpr>
+                        })
+                        .collect::<Vec<_>>(),
+                    codec,
+                )?
+            }
+            InListValues::Exprs(values) => {
+                serialize_physical_exprs(values.iter(), codec)?
+            }
+        };
         Ok(protobuf::PhysicalExprNode {
             expr_type: Some(protobuf::physical_expr_node::ExprType::InList(Box::new(
                 protobuf::PhysicalInListNode {
@@ -318,7 +339,7 @@ pub fn serialize_physical_expr(
                     // TODO: serialize the inner ArrayRef directly to avoid materialization into literals
                     // by extending the protobuf definition to support both representations and adding a public
                     // accessor method to InListExpr to get the inner ArrayRef
-                    list: serialize_physical_exprs(&expr.list()?, codec)?,
+                    list,
                     negated: expr.negated(),
                 },
             ))),

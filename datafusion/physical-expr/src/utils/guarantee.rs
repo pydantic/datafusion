@@ -20,6 +20,10 @@
 
 use crate::utils::split_disjunction;
 use crate::{split_conjunction, PhysicalExpr};
+use ahash::RandomState;
+use arrow::array::ArrayRef;
+use datafusion_common::hash_utils::create_hashes;
+use datafusion_common::utils::pretty::pretty_format_array;
 use datafusion_common::{Column, HashMap, ScalarValue};
 use datafusion_expr::Operator;
 use std::collections::HashSet;
@@ -70,11 +74,19 @@ use std::sync::Arc;
 ///    If the column can ONLY take one of these values, the predicate can not
 ///    evaluate to `true`. For example,
 ///    `(a != 1)`, `(a != 1 AND a != 2)` or `a NOT IN (1, 2, 3)`
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct LiteralGuarantee {
     pub column: Column,
     pub guarantee: Guarantee,
-    pub literals: HashSet<ScalarValue>,
+    pub literals: ArrayRef,
+}
+
+impl PartialEq for LiteralGuarantee {
+    fn eq(&self, other: &Self) -> bool {
+        self.column == other.column
+            && self.guarantee == other.guarantee
+            && self.literals.as_ref() == other.literals.as_ref()
+    }
 }
 
 /// What is guaranteed about the values for a [`LiteralGuarantee`]?
@@ -90,18 +102,9 @@ pub enum Guarantee {
 }
 
 impl LiteralGuarantee {
-    /// Create a new instance of the guarantee if the provided operator is
-    /// supported. Returns None otherwise. See [`LiteralGuarantee::analyze`] to
-    /// create these structures from an predicate (boolean expression).
-    fn new(
-        column_name: impl Into<String>,
-        guarantee: Guarantee,
-        literals: impl IntoIterator<Item = ScalarValue>,
-    ) -> Self {
-        let literals: HashSet<_> = literals.into_iter().collect();
-
+    pub fn new(column: Column, guarantee: Guarantee, literals: ArrayRef) -> Self {
         Self {
-            column: Column::from_name(column_name),
+            column,
             guarantee,
             literals,
         }
@@ -130,18 +133,11 @@ impl LiteralGuarantee {
                     .downcast_ref::<crate::expressions::InListExpr>()
                 {
                     if let Some(inlist) = ColInList::try_new(inlist) {
-                        match inlist.inlist.list() {
-                            Ok(list) => builder.aggregate_multi_conjunct(
-                                inlist.col,
-                                inlist.guarantee,
-                                list.iter().filter_map(|expr| {
-                                    expr.as_any()
-                                        .downcast_ref::<crate::expressions::Literal>()
-                                        .map(|lit| lit.value().clone())
-                                }),
-                            ),
-                            Err(_) => builder,
-                        }
+                        builder.aggregate_multi_conjunct(
+                            inlist.col,
+                            inlist.guarantee,
+                            inlist.array,
+                        )
                     } else {
                         builder
                     }
@@ -188,11 +184,17 @@ impl LiteralGuarantee {
                                 && term.guarantee == Guarantee::In
                         })
                     {
-                        builder.aggregate_multi_conjunct(
-                            first_term.unwrap().col,
-                            Guarantee::In,
-                            terms.iter().map(|term| term.lit.value().clone()),
-                        )
+                        let values: Vec<_> =
+                            terms.iter().map(|term| term.lit.value().clone()).collect();
+                        if let Ok(array) = ScalarValue::iter_to_array(values) {
+                            builder.aggregate_multi_conjunct(
+                                first_term.unwrap().col,
+                                Guarantee::In,
+                                array,
+                            )
+                        } else {
+                            builder
+                        }
                     } else {
                         // Handle disjunctions with conjunctions like (a = 1 AND b = 2) OR (a = 2 AND b = 3)
                         // Extract termsets from each disjunction
@@ -236,11 +238,13 @@ impl LiteralGuarantee {
                                 .flatten()
                                 .collect();
 
-                            builder = builder.aggregate_multi_conjunct(
-                                col,
-                                Guarantee::In,
-                                literals,
-                            );
+                            if let Ok(array) = ScalarValue::iter_to_array(literals) {
+                                builder = builder.aggregate_multi_conjunct(
+                                    col,
+                                    Guarantee::In,
+                                    array,
+                                );
+                            }
                         }
 
                         builder
@@ -253,24 +257,30 @@ impl LiteralGuarantee {
 
 impl Display for LiteralGuarantee {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let mut sorted_literals: Vec<_> =
-            self.literals.iter().map(|lit| lit.to_string()).collect();
-        sorted_literals.sort();
         match self.guarantee {
             Guarantee::In => write!(
                 f,
                 "{} in ({})",
                 self.column.name,
-                sorted_literals.join(", ")
+                pretty_format_array(self.literals.as_ref())
             ),
             Guarantee::NotIn => write!(
                 f,
                 "{} not in ({})",
                 self.column.name,
-                sorted_literals.join(", ")
+                pretty_format_array(self.literals.as_ref())
             ),
         }
     }
+}
+
+/// Intermediate storage for accumulating arrays while building a guarantee
+#[derive(Debug)]
+struct GuaranteeInProgress {
+    column: Column,
+    guarantee: Guarantee,
+    /// Accumulated arrays that will be concatenated
+    arrays: Vec<ArrayRef>,
 }
 
 /// Combines conjuncts (aka terms `AND`ed together) into [`LiteralGuarantee`]s,
@@ -280,7 +290,7 @@ struct GuaranteeBuilder<'a> {
     /// List of guarantees that have been created so far
     /// if we have determined a subsequent conjunct invalidates a guarantee
     /// e.g. `a = foo AND a = bar` then the relevant guarantee will be None
-    guarantees: Vec<Option<LiteralGuarantee>>,
+    guarantees: Vec<Option<GuaranteeInProgress>>,
 
     /// Key is the (column name, guarantee type)
     /// Value is the index into `guarantees`
@@ -299,11 +309,11 @@ impl<'a> GuaranteeBuilder<'a> {
     /// * `AND (a = 1)`: `a` is guaranteed to be 1
     /// * `AND (a != 1)`: a is guaranteed to not be 1
     fn aggregate_conjunct(self, col_op_lit: ColOpLit<'a>) -> Self {
-        self.aggregate_multi_conjunct(
-            col_op_lit.col,
-            col_op_lit.guarantee,
-            [col_op_lit.lit.value().clone()],
-        )
+        let array = match ScalarValue::iter_to_array([col_op_lit.lit.value().clone()]) {
+            Ok(array) => array,
+            Err(_) => return self,
+        };
+        self.aggregate_multi_conjunct(col_op_lit.col, col_op_lit.guarantee, array)
     }
 
     /// Aggregates a new single column, multi literal term to this builder
@@ -319,7 +329,7 @@ impl<'a> GuaranteeBuilder<'a> {
         mut self,
         col: &'a crate::expressions::Column,
         guarantee: Guarantee,
-        new_values: impl IntoIterator<Item = ScalarValue>,
+        new_array: ArrayRef,
     ) -> Self {
         let key = (col, guarantee);
         if let Some(index) = self.map.get(&key) {
@@ -332,6 +342,15 @@ impl<'a> GuaranteeBuilder<'a> {
                 return self;
             };
 
+            // Check type compatibility
+            if !existing.arrays.is_empty()
+                && existing.arrays[0].data_type() != new_array.data_type()
+            {
+                // Type mismatch - invalidate the guarantee
+                *entry = None;
+                return self;
+            }
+
             // Combine conjuncts if we have `a != foo AND a != bar`. `a = foo
             // AND a = bar` doesn't make logical sense so we don't optimize this
             // case
@@ -342,19 +361,41 @@ impl<'a> GuaranteeBuilder<'a> {
                 // another `AND a != 6` we know that a must not be either 5 or 6
                 // for the expression to be true
                 Guarantee::NotIn => {
-                    existing.literals.extend(new_values);
+                    // For NotIn, just accumulate all arrays
+                    existing.arrays.push(new_array);
                 }
                 Guarantee::In => {
-                    let intersection = new_values
-                        .into_iter()
-                        .filter(|new_value| existing.literals.contains(new_value))
-                        .collect::<Vec<_>>();
+                    // For In, we need to find intersection
+                    // Build a set of new values for efficient lookup
+                    let new_value_set: HashSet<_> = (0..new_array.len())
+                        .filter_map(|i| ScalarValue::try_from_array(&new_array, i).ok())
+                        .collect();
+
+                    // Filter existing arrays to only include values in new_value_set
+                    let mut intersection_values = Vec::new();
+                    for array in &existing.arrays {
+                        for i in 0..array.len() {
+                            if let Ok(scalar) = ScalarValue::try_from_array(array, i) {
+                                if new_value_set.contains(&scalar) {
+                                    intersection_values.push(scalar);
+                                }
+                            }
+                        }
+                    }
+
                     // for an In guarantee, if the intersection is not empty,  we can extend the guarantee
                     // e.g. `a IN (1,2,3) AND a IN (2,3,4)` is `a IN (2,3)`
                     // otherwise, we invalidate the guarantee
                     // e.g. `a IN (1,2,3) AND a IN (4,5,6)` is `a IN ()`, which is invalid
-                    if !intersection.is_empty() {
-                        existing.literals = intersection.into_iter().collect();
+                    if !intersection_values.is_empty() {
+                        // Replace arrays with intersection
+                        if let Ok(intersection_array) =
+                            ScalarValue::iter_to_array(intersection_values)
+                        {
+                            existing.arrays = vec![intersection_array];
+                        } else {
+                            *entry = None;
+                        }
                     } else {
                         // at least one was not, so invalidate the guarantee
                         *entry = None;
@@ -363,11 +404,13 @@ impl<'a> GuaranteeBuilder<'a> {
             }
         } else {
             // This is a new guarantee
-            let new_values: HashSet<_> = new_values.into_iter().collect();
-
-            let guarantee = LiteralGuarantee::new(col.name(), guarantee, new_values);
+            let in_progress = GuaranteeInProgress {
+                column: Column::from_name(col.name()),
+                guarantee,
+                arrays: vec![new_array],
+            };
             // add it to the list of guarantees
-            self.guarantees.push(Some(guarantee));
+            self.guarantees.push(Some(in_progress));
             self.map.insert(key, self.guarantees.len() - 1);
         }
 
@@ -376,8 +419,90 @@ impl<'a> GuaranteeBuilder<'a> {
 
     /// Return all guarantees that have been created so far
     fn build(self) -> Vec<LiteralGuarantee> {
-        // filter out any guarantees that have been invalidated
-        self.guarantees.into_iter().flatten().collect()
+        use arrow::compute::concat;
+
+        self.guarantees
+            .into_iter()
+            .flatten()
+            .filter_map(|in_progress| {
+                // Concatenate all arrays for this guarantee
+                if in_progress.arrays.is_empty() {
+                    return None;
+                }
+
+                // Concatenate all arrays for this guarantee
+                let concatenated = if in_progress.arrays.len() == 1 {
+                    Arc::clone(&in_progress.arrays[0])
+                } else {
+                    let array_refs: Vec<&dyn arrow::array::Array> =
+                        in_progress.arrays.iter().map(|a| a.as_ref()).collect();
+                    match concat(&array_refs) {
+                        Ok(c) => c,
+                        Err(_) => return None, // Skip if concat fails
+                    }
+                };
+
+                // Deduplicate using create_hashes for efficiency
+                let literals = if concatenated.len() == concatenated.null_count() {
+                    // All nulls, no need to deduplicate
+                    concatenated
+                } else {
+                    // Create hashes for all values
+                    let mut hashes = vec![0u64; concatenated.len()];
+                    if create_hashes(
+                        &[concatenated.clone()],
+                        &RandomState::new(),
+                        &mut hashes,
+                    )
+                    .is_err()
+                    {
+                        return None;
+                    }
+
+                    // Track seen hashes and indices to keep
+                    let mut seen_hashes = HashSet::new();
+                    let mut indices_to_keep = Vec::new();
+
+                    for (i, hash) in hashes.iter().enumerate() {
+                        // For nulls, always keep the first occurrence
+                        if concatenated.is_null(i) {
+                            if indices_to_keep.is_empty()
+                                || !concatenated
+                                    .is_null(indices_to_keep[indices_to_keep.len() - 1])
+                            {
+                                indices_to_keep.push(i);
+                            }
+                        } else if seen_hashes.insert(*hash) {
+                            indices_to_keep.push(i);
+                        }
+                    }
+
+                    // If no duplicates, use original array
+                    if indices_to_keep.len() == concatenated.len() {
+                        concatenated
+                    } else {
+                        // Take only unique indices
+                        use arrow::compute::take;
+                        let indices = arrow::array::UInt64Array::from(
+                            indices_to_keep
+                                .iter()
+                                .map(|&i| i as u64)
+                                .collect::<Vec<_>>(),
+                        );
+                        match take(concatenated.as_ref(), &indices, None) {
+                            Ok(array) => array,
+                            Err(_) => return None,
+                        }
+                    }
+                };
+
+                Some(LiteralGuarantee {
+                    column: in_progress.column,
+                    guarantee: in_progress.guarantee,
+                    literals,
+                })
+            })
+            .collect()
     }
 }
 
@@ -441,7 +566,7 @@ impl<'a> ColOpLit<'a> {
 struct ColInList<'a> {
     col: &'a crate::expressions::Column,
     guarantee: Guarantee,
-    inlist: &'a crate::expressions::InListExpr,
+    array: ArrayRef,
 }
 
 impl<'a> ColInList<'a> {
@@ -451,18 +576,19 @@ impl<'a> ColInList<'a> {
     ///
     /// Returns None otherwise
     fn try_new(inlist: &'a crate::expressions::InListExpr) -> Option<Self> {
+        use crate::expressions::InListValues;
+
         // Only support single-column inlist currently, multi-column inlist is not supported
         let col = inlist
             .expr()
             .as_any()
             .downcast_ref::<crate::expressions::Column>()?;
 
-        let list = inlist.list().ok()?;
-        // Verify all items are literals
-        for expr in &list {
-            expr.as_any()
-                .downcast_ref::<crate::expressions::Literal>()?;
-        }
+        // Extract the array, return None if not an array variant
+        let array = match inlist.list() {
+            InListValues::Array(array) => array,
+            InListValues::Exprs(_) => return None,
+        };
 
         let guarantee = if inlist.negated() {
             Guarantee::NotIn
@@ -473,7 +599,7 @@ impl<'a> ColInList<'a> {
         Some(Self {
             col,
             guarantee,
-            inlist,
+            array,
         })
     }
 }
@@ -513,15 +639,10 @@ impl<'a> ColOpLitOrInList<'a> {
         match self {
             Self::ColOpLit(col_op_lit) => Ok(vec![col_op_lit.lit.value().clone()]),
             Self::ColInList(col_in_list) => {
-                let list = col_in_list.inlist.list()?;
-                Ok(list
-                    .iter()
-                    .filter_map(|expr| {
-                        expr.as_any()
-                            .downcast_ref::<crate::expressions::Literal>()
-                            .map(|lit| lit.value().clone())
-                    })
-                    .collect())
+                // Extract scalar values from the array
+                (0..col_in_list.array.len())
+                    .map(|i| ScalarValue::try_from_array(&col_in_list.array, i))
+                    .collect()
             }
         }
     }
@@ -1103,8 +1224,10 @@ mod test {
         I: IntoIterator<Item = S>,
         S: Into<ScalarValue> + 'a,
     {
-        let literals: Vec<_> = literals.into_iter().map(|s| s.into()).collect();
-        LiteralGuarantee::new(column, Guarantee::In, literals)
+        let array = ScalarValue::iter_to_array(literals.into_iter().map(|s| s.into()))
+            .expect("should be able to build an array");
+        let column = Column::from_name(column);
+        LiteralGuarantee::new(column, Guarantee::In, array)
     }
 
     /// Guarantee that the expression is true if the column is NOT any of the specified values
@@ -1113,8 +1236,10 @@ mod test {
         I: IntoIterator<Item = S>,
         S: Into<ScalarValue> + 'a,
     {
-        let literals: Vec<_> = literals.into_iter().map(|s| s.into()).collect();
-        LiteralGuarantee::new(column, Guarantee::NotIn, literals)
+        let array = ScalarValue::iter_to_array(literals.into_iter().map(|s| s.into()))
+            .expect("should be able to build an array");
+        let column = Column::from_name(column);
+        LiteralGuarantee::new(column, Guarantee::NotIn, array)
     }
 
     // Schema for testing

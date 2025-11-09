@@ -126,6 +126,59 @@ pub trait PruningStatistics {
         column: &Column,
         values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray>;
+
+    fn contained_values(&self, column: &Column, values: &Values) -> Option<BooleanArray> {
+        if let Values::Scalars(scalars) = values {
+            self.contained(column, scalars)
+        } else {
+            let scalars = values.as_scalars()?;
+            self.contained(column, &scalars)
+        }
+    }
+}
+
+/// A set of values, either as a homogeneous Arrow array or a set of ScalarValues.
+///
+/// If a set of ScalarValues is provided they may be heterogeneous, e.g.
+/// [ScalarValue::Int32(1), ScalarValue::Float64(1.0), ScalarValue::Null].
+pub enum Values {
+    Array(ArrayRef),
+    Scalars(HashSet<ScalarValue>),
+}
+
+impl Values {
+    pub fn as_scalars(&self) -> Option<HashSet<ScalarValue>> {
+        match self {
+            Values::Scalars(scalars) => Some(scalars.clone()),
+            Values::Array(array) => {
+                let scalars = (0..array.len())
+                    .map(|i| ScalarValue::try_from_array(array, i).ok())
+                    .collect::<Option<HashSet<_>>>()?;
+                Some(scalars)
+            }
+        }
+    }
+
+    pub fn as_array(&self) -> Option<ArrayRef> {
+        match self {
+            Values::Array(array) => Some(Arc::clone(array)),
+            Values::Scalars(scalars) => {
+                ScalarValue::iter_to_array(scalars.iter().cloned()).ok()
+            }
+        }
+    }
+}
+
+impl From<HashSet<ScalarValue>> for Values {
+    fn from(values: HashSet<ScalarValue>) -> Self {
+        Self::Scalars(values)
+    }
+}
+
+impl From<ArrayRef> for Values {
+    fn from(array: ArrayRef) -> Self {
+        Self::Array(array)
+    }
 }
 
 /// Prune files based on their partition values.

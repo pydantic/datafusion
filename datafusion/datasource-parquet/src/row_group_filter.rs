@@ -19,9 +19,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::{ParquetAccessPlan, ParquetFileMetrics};
-use arrow::array::{ArrayRef, BooleanArray};
-use arrow::datatypes::Schema;
-use datafusion_common::pruning::PruningStatistics;
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Decimal128Array,
+    FixedSizeBinaryArray, LargeBinaryArray, LargeStringArray, StringViewArray,
+};
+use arrow::datatypes::{DataType, Schema};
+use arrow::downcast_dictionary_array;
+use datafusion_common::pruning::{PruningStatistics, Values};
 use datafusion_common::{Column, Result, ScalarValue};
 use datafusion_datasource::FileRange;
 use datafusion_pruning::PruningPredicate;
@@ -235,6 +239,63 @@ struct BloomFilterStatistics {
 }
 
 impl BloomFilterStatistics {
+    /// Helper function for checking if a Decimal128 value is in the bloom filter.
+    ///
+    /// Returns `true` if the value may be present (or cannot be determined), `false` if definitely not present.
+    fn check_decimal128(
+        sbbf: &Sbbf,
+        value: i128,
+        precision: u8,
+        scale: i8,
+        parquet_type: &Type,
+    ) -> bool {
+        match parquet_type {
+            Type::INT32 => {
+                //https://github.com/apache/parquet-format/blob/eb4b31c1d64a01088d02a2f9aefc6c17c54cc6fc/Encodings.md?plain=1#L35-L42
+                // All physical type  are little-endian
+                if precision > 9 {
+                    //DECIMAL can be used to annotate the following types:
+                    //
+                    // int32: for 1 <= precision <= 9
+                    // int64: for 1 <= precision <= 18
+                    return true;
+                }
+                let b = (value as i32).to_le_bytes();
+                // Use Decimal constructor after https://github.com/apache/arrow-rs/issues/5325
+                let decimal = Decimal::Int32 {
+                    value: b,
+                    precision: precision as i32,
+                    scale: scale as i32,
+                };
+                sbbf.check(&decimal)
+            }
+            Type::INT64 => {
+                if precision > 18 {
+                    return true;
+                }
+                let b = (value as i64).to_le_bytes();
+                let decimal = Decimal::Int64 {
+                    value: b,
+                    precision: precision as i32,
+                    scale: scale as i32,
+                };
+                sbbf.check(&decimal)
+            }
+            Type::FIXED_LEN_BYTE_ARRAY => {
+                // keep with from_bytes_to_i128
+                let b = value.to_be_bytes().to_vec();
+                // Use Decimal constructor after https://github.com/apache/arrow-rs/issues/5325
+                let decimal = Decimal::Bytes {
+                    value: b.into(),
+                    precision: precision as i32,
+                    scale: scale as i32,
+                };
+                sbbf.check(&decimal)
+            }
+            _ => true,
+        }
+    }
+
     /// Helper function for checking if [`Sbbf`] filter contains [`ScalarValue`].
     ///
     /// In case the type of scalar is not supported, returns `true`, assuming that the
@@ -255,56 +316,177 @@ impl BloomFilterStatistics {
             ScalarValue::Int32(Some(v)) => sbbf.check(v),
             ScalarValue::UInt64(Some(v)) => sbbf.check(v),
             ScalarValue::UInt32(Some(v)) => sbbf.check(v),
-            ScalarValue::Decimal128(Some(v), p, s) => match parquet_type {
-                Type::INT32 => {
-                    //https://github.com/apache/parquet-format/blob/eb4b31c1d64a01088d02a2f9aefc6c17c54cc6fc/Encodings.md?plain=1#L35-L42
-                    // All physical type  are little-endian
-                    if *p > 9 {
-                        //DECIMAL can be used to annotate the following types:
-                        //
-                        // int32: for 1 <= precision <= 9
-                        // int64: for 1 <= precision <= 18
-                        return true;
-                    }
-                    let b = (*v as i32).to_le_bytes();
-                    // Use Decimal constructor after https://github.com/apache/arrow-rs/issues/5325
-                    let decimal = Decimal::Int32 {
-                        value: b,
-                        precision: *p as i32,
-                        scale: *s as i32,
-                    };
-                    sbbf.check(&decimal)
-                }
-                Type::INT64 => {
-                    if *p > 18 {
-                        return true;
-                    }
-                    let b = (*v as i64).to_le_bytes();
-                    let decimal = Decimal::Int64 {
-                        value: b,
-                        precision: *p as i32,
-                        scale: *s as i32,
-                    };
-                    sbbf.check(&decimal)
-                }
-                Type::FIXED_LEN_BYTE_ARRAY => {
-                    // keep with from_bytes_to_i128
-                    let b = v.to_be_bytes().to_vec();
-                    // Use Decimal constructor after https://github.com/apache/arrow-rs/issues/5325
-                    let decimal = Decimal::Bytes {
-                        value: b.into(),
-                        precision: *p as i32,
-                        scale: *s as i32,
-                    };
-                    sbbf.check(&decimal)
-                }
-                _ => true,
-            },
+            ScalarValue::Decimal128(Some(v), p, s) => {
+                BloomFilterStatistics::check_decimal128(sbbf, *v, *p, *s, parquet_type)
+            }
             ScalarValue::Dictionary(_, inner) => {
                 BloomFilterStatistics::check_scalar(sbbf, inner, parquet_type)
             }
             _ => true,
         }
+    }
+
+    fn check_array(
+        sbbf: &Sbbf,
+        array: &ArrayRef,
+        parquet_type: &Type,
+    ) -> Option<BooleanArray> {
+        let len = array.len();
+        let mut builder = arrow::array::builder::BooleanBuilder::with_capacity(len);
+
+        // Macro to reduce boilerplate for primitive types that bloom filters support
+        // Bloom filters support: i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, bool
+        macro_rules! check_primitive {
+            ($array_type:ty) => {{
+                let array = array.as_any().downcast_ref::<$array_type>()?;
+                for i in 0..len {
+                    if array.is_null(i) {
+                        builder.append_value(false);
+                    } else {
+                        builder.append_value(sbbf.check(&array.value(i)));
+                    }
+                }
+            }};
+        }
+
+        // Macro for byte array types (strings/binary that return &str or &[u8])
+        macro_rules! check_bytes {
+            ($array_type:ty) => {{
+                let array = array.as_any().downcast_ref::<$array_type>()?;
+                for i in 0..len {
+                    if array.is_null(i) {
+                        builder.append_value(false);
+                    } else {
+                        builder.append_value(sbbf.check(&array.value(i)));
+                    }
+                }
+            }};
+        }
+
+        match array.data_type() {
+            DataType::Boolean => check_primitive!(BooleanArray),
+            DataType::Int8 => check_primitive!(arrow::array::Int8Array),
+            DataType::Int16 => check_primitive!(arrow::array::Int16Array),
+            DataType::Int32 => check_primitive!(arrow::array::Int32Array),
+            DataType::Int64 => check_primitive!(arrow::array::Int64Array),
+            DataType::UInt8 => check_primitive!(arrow::array::UInt8Array),
+            DataType::UInt16 => check_primitive!(arrow::array::UInt16Array),
+            DataType::UInt32 => check_primitive!(arrow::array::UInt32Array),
+            DataType::UInt64 => check_primitive!(arrow::array::UInt64Array),
+            DataType::Float32 => check_primitive!(arrow::array::Float32Array),
+            DataType::Float64 => check_primitive!(arrow::array::Float64Array),
+            DataType::Utf8 => check_bytes!(arrow::array::StringArray),
+            DataType::Utf8View => {
+                let array = array.as_any().downcast_ref::<StringViewArray>()?;
+                for i in 0..len {
+                    if array.is_null(i) {
+                        builder.append_value(false);
+                    } else {
+                        builder.append_value(sbbf.check(&array.value(i)));
+                    }
+                }
+            }
+            DataType::LargeUtf8 => {
+                let array = array.as_any().downcast_ref::<LargeStringArray>()?;
+                for i in 0..len {
+                    if array.is_null(i) {
+                        builder.append_value(false);
+                    } else {
+                        builder.append_value(sbbf.check(&array.value(i)));
+                    }
+                }
+            }
+            DataType::Binary => {
+                let array = array.as_any().downcast_ref::<BinaryArray>()?;
+                for i in 0..len {
+                    if array.is_null(i) {
+                        builder.append_value(false);
+                    } else {
+                        // TODO: let check accept a Bytes directly so we can make a Bytes::from_slice
+                        let values = array.value(i).to_vec();
+                        builder.append_value(sbbf.check(&values));
+                    }
+                }
+            }
+            DataType::BinaryView => {
+                let array = array.as_any().downcast_ref::<BinaryViewArray>()?;
+                for i in 0..len {
+                    if array.is_null(i) {
+                        builder.append_value(false);
+                    } else {
+                        // TODO: let check accept a Bytes directly so we can make a Bytes::from_slice
+                        let values = array.value(i).to_vec();
+                        builder.append_value(sbbf.check(&values));
+                    }
+                }
+            }
+            DataType::LargeBinary => {
+                let array = array.as_any().downcast_ref::<LargeBinaryArray>()?;
+                for i in 0..len {
+                    if array.is_null(i) {
+                        builder.append_value(false);
+                    } else {
+                        // TODO: let check accept a Bytes directly so we can make a Bytes::from_slice
+                        let values = array.value(i).to_vec();
+                        builder.append_value(sbbf.check(&values));
+                    }
+                }
+            }
+            DataType::FixedSizeBinary(_) => {
+                let array = array.as_any().downcast_ref::<FixedSizeBinaryArray>()?;
+                for i in 0..len {
+                    if array.is_null(i) {
+                        builder.append_value(false);
+                    } else {
+                        // TODO: let check accept a Bytes directly so we can make a Bytes::from_slice
+                        let values = array.value(i).to_vec();
+                        builder.append_value(sbbf.check(&values));
+                    }
+                }
+            }
+            DataType::Decimal128(precision, scale) => {
+                let array = array.as_any().downcast_ref::<Decimal128Array>()?;
+                for i in 0..len {
+                    if array.is_null(i) {
+                        builder.append_value(false);
+                    } else {
+                        let value = array.value(i);
+                        let result = BloomFilterStatistics::check_decimal128(
+                            sbbf,
+                            value,
+                            *precision,
+                            *scale,
+                            parquet_type,
+                        );
+                        builder.append_value(result);
+                    }
+                }
+            }
+            DataType::Dictionary(_, _) => {
+                downcast_dictionary_array! {
+                    array => {
+                        let values = array.values();
+                        let check_results = BloomFilterStatistics::check_array(sbbf, values, parquet_type)?;
+                        for i in 0..len {
+                            if array.is_null(i) {
+                                builder.append_value(false);
+                            } else {
+                                // Get the dictionary key to index into check_results
+                                let key = array.key(i).unwrap();
+                                builder.append_value(check_results.value(key));
+                            }
+                        }
+                    }
+                    _ => return None
+                }
+            }
+            _ => {
+                // Unsupported data type
+                return None;
+            }
+        }
+
+        Some(builder.finish())
     }
 }
 
@@ -363,6 +545,32 @@ impl PruningStatistics for BloomFilterStatistics {
         };
 
         Some(BooleanArray::from(vec![contains]))
+    }
+
+    fn contained_values(&self, column: &Column, values: &Values) -> Option<BooleanArray> {
+        let (sbbf, parquet_type) = self.column_sbbf.get(column.name.as_str())?;
+
+        match values {
+            Values::Array(array) => {
+                // Check each value in the array against the bloom filter
+                let check_results =
+                    BloomFilterStatistics::check_array(sbbf, array, parquet_type)?;
+
+                // Bloom filters are probabilistic: they can return false positives but not false negatives.
+                // If all checks are false, we know for certain that NONE of the values are present.
+                // Otherwise, we can't be sure, so we return None to indicate uncertainty.
+                let all_false = (0..check_results.len()).all(|i| !check_results.value(i));
+
+                let contains = if all_false {
+                    Some(false) // We're certain none of the values are present
+                } else {
+                    None // Uncertain - at least one value might be present (or might be false positive)
+                };
+
+                Some(BooleanArray::from(vec![contains]))
+            }
+            Values::Scalars(scalars) => self.contained(column, scalars),
+        }
     }
 }
 

@@ -30,6 +30,8 @@ use arrow::{
 };
 // pub use for backwards compatibility
 pub use datafusion_common::pruning::PruningStatistics;
+use datafusion_common::pruning::Values;
+use datafusion_physical_expr::expressions::InListValues;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_plan::metrics::Count;
 use log::{debug, trace};
@@ -513,7 +515,9 @@ impl PruningPredicate {
                 guarantee,
                 literals,
             } = literal_guarantee;
-            if let Some(results) = statistics.contained(column, literals) {
+            if let Some(results) =
+                statistics.contained_values(column, &Values::Array(Arc::clone(literals)))
+            {
                 match guarantee {
                     // `In` means the values in the column must be one of the
                     // values in the set for the predicate to evaluate to true.
@@ -1426,8 +1430,17 @@ fn build_predicate_expression(
     if let Some(in_list) = expr_any.downcast_ref::<phys_expr::InListExpr>() {
         if !in_list.is_empty() && in_list.len() <= MAX_LIST_VALUE_SIZE_REWRITE {
             let list = match in_list.list() {
-                Ok(list) => list,
-                Err(_) => return unhandled_hook.handle(expr),
+                InListValues::Array(array) => (0..array.len())
+                    .map(|i| {
+                        Some(Arc::new(phys_expr::Literal::new(
+                            ScalarValue::try_from_array(&array, i).ok()?,
+                        )) as Arc<dyn PhysicalExpr>)
+                    })
+                    .collect::<Option<Vec<_>>>(),
+                InListValues::Exprs(exprs) => Some(exprs.clone()),
+            };
+            let Some(list) = list else {
+                return unhandled_hook.handle(expr);
             };
             let eq_op = if in_list.negated() {
                 Operator::NotEq
