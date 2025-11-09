@@ -233,6 +233,30 @@ impl InListExpr {
     pub fn negated(&self) -> bool {
         self.negated
     }
+
+    /// Create a new InList expression directly from an array, bypassing expression evaluation.
+    ///
+    /// This is more efficient than `in_list()` when you already have the list as an array,
+    /// as it avoids the conversion: ArrayRef -> Vec<PhysicalExpr> -> ArrayRef -> ArraySet.
+    /// Instead it goes directly: ArrayRef -> ArraySet.
+    ///
+    /// The `list` field will be empty when using this constructor, as the array is stored
+    /// directly in the static filter.
+    pub fn try_new_from_array(
+        expr: Arc<dyn PhysicalExpr>,
+        array: ArrayRef,
+        negated: bool,
+    ) -> Result<Self> {
+        let list = (0..array.len())
+            .map(|i| {
+                let scalar = ScalarValue::try_from_array(array.as_ref(), i)?;
+                Ok(crate::expressions::lit(scalar) as Arc<dyn PhysicalExpr>)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let hash_set = make_hash_set(array.as_ref())?;
+        let static_filter = StaticFilter { array, hash_set };
+        Ok(Self::new(expr, list, negated, Some(static_filter)))
+    }
 }
 impl std::fmt::Display for InListExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -460,35 +484,6 @@ pub fn in_list(
         list,
         *negated,
         static_filter,
-    )))
-}
-
-/// Create a new InList expression directly from an array, bypassing expression evaluation.
-///
-/// This is more efficient than `in_list()` when you already have the list as an array,
-/// as it avoids the conversion: ArrayRef -> Vec<PhysicalExpr> -> ArrayRef -> ArraySet.
-/// Instead it goes directly: ArrayRef -> ArraySet.
-///
-/// The `list` field will be empty when using this constructor, as the array is stored
-/// directly in the static filter.
-pub fn in_list_from_array(
-    expr: Arc<dyn PhysicalExpr>,
-    array: ArrayRef,
-    negated: bool,
-) -> Result<Arc<dyn PhysicalExpr>> {
-    let list = (0..array.len())
-        .map(|i| {
-            let scalar = ScalarValue::try_from_array(array.as_ref(), i)?;
-            Ok(crate::expressions::lit(scalar) as Arc<dyn PhysicalExpr>)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let hash_set = make_hash_set(array.as_ref())?;
-    let static_filter = StaticFilter { array, hash_set };
-    Ok(Arc::new(InListExpr::new(
-        expr,
-        list,
-        negated,
-        Some(static_filter),
     )))
 }
 
@@ -2046,7 +2041,11 @@ mod tests {
         ])) as ArrayRef;
 
         // Create InListExpr from array
-        let expr = in_list_from_array(Arc::clone(&col_a), array, false)?;
+        let expr = Arc::new(InListExpr::try_new_from_array(
+            Arc::clone(&col_a),
+            array,
+            false,
+        )?) as Arc<dyn PhysicalExpr>;
 
         // Create test data: [1, 2, 3, 4, null]
         let a = Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4), None]);
@@ -2170,8 +2169,12 @@ mod tests {
         let null_array = Arc::new(NullArray::new(2)) as ArrayRef;
 
         // Try to create InListExpr with a NullArray list
-        // This tests whether in_list_from_array can handle Null type arrays
-        let expr = in_list_from_array(Arc::clone(&col_a), null_array, false)?;
+        // This tests whether try_new_from_array can handle Null type arrays
+        let expr = Arc::new(InListExpr::try_new_from_array(
+            Arc::clone(&col_a),
+            null_array,
+            false,
+        )?) as Arc<dyn PhysicalExpr>;
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(a)])?;
         let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
         let result = as_boolean_array(&result);
@@ -2195,7 +2198,11 @@ mod tests {
         let null_array = Arc::new(NullArray::new(2)) as ArrayRef;
 
         // Try to create InListExpr with both Null types
-        let expr = in_list_from_array(Arc::clone(&col_a), null_array, false)?;
+        let expr = Arc::new(InListExpr::try_new_from_array(
+            Arc::clone(&col_a),
+            null_array,
+            false,
+        )?) as Arc<dyn PhysicalExpr>;
 
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(a)])?;
         let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
