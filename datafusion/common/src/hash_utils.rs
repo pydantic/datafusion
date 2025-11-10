@@ -59,7 +59,7 @@ thread_local! {
 /// with an immutable reference to the computed hashes.
 ///
 /// This function manages a thread-local buffer to avoid repeated allocations. The buffer is automatically
-/// truncated if it exceeds [`MAX_BUFFER_SIZE`] after use.
+/// truncated if it exceeds `MAX_BUFFER_SIZE` after use.
 ///
 /// # Arguments
 /// * `arrays` - The arrays to hash (must contain at least one array)
