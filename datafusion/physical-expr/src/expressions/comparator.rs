@@ -342,8 +342,8 @@ pub(crate) enum Comparator {
 macro_rules! compare_float {
     ($left:expr, $right:expr, $left_nulls:expr, $right_nulls:expr, $opts:expr, $i:expr, $j:expr) => {{
         let ord = match (
-            $left_nulls.as_ref().map_or(false, |n| n.is_null($i)),
-            $right_nulls.as_ref().map_or(false, |n| n.is_null($j)),
+            $left_nulls.as_ref().is_some_and(|n| n.is_null($i)),
+            $right_nulls.as_ref().is_some_and(|n| n.is_null($j)),
         ) {
             (true, true) => return Ordering::Equal,
             (true, false) => {
@@ -679,8 +679,8 @@ fn compare_ord_values<T: ArrowNativeType + Ord>(
 ) -> Ordering {
     // Check nulls first
     let ord = match (
-        left_nulls.as_ref().map_or(false, |n| n.is_null(i)),
-        right_nulls.as_ref().map_or(false, |n| n.is_null(j)),
+        left_nulls.as_ref().is_some_and(|n| n.is_null(i)),
+        right_nulls.as_ref().is_some_and(|n| n.is_null(j)),
     ) {
         (true, true) => return Ordering::Equal,
         (true, false) => {
@@ -723,8 +723,8 @@ fn compare_boolean_values(
 ) -> Ordering {
     // Check nulls first
     let ord = match (
-        left_nulls.as_ref().map_or(false, |n| n.is_null(i)),
-        right_nulls.as_ref().map_or(false, |n| n.is_null(j)),
+        left_nulls.as_ref().is_some_and(|n| n.is_null(i)),
+        right_nulls.as_ref().is_some_and(|n| n.is_null(j)),
     ) {
         (true, true) => return Ordering::Equal,
         (true, false) => {
@@ -763,8 +763,8 @@ fn compare_bytes_values<T: ByteArrayType>(
 ) -> Ordering {
     // Check nulls first
     let ord = match (
-        left_nulls.as_ref().map_or(false, |n| n.is_null(i)),
-        right_nulls.as_ref().map_or(false, |n| n.is_null(j)),
+        left_nulls.as_ref().is_some_and(|n| n.is_null(i)),
+        right_nulls.as_ref().is_some_and(|n| n.is_null(j)),
     ) {
         (true, true) => return Ordering::Equal,
         (true, false) => {
@@ -807,8 +807,8 @@ fn compare_byte_view_values<T: ByteViewType>(
 ) -> Ordering {
     // Check nulls first
     let ord = match (
-        left_nulls.as_ref().map_or(false, |n| n.is_null(i)),
-        right_nulls.as_ref().map_or(false, |n| n.is_null(j)),
+        left_nulls.as_ref().is_some_and(|n| n.is_null(i)),
+        right_nulls.as_ref().is_some_and(|n| n.is_null(j)),
     ) {
         (true, true) => return Ordering::Equal,
         (true, false) => {
@@ -851,8 +851,8 @@ fn compare_fixed_binary_values(
 ) -> Ordering {
     // Check nulls first
     let ord = match (
-        left_nulls.as_ref().map_or(false, |n| n.is_null(i)),
-        right_nulls.as_ref().map_or(false, |n| n.is_null(j)),
+        left_nulls.as_ref().is_some_and(|n| n.is_null(i)),
+        right_nulls.as_ref().is_some_and(|n| n.is_null(j)),
     ) {
         (true, true) => return Ordering::Equal,
         (true, false) => {
@@ -886,21 +886,6 @@ fn compare_fixed_binary_values(
 ///
 /// # Errors
 /// If the data types of the arrays are not supported for comparison.
-///
-/// # Example
-///
-/// ```rust
-/// use arrow::array::{Int32Array, Array};
-/// use arrow::compute::SortOptions;
-/// use datafusion::physical_expr::expressions::comparator::make_comparator;
-///
-/// let left: Int32Array = Int32Array::from(vec![1, 2, 3]);
-/// let right: Int32Array = Int32Array::from(vec![3, 2, 1]);
-/// let opts = SortOptions::default();
-/// let comparator = make_comparator(&left, &right, opts).unwrap();
-/// let ordering = comparator.compare(0, 2); // Compare left[0] with right[2]
-/// assert_eq!(ordering, std::cmp::Ordering::Less);
-/// ```
 pub(crate) fn make_comparator(
     left: &dyn Array,
     right: &dyn Array,

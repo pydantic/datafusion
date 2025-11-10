@@ -339,9 +339,10 @@ impl PhysicalExpr for InListExpr {
                         if result_array.is_null(0) {
                             BooleanArray::from(vec![None; num_rows])
                         } else {
-                            BooleanArray::from_iter(
-                                std::iter::repeat(result_array.value(0)).take(num_rows),
-                            )
+                            BooleanArray::from_iter(std::iter::repeat_n(
+                                result_array.value(0),
+                                num_rows,
+                            ))
                         }
                     }
                 }

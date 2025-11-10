@@ -1165,8 +1165,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("reentrantly") || err_msg.contains("cannot be called"),
-            "Error message should mention reentrancy: {}",
-            err_msg
+            "Error message should mention reentrancy: {err_msg}",
         );
     }
 }
