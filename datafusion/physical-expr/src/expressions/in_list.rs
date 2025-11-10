@@ -33,54 +33,13 @@ use arrow::compute::{take, SortOptions};
 use arrow::datatypes::*;
 use arrow::downcast_dictionary_array;
 use arrow::util::bit_iterator::BitIndexIterator;
-use datafusion_common::hash_utils::create_hashes;
+use datafusion_common::hash_utils::with_hashes;
 use datafusion_common::{exec_err, internal_err, DFSchema, Result, ScalarValue};
 use datafusion_expr::{expr_vec_fmt, ColumnarValue};
 
 use ahash::RandomState;
 use datafusion_common::HashMap;
 use hashbrown::hash_map::RawEntryMut;
-use std::cell::RefCell;
-
-/// Maximum size for the thread-local hash buffer before truncation (4MB = 524,288 u64 elements).
-/// The goal of this is to avoid unbounded memory growth that would appear as a memory leak.
-/// We allow temporary allocations beyond this size, but after use the buffer is truncated
-/// to this size.
-const MAX_BUFFER_SIZE: usize = 524_288;
-
-thread_local! {
-    /// Thread-local buffer for hash computations to avoid repeated allocations.
-    /// The buffer is reused across calls and truncated if it exceeds MAX_BUFFER_SIZE.
-    /// Defaults to a capacity of 8192 u64 elements which is the default batch size.
-    /// This corresponds to 64KB of memory.
-    static HASH_BUFFER: RefCell<Vec<u64>> = RefCell::new(Vec::with_capacity(8192));
-}
-
-/// Borrows the thread-local hash buffer, resizes it to the required size, and executes the callback.
-/// The buffer is automatically truncated if it exceeds MAX_BUFFER_SIZE after use.
-fn with_hash_buffer<F, R>(required_size: usize, f: F) -> R
-where
-    F: FnOnce(&mut [u64]) -> R,
-{
-    HASH_BUFFER.with(|cell| {
-        let mut buffer = cell.borrow_mut();
-
-        // Ensure buffer has sufficient length, clearing old values
-        buffer.clear();
-        buffer.resize(required_size, 0);
-
-        // Execute the callback with a slice of exactly the required size
-        let result = f(&mut buffer[..required_size]);
-
-        // Cleanup: truncate if buffer grew too large
-        if buffer.capacity() > MAX_BUFFER_SIZE {
-            buffer.truncate(MAX_BUFFER_SIZE);
-            buffer.shrink_to_fit();
-        }
-
-        result
-    })
-}
 
 /// Static filter for InList that stores the array and hash set for O(1) lookups
 #[derive(Debug, Clone)]
@@ -141,8 +100,7 @@ impl ArrayHashSet {
 
         let has_nulls = in_array.null_count() != 0;
 
-        with_hash_buffer(v.len(), |hashes_buffer| {
-            create_hashes([v], &self.state, hashes_buffer)?;
+        with_hashes([v], &self.state, |hashes| {
             let cmp = make_comparator(v, in_array, SortOptions::default())?;
             Ok((0..v.len())
                 .map(|i| {
@@ -151,7 +109,7 @@ impl ArrayHashSet {
                         return None;
                     }
 
-                    let hash = hashes_buffer[i];
+                    let hash = hashes[i];
                     let contains = self
                         .map
                         .raw_entry()
@@ -187,17 +145,16 @@ fn make_hash_set(array: &dyn Array) -> Result<ArrayHashSet> {
     let state = RandomState::new();
     let mut map: HashMap<usize, (), ()> = HashMap::with_hasher(());
 
-    with_hash_buffer(array.len(), |hashes_buffer| -> Result<()> {
-        create_hashes([array], &state, hashes_buffer)?;
+    with_hashes([array], &state, |hashes| -> Result<()> {
         let cmp = make_comparator(array, array, SortOptions::default())?;
 
         let insert_value = |idx| {
-            let hash = hashes_buffer[idx];
+            let hash = hashes[idx];
             if let RawEntryMut::Vacant(v) = map
                 .raw_entry_mut()
                 .from_hash(hash, |x| cmp.compare(*x, idx).is_eq())
             {
-                v.insert_with_hasher(hash, idx, (), |x| hashes_buffer[*x]);
+                v.insert_with_hasher(hash, idx, (), |x| hashes[*x]);
             }
         };
 
@@ -372,15 +329,20 @@ impl PhysicalExpr for InListExpr {
                         // Use a 1 row array to avoid code duplication/branching
                         // Since all we do is compute hash and lookup this should be efficient enough
                         let array = scalar.to_array()?;
-                        let array = filter.hash_set.contains(
+                        let result_array = filter.hash_set.contains(
                             array.as_ref(),
                             filter.array.as_ref(),
                             self.negated,
                         )?;
                         // Broadcast the single result to all rows
-                        BooleanArray::from_iter(
-                            std::iter::repeat(array.value(0)).take(num_rows),
-                        )
+                        // Must check is_null() to preserve NULL values (SQL three-valued logic)
+                        if result_array.is_null(0) {
+                            BooleanArray::from(vec![None; num_rows])
+                        } else {
+                            BooleanArray::from_iter(
+                                std::iter::repeat(result_array.value(0)).take(num_rows),
+                            )
+                        }
                     }
                 }
             }
@@ -2283,8 +2245,11 @@ mod tests {
         };
 
         // Helper to run a test
-        let run_test = |batch: &RecordBatch, expr: Arc<dyn PhysicalExpr>,
-                        list: Vec<Arc<dyn PhysicalExpr>>, expected: Vec<Option<bool>>| -> Result<()> {
+        let run_test = |batch: &RecordBatch,
+                        expr: Arc<dyn PhysicalExpr>,
+                        list: Vec<Arc<dyn PhysicalExpr>>,
+                        expected: Vec<Option<bool>>|
+         -> Result<()> {
             let in_expr = in_list(expr, list, &false, schema.as_ref())?;
             let result = in_expr.evaluate(batch)?.into_array(batch.num_rows())?;
             let result = as_boolean_array(&result);
@@ -2298,23 +2263,48 @@ mod tests {
 
         // [1] IN (1, 2) => [TRUE]
         let batch = make_batch(vec![Some(1)])?;
-        run_test(&batch, Arc::clone(&col_b), vec![lit(1i32), lit(2i32)], vec![Some(true)])?;
+        run_test(
+            &batch,
+            Arc::clone(&col_b),
+            vec![lit(1i32), lit(2i32)],
+            vec![Some(true)],
+        )?;
 
         // [1, 2] IN (1, 2) => [TRUE, TRUE]
         let batch = make_batch(vec![Some(1), Some(2)])?;
-        run_test(&batch, Arc::clone(&col_b), vec![lit(1i32), lit(2i32)], vec![Some(true), Some(true)])?;
+        run_test(
+            &batch,
+            Arc::clone(&col_b),
+            vec![lit(1i32), lit(2i32)],
+            vec![Some(true), Some(true)],
+        )?;
 
         // [3, 4] IN (1, 2) => [FALSE, FALSE]
         let batch = make_batch(vec![Some(3), Some(4)])?;
-        run_test(&batch, Arc::clone(&col_b), vec![lit(1i32), lit(2i32)], vec![Some(false), Some(false)])?;
+        run_test(
+            &batch,
+            Arc::clone(&col_b),
+            vec![lit(1i32), lit(2i32)],
+            vec![Some(false), Some(false)],
+        )?;
 
         // [1, NULL] IN (1, 2) => [TRUE, NULL]
         let batch = make_batch(vec![Some(1), None])?;
-        run_test(&batch, Arc::clone(&col_b), vec![lit(1i32), lit(2i32)], vec![Some(true), None])?;
+        run_test(
+            &batch,
+            Arc::clone(&col_b),
+            vec![lit(1i32), lit(2i32)],
+            vec![Some(true), None],
+        )?;
 
         // [3, NULL] IN (1, 2) => [FALSE, NULL] (no match, NULL is NULL)
         let batch = make_batch(vec![Some(3), None])?;
-        run_test(&batch, Arc::clone(&col_b), vec![lit(1i32), lit(2i32)], vec![Some(false), None])?;
+        run_test(
+            &batch,
+            Arc::clone(&col_b),
+            vec![lit(1i32), lit(2i32)],
+            vec![Some(false), None],
+        )?;
 
         // ========================================================================
         // COLUMN WITH NULL IN LIST - col(b) IN [NULL, 1]
@@ -2322,15 +2312,30 @@ mod tests {
 
         // [1] IN (NULL, 1) => [TRUE] (found match)
         let batch = make_batch(vec![Some(1)])?;
-        run_test(&batch, Arc::clone(&col_b), vec![lit(null_i32.clone()), lit(1i32)], vec![Some(true)])?;
+        run_test(
+            &batch,
+            Arc::clone(&col_b),
+            vec![lit(null_i32.clone()), lit(1i32)],
+            vec![Some(true)],
+        )?;
 
         // [2] IN (NULL, 1) => [NULL] (no match, but list has NULL)
         let batch = make_batch(vec![Some(2)])?;
-        run_test(&batch, Arc::clone(&col_b), vec![lit(null_i32.clone()), lit(1i32)], vec![None])?;
+        run_test(
+            &batch,
+            Arc::clone(&col_b),
+            vec![lit(null_i32.clone()), lit(1i32)],
+            vec![None],
+        )?;
 
         // [NULL] IN (NULL, 1) => [NULL]
         let batch = make_batch(vec![None])?;
-        run_test(&batch, Arc::clone(&col_b), vec![lit(null_i32.clone()), lit(1i32)], vec![None])?;
+        run_test(
+            &batch,
+            Arc::clone(&col_b),
+            vec![lit(null_i32.clone()), lit(1i32)],
+            vec![None],
+        )?;
 
         // ========================================================================
         // COLUMN WITH ALL NULLS IN LIST - col(b) IN [NULL, NULL]
@@ -2338,11 +2343,21 @@ mod tests {
 
         // [1] IN (NULL, NULL) => [NULL]
         let batch = make_batch(vec![Some(1)])?;
-        run_test(&batch, Arc::clone(&col_b), vec![lit(null_i32.clone()), lit(null_i32.clone())], vec![None])?;
+        run_test(
+            &batch,
+            Arc::clone(&col_b),
+            vec![lit(null_i32.clone()), lit(null_i32.clone())],
+            vec![None],
+        )?;
 
         // [NULL] IN (NULL, NULL) => [NULL]
         let batch = make_batch(vec![None])?;
-        run_test(&batch, Arc::clone(&col_b), vec![lit(null_i32.clone()), lit(null_i32.clone())], vec![None])?;
+        run_test(
+            &batch,
+            Arc::clone(&col_b),
+            vec![lit(null_i32.clone()), lit(null_i32.clone())],
+            vec![None],
+        )?;
 
         // ========================================================================
         // LITERAL IN LIST WITH COLUMN - lit(1) IN [2, col(b)]
@@ -2350,15 +2365,30 @@ mod tests {
 
         // 1 IN (2, [1]) => [TRUE] (matches column value)
         let batch = make_batch(vec![Some(1)])?;
-        run_test(&batch, lit(1i32), vec![lit(2i32), Arc::clone(&col_b)], vec![Some(true)])?;
+        run_test(
+            &batch,
+            lit(1i32),
+            vec![lit(2i32), Arc::clone(&col_b)],
+            vec![Some(true)],
+        )?;
 
         // 1 IN (2, [3]) => [FALSE] (no match)
         let batch = make_batch(vec![Some(3)])?;
-        run_test(&batch, lit(1i32), vec![lit(2i32), Arc::clone(&col_b)], vec![Some(false)])?;
+        run_test(
+            &batch,
+            lit(1i32),
+            vec![lit(2i32), Arc::clone(&col_b)],
+            vec![Some(false)],
+        )?;
 
         // 1 IN (2, [NULL]) => [NULL] (no match, column is NULL)
         let batch = make_batch(vec![None])?;
-        run_test(&batch, lit(1i32), vec![lit(2i32), Arc::clone(&col_b)], vec![None])?;
+        run_test(
+            &batch,
+            lit(1i32),
+            vec![lit(2i32), Arc::clone(&col_b)],
+            vec![None],
+        )?;
 
         // ========================================================================
         // COLUMN IN LIST CONTAINING ITSELF - col(b) IN [1, col(b)]
@@ -2366,26 +2396,39 @@ mod tests {
 
         // [1] IN (1, [1]) => [TRUE] (always matches - either list literal or itself)
         let batch = make_batch(vec![Some(1)])?;
-        run_test(&batch, Arc::clone(&col_b), vec![lit(1i32), Arc::clone(&col_b)], vec![Some(true)])?;
+        run_test(
+            &batch,
+            Arc::clone(&col_b),
+            vec![lit(1i32), Arc::clone(&col_b)],
+            vec![Some(true)],
+        )?;
 
         // [2] IN (1, [2]) => [TRUE] (matches itself)
         let batch = make_batch(vec![Some(2)])?;
-        run_test(&batch, Arc::clone(&col_b), vec![lit(1i32), Arc::clone(&col_b)], vec![Some(true)])?;
+        run_test(
+            &batch,
+            Arc::clone(&col_b),
+            vec![lit(1i32), Arc::clone(&col_b)],
+            vec![Some(true)],
+        )?;
 
         // [NULL] IN (1, [NULL]) => [NULL] (NULL is never equal to anything)
         let batch = make_batch(vec![None])?;
-        run_test(&batch, Arc::clone(&col_b), vec![lit(1i32), Arc::clone(&col_b)], vec![None])?;
+        run_test(
+            &batch,
+            Arc::clone(&col_b),
+            vec![lit(1i32), Arc::clone(&col_b)],
+            vec![None],
+        )?;
 
         Ok(())
     }
 
     #[test]
-    fn test_in_list_null_literal_cases() -> Result<()> {
-        // Test NULL literal cases to ensure SQL three-valued logic is correctly implemented.
-        // According to SQL semantics and DuckDB behavior, NULL IN (any_list) should always
-        // return NULL (not false or true).
-        //
-        // These cases complement the existing in_list_no_cols() test.
+    fn test_in_list_scalar_literal_cases() -> Result<()> {
+        // Test scalar literal cases (both NULL and non-NULL) to ensure SQL three-valued
+        // logic is correctly implemented. This covers the important case where a scalar
+        // value is tested against a list containing NULL.
 
         let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, true)]));
         let null_i32 = ScalarValue::Int32(None);
@@ -2397,29 +2440,167 @@ mod tests {
         };
 
         // Helper to run a test
-        let run_test = |batch: &RecordBatch, expr: Arc<dyn PhysicalExpr>,
-                        list: Vec<Arc<dyn PhysicalExpr>>, expected: Vec<Option<bool>>| -> Result<()> {
-            let in_expr = in_list(expr, list, &false, schema.as_ref())?;
+        let run_test = |batch: &RecordBatch,
+                        expr: Arc<dyn PhysicalExpr>,
+                        list: Vec<Arc<dyn PhysicalExpr>>,
+                        negated: bool,
+                        expected: Vec<Option<bool>>|
+         -> Result<()> {
+            let in_expr = in_list(expr, list, &negated, schema.as_ref())?;
             let result = in_expr.evaluate(batch)?.into_array(batch.num_rows())?;
             let result = as_boolean_array(&result);
             let expected_array = BooleanArray::from(expected);
-            assert_eq!(result, &expected_array,
-                      "Expected {:?}, got {:?}", expected_array, result.iter().collect::<Vec<_>>());
+            assert_eq!(
+                result,
+                &expected_array,
+                "Expected {:?}, got {:?}",
+                expected_array,
+                result.iter().collect::<Vec<_>>()
+            );
             Ok(())
         };
 
         let batch = make_batch(vec![Some(1)])?;
 
-        // Test NULL literal cases - all should return NULL per SQL three-valued logic
+        // ========================================================================
+        // NULL LITERAL TESTS
+        // According to SQL semantics, NULL IN (any_list) should always return NULL
+        // ========================================================================
 
         // NULL IN (1, 1) => NULL
-        run_test(&batch, lit(null_i32.clone()), vec![lit(1i32), lit(1i32)], vec![None])?;
+        run_test(
+            &batch,
+            lit(null_i32.clone()),
+            vec![lit(1i32), lit(1i32)],
+            false,
+            vec![None],
+        )?;
 
         // NULL IN (NULL, 1) => NULL
-        run_test(&batch, lit(null_i32.clone()), vec![lit(null_i32.clone()), lit(1i32)], vec![None])?;
+        run_test(
+            &batch,
+            lit(null_i32.clone()),
+            vec![lit(null_i32.clone()), lit(1i32)],
+            false,
+            vec![None],
+        )?;
 
         // NULL IN (NULL, NULL) => NULL
-        run_test(&batch, lit(null_i32.clone()), vec![lit(null_i32.clone()), lit(null_i32.clone())], vec![None])?;
+        run_test(
+            &batch,
+            lit(null_i32.clone()),
+            vec![lit(null_i32.clone()), lit(null_i32.clone())],
+            false,
+            vec![None],
+        )?;
+
+        // ========================================================================
+        // NON-NULL SCALAR LITERALS WITH NULL IN LIST - Int32
+        // When a scalar value is NOT in a list containing NULL, the result is NULL
+        // When a scalar value IS in the list, the result is TRUE (NULL doesn't matter)
+        // ========================================================================
+
+        // 3 IN (0, 1, 2, NULL) => NULL (not in list, but list has NULL)
+        run_test(
+            &batch,
+            lit(3i32),
+            vec![lit(0i32), lit(1i32), lit(2i32), lit(null_i32.clone())],
+            false,
+            vec![None],
+        )?;
+
+        // 3 NOT IN (0, 1, 2, NULL) => NULL (not in list, but list has NULL)
+        run_test(
+            &batch,
+            lit(3i32),
+            vec![lit(0i32), lit(1i32), lit(2i32), lit(null_i32.clone())],
+            true,
+            vec![None],
+        )?;
+
+        // 1 IN (0, 1, 2, NULL) => TRUE (found match, NULL doesn't matter)
+        run_test(
+            &batch,
+            lit(1i32),
+            vec![lit(0i32), lit(1i32), lit(2i32), lit(null_i32.clone())],
+            false,
+            vec![Some(true)],
+        )?;
+
+        // 1 NOT IN (0, 1, 2, NULL) => FALSE (found match, NULL doesn't matter)
+        run_test(
+            &batch,
+            lit(1i32),
+            vec![lit(0i32), lit(1i32), lit(2i32), lit(null_i32.clone())],
+            true,
+            vec![Some(false)],
+        )?;
+
+        // ========================================================================
+        // NON-NULL SCALAR LITERALS WITH NULL IN LIST - String
+        // Same semantics as Int32 but with string type
+        // ========================================================================
+
+        let schema_str =
+            Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let batch_str = RecordBatch::try_new(
+            Arc::clone(&schema_str),
+            vec![Arc::new(StringArray::from(vec![Some("dummy")]))],
+        )?;
+        let null_str = ScalarValue::Utf8(None);
+
+        let run_test_str = |expr: Arc<dyn PhysicalExpr>,
+                            list: Vec<Arc<dyn PhysicalExpr>>,
+                            negated: bool,
+                            expected: Vec<Option<bool>>|
+         -> Result<()> {
+            let in_expr = in_list(expr, list, &negated, schema_str.as_ref())?;
+            let result = in_expr
+                .evaluate(&batch_str)?
+                .into_array(batch_str.num_rows())?;
+            let result = as_boolean_array(&result);
+            let expected_array = BooleanArray::from(expected);
+            assert_eq!(
+                result,
+                &expected_array,
+                "Expected {:?}, got {:?}",
+                expected_array,
+                result.iter().collect::<Vec<_>>()
+            );
+            Ok(())
+        };
+
+        // 'c' IN ('a', 'b', NULL) => NULL (not in list, but list has NULL)
+        run_test_str(
+            lit("c"),
+            vec![lit("a"), lit("b"), lit(null_str.clone())],
+            false,
+            vec![None],
+        )?;
+
+        // 'c' NOT IN ('a', 'b', NULL) => NULL (not in list, but list has NULL)
+        run_test_str(
+            lit("c"),
+            vec![lit("a"), lit("b"), lit(null_str.clone())],
+            true,
+            vec![None],
+        )?;
+
+        // 'a' IN ('a', 'b', NULL) => TRUE (found match, NULL doesn't matter)
+        run_test_str(
+            lit("a"),
+            vec![lit("a"), lit("b"), lit(null_str.clone())],
+            false,
+            vec![Some(true)],
+        )?;
+
+        // 'a' NOT IN ('a', 'b', NULL) => FALSE (found match, NULL doesn't matter)
+        run_test_str(
+            lit("a"),
+            vec![lit("a"), lit("b"), lit(null_str.clone())],
+            true,
+            vec![Some(false)],
+        )?;
 
         Ok(())
     }
@@ -2454,7 +2635,10 @@ mod tests {
         )?;
 
         // Helper to run tuple tests
-        let run_tuple_test = |lhs: ScalarValue, list: Vec<ScalarValue>, expected: Vec<Option<bool>>| -> Result<()> {
+        let run_tuple_test = |lhs: ScalarValue,
+                              list: Vec<ScalarValue>,
+                              expected: Vec<Option<bool>>|
+         -> Result<()> {
             let expr = in_list(
                 lit(lhs),
                 list.into_iter().map(lit).collect(),

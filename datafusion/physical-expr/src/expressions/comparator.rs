@@ -21,7 +21,7 @@
 //! with variants for each scalar Arrow type, eliminating the overhead of dynamic
 //! dispatch for common comparison operations. Complex recursive types (List, Struct,
 //! Map, Dictionary) fall back to dynamic dispatch.
-//! 
+//!
 //! While we are implementing this in DataFusion for now we hope to upstream this into arrow-rs
 //! and replace the existing completely dynamic comparator there with this more efficient one.
 
@@ -883,6 +883,24 @@ fn compare_fixed_binary_values(
 ///
 /// This wraps Arrow's `make_comparator` but returns our enum-based `Comparator`
 /// for scalar types, falling back to dynamic dispatch for complex types.
+///
+/// # Errors
+/// If the data types of the arrays are not supported for comparison.
+///
+/// # Example
+///
+/// ```rust
+/// use arrow::array::{Int32Array, Array};
+/// use arrow::compute::SortOptions;
+/// use datafusion::physical_expr::expressions::comparator::make_comparator;
+///
+/// let left: Int32Array = Int32Array::from(vec![1, 2, 3]);
+/// let right: Int32Array = Int32Array::from(vec![3, 2, 1]);
+/// let opts = SortOptions::default();
+/// let comparator = make_comparator(&left, &right, opts).unwrap();
+/// let ordering = comparator.compare(0, 2); // Compare left[0] with right[2]
+/// assert_eq!(ordering, std::cmp::Ordering::Less);
+/// ```
 pub(crate) fn make_comparator(
     left: &dyn Array,
     right: &dyn Array,
