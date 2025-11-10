@@ -45,7 +45,6 @@ pub use case::{case, CaseExpr};
 pub use cast::{cast, CastExpr};
 pub use cast_column::CastColumnExpr;
 pub use column::{col, with_new_schema, Column};
-pub(crate) use comparator::{make_comparator, Comparator};
 pub use datafusion_expr::utils::format_state_name;
 pub use dynamic_filters::DynamicFilterPhysicalExpr;
 pub use in_list::{in_list, InListExpr};
