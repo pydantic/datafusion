@@ -21,6 +21,9 @@
 //! with variants for each scalar Arrow type, eliminating the overhead of dynamic
 //! dispatch for common comparison operations. Complex recursive types (List, Struct,
 //! Map, Dictionary) fall back to dynamic dispatch.
+//! 
+//! While we are implementing this in DataFusion for now we hope to upstream this into arrow-rs
+//! and replace the existing completely dynamic comparator there with this more efficient one.
 
 use arrow::array::types::*;
 use arrow::array::{make_comparator as arrow_make_comparator, *};
@@ -887,8 +890,8 @@ pub(crate) fn make_comparator(
 ) -> Result<Comparator, ArrowError> {
     use DataType::*;
 
-    let left_nulls = left.logical_nulls().filter(|x| x.null_count() > 0);
-    let right_nulls = right.logical_nulls().filter(|x| x.null_count() > 0);
+    let left_nulls = left.nulls().filter(|x| x.null_count() > 0).cloned();
+    let right_nulls = right.nulls().filter(|x| x.null_count() > 0).cloned();
 
     Ok(match (left.data_type(), right.data_type()) {
         (Int8, Int8) => {
