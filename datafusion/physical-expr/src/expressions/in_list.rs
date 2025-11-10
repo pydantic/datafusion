@@ -127,7 +127,7 @@ impl ArrayHashSet {
     }
 }
 
-/// Computes an [`ArraySet`] for the provided [`Array`] if there
+/// Computes an [`ArrayHashSet`] for the provided [`Array`] if there
 /// are nulls present or there are more than the configured number of
 /// elements.
 ///
@@ -241,11 +241,14 @@ impl InListExpr {
     /// Create a new InList expression directly from an array, bypassing expression evaluation.
     ///
     /// This is more efficient than `in_list()` when you already have the list as an array,
-    /// as it avoids the conversion: ArrayRef -> Vec<PhysicalExpr> -> ArrayRef -> ArraySet.
-    /// Instead it goes directly: ArrayRef -> ArraySet.
+    /// as it avoids the conversion: `ArrayRef -> Vec<PhysicalExpr> -> ArrayRef -> ArrayHashSet`.
+    /// Instead it goes directly: `ArrayRef -> ArrayHashSet`.
     ///
     /// The `list` field will be empty when using this constructor, as the array is stored
     /// directly in the static filter.
+    ///
+    /// This does not make the expression any more performant at runtime, but it does make it slightly
+    /// cheaper to build.
     pub fn try_new_from_array(
         expr: Arc<dyn PhysicalExpr>,
         array: ArrayRef,
