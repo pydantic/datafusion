@@ -31,7 +31,7 @@ use crate::cast::{
     as_string_array, as_string_view_array, as_struct_array,
 };
 use crate::error::Result;
-use crate::error::_internal_err;
+use crate::error::{_internal_datafusion_err, _internal_err};
 use std::cell::RefCell;
 
 // Combines two hashes into one hash
@@ -67,7 +67,10 @@ thread_local! {
 /// * `callback` - A function that receives an immutable reference to the hash slice and returns a result
 ///
 /// # Errors
-/// Returns an error if no arrays are provided.
+/// Returns an error if:
+/// - No arrays are provided
+/// - The function is called reentrantly (i.e., the callback invokes `with_hashes` again on the same thread)
+/// - The function is called during or after thread destruction
 ///
 /// # Example
 /// ```ignore
@@ -102,8 +105,9 @@ where
         None => return _internal_err!("with_hashes requires at least one array"),
     };
 
-    HASH_BUFFER.with(|cell| {
-        let mut buffer = cell.borrow_mut();
+    HASH_BUFFER.try_with(|cell| {
+        let mut buffer = cell.try_borrow_mut()
+            .map_err(|_| _internal_datafusion_err!("with_hashes cannot be called reentrantly on the same thread"))?;
 
         // Ensure buffer has sufficient length, clearing old values
         buffer.clear();
@@ -122,7 +126,7 @@ where
         }
 
         Ok(result)
-    })
+    }).map_err(|_| _internal_datafusion_err!("with_hashes cannot access thread-local storage during or after thread destruction"))?
 }
 
 #[cfg(not(feature = "force_hash_collisions"))]
@@ -1143,5 +1147,26 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("requires at least one array"));
+    }
+
+    #[test]
+    fn test_with_hashes_reentrancy() {
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let array2: ArrayRef = Arc::new(Int32Array::from(vec![4, 5, 6]));
+        let random_state = RandomState::with_seeds(0, 0, 0, 0);
+
+        // Test that reentrant calls return an error instead of panicking
+        let result = with_hashes([&array], &random_state, |_hashes| {
+            // Try to call with_hashes again inside the callback
+            with_hashes([&array2], &random_state, |_inner_hashes| Ok(()))
+        });
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("reentrantly") || err_msg.contains("cannot be called"),
+            "Error message should mention reentrancy: {}",
+            err_msg
+        );
     }
 }
