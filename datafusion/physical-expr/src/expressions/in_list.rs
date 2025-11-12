@@ -33,7 +33,7 @@ use arrow::compute::{take, SortOptions};
 use arrow::datatypes::*;
 use arrow::downcast_dictionary_array;
 use arrow::util::bit_iterator::BitIndexIterator;
-use datafusion_common::hash_utils::with_hashes;
+use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::{exec_err, internal_err, DFSchema, Result, ScalarValue};
 use datafusion_expr::{expr_vec_fmt, ColumnarValue};
 
@@ -100,30 +100,32 @@ impl ArrayHashSet {
 
         let has_nulls = in_array.null_count() != 0;
 
-        with_hashes([v], &self.state, |hashes| {
-            let cmp = make_comparator(v, in_array, SortOptions::default())?;
-            Ok((0..v.len())
-                .map(|i| {
-                    // SQL three-valued logic: null IN (...) is always null
-                    if v.is_null(i) {
-                        return None;
-                    }
+        // Allocate a fresh buffer for this call (no TLS access, no contention!)
+        let mut hashes = vec![0; v.len()];
+        create_hashes([v], &self.state, &mut hashes[..])?;
 
-                    let hash = hashes[i];
-                    let contains = self
-                        .map
-                        .raw_entry()
-                        .from_hash(hash, |idx| cmp.compare(i, *idx).is_eq())
-                        .is_some();
+        let cmp = make_comparator(v, in_array, SortOptions::default())?;
+        Ok((0..v.len())
+            .map(|i| {
+                // SQL three-valued logic: null IN (...) is always null
+                if v.is_null(i) {
+                    return None;
+                }
 
-                    match contains {
-                        true => Some(!negated),
-                        false if has_nulls => None,
-                        false => Some(negated),
-                    }
-                })
-                .collect())
-        })
+                let hash = hashes[i];
+                let contains = self
+                    .map
+                    .raw_entry()
+                    .from_hash(hash, |idx| cmp.compare(i, *idx).is_eq())
+                    .is_some();
+
+                match contains {
+                    true => Some(!negated),
+                    false if has_nulls => None,
+                    false => Some(negated),
+                }
+            })
+            .collect())
     }
 }
 
@@ -145,29 +147,29 @@ fn make_hash_set(array: &dyn Array) -> Result<ArrayHashSet> {
     let state = RandomState::new();
     let mut map: HashMap<usize, (), ()> = HashMap::with_hasher(());
 
-    with_hashes([array], &state, |hashes| -> Result<()> {
-        let cmp = make_comparator(array, array, SortOptions::default())?;
+    // Use a local buffer for initial hash set construction
+    let mut hashes = vec![0; array.len()];
+    create_hashes([array], &state, &mut hashes[..])?;
 
-        let insert_value = |idx| {
-            let hash = hashes[idx];
-            if let RawEntryMut::Vacant(v) = map
-                .raw_entry_mut()
-                .from_hash(hash, |x| cmp.compare(*x, idx).is_eq())
-            {
-                v.insert_with_hasher(hash, idx, (), |x| hashes[*x]);
-            }
-        };
+    let cmp = make_comparator(array, array, SortOptions::default())?;
 
-        match array.nulls() {
-            Some(nulls) => {
-                BitIndexIterator::new(nulls.validity(), nulls.offset(), nulls.len())
-                    .for_each(insert_value)
-            }
-            None => (0..array.len()).for_each(insert_value),
+    let insert_value = |idx| {
+        let hash = hashes[idx];
+        if let RawEntryMut::Vacant(v) = map
+            .raw_entry_mut()
+            .from_hash(hash, |x| cmp.compare(*x, idx).is_eq())
+        {
+            v.insert_with_hasher(hash, idx, (), |x| hashes[*x]);
         }
+    };
 
-        Ok(())
-    })?;
+    match array.nulls() {
+        Some(nulls) => {
+            BitIndexIterator::new(nulls.validity(), nulls.offset(), nulls.len())
+                .for_each(insert_value)
+        }
+        None => (0..array.len()).for_each(insert_value),
+    }
 
     Ok(ArrayHashSet { state, map })
 }
