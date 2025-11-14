@@ -591,7 +591,7 @@ impl DataSource for FileScanConfig {
         if let Some(filter) = self.file_source.filter() {
             // We need to remap column indexes to match the projected schema since that's what the equivalence properties deal with.
             // Note that this will *ignore* any non-projected columns: these don't factor into ordering / equivalence.
-            match Self::add_filter_equivalence_info(filter, &mut eq_properties, schema) {
+            match Self::add_filter_equivalence_info(&filter, &mut eq_properties, schema) {
                 Ok(()) => {}
                 Err(e) => {
                     warn!("Failed to add filter equivalence info: {e}");

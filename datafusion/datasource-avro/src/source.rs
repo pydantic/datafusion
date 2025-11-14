@@ -71,7 +71,7 @@ impl AvroSource {
             reader,
             &Arc::clone(self.table_schema.file_schema()),
             self.batch_size.expect("Batch size must set before open"),
-            projection,
+            projection.as_ref(),
         )
     }
 }
