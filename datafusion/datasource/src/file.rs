@@ -27,7 +27,8 @@ use crate::file_scan_config::FileScanConfig;
 use crate::file_stream::FileOpener;
 use crate::schema_adapter::SchemaAdapterFactory;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::{not_impl_err, Result, Statistics};
+use datafusion_common::{not_impl_err, Result};
+use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -57,7 +58,7 @@ pub trait FileSource: Send + Sync {
         object_store: Arc<dyn ObjectStore>,
         base_config: &FileScanConfig,
         partition: usize,
-    ) -> Arc<dyn FileOpener>;
+    ) -> Result<Arc<dyn FileOpener>>;
     /// Any
     fn as_any(&self) -> &dyn Any;
     /// Returns the table schema for this file source.
@@ -66,18 +67,16 @@ pub trait FileSource: Send + Sync {
     fn table_schema(&self) -> &crate::table_schema::TableSchema;
     /// Initialize new type with batch size configuration
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource>;
-    /// Initialize new instance with projection information
-    fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource>;
-    /// Initialize new instance with projected statistics
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource>;
     /// Returns the filter expression that will be applied during the file scan.
     fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
         None
     }
+    /// Return the projection that will be applied to the output stream on top of the table schema.
+    fn projection(&self) -> Option<&ProjectionExprs> {
+        None
+    }
     /// Return execution plan metrics
     fn metrics(&self) -> &ExecutionPlanMetricsSet;
-    /// Return projected statistics
-    fn statistics(&self) -> Result<Statistics>;
     /// String representation of file source such as "csv", "json", "parquet"
     fn file_type(&self) -> &str;
     /// Format FileType specific information
@@ -128,6 +127,13 @@ pub trait FileSource: Send + Sync {
         Ok(FilterPushdownPropagation::with_parent_pushdown_result(
             vec![PushedDown::No; filters.len()],
         ))
+    }
+
+    fn try_pushdown_projection(
+        &self,
+        _projection: &ProjectionExprs,
+    ) -> Result<Option<Arc<dyn FileSource>>> {
+        Ok(None)
     }
 
     /// Set optional schema adapter factory.
