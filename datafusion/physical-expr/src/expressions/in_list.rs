@@ -98,14 +98,16 @@ impl ArrayHashSet {
             _ => {}
         }
 
-        let has_nulls = in_array.null_count() != 0;
+        let needle_nulls = v.logical_nulls();
+        let needle_nulls = needle_nulls.as_ref();
+        let haystack_has_nulls = in_array.null_count() != 0;
 
         with_hashes([v], &self.state, |hashes| {
             let cmp = make_comparator(v, in_array, SortOptions::default())?;
             Ok((0..v.len())
                 .map(|i| {
                     // SQL three-valued logic: null IN (...) is always null
-                    if v.is_null(i) {
+                    if needle_nulls.is_some_and(|nulls| nulls.is_null(i)) {
                         return None;
                     }
 
@@ -118,7 +120,7 @@ impl ArrayHashSet {
 
                     match contains {
                         true => Some(!negated),
-                        false if has_nulls => None,
+                        false if haystack_has_nulls => None,
                         false => Some(negated),
                     }
                 })
