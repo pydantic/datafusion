@@ -606,7 +606,8 @@ impl FileSource for ParquetSource {
             encryption_factory: self.get_encryption_factory_with_config(),
             max_predicate_cache_size: self.max_predicate_cache_size(),
         }) as Arc<dyn FileOpener>;
-        opener = ProjectionOpener::new(split_projection.clone(), Arc::clone(&opener))?;
+        opener =
+            ProjectionOpener::try_new(split_projection.clone(), Arc::clone(&opener))?;
         Ok(opener)
     }
 
@@ -633,7 +634,7 @@ impl FileSource for ParquetSource {
         projection: &ProjectionExprs,
     ) -> datafusion_common::Result<Option<Arc<dyn FileSource>>> {
         let mut source = self.clone();
-        let new_projection = self.projection.source.try_merge(&projection)?;
+        let new_projection = self.projection.source.try_merge(projection)?;
         let split_projection =
             SplitProjection::new(self.table_schema.file_schema(), &new_projection);
         source.projection = split_projection;

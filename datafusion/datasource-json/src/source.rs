@@ -126,7 +126,7 @@ impl FileSource for JsonSource {
         }) as Arc<dyn FileOpener>;
 
         // Wrap with ProjectionOpener
-        opener = ProjectionOpener::new(self.projection.clone(), Arc::clone(&opener))?;
+        opener = ProjectionOpener::try_new(self.projection.clone(), Arc::clone(&opener))?;
 
         Ok(opener)
     }
@@ -150,7 +150,7 @@ impl FileSource for JsonSource {
         projection: &ProjectionExprs,
     ) -> Result<Option<Arc<dyn FileSource>>> {
         let mut source = self.clone();
-        let new_projection = self.projection.source.try_merge(&projection)?;
+        let new_projection = self.projection.source.try_merge(projection)?;
         let split_projection =
             SplitProjection::new(self.table_schema.file_schema(), &new_projection);
         source.projection = split_projection;

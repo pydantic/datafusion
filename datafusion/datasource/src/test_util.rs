@@ -123,7 +123,7 @@ impl FileSource for MockSource {
         projection: &datafusion_physical_plan::projection::ProjectionExprs,
     ) -> Result<Option<Arc<dyn FileSource>>> {
         let mut source = self.clone();
-        let new_projection = self.projection.source.try_merge(&projection)?;
+        let new_projection = self.projection.source.try_merge(projection)?;
         let split_projection = crate::projection::SplitProjection::new(
             self.table_schema.file_schema(),
             &new_projection,

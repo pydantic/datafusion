@@ -51,7 +51,7 @@ pub struct ProjectionOpener {
 }
 
 impl ProjectionOpener {
-    pub fn new(
+    pub fn try_new(
         projection: SplitProjection,
         inner: Arc<dyn FileOpener>,
     ) -> Result<Arc<dyn FileOpener>> {
@@ -149,11 +149,12 @@ fn inject_partition_columns_into_projection(
 /// - The projection indices into the partition values (partition_value_indices), which pre-compute both the index into the table schema
 ///   and the index into the partition values array
 /// - A remapped projection that can be applied after the file projection is applied
-/// This remapped projection has the following properties:
-///   - Column indices referring to file columns are remapped to [0..file_indices.len())
-///   - Column indices referring to partition columns are remapped to [file_indices.len()..)
-/// This allows the ProjectionOpener to easily identify which columns in the remapped projection
-/// refer to partition columns and substitute them with literals from the partition values.
+///   This remapped projection has the following properties:
+///     - Column indices referring to file columns are remapped to [0..file_indices.len())
+///     - Column indices referring to partition columns are remapped to [file_indices.len()..)
+///
+///   This allows the ProjectionOpener to easily identify which columns in the remapped projection
+///   refer to partition columns and substitute them with literals from the partition values.
 #[derive(Debug, Clone)]
 pub struct SplitProjection {
     /// The original projection this [`SplitProjection`] was derived from
@@ -170,9 +171,9 @@ impl SplitProjection {
     pub fn unprojected(table_schema: &TableSchema) -> Self {
         let projection = ProjectionExprs::from_indices(
             &(0..table_schema.table_schema().fields().len()).collect_vec(),
-            &table_schema.table_schema(),
+            table_schema.table_schema(),
         );
-        Self::new(&table_schema.file_schema(), &projection)
+        Self::new(table_schema.file_schema(), &projection)
     }
 
     /// Creates a new `SplitProjection` by splitting columns into file and partition columns.
@@ -400,7 +401,7 @@ mod test {
                 .value(0),
             4
         );
-        assert_eq!(result.column(1).as_boolean().value(0), true);
+        assert!(result.column(1).as_boolean().value(0));
         assert_eq!(result.column(2).as_string::<i32>().value(0), "2021-10-26");
         assert_eq!(
             result
@@ -423,13 +424,13 @@ mod test {
         use arrow_schema::Field;
 
         let file_fields: Vec<_> = (0..file_cols)
-            .map(|i| Field::new(format!("col_{}", i), DataType::Int32, false))
+            .map(|i| Field::new(format!("col_{i}"), DataType::Int32, false))
             .collect();
 
         let mut table_fields = file_fields.clone();
         table_fields.extend(
             (0..partition_cols)
-                .map(|i| Field::new(format!("part_{}", i), DataType::Utf8, false)),
+                .map(|i| Field::new(format!("part_{i}"), DataType::Utf8, false)),
         );
 
         (

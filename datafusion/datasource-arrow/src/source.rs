@@ -117,8 +117,8 @@ impl FileOpener for ArrowStreamFileOpener {
             {
                 Ok(stream
                     .and_then(move |batch| {
-                        let factory = factory.clone();
-                        let proj_schema = proj_schema.clone();
+                        let factory = Arc::clone(&factory);
+                        let proj_schema = Arc::clone(&proj_schema);
                         async move {
                             let schema_adapter =
                                 factory.create_with_projected_schema(proj_schema);
@@ -182,8 +182,8 @@ impl FileOpener for ArrowFileOpener {
                     {
                         Ok(stream
                             .and_then(move |batch| {
-                                let factory = factory.clone();
-                                let proj_schema = proj_schema.clone();
+                                let factory = Arc::clone(&factory);
+                                let proj_schema = Arc::clone(&proj_schema);
                                 async move {
                                     let schema_adapter =
                                         factory.create_with_projected_schema(proj_schema);
@@ -303,8 +303,8 @@ impl FileOpener for ArrowFileOpener {
                     {
                         Ok(stream
                             .and_then(move |batch| {
-                                let factory = factory.clone();
-                                let proj_schema = proj_schema.clone();
+                                let factory = Arc::clone(&factory);
+                                let proj_schema = Arc::clone(&proj_schema);
                                 async move {
                                     let schema_adapter =
                                         factory.create_with_projected_schema(proj_schema);
@@ -386,7 +386,7 @@ impl FileSource for ArrowSource {
             ArrowFormat::File => Arc::new(ArrowFileOpener {
                 object_store,
                 projection: Some(split_projection.file_indices.clone()),
-                projected_schema: Some(projected_file_schema.clone()),
+                projected_schema: Some(Arc::clone(&projected_file_schema)),
                 schema_adapter_factory: Some(schema_adapter_factory),
             }),
             ArrowFormat::Stream => Arc::new(ArrowStreamFileOpener {
@@ -396,7 +396,7 @@ impl FileSource for ArrowSource {
                 schema_adapter_factory: Some(schema_adapter_factory),
             }),
         };
-        Ok(ProjectionOpener::new(split_projection, opener)?)
+        ProjectionOpener::try_new(split_projection, opener)
     }
 
     fn as_any(&self) -> &dyn Any {

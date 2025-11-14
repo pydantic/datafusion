@@ -249,7 +249,7 @@ impl FileSource for CsvSource {
             file_compression_type: base_config.file_compression_type,
             object_store,
         }) as Arc<dyn FileOpener>;
-        opener = ProjectionOpener::new(self.projection.clone(), Arc::clone(&opener))?;
+        opener = ProjectionOpener::try_new(self.projection.clone(), Arc::clone(&opener))?;
         Ok(opener)
     }
 
@@ -272,7 +272,7 @@ impl FileSource for CsvSource {
         projection: &ProjectionExprs,
     ) -> Result<Option<Arc<dyn FileSource>>> {
         let mut source = self.clone();
-        let new_projection = self.projection.source.try_merge(&projection)?;
+        let new_projection = self.projection.source.try_merge(projection)?;
         let split_projection =
             SplitProjection::new(self.table_schema.file_schema(), &new_projection);
         source.projection = split_projection;
