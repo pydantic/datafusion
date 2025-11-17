@@ -119,7 +119,7 @@ impl StaticFilter {
         })
     }
 
-    /// Computes an [`ArrayHashSet`] for the provided [`Array`] if there
+    /// Computes a [`StaticFilter`] for the provided [`Array`] if there
     /// are nulls present or there are more than the configured number of
     /// elements.
     ///
@@ -239,8 +239,8 @@ impl InListExpr {
     /// Create a new InList expression directly from an array, bypassing expression evaluation.
     ///
     /// This is more efficient than `in_list()` when you already have the list as an array,
-    /// as it avoids the conversion: `ArrayRef -> Vec<PhysicalExpr> -> ArrayRef -> ArrayHashSet`.
-    /// Instead it goes directly: `ArrayRef -> ArrayHashSet`.
+    /// as it avoids the conversion: `ArrayRef -> Vec<PhysicalExpr> -> ArrayRef -> StaticFilter`.
+    /// Instead it goes directly: `ArrayRef -> StaticFilter`.
     ///
     /// The `list` field will be empty when using this constructor, as the array is stored
     /// directly in the static filter.
