@@ -357,7 +357,7 @@ fn hash_union_array(
         let child_offset = array.value_offset(i);
 
         let child_hash = child_hashes.get(&type_id).expect("invalid type_id");
-        hashes_buffer[i] = child_hash[child_offset];
+        hashes_buffer[i] = combine_hashes(hashes_buffer[i], child_hash[child_offset]);
     }
 
     Ok(())

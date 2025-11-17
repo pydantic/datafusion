@@ -65,3 +65,37 @@ select union_tag(union_column, 'int') from union_table;
 
 query error DataFusion error: Execution error: union_tag only support unions, got Utf8
 select union_tag('int') from union_table;
+
+## UNION Hashing Tests (GROUP BY, DISTINCT, Aggregation)
+
+# group by
+query ?I
+select union_column, count(*) from union_table group by union_column order by union_column;
+----
+{int=1} 1
+{int=3} 1
+{string=bar} 1
+
+# distinct with order by
+query ?
+select distinct union_column from union_table order by union_column;
+----
+{int=1}
+{int=3}
+{string=bar}
+
+# count distinct
+query I
+select count(distinct union_column) from union_table;
+----
+3
+
+query ?II
+select union_column, count(*), sum(union_extract(union_column, 'int'))
+from union_table
+group by union_column
+order by union_column;
+----
+{int=1} 1 1
+{int=3} 1 3
+{string=bar} 1 NULL

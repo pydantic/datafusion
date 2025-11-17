@@ -437,14 +437,14 @@ fn create_example_udf() -> ScalarUDF {
 fn register_union_table(ctx: &SessionContext) {
     let union = UnionArray::try_new(
         UnionFields::new(
-            // typeids: 3 for int, 1 for string
-            vec![3, 1],
+            // typeids: 0 for int, 1 for string
+            vec![0, 1],
             vec![
                 Field::new("int", DataType::Int32, false),
                 Field::new("string", DataType::Utf8, false),
             ],
         ),
-        ScalarBuffer::from(vec![3, 1, 3]),
+        ScalarBuffer::from(vec![0, 1, 0]),
         None,
         vec![
             Arc::new(Int32Array::from(vec![1, 2, 3])),

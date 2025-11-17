@@ -183,6 +183,26 @@ testcontainers-modules = { version = "0.13" }
 tokio = { version = "1.48", features = ["macros", "rt", "sync"] }
 url = "2.5.7"
 
+[patch.crates-io]
+# Needs: https://github.com/apache/arrow-rs/pull/8839 (Union types in RowConverter)
+# and https://github.com/apache/arrow-rs/pull/8838 (Union ordering/comparison)
+arrow = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+arrow-arith = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+arrow-array = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+arrow-buffer = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+arrow-cast = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+arrow-csv = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+arrow-data = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+arrow-flight = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+arrow-ipc = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+arrow-json = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+arrow-ord = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+arrow-row = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+arrow-schema = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+arrow-select = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+arrow-string = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+parquet = { git = "https://github.com/pydantic/arrow-rs.git", branch = "friendlymatthew/union-row-converter-and-ordering" }
+
 [workspace.lints.clippy]
 # Detects large stack-allocated futures that may cause stack overflow crashes (see threshold in clippy.toml)
 large_futures = "warn"
