@@ -138,9 +138,29 @@ fn instantiate_static_filter(
     in_array: ArrayRef,
 ) -> Result<Arc<dyn StaticFilter + Send + Sync>> {
     match in_array.data_type() {
+        // Integer primitive types
+        DataType::Int8 => Ok(Arc::new(Int8StaticFilter::try_new(&in_array)?)),
+        DataType::Int16 => Ok(Arc::new(Int16StaticFilter::try_new(&in_array)?)),
         DataType::Int32 => Ok(Arc::new(Int32StaticFilter::try_new(&in_array)?)),
+        DataType::Int64 => Ok(Arc::new(Int64StaticFilter::try_new(&in_array)?)),
+        DataType::UInt8 => Ok(Arc::new(UInt8StaticFilter::try_new(&in_array)?)),
+        DataType::UInt16 => Ok(Arc::new(UInt16StaticFilter::try_new(&in_array)?)),
+        DataType::UInt32 => Ok(Arc::new(UInt32StaticFilter::try_new(&in_array)?)),
+        DataType::UInt64 => Ok(Arc::new(UInt64StaticFilter::try_new(&in_array)?)),
+        // Boolean
+        DataType::Boolean => Ok(Arc::new(BooleanStaticFilter::try_new(&in_array)?)),
+        // String types
+        DataType::Utf8 => Ok(Arc::new(Utf8StaticFilter::try_new(&in_array)?)),
+        DataType::LargeUtf8 => Ok(Arc::new(LargeUtf8StaticFilter::try_new(&in_array)?)),
+        DataType::Utf8View => Ok(Arc::new(Utf8ViewStaticFilter::try_new(&in_array)?)),
+        // Binary types
+        DataType::Binary => Ok(Arc::new(BinaryStaticFilter::try_new(&in_array)?)),
+        DataType::LargeBinary => {
+            Ok(Arc::new(LargeBinaryStaticFilter::try_new(&in_array)?))
+        }
+        DataType::BinaryView => Ok(Arc::new(BinaryViewStaticFilter::try_new(&in_array)?)),
         _ => {
-            /* fall through to generic implementation */
+            /* fall through to generic implementation for unsupported types (Float32/Float64, Struct, etc.) */
             Ok(Arc::new(ArrayStaticFilter::try_new(in_array)?))
         }
     }
@@ -198,18 +218,135 @@ impl ArrayStaticFilter {
     }
 }
 
-struct Int32StaticFilter {
-    null_count: usize,
-    values: HashSet<i32>,
+// Macro to generate specialized StaticFilter implementations for primitive types
+macro_rules! primitive_static_filter {
+    ($Name:ident, $ArrowType:ty) => {
+        struct $Name {
+            null_count: usize,
+            values: HashSet<<$ArrowType as ArrowPrimitiveType>::Native>,
+        }
+
+        impl $Name {
+            fn try_new(in_array: &ArrayRef) -> Result<Self> {
+                let in_array = in_array
+                    .as_primitive_opt::<$ArrowType>()
+                    .ok_or_else(|| exec_datafusion_err!("Failed to downcast array"))?;
+
+                let mut values = HashSet::with_capacity(in_array.len());
+                let null_count = in_array.null_count();
+
+                for v in in_array.iter().flatten() {
+                    values.insert(v);
+                }
+
+                Ok(Self { null_count, values })
+            }
+        }
+
+        impl StaticFilter for $Name {
+            fn null_count(&self) -> usize {
+                self.null_count
+            }
+
+            fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
+                // Handle dictionary arrays by recursing on the values
+                downcast_dictionary_array! {
+                    v => {
+                        let values_contains = self.contains(v.values().as_ref(), negated)?;
+                        let result = take(&values_contains, v.keys(), None)?;
+                        return Ok(downcast_array(result.as_ref()))
+                    }
+                    _ => {}
+                }
+
+                let v = v
+                    .as_primitive_opt::<$ArrowType>()
+                    .ok_or_else(|| exec_datafusion_err!("Failed to downcast array"))?;
+
+                let haystack_has_nulls = self.null_count > 0;
+
+                let result = match (v.null_count() > 0, haystack_has_nulls, negated) {
+                    (true, _, false) | (false, true, false) => {
+                        // Either needle or haystack has nulls, not negated
+                        BooleanArray::from_iter(v.iter().map(|value| {
+                            match value {
+                                // SQL three-valued logic: null IN (...) is always null
+                                None => None,
+                                Some(v) => {
+                                    if self.values.contains(&v) {
+                                        Some(true)
+                                    } else if haystack_has_nulls {
+                                        // value not in set, but set has nulls -> null
+                                        None
+                                    } else {
+                                        Some(false)
+                                    }
+                                }
+                            }
+                        }))
+                    }
+                    (true, _, true) | (false, true, true) => {
+                        // Either needle or haystack has nulls, negated
+                        BooleanArray::from_iter(v.iter().map(|value| {
+                            match value {
+                                // SQL three-valued logic: null NOT IN (...) is always null
+                                None => None,
+                                Some(v) => {
+                                    if self.values.contains(&v) {
+                                        Some(false)
+                                    } else if haystack_has_nulls {
+                                        // value not in set, but set has nulls -> null
+                                        None
+                                    } else {
+                                        Some(true)
+                                    }
+                                }
+                            }
+                        }))
+                    }
+                    (false, false, false) => {
+                        // no nulls anywhere, not negated
+                        BooleanArray::from_iter(
+                            v.values().iter().map(|value| self.values.contains(value)),
+                        )
+                    }
+                    (false, false, true) => {
+                        // no nulls anywhere, negated
+                        BooleanArray::from_iter(
+                            v.values().iter().map(|value| !self.values.contains(value)),
+                        )
+                    }
+                };
+                Ok(result)
+            }
+        }
+    };
 }
 
-impl Int32StaticFilter {
+// Generate specialized filters for all integer primitive types
+// Note: Float32 and Float64 are excluded because they don't implement Hash/Eq due to NaN
+primitive_static_filter!(Int8StaticFilter, Int8Type);
+primitive_static_filter!(Int16StaticFilter, Int16Type);
+primitive_static_filter!(Int32StaticFilter, Int32Type);
+primitive_static_filter!(Int64StaticFilter, Int64Type);
+primitive_static_filter!(UInt8StaticFilter, UInt8Type);
+primitive_static_filter!(UInt16StaticFilter, UInt16Type);
+primitive_static_filter!(UInt32StaticFilter, UInt32Type);
+primitive_static_filter!(UInt64StaticFilter, UInt64Type);
+
+// Boolean static filter
+struct BooleanStaticFilter {
+    null_count: usize,
+    values: HashSet<bool>,
+}
+
+impl BooleanStaticFilter {
     fn try_new(in_array: &ArrayRef) -> Result<Self> {
         let in_array = in_array
-            .as_primitive_opt::<Int32Type>()
+            .as_boolean_opt()
             .ok_or_else(|| exec_datafusion_err!("Failed to downcast array"))?;
 
-        let mut values = HashSet::with_capacity(in_array.len());
+        let mut values = HashSet::with_capacity(in_array.len().min(2));
         let null_count = in_array.null_count();
 
         for v in in_array.iter().flatten() {
@@ -220,45 +357,214 @@ impl Int32StaticFilter {
     }
 }
 
-impl StaticFilter for Int32StaticFilter {
+impl StaticFilter for BooleanStaticFilter {
     fn null_count(&self) -> usize {
         self.null_count
     }
 
     fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
+        // Handle dictionary arrays by recursing on the values
+        downcast_dictionary_array! {
+            v => {
+                let values_contains = self.contains(v.values().as_ref(), negated)?;
+                let result = take(&values_contains, v.keys(), None)?;
+                return Ok(downcast_array(result.as_ref()))
+            }
+            _ => {}
+        }
+
         let v = v
-            .as_primitive_opt::<Int32Type>()
+            .as_boolean_opt()
             .ok_or_else(|| exec_datafusion_err!("Failed to downcast array"))?;
 
-        let result = match (v.null_count() > 0, negated) {
-            (true, false) => {
-                // has nulls, not negated"
-                BooleanArray::from_iter(
-                    v.iter().map(|value| Some(self.values.contains(&value?))),
-                )
+        let haystack_has_nulls = self.null_count > 0;
+
+        let result = match (v.null_count() > 0, haystack_has_nulls, negated) {
+            (true, _, false) | (false, true, false) => {
+                BooleanArray::from_iter(v.iter().map(|value| match value {
+                    None => None,
+                    Some(v) => {
+                        if self.values.contains(&v) {
+                            Some(true)
+                        } else if haystack_has_nulls {
+                            None
+                        } else {
+                            Some(false)
+                        }
+                    }
+                }))
             }
-            (true, true) => {
-                // has nulls, negated
-                BooleanArray::from_iter(
-                    v.iter().map(|value| Some(!self.values.contains(&value?))),
-                )
+            (true, _, true) | (false, true, true) => {
+                BooleanArray::from_iter(v.iter().map(|value| match value {
+                    None => None,
+                    Some(v) => {
+                        if self.values.contains(&v) {
+                            Some(false)
+                        } else if haystack_has_nulls {
+                            None
+                        } else {
+                            Some(true)
+                        }
+                    }
+                }))
             }
-            (false, false) => {
-                //no null, not negated
-                BooleanArray::from_iter(
-                    v.values().iter().map(|value| self.values.contains(value)),
-                )
-            }
-            (false, true) => {
-                // no null, negated
-                BooleanArray::from_iter(
-                    v.values().iter().map(|value| !self.values.contains(value)),
-                )
-            }
+            (false, false, false) => BooleanArray::from_iter(
+                v.values().iter().map(|value| self.values.contains(&value)),
+            ),
+            (false, false, true) => BooleanArray::from_iter(
+                v.values().iter().map(|value| !self.values.contains(&value)),
+            ),
         };
         Ok(result)
     }
 }
+
+// Macro to generate static filter implementations for string and binary types
+// This eliminates ~550 lines of duplicated code across 6 implementations
+macro_rules! define_static_filter {
+    (
+        $name:ident,
+        $value_type:ty,
+        |$arr_param:ident| $downcast:expr,
+        $convert:ident
+    ) => {
+        struct $name {
+            null_count: usize,
+            values: HashSet<$value_type>,
+        }
+
+        impl $name {
+            fn try_new(in_array: &ArrayRef) -> Result<Self> {
+                let $arr_param = in_array;
+                let in_array = $downcast
+                    .ok_or_else(|| exec_datafusion_err!("Failed to downcast array"))?;
+
+                let mut values = HashSet::with_capacity(in_array.len());
+                let null_count = in_array.null_count();
+
+                for v in in_array.iter().flatten() {
+                    values.insert(v.$convert());
+                }
+
+                Ok(Self { null_count, values })
+            }
+        }
+
+        impl StaticFilter for $name {
+            fn null_count(&self) -> usize {
+                self.null_count
+            }
+
+            fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
+                // Handle dictionary arrays by recursing on the values
+                downcast_dictionary_array! {
+                    v => {
+                        let values_contains = self.contains(v.values().as_ref(), negated)?;
+                        let result = take(&values_contains, v.keys(), None)?;
+                        return Ok(downcast_array(result.as_ref()))
+                    }
+                    _ => {}
+                }
+
+                let $arr_param = v;
+                let v = $downcast
+                    .ok_or_else(|| exec_datafusion_err!("Failed to downcast array"))?;
+
+                let haystack_has_nulls = self.null_count > 0;
+
+                let result = match (v.null_count() > 0, haystack_has_nulls, negated) {
+                    (true, _, false) | (false, true, false) => {
+                        BooleanArray::from_iter(v.iter().map(|value| {
+                            match value {
+                                None => None,
+                                Some(v) => {
+                                    if self.values.contains(v) {
+                                        Some(true)
+                                    } else if haystack_has_nulls {
+                                        None
+                                    } else {
+                                        Some(false)
+                                    }
+                                }
+                            }
+                        }))
+                    }
+                    (true, _, true) | (false, true, true) => {
+                        BooleanArray::from_iter(v.iter().map(|value| {
+                            match value {
+                                None => None,
+                                Some(v) => {
+                                    if self.values.contains(v) {
+                                        Some(false)
+                                    } else if haystack_has_nulls {
+                                        None
+                                    } else {
+                                        Some(true)
+                                    }
+                                }
+                            }
+                        }))
+                    }
+                    (false, false, false) => {
+                        BooleanArray::from_iter(
+                            v.iter().map(|value| self.values.contains(value.unwrap())),
+                        )
+                    }
+                    (false, false, true) => {
+                        BooleanArray::from_iter(
+                            v.iter().map(|value| !self.values.contains(value.unwrap())),
+                        )
+                    }
+                };
+                Ok(result)
+            }
+        }
+    };
+}
+
+// String static filters
+define_static_filter!(
+    Utf8StaticFilter,
+    String,
+    |arr| arr.as_string_opt::<i32>(),
+    to_string
+);
+
+define_static_filter!(
+    LargeUtf8StaticFilter,
+    String,
+    |arr| arr.as_string_opt::<i64>(),
+    to_string
+);
+
+define_static_filter!(
+    Utf8ViewStaticFilter,
+    String,
+    |arr| arr.as_string_view_opt(),
+    to_string
+);
+
+// Binary static filters
+define_static_filter!(
+    BinaryStaticFilter,
+    Vec<u8>,
+    |arr| arr.as_binary_opt::<i32>(),
+    to_vec
+);
+
+define_static_filter!(
+    LargeBinaryStaticFilter,
+    Vec<u8>,
+    |arr| arr.as_binary_opt::<i64>(),
+    to_vec
+);
+
+define_static_filter!(
+    BinaryViewStaticFilter,
+    Vec<u8>,
+    |arr| arr.as_binary_view_opt(),
+    to_vec
+);
 
 /// Evaluates the list of expressions into an array, flattening any dictionaries
 fn evaluate_list(
@@ -572,11 +878,8 @@ pub fn in_list(
 
     // Try to create a static filter for constant expressions
     let static_filter = try_evaluate_constant_list(&list, schema)
-        .and_then(ArrayStaticFilter::try_new)
-        .ok()
-        .map(|static_filter| {
-            Arc::new(static_filter) as Arc<dyn StaticFilter + Send + Sync>
-        });
+        .and_then(instantiate_static_filter)
+        .ok();
 
     Ok(Arc::new(InListExpr::new(
         expr,
