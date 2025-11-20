@@ -147,8 +147,6 @@ fn instantiate_static_filter(
         DataType::UInt16 => Ok(Arc::new(UInt16StaticFilter::try_new(&in_array)?)),
         DataType::UInt32 => Ok(Arc::new(UInt32StaticFilter::try_new(&in_array)?)),
         DataType::UInt64 => Ok(Arc::new(UInt64StaticFilter::try_new(&in_array)?)),
-        // Boolean
-        DataType::Boolean => Ok(Arc::new(BooleanStaticFilter::try_new(&in_array)?)),
         _ => {
             /* fall through to generic implementation for unsupported types (Float32/Float64, Struct, etc.) */
             Ok(Arc::new(ArrayStaticFilter::try_new(in_array)?))
@@ -323,91 +321,6 @@ primitive_static_filter!(UInt8StaticFilter, UInt8Type);
 primitive_static_filter!(UInt16StaticFilter, UInt16Type);
 primitive_static_filter!(UInt32StaticFilter, UInt32Type);
 primitive_static_filter!(UInt64StaticFilter, UInt64Type);
-
-// Boolean static filter
-struct BooleanStaticFilter {
-    null_count: usize,
-    values: HashSet<bool>,
-}
-
-impl BooleanStaticFilter {
-    fn try_new(in_array: &ArrayRef) -> Result<Self> {
-        let in_array = in_array
-            .as_boolean_opt()
-            .ok_or_else(|| exec_datafusion_err!("Failed to downcast an array to a boolean array"))?;
-
-        let mut values = HashSet::with_capacity(in_array.len().min(2));
-        let null_count = in_array.null_count();
-
-        for v in in_array.iter().flatten() {
-            values.insert(v);
-        }
-
-        Ok(Self { null_count, values })
-    }
-}
-
-impl StaticFilter for BooleanStaticFilter {
-    fn null_count(&self) -> usize {
-        self.null_count
-    }
-
-    fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
-        // Handle dictionary arrays by recursing on the values
-        downcast_dictionary_array! {
-            v => {
-                let values_contains = self.contains(v.values().as_ref(), negated)?;
-                let result = take(&values_contains, v.keys(), None)?;
-                return Ok(downcast_array(result.as_ref()))
-            }
-            _ => {}
-        }
-
-        let v = v
-            .as_boolean_opt()
-            .ok_or_else(|| exec_datafusion_err!("Failed to downcast an array to a boolean array"))?;
-
-        let haystack_has_nulls = self.null_count > 0;
-
-        let result = match (v.null_count() > 0, haystack_has_nulls, negated) {
-            (true, _, false) | (false, true, false) => {
-                BooleanArray::from_iter(v.iter().map(|value| match value {
-                    None => None,
-                    Some(v) => {
-                        if self.values.contains(&v) {
-                            Some(true)
-                        } else if haystack_has_nulls {
-                            None
-                        } else {
-                            Some(false)
-                        }
-                    }
-                }))
-            }
-            (true, _, true) | (false, true, true) => {
-                BooleanArray::from_iter(v.iter().map(|value| match value {
-                    None => None,
-                    Some(v) => {
-                        if self.values.contains(&v) {
-                            Some(false)
-                        } else if haystack_has_nulls {
-                            None
-                        } else {
-                            Some(true)
-                        }
-                    }
-                }))
-            }
-            (false, false, false) => BooleanArray::from_iter(
-                v.values().iter().map(|value| self.values.contains(&value)),
-            ),
-            (false, false, true) => BooleanArray::from_iter(
-                v.values().iter().map(|value| !self.values.contains(&value)),
-            ),
-        };
-        Ok(result)
-    }
-}
 
 /// Evaluates the list of expressions into an array, flattening any dictionaries
 fn evaluate_list(
