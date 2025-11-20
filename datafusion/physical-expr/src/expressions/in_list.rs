@@ -220,7 +220,7 @@ macro_rules! primitive_static_filter {
             fn try_new(in_array: &ArrayRef) -> Result<Self> {
                 let in_array = in_array
                     .as_primitive_opt::<$ArrowType>()
-                    .ok_or_else(|| exec_datafusion_err!("Failed to downcast array"))?;
+                    .ok_or_else(|| exec_datafusion_err!(format!("Failed to downcast an array to a '{}' array", stringify!($ArrowType))))?;
 
                 let mut values = HashSet::with_capacity(in_array.len());
                 let null_count = in_array.null_count();
@@ -251,7 +251,7 @@ macro_rules! primitive_static_filter {
 
                 let v = v
                     .as_primitive_opt::<$ArrowType>()
-                    .ok_or_else(|| exec_datafusion_err!("Failed to downcast array"))?;
+                    .ok_or_else(|| exec_datafusion_err!(format!("Failed to downcast an array to a '{}' array", stringify!($ArrowType))))?;
 
                 let haystack_has_nulls = self.null_count > 0;
 
@@ -334,7 +334,7 @@ impl BooleanStaticFilter {
     fn try_new(in_array: &ArrayRef) -> Result<Self> {
         let in_array = in_array
             .as_boolean_opt()
-            .ok_or_else(|| exec_datafusion_err!("Failed to downcast array"))?;
+            .ok_or_else(|| exec_datafusion_err!("Failed to downcast an array to a boolean array"))?;
 
         let mut values = HashSet::with_capacity(in_array.len().min(2));
         let null_count = in_array.null_count();
@@ -365,7 +365,7 @@ impl StaticFilter for BooleanStaticFilter {
 
         let v = v
             .as_boolean_opt()
-            .ok_or_else(|| exec_datafusion_err!("Failed to downcast array"))?;
+            .ok_or_else(|| exec_datafusion_err!("Failed to downcast an array to a boolean array"))?;
 
         let haystack_has_nulls = self.null_count > 0;
 
