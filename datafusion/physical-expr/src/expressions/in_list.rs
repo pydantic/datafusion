@@ -419,34 +419,54 @@ impl StaticFilter for BooleanStaticFilter {
     }
 }
 
-// Macro to generate static filter implementations for string and binary types
-// This eliminates ~550 lines of duplicated code across 6 implementations
-macro_rules! define_static_filter {
-    (
-        $name:ident,
-        $value_type:ty,
-        |$arr_param:ident| $downcast:expr,
-        $convert:ident
-    ) => {
+// Macro to generate hash-based static filter implementations for string and binary types
+// This avoids copying string/binary data by storing only the original array and hash indices
+macro_rules! define_hash_based_static_filter {
+    ($name:ident, |$arr_param:ident| $downcast:expr) => {
         struct $name {
+            in_array: ArrayRef,
+            state: RandomState,
+            map: HashMap<usize, (), ()>,
             null_count: usize,
-            values: HashSet<$value_type>,
         }
 
         impl $name {
             fn try_new(in_array: &ArrayRef) -> Result<Self> {
-                let $arr_param = in_array;
-                let in_array = $downcast
-                    .ok_or_else(|| exec_datafusion_err!("Failed to downcast array"))?;
-
-                let mut values = HashSet::with_capacity(in_array.len());
                 let null_count = in_array.null_count();
+                let in_array_clone = Arc::clone(in_array);
+                let state = RandomState::new();
+                let mut map: HashMap<usize, (), ()> = HashMap::with_hasher(());
 
-                for v in in_array.iter().flatten() {
-                    values.insert(v.$convert());
-                }
+                with_hashes([in_array.as_ref()], &state, |hashes| -> Result<()> {
+                    let cmp = make_comparator(in_array, in_array, SortOptions::default())?;
 
-                Ok(Self { null_count, values })
+                    let insert_value = |idx| {
+                        let hash = hashes[idx];
+                        if let RawEntryMut::Vacant(v) = map
+                            .raw_entry_mut()
+                            .from_hash(hash, |x| cmp(*x, idx).is_eq())
+                        {
+                            v.insert_with_hasher(hash, idx, (), |x| hashes[*x]);
+                        }
+                    };
+
+                    match in_array.nulls() {
+                        Some(nulls) => {
+                            BitIndexIterator::new(nulls.validity(), nulls.offset(), nulls.len())
+                                .for_each(insert_value)
+                        }
+                        None => (0..in_array.len()).for_each(insert_value),
+                    }
+
+                    Ok(())
+                })?;
+
+                Ok(Self {
+                    in_array: in_array_clone,
+                    state,
+                    map,
+                    null_count,
+                })
             }
         }
 
@@ -466,105 +486,45 @@ macro_rules! define_static_filter {
                     _ => {}
                 }
 
-                let $arr_param = v;
-                let v = $downcast
-                    .ok_or_else(|| exec_datafusion_err!("Failed to downcast array"))?;
-
                 let haystack_has_nulls = self.null_count > 0;
 
-                let result = match (v.null_count() > 0, haystack_has_nulls, negated) {
-                    (true, _, false) | (false, true, false) => {
-                        BooleanArray::from_iter(v.iter().map(|value| {
-                            match value {
-                                None => None,
-                                Some(v) => {
-                                    if self.values.contains(v) {
-                                        Some(true)
-                                    } else if haystack_has_nulls {
-                                        None
-                                    } else {
-                                        Some(false)
-                                    }
-                                }
-                            }
-                        }))
-                    }
-                    (true, _, true) | (false, true, true) => {
-                        BooleanArray::from_iter(v.iter().map(|value| {
-                            match value {
-                                None => None,
-                                Some(v) => {
-                                    if self.values.contains(v) {
-                                        Some(false)
-                                    } else if haystack_has_nulls {
-                                        None
-                                    } else {
-                                        Some(true)
-                                    }
-                                }
-                            }
-                        }))
-                    }
-                    (false, false, false) => {
-                        BooleanArray::from_iter(
-                            v.iter().map(|value| self.values.contains(value.expect("null_count is 0"))),
-                        )
-                    }
-                    (false, false, true) => {
-                        BooleanArray::from_iter(
-                            v.iter().map(|value| !self.values.contains(value.expect("null_count is 0"))),
-                        )
-                    }
-                };
-                Ok(result)
+                // Use hash-based lookup with verification
+                with_hashes([v], &self.state, |hashes| {
+                    let cmp = make_comparator(v, &self.in_array, SortOptions::default())?;
+
+                    Ok(BooleanArray::from_iter((0..v.len()).map(|i| {
+                        if v.is_null(i) {
+                            return None;
+                        }
+
+                        let hash = hashes[i];
+                        let contains = self
+                            .map
+                            .raw_entry()
+                            .from_hash(hash, |idx| cmp(i, *idx).is_eq())
+                            .is_some();
+
+                        match contains {
+                            true => Some(!negated),
+                            false if haystack_has_nulls => None,
+                            false => Some(negated),
+                        }
+                    })))
+                })
             }
         }
     };
 }
 
 // String static filters
-define_static_filter!(
-    Utf8StaticFilter,
-    String,
-    |arr| arr.as_string_opt::<i32>(),
-    to_string
-);
-
-define_static_filter!(
-    LargeUtf8StaticFilter,
-    String,
-    |arr| arr.as_string_opt::<i64>(),
-    to_string
-);
-
-define_static_filter!(
-    Utf8ViewStaticFilter,
-    String,
-    |arr| arr.as_string_view_opt(),
-    to_string
-);
+define_hash_based_static_filter!(Utf8StaticFilter, |arr| arr.as_string_opt::<i32>());
+define_hash_based_static_filter!(LargeUtf8StaticFilter, |arr| arr.as_string_opt::<i64>());
+define_hash_based_static_filter!(Utf8ViewStaticFilter, |arr| arr.as_string_view_opt());
 
 // Binary static filters
-define_static_filter!(
-    BinaryStaticFilter,
-    Vec<u8>,
-    |arr| arr.as_binary_opt::<i32>(),
-    to_vec
-);
-
-define_static_filter!(
-    LargeBinaryStaticFilter,
-    Vec<u8>,
-    |arr| arr.as_binary_opt::<i64>(),
-    to_vec
-);
-
-define_static_filter!(
-    BinaryViewStaticFilter,
-    Vec<u8>,
-    |arr| arr.as_binary_view_opt(),
-    to_vec
-);
+define_hash_based_static_filter!(BinaryStaticFilter, |arr| arr.as_binary_opt::<i32>());
+define_hash_based_static_filter!(LargeBinaryStaticFilter, |arr| arr.as_binary_opt::<i64>());
+define_hash_based_static_filter!(BinaryViewStaticFilter, |arr| arr.as_binary_view_opt());
 
 /// Evaluates the list of expressions into an array, flattening any dictionaries
 fn evaluate_list(
