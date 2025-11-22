@@ -26,7 +26,7 @@ use crate::physical_expr::physical_exprs_bag_equal;
 use crate::PhysicalExpr;
 
 use arrow::array::*;
-use arrow::buffer::BooleanBuffer;
+use arrow::buffer::{BooleanBuffer, NullBuffer};
 use arrow::compute::kernels::boolean::{not, or_kleene};
 use arrow::compute::{take, SortOptions};
 use arrow::datatypes::*;
@@ -91,7 +91,12 @@ impl StaticFilter for ArrayStaticFilter {
         if v.data_type() == &DataType::Null
             || self.in_array.data_type() == &DataType::Null
         {
-            return Ok(BooleanArray::from(vec![None; v.len()]));
+            // return Ok(BooleanArray::new(vec![None; v.len()]));
+            let nulls = NullBuffer::new_null(v.len());
+            return Ok(BooleanArray::new(
+                BooleanBuffer::new_unset(v.len()),
+                Some(nulls),
+            ));
         }
 
         downcast_dictionary_array! {
@@ -218,7 +223,7 @@ macro_rules! primitive_static_filter {
             fn try_new(in_array: &ArrayRef) -> Result<Self> {
                 let in_array = in_array
                     .as_primitive_opt::<$ArrowType>()
-                    .ok_or_else(|| exec_datafusion_err!(format!("Failed to downcast an array to a '{}' array", stringify!($ArrowType))))?;
+                    .ok_or_else(|| exec_datafusion_err!("Failed to downcast an array to a '{}' array", stringify!($ArrowType)))?;
 
                 let mut values = HashSet::with_capacity(in_array.len());
                 let null_count = in_array.null_count();
@@ -249,7 +254,7 @@ macro_rules! primitive_static_filter {
 
                 let v = v
                     .as_primitive_opt::<$ArrowType>()
-                    .ok_or_else(|| exec_datafusion_err!(format!("Failed to downcast an array to a '{}' array", stringify!($ArrowType))))?;
+                    .ok_or_else(|| exec_datafusion_err!("Failed to downcast an array to a '{}' array", stringify!($ArrowType)))?;
 
                 let haystack_has_nulls = self.null_count > 0;
 
@@ -294,15 +299,20 @@ macro_rules! primitive_static_filter {
                     }
                     (false, false, false) => {
                         // no nulls anywhere, not negated
-                        BooleanArray::from_iter(
-                            v.values().iter().map(|value| self.values.contains(value)),
-                        )
+                        let values = v.values();
+                        let mut builder = BooleanBufferBuilder::new(values.len());
+                        for value in values.iter() {
+                            builder.append(self.values.contains(value));
+                        }
+                        BooleanArray::new(builder.finish(), None)
                     }
                     (false, false, true) => {
-                        // no nulls anywhere, negated
-                        BooleanArray::from_iter(
-                            v.values().iter().map(|value| !self.values.contains(value)),
-                        )
+                        let values = v.values();
+                        let mut builder = BooleanBufferBuilder::new(values.len());
+                        for value in values.iter() {
+                            builder.append(!self.values.contains(value));
+                        }
+                        BooleanArray::new(builder.finish(), None)
                     }
                 };
                 Ok(result)
@@ -476,8 +486,12 @@ impl PhysicalExpr for InListExpr {
                         if scalar.is_null() {
                             // SQL three-valued logic: null IN (...) is always null
                             // The code below would handle this correctly but this is a faster path
+                            let nulls = NullBuffer::new_null(num_rows);
                             return Ok(ColumnarValue::Array(Arc::new(
-                                BooleanArray::from(vec![None; num_rows]),
+                                BooleanArray::new(
+                                    BooleanBuffer::new_unset(num_rows),
+                                    Some(nulls),
+                                ),
                             )));
                         }
                         // Use a 1 row array to avoid code duplication/branching
@@ -488,12 +502,15 @@ impl PhysicalExpr for InListExpr {
                         // Broadcast the single result to all rows
                         // Must check is_null() to preserve NULL values (SQL three-valued logic)
                         if result_array.is_null(0) {
-                            BooleanArray::from(vec![None; num_rows])
+                            let nulls = NullBuffer::new_null(num_rows);
+                            BooleanArray::new(
+                                BooleanBuffer::new_unset(num_rows),
+                                Some(nulls),
+                            )
+                        } else if result_array.value(0) {
+                            BooleanArray::new(BooleanBuffer::new_set(num_rows), None)
                         } else {
-                            BooleanArray::from_iter(std::iter::repeat_n(
-                                result_array.value(0),
-                                num_rows,
-                            ))
+                            BooleanArray::new(BooleanBuffer::new_unset(num_rows), None)
                         }
                     }
                 }
