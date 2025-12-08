@@ -257,62 +257,57 @@ macro_rules! primitive_static_filter {
                     .ok_or_else(|| exec_datafusion_err!("Failed to downcast an array to a '{}' array", stringify!($ArrowType)))?;
 
                 let haystack_has_nulls = self.null_count > 0;
+                let has_nulls = v.null_count() > 0 || haystack_has_nulls;
 
-                let result = match (v.null_count() > 0, haystack_has_nulls, negated) {
-                    (true, _, false) | (false, true, false) => {
-                        // Either needle or haystack has nulls, not negated
-                        BooleanArray::from_iter(v.iter().map(|value| {
-                            match value {
-                                // SQL three-valued logic: null IN (...) is always null
-                                None => None,
-                                Some(v) => {
-                                    if self.values.contains(&v) {
-                                        Some(true)
-                                    } else if haystack_has_nulls {
-                                        // value not in set, but set has nulls -> null
-                                        None
-                                    } else {
-                                        Some(false)
-                                    }
-                                }
-                            }
-                        }))
+                // SAFETY: collect_bool guarantees i < len for all closure calls
+                let result = match (has_nulls, negated) {
+                    (true, false) => {
+                        // Has nulls somewhere, not negated
+                        let len = v.len();
+                        let values_buf = BooleanBuffer::collect_bool(len, |i| {
+                            // SAFETY: i < len is guaranteed by collect_bool
+                            // If found in set -> true, otherwise false (null handled by validity)
+                            v.is_valid(i) && self.values.contains(unsafe { &v.value_unchecked(i) })
+                        });
+                        let nulls_buf = BooleanBuffer::collect_bool(len, |i| {
+                            // SAFETY: i < len is guaranteed by collect_bool
+                            // Valid (not null) if: needle is valid AND (found OR haystack has no nulls)
+                            v.is_valid(i) && (self.values.contains(unsafe { &v.value_unchecked(i) }) || !haystack_has_nulls)
+                        });
+                        BooleanArray::new(values_buf, Some(NullBuffer::new(nulls_buf)))
                     }
-                    (true, _, true) | (false, true, true) => {
-                        // Either needle or haystack has nulls, negated
-                        BooleanArray::from_iter(v.iter().map(|value| {
-                            match value {
-                                // SQL three-valued logic: null NOT IN (...) is always null
-                                None => None,
-                                Some(v) => {
-                                    if self.values.contains(&v) {
-                                        Some(false)
-                                    } else if haystack_has_nulls {
-                                        // value not in set, but set has nulls -> null
-                                        None
-                                    } else {
-                                        Some(true)
-                                    }
-                                }
-                            }
-                        }))
+                    (true, true) => {
+                        // Has nulls somewhere, negated
+                        let len = v.len();
+                        let values_buf = BooleanBuffer::collect_bool(len, |i| {
+                            // SAFETY: i < len is guaranteed by collect_bool
+                            // If found in set -> false, otherwise true (null handled by validity)
+                            v.is_valid(i) && !self.values.contains(unsafe { &v.value_unchecked(i) })
+                        });
+                        let nulls_buf = BooleanBuffer::collect_bool(len, |i| {
+                            // SAFETY: i < len is guaranteed by collect_bool
+                            // Valid (not null) if: needle is valid AND (found OR haystack has no nulls)
+                            v.is_valid(i) && (self.values.contains(unsafe { &v.value_unchecked(i) }) || !haystack_has_nulls)
+                        });
+                        BooleanArray::new(values_buf, Some(NullBuffer::new(nulls_buf)))
                     }
-                    (false, false, false) => {
-                        // no nulls anywhere, not negated
+                    (false, false) => {
+                        // No nulls anywhere, not negated
                         let values = v.values();
-                        let mut builder = BooleanBufferBuilder::new(values.len());
-                        for value in values.iter() {
-                            builder.append(self.values.contains(value));
-                        }
-                        BooleanArray::new(builder.finish(), None)
+                        let values_buf = BooleanBuffer::collect_bool(values.len(), |i| {
+                            // SAFETY: i < len is guaranteed by collect_bool
+                            self.values.contains(unsafe { values.get_unchecked(i) })
+                        });
+                        BooleanArray::new(values_buf, None)
                     }
-                    (false, false, true) => {
+                    (false, true) => {
+                        // No nulls anywhere, negated
                         let values = v.values();
-                        let mut builder = BooleanBufferBuilder::new(values.len());
-                        for value in values.iter() {
-                            builder.append(!self.values.contains(value));
-                        }
-                        BooleanArray::new(builder.finish(), None)
+                        let values_buf = BooleanBuffer::collect_bool(values.len(), |i| {
+                            // SAFETY: i < len is guaranteed by collect_bool
+                            !self.values.contains(unsafe { values.get_unchecked(i) })
+                        });
+                        BooleanArray::new(values_buf, None)
                     }
                 };
                 Ok(result)
