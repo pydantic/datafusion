@@ -25,7 +25,6 @@ use datafusion_common::ScalarValue;
 use datafusion_physical_expr::expressions::{col, in_list, lit};
 use rand::distr::Alphanumeric;
 use rand::prelude::*;
-use std::any::TypeId;
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -47,35 +46,10 @@ fn random_string(rng: &mut StdRng, len: usize) -> String {
     String::from_utf8(value).unwrap()
 }
 
-const IN_LIST_LENGTHS: [usize; 3] = [3, 8, 100];
+const IN_LIST_LENGTHS: [usize; 4] = [3, 6, 8, 100];
 const NULL_PERCENTS: [f64; 2] = [0., 0.2];
 const STRING_LENGTHS: [usize; 3] = [3, 12, 100];
 const ARRAY_LENGTH: usize = 1024;
-
-/// Returns a friendly type name for the array type.
-fn array_type_name<A: 'static>() -> &'static str {
-    let id = TypeId::of::<A>();
-    if id == TypeId::of::<StringArray>() {
-        "Utf8"
-    } else if id == TypeId::of::<StringViewArray>() {
-        "Utf8View"
-    } else if id == TypeId::of::<Float32Array>() {
-        "Float32"
-    } else if id == TypeId::of::<Int32Array>() {
-        "Int32"
-    } else {
-        "Unknown"
-    }
-}
-
-/// Builds a benchmark name from array type, list size, and null percentage.
-fn bench_name<A: 'static>(in_list_length: usize, null_percent: f64) -> String {
-    format!(
-        "in_list/{}/list={in_list_length}/nulls={}%",
-        array_type_name::<A>(),
-        (null_percent * 100.0) as u32
-    )
-}
 
 /// Runs in_list benchmarks for a string array type across all list-size × null-ratio × string-length combinations.
 fn bench_string_type<A>(
@@ -94,6 +68,7 @@ fn bench_string_type<A>(
                             .then(|| random_string(rng, string_length))
                     })
                     .collect();
+                let values: ArrayRef = Arc::new(values);
 
                 let in_list: Vec<_> = (0..in_list_length)
                     .map(|_| make_scalar(random_string(rng, string_length)))
@@ -102,10 +77,11 @@ fn bench_string_type<A>(
                 do_bench(
                     c,
                     &format!(
-                        "{}/str={string_length}",
-                        bench_name::<A>(in_list_length, null_percent)
+                        "in_list/{}/list={in_list_length}/nulls={}%/str={string_length}",
+                        values.data_type(),
+                        (null_percent * 100.0) as u32
                     ),
-                    Arc::new(values),
+                    values,
                     &in_list,
                 )
             }
@@ -127,6 +103,7 @@ fn bench_numeric_type<T, A>(
             let values: A = (0..ARRAY_LENGTH)
                 .map(|_| rng.random_bool(1.0 - null_percent).then(|| gen_value(rng)))
                 .collect();
+            let values: ArrayRef = Arc::new(values);
 
             let in_list: Vec<_> = (0..in_list_length)
                 .map(|_| make_scalar(gen_value(rng)))
@@ -134,8 +111,12 @@ fn bench_numeric_type<T, A>(
 
             do_bench(
                 c,
-                &bench_name::<A>(in_list_length, null_percent),
-                Arc::new(values),
+                &format!(
+                    "in_list/{}/list={in_list_length}/nulls={}%",
+                    values.data_type(),
+                    (null_percent * 100.0) as u32
+                ),
+                values,
                 &in_list,
             );
         }

@@ -26,7 +26,7 @@ use crate::physical_expr::physical_exprs_bag_equal;
 use crate::PhysicalExpr;
 
 use arrow::array::*;
-use arrow::buffer::{BooleanBuffer, NullBuffer};
+use arrow::buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow::compute::kernels::boolean::{not, or_kleene};
 use arrow::compute::{take, SortOptions};
 use arrow::datatypes::*;
@@ -87,18 +87,7 @@ impl StaticFilter for ArrayStaticFilter {
 
     /// Checks if values in `v` are contained in the `in_array` using this hash set for lookup.
     fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
-        // Null type comparisons always return null (SQL three-valued logic)
-        if v.data_type() == &DataType::Null
-            || self.in_array.data_type() == &DataType::Null
-        {
-            // return Ok(BooleanArray::new(vec![None; v.len()]));
-            let nulls = NullBuffer::new_null(v.len());
-            return Ok(BooleanArray::new(
-                BooleanBuffer::new_unset(v.len()),
-                Some(nulls),
-            ));
-        }
-
+        // Handle dictionary arrays
         downcast_dictionary_array! {
             v => {
                 let values_contains = self.contains(v.values().as_ref(), negated)?;
@@ -108,9 +97,53 @@ impl StaticFilter for ArrayStaticFilter {
             _ => {}
         }
 
+        // Null type comparisons always return null (SQL three-valued logic)
+        if v.data_type() == &DataType::Null
+            || self.in_array.data_type() == &DataType::Null
+        {
+            return Ok(BooleanArray::new(
+                BooleanBuffer::new_unset(v.len()),
+                Some(NullBuffer::new_null(v.len())),
+            ));
+        }
+
+        // Early exit: empty haystack means nothing can match
+        if self.map.is_empty() {
+            return if self.in_array.null_count() > 0 {
+                // Haystack has only nulls -> result is all null
+                Ok(BooleanArray::new(
+                    BooleanBuffer::new_unset(v.len()),
+                    Some(NullBuffer::new_null(v.len())),
+                ))
+            } else {
+                // Haystack is truly empty -> no matches
+                Ok(BooleanArray::from(vec![negated; v.len()]))
+            };
+        }
+
+        let haystack_has_nulls = self.in_array.null_count() != 0;
+
+        // Fast path: no nulls in needle or haystack - skip all null handling
+        if v.null_count() == 0 && !haystack_has_nulls {
+            return with_hashes([v], &self.state, |hashes| {
+                let cmp = make_comparator(v, &self.in_array, SortOptions::default())?;
+                let values: BooleanBuffer = (0..v.len())
+                    .map(|i| {
+                        let contains = self
+                            .map
+                            .raw_entry()
+                            .from_hash(hashes[i], |idx| cmp(i, *idx).is_eq())
+                            .is_some();
+                        contains != negated
+                    })
+                    .collect();
+                Ok(BooleanArray::new(values, None))
+            });
+        }
+
+        // Slow path: handle nulls
         let needle_nulls = v.logical_nulls();
         let needle_nulls = needle_nulls.as_ref();
-        let haystack_has_nulls = self.in_array.null_count() != 0;
 
         with_hashes([v], &self.state, |hashes| {
             let cmp = make_comparator(v, &self.in_array, SortOptions::default())?;
@@ -121,11 +154,10 @@ impl StaticFilter for ArrayStaticFilter {
                         return None;
                     }
 
-                    let hash = hashes[i];
                     let contains = self
                         .map
                         .raw_entry()
-                        .from_hash(hash, |idx| cmp(i, *idx).is_eq())
+                        .from_hash(hashes[i], |idx| cmp(i, *idx).is_eq())
                         .is_some();
 
                     match contains {
@@ -139,72 +171,253 @@ impl StaticFilter for ArrayStaticFilter {
     }
 }
 
+// =============================================================================
+// STATIC FILTER ARCHITECTURE
+// =============================================================================
+//
+// This module provides optimized membership testing for SQL `IN` expressions.
+//
+// ## Filter Selection
+//
+// ```text
+// instantiate_static_filter(array)
+//   │
+//   ├─ Small primitives (1-8 bytes):
+//   │    ├─► BranchlessFilter<T, N>    (≤16 elements, branchless OR-chain)
+//   │    ├─► PrimitiveFilter<T, SortedLookup>  (17-32, binary search)
+//   │    └─► PrimitiveFilter<T, HashedLookup>  (>32, hash set)
+//   │
+//   ├─ Large primitives (16 bytes, e.g., Decimal128):
+//   │    ├─► BranchlessFilter<T, N>    (≤6 elements)
+//   │    └─► PrimitiveFilter<T, HashedLookup>  (>6, hash set)
+//   │
+//   ├─ Utf8View (short strings ≤12 bytes):
+//   │    └─► Reinterpret as i128, then use Decimal128 filters
+//   │
+//   └─► ArrayStaticFilter  (fallback for complex types)
+// ```
+//
+// ## Type Normalization
+//
+// For equality comparison, only the bit pattern matters. We normalize types
+// to reduce implementations:
+//   - Signed integers → Unsigned equivalents (Int32 → UInt32)
+//   - Floats → Unsigned equivalents (Float64 → UInt64)
+//   - Short Utf8View → Decimal128 (16-byte inline representation)
+//
+// This is implemented via `TransformingFilter`, which wraps an inner filter
+// and transforms input arrays before lookup.
+
+// =============================================================================
+// LOOKUP STRATEGY THRESHOLDS (tuned via microbenchmarks)
+// =============================================================================
+
+/// Maximum list size for branchless lookup on small primitives (1-8 bytes).
+const SMALL_BRANCHLESS_MAX: usize = 16;
+
+/// Maximum list size for binary search on small primitives (1-8 bytes).
+const SMALL_BINARY_MAX: usize = 32;
+
+/// Maximum list size for branchless lookup on 16-byte types (Decimal128, short Utf8View).
+const LARGE_BRANCHLESS_MAX: usize = 6;
+
+/// Maximum length for inline strings in Utf8View (stored in 16-byte view).
+const UTF8VIEW_INLINE_LEN: usize = 12;
+
+// =============================================================================
+// FILTER STRATEGY SELECTION
+// =============================================================================
+
+/// The lookup strategy to use for a given data type and list size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterStrategy {
+    Branchless,
+    Binary,
+    Hashed,
+    Generic,
+}
+
+/// Determines the optimal lookup strategy based on data type and list size.
+fn select_strategy(dt: &DataType, len: usize) -> FilterStrategy {
+    let (max_branchless, max_binary) = match dt.primitive_width() {
+        Some(1 | 2 | 4 | 8) => (SMALL_BRANCHLESS_MAX, SMALL_BINARY_MAX),
+        Some(16) => (LARGE_BRANCHLESS_MAX, LARGE_BRANCHLESS_MAX), // skip binary for 16-byte
+        _ => return FilterStrategy::Generic,
+    };
+    if len <= max_branchless {
+        FilterStrategy::Branchless
+    } else if len <= max_binary {
+        FilterStrategy::Binary
+    } else {
+        FilterStrategy::Hashed
+    }
+}
+
+// =============================================================================
+// FILTER INSTANTIATION
+// =============================================================================
+
+/// Creates the optimal static filter for the given array.
 fn instantiate_static_filter(
     in_array: ArrayRef,
 ) -> Result<Arc<dyn StaticFilter + Send + Sync>> {
-    if in_array.len() <= SORTED_LOOKUP_MAX_LEN {
-        instantiate_sorted_filter(in_array)
-    } else {
-        instantiate_hashed_filter(in_array)
+    let len = in_array.len();
+    let dt = in_array.data_type();
+
+    // Special case: Utf8View with short strings can be reinterpreted as i128
+    if matches!(dt, DataType::Utf8View) && utf8view_all_short_strings(in_array.as_ref()) {
+        return create_utf8view_filter(&in_array, |arr| {
+            if len <= LARGE_BRANCHLESS_MAX {
+                instantiate_branchless_filter_for_type::<Decimal128Type>(arr)
+            } else {
+                Ok(Arc::new(
+                    PrimitiveFilter::<Decimal128Type, HashedLookup<_>>::try_new(&arr)?,
+                ))
+            }
+        });
+    }
+
+    match select_strategy(dt, len) {
+        FilterStrategy::Branchless => dispatch_filter(&in_array, dispatch_branchless),
+        FilterStrategy::Binary => dispatch_filter(&in_array, dispatch_sorted),
+        FilterStrategy::Hashed => dispatch_filter(&in_array, dispatch_hashed),
+        FilterStrategy::Generic => Ok(Arc::new(ArrayStaticFilter::try_new(in_array)?)),
     }
 }
 
-/// Sorted filter using binary search. Best for small lists (≤8 elements).
-fn instantiate_sorted_filter(
-    in_array: ArrayRef,
-) -> Result<Arc<dyn StaticFilter + Send + Sync>> {
-    match in_array.data_type() {
-        DataType::Int8 => Ok(Arc::new(Int8SortedFilter::try_new(&in_array)?)),
-        DataType::Int16 => Ok(Arc::new(Int16SortedFilter::try_new(&in_array)?)),
-        DataType::Int32 => Ok(Arc::new(Int32SortedFilter::try_new(&in_array)?)),
-        DataType::Int64 => Ok(Arc::new(Int64SortedFilter::try_new(&in_array)?)),
-        DataType::UInt8 => Ok(Arc::new(UInt8SortedFilter::try_new(&in_array)?)),
-        DataType::UInt16 => Ok(Arc::new(UInt16SortedFilter::try_new(&in_array)?)),
-        DataType::UInt32 => Ok(Arc::new(UInt32SortedFilter::try_new(&in_array)?)),
-        DataType::UInt64 => Ok(Arc::new(UInt64SortedFilter::try_new(&in_array)?)),
-        DataType::Float32 => Ok(Arc::new(Float32SortedFilter::try_new(&in_array)?)),
-        DataType::Float64 => Ok(Arc::new(Float64SortedFilter::try_new(&in_array)?)),
-        DataType::Utf8View => match Utf8ViewSortedFilter::try_new(&in_array) {
-            Some(Ok(filter)) => Ok(Arc::new(filter)),
-            Some(Err(e)) => Err(e),
-            None => Ok(Arc::new(ArrayStaticFilter::try_new(in_array)?)),
-        },
-        _ => Ok(Arc::new(ArrayStaticFilter::try_new(in_array)?)),
-    }
+/// Generic filter dispatcher with fallback to ArrayStaticFilter.
+fn dispatch_filter<F>(
+    in_array: &ArrayRef,
+    dispatch: F,
+) -> Result<Arc<dyn StaticFilter + Send + Sync>>
+where
+    F: Fn(&ArrayRef) -> Option<Result<Arc<dyn StaticFilter + Send + Sync>>>,
+{
+    dispatch(in_array).unwrap_or_else(|| {
+        Ok(Arc::new(ArrayStaticFilter::try_new(Arc::clone(in_array))?))
+    })
 }
 
-/// Hashed filter using HashSet. Best for larger lists (>8 elements).
-fn instantiate_hashed_filter(
-    in_array: ArrayRef,
-) -> Result<Arc<dyn StaticFilter + Send + Sync>> {
-    match in_array.data_type() {
-        DataType::Int8 => Ok(Arc::new(Int8HashedFilter::try_new(&in_array)?)),
-        DataType::Int16 => Ok(Arc::new(Int16HashedFilter::try_new(&in_array)?)),
-        DataType::Int32 => Ok(Arc::new(Int32HashedFilter::try_new(&in_array)?)),
-        DataType::Int64 => Ok(Arc::new(Int64HashedFilter::try_new(&in_array)?)),
-        DataType::UInt8 => Ok(Arc::new(UInt8HashedFilter::try_new(&in_array)?)),
-        DataType::UInt16 => Ok(Arc::new(UInt16HashedFilter::try_new(&in_array)?)),
-        DataType::UInt32 => Ok(Arc::new(UInt32HashedFilter::try_new(&in_array)?)),
-        DataType::UInt64 => Ok(Arc::new(UInt64HashedFilter::try_new(&in_array)?)),
-        // Floats don't implement Hash, fall through to generic
-        DataType::Utf8View => match Utf8ViewHashedFilter::try_new(&in_array) {
-            Some(Ok(filter)) => Ok(Arc::new(filter)),
-            Some(Err(e)) => Err(e),
-            None => Ok(Arc::new(ArrayStaticFilter::try_new(in_array)?)),
-        },
-        _ => Ok(Arc::new(ArrayStaticFilter::try_new(in_array)?)),
-    }
+// =============================================================================
+// TYPE DISPATCH
+// =============================================================================
+//
+// Dispatches filter creation to the appropriate primitive type.
+// - Unsigned types: use directly
+// - Signed/Float types: reinterpret as unsigned (same bit pattern for equality)
+
+/// Dispatch macro that routes to the appropriate type-specific filter creation.
+/// Uses $direct for unsigned types and $reinterpret for signed/float types.
+macro_rules! dispatch_primitive {
+    ($arr:expr, $direct:ident, $reinterpret:ident) => {
+        match $arr.data_type() {
+            DataType::UInt8 => Some($direct::<UInt8Type>($arr)),
+            DataType::UInt16 => Some($direct::<UInt16Type>($arr)),
+            DataType::UInt32 => Some($direct::<UInt32Type>($arr)),
+            DataType::UInt64 => Some($direct::<UInt64Type>($arr)),
+            DataType::Int8 => Some($reinterpret::<Int8Type, UInt8Type>($arr)),
+            DataType::Int16 => Some($reinterpret::<Int16Type, UInt16Type>($arr)),
+            DataType::Int32 => Some($reinterpret::<Int32Type, UInt32Type>($arr)),
+            DataType::Int64 => Some($reinterpret::<Int64Type, UInt64Type>($arr)),
+            DataType::Float32 => Some($reinterpret::<Float32Type, UInt32Type>($arr)),
+            DataType::Float64 => Some($reinterpret::<Float64Type, UInt64Type>($arr)),
+            _ => None,
+        }
+    };
 }
+
+fn dispatch_branchless(
+    arr: &ArrayRef,
+) -> Option<Result<Arc<dyn StaticFilter + Send + Sync>>> {
+    fn direct<T: ArrowPrimitiveType + 'static>(
+        arr: &ArrayRef,
+    ) -> Result<Arc<dyn StaticFilter + Send + Sync>>
+    where
+        T::Native: Copy + Default + PartialEq + Send + Sync + 'static,
+    {
+        instantiate_branchless_filter_for_type::<T>(Arc::clone(arr))
+    }
+    fn reinterpret<S: ArrowPrimitiveType + 'static, D: ArrowPrimitiveType + 'static>(
+        arr: &ArrayRef,
+    ) -> Result<Arc<dyn StaticFilter + Send + Sync>>
+    where
+        D::Native: Copy + Default + PartialEq + Send + Sync + 'static,
+    {
+        create_reinterpreting_filter::<S, D, _>(arr, |a| {
+            instantiate_branchless_filter_for_type::<D>(a)
+        })
+    }
+    dispatch_primitive!(arr, direct, reinterpret)
+}
+
+fn dispatch_sorted(
+    arr: &ArrayRef,
+) -> Option<Result<Arc<dyn StaticFilter + Send + Sync>>> {
+    fn direct<T: ArrowPrimitiveType + 'static>(
+        arr: &ArrayRef,
+    ) -> Result<Arc<dyn StaticFilter + Send + Sync>>
+    where
+        T::Native: Ord + Send + Sync + 'static,
+    {
+        Ok(Arc::new(
+            PrimitiveFilter::<T, SortedLookup<T::Native>>::try_new(arr)?,
+        ))
+    }
+    fn reinterpret<S: ArrowPrimitiveType + 'static, D: ArrowPrimitiveType + 'static>(
+        arr: &ArrayRef,
+    ) -> Result<Arc<dyn StaticFilter + Send + Sync>>
+    where
+        D::Native: Ord + Send + Sync + 'static,
+    {
+        create_reinterpreting_filter::<S, D, _>(arr, |a| {
+            Ok(Arc::new(
+                PrimitiveFilter::<D, SortedLookup<D::Native>>::try_new(&a)?,
+            ))
+        })
+    }
+    dispatch_primitive!(arr, direct, reinterpret)
+}
+
+fn dispatch_hashed(
+    arr: &ArrayRef,
+) -> Option<Result<Arc<dyn StaticFilter + Send + Sync>>> {
+    if matches!(arr.data_type(), DataType::Decimal128(_, _)) {
+        return Some(
+            PrimitiveFilter::<Decimal128Type, HashedLookup<_>>::try_new(arr)
+                .map(|f| Arc::new(f) as _),
+        );
+    }
+    fn direct<T: ArrowPrimitiveType + 'static>(
+        arr: &ArrayRef,
+    ) -> Result<Arc<dyn StaticFilter + Send + Sync>>
+    where
+        T::Native: Hash + Eq + Send + Sync + 'static,
+    {
+        Ok(Arc::new(
+            PrimitiveFilter::<T, HashedLookup<T::Native>>::try_new(arr)?,
+        ))
+    }
+    fn reinterpret<S: ArrowPrimitiveType + 'static, D: ArrowPrimitiveType + 'static>(
+        arr: &ArrayRef,
+    ) -> Result<Arc<dyn StaticFilter + Send + Sync>>
+    where
+        D::Native: Hash + Eq + Send + Sync + 'static,
+    {
+        create_reinterpreting_filter::<S, D, _>(arr, |a| {
+            Ok(Arc::new(
+                PrimitiveFilter::<D, HashedLookup<D::Native>>::try_new(&a)?,
+            ))
+        })
+    }
+    dispatch_primitive!(arr, direct, reinterpret)
+}
+
+// =============================================================================
+// GENERIC ARRAY FILTER (fallback for unsupported types)
+// =============================================================================
 
 impl ArrayStaticFilter {
-    /// Computes a [`StaticFilter`] for the provided [`Array`] if there
-    /// are nulls present or there are more than the configured number of
-    /// elements.
-    ///
-    /// Note: This is split into a separate function as higher-rank trait bounds currently
-    /// cause type inference to misbehave
     fn try_new(in_array: ArrayRef) -> Result<ArrayStaticFilter> {
-        // Null type has no natural order - return empty hash set
         if in_array.data_type() == &DataType::Null {
             return Ok(ArrayStaticFilter {
                 in_array,
@@ -218,7 +431,6 @@ impl ArrayStaticFilter {
 
         with_hashes([&in_array], &state, |hashes| -> Result<()> {
             let cmp = make_comparator(&in_array, &in_array, SortOptions::default())?;
-
             let insert_value = |idx| {
                 let hash = hashes[idx];
                 if let RawEntryMut::Vacant(v) = map
@@ -228,7 +440,6 @@ impl ArrayStaticFilter {
                     v.insert_with_hasher(hash, idx, (), |x| hashes[*x]);
                 }
             };
-
             match in_array.nulls() {
                 Some(nulls) => {
                     BitIndexIterator::new(nulls.validity(), nulls.offset(), nulls.len())
@@ -236,7 +447,6 @@ impl ArrayStaticFilter {
                 }
                 None => (0..in_array.len()).for_each(insert_value),
             }
-
             Ok(())
         })?;
 
@@ -248,21 +458,20 @@ impl ArrayStaticFilter {
     }
 }
 
-/// Threshold for switching from sorted Vec (binary search) to HashSet
-/// For small lists, binary search has better cache locality and lower overhead
-/// Maximum list size for using sorted lookup (binary search).
-/// Lists with more elements use hash lookup instead.
-const SORTED_LOOKUP_MAX_LEN: usize = 8;
+// =============================================================================
+// RESULT BUILDER FOR IN LIST OPERATIONS
+// =============================================================================
+//
+// Truth table for (needle_nulls, haystack_has_nulls, negated):
+// (Some, true,  false) → values: valid & contains,           nulls: valid & contains
+// (None, true,  false) → values: contains,                   nulls: contains
+// (Some, true,  true)  → values: valid ^ (valid & contains), nulls: valid & contains
+// (None, true,  true)  → values: !contains,                  nulls: contains
+// (Some, false, false) → values: valid & contains,           nulls: valid
+// (Some, false, true)  → values: valid & !contains,          nulls: valid
+// (None, false, false) → values: contains,                   nulls: none
+// (None, false, true)  → values: !contains,                  nulls: none
 
-/// Helper to build a BooleanArray result for IN list operations.
-/// Handles SQL three-valued logic for NULL values.
-///
-/// # Arguments
-/// * `len` - Number of elements in the needle array
-/// * `needle_nulls` - Optional validity buffer from the needle array
-/// * `haystack_has_nulls` - Whether the IN list contains NULL values
-/// * `negated` - Whether this is a NOT IN operation
-/// * `contains` - Closure that returns whether needle[i] is found in the haystack
 #[inline]
 fn build_in_list_result<C>(
     len: usize,
@@ -274,125 +483,82 @@ fn build_in_list_result<C>(
 where
     C: Fn(usize) -> bool,
 {
-    // Use collect_bool for all paths - it's vectorized and faster than element-by-element append.
-    // Match on (needle_has_nulls, haystack_has_nulls, negated) to specialize each case.
+    let contains_buf = BooleanBuffer::collect_bool(len, &contains);
+    build_result_from_contains(needle_nulls, haystack_has_nulls, negated, contains_buf)
+}
+
+#[inline]
+fn build_result_from_contains(
+    needle_nulls: Option<&NullBuffer>,
+    haystack_has_nulls: bool,
+    negated: bool,
+    contains_buf: BooleanBuffer,
+) -> BooleanArray {
     match (needle_nulls, haystack_has_nulls, negated) {
-        // Haystack has nulls: result is NULL when not found (might match the NULL)
-        // values_buf == nulls_buf, so compute once and clone
-        (Some(validity), true, false) => {
-            let contains_buf = BooleanBuffer::collect_bool(len, |i| contains(i));
-            let buf = validity.inner() & &contains_buf;
+        (Some(v), true, false) => {
+            let buf = v.inner() & &contains_buf;
             BooleanArray::new(buf.clone(), Some(NullBuffer::new(buf)))
         }
         (None, true, false) => {
-            let buf = BooleanBuffer::collect_bool(len, |i| contains(i));
-            BooleanArray::new(buf.clone(), Some(NullBuffer::new(buf)))
+            BooleanArray::new(contains_buf.clone(), Some(NullBuffer::new(contains_buf)))
         }
-        (Some(validity), true, true) => {
-            // Compute nulls_buf via SIMD AND, then derive values_buf via XOR.
-            // Uses identity: A & !B = A ^ (A & B) to get values from nulls.
-            let contains_buf = BooleanBuffer::collect_bool(len, |i| contains(i));
-            let nulls_buf = validity.inner() & &contains_buf;
-            let values_buf = validity.inner() ^ &nulls_buf; // valid & !contains
-            BooleanArray::new(values_buf, Some(NullBuffer::new(nulls_buf)))
+        (Some(v), true, true) => {
+            let nulls = v.inner() & &contains_buf;
+            BooleanArray::new(v.inner() ^ &nulls, Some(NullBuffer::new(nulls)))
         }
         (None, true, true) => {
-            // No needle nulls, but haystack has nulls
-            let contains_buf = BooleanBuffer::collect_bool(len, |i| contains(i));
-            let values_buf = !&contains_buf;
-            BooleanArray::new(values_buf, Some(NullBuffer::new(contains_buf)))
+            BooleanArray::new(!&contains_buf, Some(NullBuffer::new(contains_buf)))
         }
-        // Only needle has nulls: nulls_buf is just validity (reuse it directly!)
-        (Some(validity), false, false) => {
-            let contains_buf = BooleanBuffer::collect_bool(len, |i| contains(i));
-            let values_buf = validity.inner() & &contains_buf;
-            BooleanArray::new(values_buf, Some(validity.clone()))
+        (Some(v), false, false) => {
+            BooleanArray::new(v.inner() & &contains_buf, Some(v.clone()))
         }
-        (Some(validity), false, true) => {
-            let contains_buf = BooleanBuffer::collect_bool(len, |i| contains(i));
-            let values_buf = validity.inner() & &(!&contains_buf);
-            BooleanArray::new(values_buf, Some(validity.clone()))
+        (Some(v), false, true) => {
+            BooleanArray::new(v.inner() & &(!&contains_buf), Some(v.clone()))
         }
-        // No nulls anywhere: no validity buffer needed
-        (None, false, false) => {
-            let buf = BooleanBuffer::collect_bool(len, |i| contains(i));
-            BooleanArray::new(buf, None)
-        }
-        (None, false, true) => {
-            let buf = BooleanBuffer::collect_bool(len, |i| !contains(i));
-            BooleanArray::new(buf, None)
-        }
+        (None, false, false) => BooleanArray::new(contains_buf, None),
+        (None, false, true) => BooleanArray::new(!&contains_buf, None),
     }
 }
 
-/// Sorted lookup using binary search. Best for small lists (< 8 elements).
+// =============================================================================
+// LOOKUP STRATEGY TRAIT AND IMPLEMENTATIONS
+// =============================================================================
+
+trait LookupStrategy<T>: Send + Sync {
+    fn new(values: Vec<T>) -> Self;
+    fn contains(&self, value: &T) -> bool;
+}
+
 struct SortedLookup<T>(Vec<T>);
 
-impl<T: Ord> SortedLookup<T> {
+impl<T: Ord + Send + Sync> LookupStrategy<T> for SortedLookup<T> {
     fn new(mut values: Vec<T>) -> Self {
         values.sort_unstable();
         values.dedup();
         Self(values)
     }
-
     #[inline]
     fn contains(&self, value: &T) -> bool {
         self.0.binary_search(value).is_ok()
     }
 }
 
-/// Sorted lookup for f32 using total_cmp (floats don't implement Ord due to NaN).
-struct F32SortedLookup(Vec<f32>);
-
-impl F32SortedLookup {
-    fn new(mut values: Vec<f32>) -> Self {
-        values.sort_unstable_by(|a, b| a.total_cmp(b));
-        values.dedup_by(|a, b| a.total_cmp(b).is_eq());
-        Self(values)
-    }
-
-    #[inline]
-    fn contains(&self, value: &f32) -> bool {
-        self.0
-            .binary_search_by(|probe| probe.total_cmp(value))
-            .is_ok()
-    }
-}
-
-/// Sorted lookup for f64 using total_cmp (floats don't implement Ord due to NaN).
-struct F64SortedLookup(Vec<f64>);
-
-impl F64SortedLookup {
-    fn new(mut values: Vec<f64>) -> Self {
-        values.sort_unstable_by(|a, b| a.total_cmp(b));
-        values.dedup_by(|a, b| a.total_cmp(b).is_eq());
-        Self(values)
-    }
-
-    #[inline]
-    fn contains(&self, value: &f64) -> bool {
-        self.0
-            .binary_search_by(|probe| probe.total_cmp(value))
-            .is_ok()
-    }
-}
-
-/// Hash-based lookup. Best for larger lists (>= 8 elements).
 struct HashedLookup<T>(HashSet<T>);
 
-impl<T: Hash + Eq> HashedLookup<T> {
+impl<T: Hash + Eq + Send + Sync> LookupStrategy<T> for HashedLookup<T> {
     fn new(values: Vec<T>) -> Self {
         Self(values.into_iter().collect())
     }
-
     #[inline]
     fn contains(&self, value: &T) -> bool {
         self.0.contains(value)
     }
 }
 
-/// Helper macro for dictionary array handling in StaticFilter::contains
-/// This pattern is the same across all filter implementations
+// =============================================================================
+// DICTIONARY ARRAY HANDLING
+// =============================================================================
+
 macro_rules! handle_dictionary {
     ($self:ident, $v:ident, $negated:ident) => {
         downcast_dictionary_array! {
@@ -406,257 +572,229 @@ macro_rules! handle_dictionary {
     };
 }
 
-// Base macro to generate sorted StaticFilter with explicit lookup type.
-macro_rules! sorted_static_filter_impl {
-    ($Name:ident, $ArrowType:ty, $LookupType:ty) => {
-        struct $Name {
-            null_count: usize,
-            values: $LookupType,
-        }
+// =============================================================================
+// UNIFIED PRIMITIVE FILTER
+// =============================================================================
 
-        impl $Name {
-            fn try_new(in_array: &ArrayRef) -> Result<Self> {
-                let in_array =
-                    in_array.as_primitive_opt::<$ArrowType>().ok_or_else(|| {
-                        exec_datafusion_err!(
-                            "Failed to downcast an array to a '{}' array",
-                            stringify!($ArrowType)
-                        )
-                    })?;
-
-                let null_count = in_array.null_count();
-                let values = <$LookupType>::new(in_array.iter().flatten().collect());
-
-                Ok(Self { null_count, values })
-            }
-        }
-
-        impl StaticFilter for $Name {
-            fn null_count(&self) -> usize {
-                self.null_count
-            }
-
-            fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
-                handle_dictionary!(self, v, negated);
-
-                let v = v.as_primitive_opt::<$ArrowType>().ok_or_else(|| {
-                    exec_datafusion_err!(
-                        "Failed to downcast an array to a '{}' array",
-                        stringify!($ArrowType)
-                    )
-                })?;
-
-                let values = v.values();
-                Ok(build_in_list_result(
-                    v.len(),
-                    v.nulls(),
-                    self.null_count > 0,
-                    negated,
-                    // SAFETY: i < len is guaranteed by build_in_list_result
-                    |i| self.values.contains(unsafe { values.get_unchecked(i) }),
-                ))
-            }
-        }
-    };
+struct PrimitiveFilter<T: ArrowPrimitiveType, S> {
+    null_count: usize,
+    lookup: S,
+    _phantom: std::marker::PhantomData<fn() -> T>,
 }
 
-// Convenience macro for integer types (derives SortedLookup from ArrowType).
-macro_rules! sorted_static_filter {
-    ($Name:ident, $ArrowType:ty) => {
-        sorted_static_filter_impl!(
-            $Name,
-            $ArrowType,
-            SortedLookup<<$ArrowType as ArrowPrimitiveType>::Native>
-        );
-    };
+impl<T: ArrowPrimitiveType, S: LookupStrategy<T::Native>> PrimitiveFilter<T, S> {
+    fn try_new(in_array: &ArrayRef) -> Result<Self> {
+        let arr = in_array.as_primitive_opt::<T>().ok_or_else(|| {
+            exec_datafusion_err!(
+                "PrimitiveFilter: expected {} array",
+                std::any::type_name::<T>()
+            )
+        })?;
+        Ok(Self {
+            null_count: arr.null_count(),
+            lookup: S::new(arr.iter().flatten().collect()),
+            _phantom: std::marker::PhantomData,
+        })
+    }
 }
 
-// Macro to generate hashed StaticFilter for primitive types using HashedLookup.
-macro_rules! hashed_static_filter {
-    ($Name:ident, $ArrowType:ty) => {
-        struct $Name {
-            null_count: usize,
-            values: HashedLookup<<$ArrowType as ArrowPrimitiveType>::Native>,
-        }
+impl<T, S> StaticFilter for PrimitiveFilter<T, S>
+where
+    T: ArrowPrimitiveType + 'static,
+    T::Native: Send + Sync + 'static,
+    S: LookupStrategy<T::Native> + 'static,
+{
+    fn null_count(&self) -> usize {
+        self.null_count
+    }
 
-        impl $Name {
-            fn try_new(in_array: &ArrayRef) -> Result<Self> {
-                let in_array =
-                    in_array.as_primitive_opt::<$ArrowType>().ok_or_else(|| {
-                        exec_datafusion_err!(
-                            "Failed to downcast an array to a '{}' array",
-                            stringify!($ArrowType)
-                        )
-                    })?;
-
-                let null_count = in_array.null_count();
-                let values = HashedLookup::new(in_array.iter().flatten().collect());
-
-                Ok(Self { null_count, values })
-            }
-        }
-
-        impl StaticFilter for $Name {
-            fn null_count(&self) -> usize {
-                self.null_count
-            }
-
-            fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
-                handle_dictionary!(self, v, negated);
-
-                let v = v.as_primitive_opt::<$ArrowType>().ok_or_else(|| {
-                    exec_datafusion_err!(
-                        "Failed to downcast an array to a '{}' array",
-                        stringify!($ArrowType)
-                    )
-                })?;
-
-                let values = v.values();
-                Ok(build_in_list_result(
-                    v.len(),
-                    v.nulls(),
-                    self.null_count > 0,
-                    negated,
-                    // SAFETY: i < len is guaranteed by build_in_list_result
-                    |i| self.values.contains(unsafe { values.get_unchecked(i) }),
-                ))
-            }
-        }
-    };
+    fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
+        handle_dictionary!(self, v, negated);
+        let v = v.as_primitive_opt::<T>().ok_or_else(|| {
+            exec_datafusion_err!(
+                "PrimitiveFilter: expected {} array",
+                std::any::type_name::<T>()
+            )
+        })?;
+        let values = v.values();
+        Ok(build_in_list_result(
+            v.len(),
+            v.nulls(),
+            self.null_count > 0,
+            negated,
+            |i| self.lookup.contains(unsafe { values.get_unchecked(i) }),
+        ))
+    }
 }
 
-// Generate specialized filters for integer types (sorted for small lists, hashed for large).
-sorted_static_filter!(Int8SortedFilter, Int8Type);
-sorted_static_filter!(Int16SortedFilter, Int16Type);
-sorted_static_filter!(Int32SortedFilter, Int32Type);
-sorted_static_filter!(Int64SortedFilter, Int64Type);
-sorted_static_filter!(UInt8SortedFilter, UInt8Type);
-sorted_static_filter!(UInt16SortedFilter, UInt16Type);
-sorted_static_filter!(UInt32SortedFilter, UInt32Type);
-sorted_static_filter!(UInt64SortedFilter, UInt64Type);
+// =============================================================================
+// BRANCHLESS FILTER (Const Generic for Small Lists)
+// =============================================================================
 
-hashed_static_filter!(Int8HashedFilter, Int8Type);
-hashed_static_filter!(Int16HashedFilter, Int16Type);
-hashed_static_filter!(Int32HashedFilter, Int32Type);
-hashed_static_filter!(Int64HashedFilter, Int64Type);
-hashed_static_filter!(UInt8HashedFilter, UInt8Type);
-hashed_static_filter!(UInt16HashedFilter, UInt16Type);
-hashed_static_filter!(UInt32HashedFilter, UInt32Type);
-hashed_static_filter!(UInt64HashedFilter, UInt64Type);
+struct BranchlessFilter<T: ArrowPrimitiveType, const N: usize> {
+    null_count: usize,
+    values: [T::Native; N],
+}
 
-// Float types: sorted only (floats don't implement Hash/Eq due to NaN).
-sorted_static_filter_impl!(Float32SortedFilter, Float32Type, F32SortedLookup);
-sorted_static_filter_impl!(Float64SortedFilter, Float64Type, F64SortedLookup);
+impl<T: ArrowPrimitiveType, const N: usize> BranchlessFilter<T, N>
+where
+    T::Native: Copy + Default + PartialEq,
+{
+    fn try_new(in_array: &ArrayRef) -> Option<Result<Self>> {
+        let in_array = in_array.as_primitive_opt::<T>()?;
+        let non_null_count = in_array.len() - in_array.null_count();
+        if non_null_count != N {
+            return None;
+        }
+        let values: Vec<_> = in_array.iter().flatten().collect();
+        let mut arr = [T::Native::default(); N];
+        arr.copy_from_slice(&values);
+        Some(Ok(Self {
+            null_count: in_array.null_count(),
+            values: arr,
+        }))
+    }
 
-/// Maximum length for inline strings in Utf8View.
-/// Strings ≤12 bytes are stored entirely inline in the u128 view.
-const UTF8VIEW_INLINE_LEN: usize = 12;
+    #[inline(always)]
+    fn check(&self, needle: T::Native) -> bool {
+        self.values
+            .iter()
+            .fold(false, |acc, &v| acc | (v == needle))
+    }
+}
 
-/// Extract string length from a StringView u128 representation
-/// Layout: bytes 0-3 = length (u32 little-endian), bytes 4-15 = inline data
+impl<T: ArrowPrimitiveType, const N: usize> StaticFilter for BranchlessFilter<T, N>
+where
+    T::Native: Copy + Default + PartialEq + Send + Sync,
+{
+    fn null_count(&self) -> usize {
+        self.null_count
+    }
+
+    fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
+        handle_dictionary!(self, v, negated);
+        let v = v.as_primitive_opt::<T>().ok_or_else(|| {
+            exec_datafusion_err!("Failed to downcast array to primitive type")
+        })?;
+        let input_values = v.values();
+        Ok(build_in_list_result(
+            v.len(),
+            v.nulls(),
+            self.null_count > 0,
+            negated,
+            #[inline(always)]
+            |i| self.check(unsafe { *input_values.get_unchecked(i) }),
+        ))
+    }
+}
+
+fn instantiate_branchless_filter_for_type<T: ArrowPrimitiveType>(
+    in_array: ArrayRef,
+) -> Result<Arc<dyn StaticFilter + Send + Sync>>
+where
+    T::Native: Copy + Default + PartialEq + Send + Sync + 'static,
+{
+    macro_rules! try_branchless {
+        ($($n:literal),*) => {
+            $(if let Some(Ok(f)) = BranchlessFilter::<T, $n>::try_new(&in_array) {
+                return Ok(Arc::new(f));
+            })*
+        };
+    }
+    try_branchless!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+    Ok(Arc::new(ArrayStaticFilter::try_new(in_array)?))
+}
+
+// =============================================================================
+// TRANSFORMING FILTER (Unified Type Reinterpretation)
+// =============================================================================
+
+struct TransformingFilter<F> {
+    inner: Arc<dyn StaticFilter + Send + Sync>,
+    transform: F,
+}
+
+impl<F> StaticFilter for TransformingFilter<F>
+where
+    F: Fn(&dyn Array) -> ArrayRef + Send + Sync,
+{
+    fn null_count(&self) -> usize {
+        self.inner.null_count()
+    }
+
+    fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
+        handle_dictionary!(self, v, negated);
+        self.inner.contains((self.transform)(v).as_ref(), negated)
+    }
+}
+
+/// Creates a TransformingFilter that reinterprets arrays from type S to type D.
+fn create_reinterpreting_filter<S, D, F>(
+    in_array: &ArrayRef,
+    create_inner: F,
+) -> Result<Arc<dyn StaticFilter + Send + Sync>>
+where
+    S: ArrowPrimitiveType + 'static,
+    D: ArrowPrimitiveType + 'static,
+    F: FnOnce(ArrayRef) -> Result<Arc<dyn StaticFilter + Send + Sync>>,
+{
+    let reinterpreted = reinterpret_primitive::<S, D>(in_array.as_ref());
+    let inner = create_inner(reinterpreted)?;
+    Ok(Arc::new(TransformingFilter {
+        inner,
+        transform: |v: &dyn Array| reinterpret_primitive::<S, D>(v),
+    }))
+}
+
+/// Creates a TransformingFilter for Utf8View arrays reinterpreted as Decimal128.
+fn create_utf8view_filter<F>(
+    in_array: &ArrayRef,
+    create_inner: F,
+) -> Result<Arc<dyn StaticFilter + Send + Sync>>
+where
+    F: FnOnce(ArrayRef) -> Result<Arc<dyn StaticFilter + Send + Sync>>,
+{
+    let reinterpreted = reinterpret_utf8view_as_decimal128(in_array.as_ref());
+    let inner = create_inner(reinterpreted)?;
+    Ok(Arc::new(TransformingFilter {
+        inner,
+        transform: reinterpret_utf8view_as_decimal128,
+    }))
+}
+
+// =============================================================================
+// PRIMITIVE TYPE REINTERPRETATION
+// =============================================================================
+
 #[inline]
-fn view_len(view: u128) -> usize {
-    (view as u32) as usize
+fn reinterpret_primitive<S: ArrowPrimitiveType, T: ArrowPrimitiveType>(
+    array: &dyn Array,
+) -> ArrayRef {
+    let source = array.as_primitive::<S>();
+    let buffer: ScalarBuffer<T::Native> = source.values().inner().clone().into();
+    Arc::new(PrimitiveArray::<T>::new(buffer, source.nulls().cloned()))
 }
 
-/// Returns (null_count, views) if all non-null strings are ≤12 bytes, otherwise None.
-fn collect_short_string_views(in_array: &ArrayRef) -> Option<(usize, Vec<u128>)> {
-    let in_array = in_array.as_string_view_opt()?;
-    let raw_views = in_array.views();
+// =============================================================================
+// UTF8VIEW REINTERPRETATION (short strings ≤12 bytes → Decimal128)
+// =============================================================================
 
-    // Check that all non-null strings are ≤12 bytes (inline)
-    for i in 0..in_array.len() {
-        if in_array.is_valid(i) && view_len(raw_views[i]) > UTF8VIEW_INLINE_LEN {
-            return None; // Has long strings, use generic filter
-        }
-    }
-
-    let views: Vec<u128> = (0..in_array.len())
-        .filter(|&i| in_array.is_valid(i))
-        .map(|i| raw_views[i])
-        .collect();
-
-    Some((in_array.null_count(), views))
+#[inline]
+fn utf8view_all_short_strings(array: &dyn Array) -> bool {
+    let sv = array.as_string_view();
+    sv.views().iter().enumerate().all(|(i, &view)| {
+        !sv.is_valid(i) || (view as u32) as usize <= UTF8VIEW_INLINE_LEN
+    })
 }
 
-/// Sorted filter for Utf8View when all values are short (≤12 bytes inline).
-/// Uses binary search over sorted raw u128 views. Best for small lists.
-struct Utf8ViewSortedFilter {
-    null_count: usize,
-    values: SortedLookup<u128>,
-}
-
-impl Utf8ViewSortedFilter {
-    fn try_new(in_array: &ArrayRef) -> Option<Result<Self>> {
-        let (null_count, views) = collect_short_string_views(in_array)?;
-        Some(Ok(Self {
-            null_count,
-            values: SortedLookup::new(views),
-        }))
-    }
-}
-
-impl StaticFilter for Utf8ViewSortedFilter {
-    fn null_count(&self) -> usize {
-        self.null_count
-    }
-
-    fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
-        handle_dictionary!(self, v, negated);
-
-        let v = v.as_string_view_opt().ok_or_else(|| {
-            exec_datafusion_err!("Failed to downcast array to StringViewArray")
-        })?;
-
-        let views = v.views();
-        Ok(build_in_list_result(
-            v.len(),
-            v.nulls(),
-            self.null_count > 0,
-            negated,
-            |i| self.values.contains(&views[i]),
-        ))
-    }
-}
-
-/// Hashed filter for Utf8View when all values are short (≤12 bytes inline).
-/// Uses hash lookup over u128 views. Best for large lists.
-struct Utf8ViewHashedFilter {
-    null_count: usize,
-    values: HashedLookup<u128>,
-}
-
-impl Utf8ViewHashedFilter {
-    fn try_new(in_array: &ArrayRef) -> Option<Result<Self>> {
-        let (null_count, views) = collect_short_string_views(in_array)?;
-        Some(Ok(Self {
-            null_count,
-            values: HashedLookup::new(views),
-        }))
-    }
-}
-
-impl StaticFilter for Utf8ViewHashedFilter {
-    fn null_count(&self) -> usize {
-        self.null_count
-    }
-
-    fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
-        handle_dictionary!(self, v, negated);
-
-        let v = v.as_string_view_opt().ok_or_else(|| {
-            exec_datafusion_err!("Failed to downcast array to StringViewArray")
-        })?;
-
-        let views = v.views();
-        Ok(build_in_list_result(
-            v.len(),
-            v.nulls(),
-            self.null_count > 0,
-            negated,
-            |i| self.values.contains(&views[i]),
-        ))
-    }
+#[inline]
+fn reinterpret_utf8view_as_decimal128(array: &dyn Array) -> ArrayRef {
+    let sv = array.as_string_view();
+    let buffer: ScalarBuffer<i128> = sv.views().inner().clone().into();
+    Arc::new(PrimitiveArray::<Decimal128Type>::new(
+        buffer,
+        sv.nulls().cloned(),
+    ))
 }
 
 /// Evaluates the list of expressions into an array, flattening any dictionaries
