@@ -50,6 +50,10 @@ pub type CastColumnFn = dyn Fn(
 ///
 /// Most users should use [`DefaultSchemaAdapterFactory`]. See that struct for
 /// more details and examples.
+#[deprecated(
+    since = "49.0.0",
+    note = "Use PhysicalExprAdapterFactory instead. See https://github.com/apache/datafusion/issues/16800"
+)]
 pub trait SchemaAdapterFactory: Debug + Send + Sync + 'static {
     /// Create a [`SchemaAdapter`]
     ///
@@ -59,6 +63,7 @@ pub trait SchemaAdapterFactory: Debug + Send + Sync + 'static {
     ///   include only the fields being output (projected) by the this mapping.
     ///
     /// * `table_schema`: The entire table schema for the table
+    #[expect(deprecated)]
     fn create(
         &self,
         projected_table_schema: SchemaRef,
@@ -69,6 +74,7 @@ pub trait SchemaAdapterFactory: Debug + Send + Sync + 'static {
     ///
     /// This is a convenience method for cases where the table schema and the
     /// projected table schema are the same.
+    #[expect(deprecated)]
     fn create_with_projected_schema(
         &self,
         projected_table_schema: SchemaRef,
@@ -84,6 +90,10 @@ pub trait SchemaAdapterFactory: Debug + Send + Sync + 'static {
 /// This is useful for implementing schema evolution in partitioned datasets.
 ///
 /// See [`DefaultSchemaAdapterFactory`] for more details and examples.
+#[deprecated(
+    since = "49.0.0",
+    note = "Use PhysicalExprAdapter instead. See https://github.com/apache/datafusion/issues/16800"
+)]
 pub trait SchemaAdapter: Send + Sync {
     /// Map a column index in the table schema to a column index in a particular
     /// file schema
@@ -109,6 +119,7 @@ pub trait SchemaAdapter: Send + Sync {
     /// Returns:
     /// * a [`SchemaMapper`]
     /// * an ordered list of columns to project from the file
+    #[expect(deprecated)]
     fn map_schema(
         &self,
         file_schema: &Schema,
@@ -118,6 +129,10 @@ pub trait SchemaAdapter: Send + Sync {
 /// Maps, columns from a specific file schema to the table schema.
 ///
 /// See [`DefaultSchemaAdapterFactory`] for more details and examples.
+#[deprecated(
+    since = "49.0.0",
+    note = "Use PhysicalExprAdapter instead. See https://github.com/apache/datafusion/issues/16800"
+)]
 pub trait SchemaMapper: Debug + Send + Sync {
     /// Adapts a `RecordBatch` to match the `table_schema`
     fn map_batch(&self, batch: RecordBatch) -> datafusion_common::Result<RecordBatch>;
@@ -177,6 +192,7 @@ pub trait SchemaMapper: Debug + Send + Sync {
 /// ```
 /// # use std::sync::Arc;
 /// # use arrow::datatypes::{DataType, Field, Schema};
+/// # #[expect(deprecated)]
 /// # use datafusion_datasource::schema_adapter::{DefaultSchemaAdapterFactory, SchemaAdapterFactory};
 /// # use datafusion_common::record_batch;
 /// // Table has fields "a",  "b" and "c"
@@ -187,6 +203,7 @@ pub trait SchemaMapper: Debug + Send + Sync {
 /// ]);
 ///
 /// // create an adapter to map the table schema to the file schema
+/// #[expect(deprecated)]
 /// let adapter = DefaultSchemaAdapterFactory::from_schema(Arc::new(table_schema));
 ///
 /// // The file schema has fields "c" and "b" but "b" is stored as an 'Float64'
@@ -197,6 +214,7 @@ pub trait SchemaMapper: Debug + Send + Sync {
 /// ]);
 ///
 /// // Get a mapping from the file schema to the table schema
+/// #[expect(deprecated)]
 /// let (mapper, _indices) = adapter.map_schema(&file_schema).unwrap();
 ///
 /// let file_batch = record_batch!(
@@ -204,6 +222,7 @@ pub trait SchemaMapper: Debug + Send + Sync {
 ///     ("b", Float64, vec![1.0, 2.0])
 /// ).unwrap();
 ///
+/// #[expect(deprecated)]
 /// let mapped_batch = mapper.map_batch(file_batch).unwrap();
 ///
 /// // the mapped batch has the correct schema and the "b" column has been cast to Utf8
@@ -214,9 +233,14 @@ pub trait SchemaMapper: Debug + Send + Sync {
 /// ).unwrap();
 /// assert_eq!(mapped_batch, expected_batch);
 /// ```
+#[deprecated(
+    since = "49.0.0",
+    note = "Use DefaultPhysicalExprAdapterFactory instead. See https://github.com/apache/datafusion/issues/16800"
+)]
 #[derive(Clone, Debug, Default)]
 pub struct DefaultSchemaAdapterFactory;
 
+#[expect(deprecated)]
 impl DefaultSchemaAdapterFactory {
     /// Create a new factory for mapping batches from a file schema to a table
     /// schema.
@@ -229,6 +253,7 @@ impl DefaultSchemaAdapterFactory {
     }
 }
 
+#[expect(deprecated)]
 impl SchemaAdapterFactory for DefaultSchemaAdapterFactory {
     fn create(
         &self,
@@ -278,6 +303,7 @@ pub(crate) fn can_cast_field(
     }
 }
 
+#[expect(deprecated)]
 impl SchemaAdapter for DefaultSchemaAdapter {
     /// Map a column index in the table schema to a column index in a particular
     /// file schema
@@ -363,6 +389,10 @@ where
 /// `projected_table_schema` as it can only operate on the projected fields.
 ///
 /// [`map_batch`]: Self::map_batch
+#[deprecated(
+    since = "49.0.0",
+    note = "Use PhysicalExprAdapter instead. See https://github.com/apache/datafusion/issues/16800"
+)]
 pub struct SchemaMapping {
     /// The schema of the table. This is the expected schema after conversion
     /// and it should match the schema of the query result.
@@ -378,6 +408,7 @@ pub struct SchemaMapping {
     cast_column: Arc<CastColumnFn>,
 }
 
+#[expect(deprecated)]
 impl Debug for SchemaMapping {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SchemaMapping")
@@ -388,6 +419,7 @@ impl Debug for SchemaMapping {
     }
 }
 
+#[expect(deprecated)]
 impl SchemaMapping {
     /// Creates a new SchemaMapping instance
     ///
@@ -405,6 +437,7 @@ impl SchemaMapping {
     }
 }
 
+#[expect(deprecated)]
 impl SchemaMapper for SchemaMapping {
     /// Adapts a `RecordBatch` to match the `projected_table_schema` using the stored mapping and
     /// conversions.
@@ -479,6 +512,7 @@ impl SchemaMapper for SchemaMapping {
 }
 
 #[cfg(test)]
+#[expect(deprecated)]
 mod tests {
     use super::*;
     use arrow::{

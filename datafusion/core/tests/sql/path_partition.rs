@@ -464,10 +464,37 @@ async fn parquet_statistics() -> Result<()> {
     assert_eq!(stat_cols.len(), 4);
     // stats for the first col are read from the parquet file
     assert_eq!(stat_cols[0].null_count, Precision::Exact(3));
-    // TODO assert partition column (1,2,3) stats once implemented (#1186)
-    assert_eq!(stat_cols[1], ColumnStatistics::new_unknown(),);
-    assert_eq!(stat_cols[2], ColumnStatistics::new_unknown(),);
-    assert_eq!(stat_cols[3], ColumnStatistics::new_unknown(),);
+    // Partition column stats are now computed from partition values
+    // year=2021 for all files
+    assert_eq!(stat_cols[1].null_count, Precision::Exact(0));
+    assert_eq!(
+        stat_cols[1].min_value,
+        Precision::Exact(ScalarValue::Int32(Some(2021)))
+    );
+    assert_eq!(
+        stat_cols[1].max_value,
+        Precision::Exact(ScalarValue::Int32(Some(2021)))
+    );
+    // month: "09", "10", "10" -> min="09", max="10"
+    assert_eq!(stat_cols[2].null_count, Precision::Exact(0));
+    assert_eq!(
+        stat_cols[2].min_value,
+        Precision::Exact(ScalarValue::Utf8(Some("09".to_string())))
+    );
+    assert_eq!(
+        stat_cols[2].max_value,
+        Precision::Exact(ScalarValue::Utf8(Some("10".to_string())))
+    );
+    // day: "09", "09", "28" -> min="09", max="28"
+    assert_eq!(stat_cols[3].null_count, Precision::Exact(0));
+    assert_eq!(
+        stat_cols[3].min_value,
+        Precision::Exact(ScalarValue::Utf8(Some("09".to_string())))
+    );
+    assert_eq!(
+        stat_cols[3].max_value,
+        Precision::Exact(ScalarValue::Utf8(Some("28".to_string())))
+    );
 
     //// WITH PROJECTION ////
     let dataframe = ctx.sql("SELECT mycol, day FROM t WHERE day='28'").await?;
@@ -479,8 +506,16 @@ async fn parquet_statistics() -> Result<()> {
     assert_eq!(stat_cols.len(), 2);
     // stats for the first col are read from the parquet file
     assert_eq!(stat_cols[0].null_count, Precision::Exact(1));
-    // TODO assert partition column stats once implemented (#1186)
-    assert_eq!(stat_cols[1], ColumnStatistics::new_unknown());
+    // Partition column stats are now computed (only day='28' due to filter)
+    assert_eq!(stat_cols[1].null_count, Precision::Exact(0));
+    assert_eq!(
+        stat_cols[1].min_value,
+        Precision::Exact(ScalarValue::Utf8(Some("28".to_string())))
+    );
+    assert_eq!(
+        stat_cols[1].max_value,
+        Precision::Exact(ScalarValue::Utf8(Some("28".to_string())))
+    );
 
     Ok(())
 }

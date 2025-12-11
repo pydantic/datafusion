@@ -366,7 +366,10 @@ impl FileGroupPartitioner {
 pub struct FileGroup {
     /// The files in this group
     files: Vec<PartitionedFile>,
-    /// Optional statistics for the data across all files in the group
+    /// Optional statistics for the data across all files in the group.
+    ///
+    /// These statistics cover the full table schema: file columns plus partition columns.
+    /// Partition column statistics are computed from individual file partition values.
     statistics: Option<Arc<Statistics>>,
 }
 

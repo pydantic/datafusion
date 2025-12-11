@@ -53,6 +53,7 @@ pub use datafusion_datasource::file_stream::{
 };
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::sync::Arc;
 

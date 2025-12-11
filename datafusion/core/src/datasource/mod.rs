@@ -42,6 +42,7 @@ pub use datafusion_catalog::default_table_source;
 pub use datafusion_catalog::memory;
 pub use datafusion_catalog::stream;
 pub use datafusion_catalog::view;
+#[allow(deprecated)]
 pub use datafusion_datasource::schema_adapter;
 pub use datafusion_datasource::sink;
 pub use datafusion_datasource::source;
@@ -50,6 +51,7 @@ pub use datafusion_execution::object_store;
 pub use datafusion_physical_expr::create_ordering;
 
 #[cfg(all(test, feature = "parquet"))]
+#[allow(deprecated)]
 mod tests {
 
     use crate::prelude::SessionContext;

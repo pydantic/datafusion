@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// TODO: Remove this allow once SchemaAdapter is fully migrated to PhysicalExprAdapter
+// See https://github.com/apache/datafusion/issues/16800
+#![allow(deprecated)]
+
 //! Execution plan for reading CSV files
 
 use datafusion_datasource::projection::{ProjectionOpener, SplitProjection};

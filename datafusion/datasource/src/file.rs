@@ -25,6 +25,7 @@ use std::sync::Arc;
 use crate::file_groups::FileGroupPartitioner;
 use crate::file_scan_config::FileScanConfig;
 use crate::file_stream::FileOpener;
+#[expect(deprecated)]
 use crate::schema_adapter::SchemaAdapterFactory;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Result, not_impl_err};
@@ -167,6 +168,11 @@ pub trait FileSource: Send + Sync {
     /// The default implementation returns a not implemented error.
     ///
     /// [`schema_adapter_factory`]: Self::schema_adapter_factory
+    #[deprecated(
+        since = "49.0.0",
+        note = "Use PhysicalExprAdapterFactory instead. See https://github.com/apache/datafusion/issues/16800"
+    )]
+    #[expect(deprecated)]
     fn with_schema_adapter_factory(
         &self,
         _factory: Arc<dyn SchemaAdapterFactory>,
@@ -180,6 +186,11 @@ pub trait FileSource: Send + Sync {
     /// Returns the current schema adapter factory if set
     ///
     /// Default implementation returns `None`.
+    #[deprecated(
+        since = "49.0.0",
+        note = "Use PhysicalExprAdapterFactory instead. See https://github.com/apache/datafusion/issues/16800"
+    )]
+    #[expect(deprecated)]
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
         None
     }
