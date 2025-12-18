@@ -65,6 +65,26 @@ impl TypeCoercion {
     }
 }
 
+/// Check if a type can be cast to another type, with special handling for Union types.
+/// For Union types, returns true if any variant can be cast to the target type.
+fn can_cast_types_with_union(from_type: &DataType, to_type: &DataType) -> bool {
+    use DataType::*;
+
+    // if types are equal, no cast is needed
+    if from_type == to_type {
+        return true;
+    }
+
+    if let Union(fields, _) = from_type {
+        // For Union types, check if any variant can be cast to the target type
+        fields
+            .iter()
+            .any(|(_, f)| can_cast_types(f.data_type(), to_type))
+    } else {
+        can_cast_types(from_type, to_type)
+    }
+}
+
 /// Coerce output schema based upon optimizer config.
 fn coerce_output(plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
     if !config.optimizer.expand_views_at_output {
@@ -294,8 +314,8 @@ impl<'a> TypeCoercionRewriter<'a> {
         let (left_type, right_type) =
             BinaryTypeCoercer::new(&left_data_type, &op, &right_data_type)
                 .get_input_types()?;
-        let left_cast_ok = can_cast_types(&left_data_type, &left_type);
-        let right_cast_ok = can_cast_types(&right_data_type, &right_type);
+        let left_cast_ok = can_cast_types_with_union(&left_data_type, &left_type);
+        let right_cast_ok = can_cast_types_with_union(&right_data_type, &right_type);
 
         // handle special cases for
         // * Date +/- int => Date

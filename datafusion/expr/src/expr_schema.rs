@@ -599,12 +599,18 @@ impl ExprSchemable for Expr {
         // like all of the binary expressions below. Perhaps Expr should track the
         // type of the expression?
 
-        // Special handling for struct-to-struct casts with name-based field matching
+        // Special handling for struct-to-struct and union casts
         let can_cast = match (&this_type, cast_to_type) {
             (DataType::Struct(_), DataType::Struct(_)) => {
                 // Always allow struct-to-struct casts; field matching happens at runtime
                 true
             }
+            // Union casting requires checking if any variant can cast to target.
+            // We can't pass type ids through the coercion system and there can be
+            // duplicate tag ids, so we check for cast-compatible variants.
+            (DataType::Union(fields, _), _) => fields
+                .iter()
+                .any(|(_, field)| can_cast_types(field.data_type(), cast_to_type)),
             _ => can_cast_types(&this_type, cast_to_type),
         };
 
