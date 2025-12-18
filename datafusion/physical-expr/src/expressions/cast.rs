@@ -339,14 +339,21 @@ pub fn cast_with_target_field(
     }
 
     let can_build_cast = if requires_nested_struct_cast(&expr_type, cast_type) {
-        // Allow casts involving structs (including nested inside Lists, Dictionaries,
+        // allow casts involving structs (including nested inside Lists, Dictionaries,
         // etc.) that pass name-based compatibility validation. This validation is
         // applied at planning time (now) to fail fast, rather than deferring errors
         // to execution time. The name-based casting logic will be executed at runtime
         // via ColumnarValue::cast_to.
         can_cast_named_struct_types(&expr_type, cast_type)
     } else {
-        can_cast_types(&expr_type, cast_type)
+        // check if cast is supported, with special handling for union types.
+        match &expr_type {
+            // union casting requires checking if any variant can cast to target.
+            Union(fields, _) => fields
+                .iter()
+                .any(|(_, f)| can_cast_types(f.data_type(), cast_type)),
+            _ => can_cast_types(&expr_type, cast_type),
+        }
     };
 
     if !can_build_cast {
