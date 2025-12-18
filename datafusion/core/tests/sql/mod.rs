@@ -72,6 +72,8 @@ pub mod select;
 mod sql_api;
 mod unparser;
 
+mod union_comparison;
+
 async fn register_aggregate_csv_by_sql(ctx: &SessionContext) {
     let testdata = test_util::arrow_test_data();
 
