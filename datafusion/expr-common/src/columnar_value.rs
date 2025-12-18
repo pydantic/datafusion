@@ -357,10 +357,7 @@ fn cast_union_array(
         if type_id == match_id {
             let o = match mode {
                 UnionMode::Sparse => i,
-                UnionMode::Dense => union_array
-                    .value_offset(i)
-                    .try_into()
-                    .map_err(|_| ArrowError::CastError("invalid offset".into()))?,
+                UnionMode::Dense => union_array.value_offset(i),
             };
             indices.push(o as u32);
             null_mask.push(true);
