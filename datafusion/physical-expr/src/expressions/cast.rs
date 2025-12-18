@@ -333,10 +333,21 @@ pub fn cast_with_options(
         } else {
             not_impl_err!("Unsupported CAST from {expr_type} to {cast_type}")
         }
-    } else if can_cast_types(&expr_type, &cast_type) {
-        Ok(Arc::new(CastExpr::new(expr, cast_type, cast_options)))
     } else {
-        not_impl_err!("Unsupported CAST from {expr_type} to {cast_type}")
+        // Check if cast is supported, with special handling for union types.
+        let can_cast = match &expr_type {
+            // Union casting requires checking if any variant can cast to target.
+            Union(fields, _) => fields
+                .iter()
+                .any(|(_, f)| can_cast_types(f.data_type(), &cast_type)),
+            _ => can_cast_types(&expr_type, &cast_type),
+        };
+
+        if can_cast {
+            Ok(Arc::new(CastExpr::new(expr, cast_type, cast_options)))
+        } else {
+            not_impl_err!("Unsupported CAST from {expr_type} to {cast_type}")
+        }
     }
 }
 
