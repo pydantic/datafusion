@@ -672,7 +672,20 @@ impl ExprSchemable for Expr {
         // like all of the binary expressions below. Perhaps Expr should track the
         // type of the expression?
 
-        if can_cast_types(&this_type, cast_to_type) {
+        // special handling for union types
+        // Union casting requires exact match because we can't pass type ids through the coercion system
+        // and there can be duplicate tag ids
+        // using `can_cast_types` would allow Union(Int32) -> Int64
+        // but `cast_union_array` requires exact matching
+        let can_cast = if let DataType::Union(fields, _) = &this_type {
+            fields
+                .iter()
+                .any(|(_, field)| can_cast_types(field.data_type(), cast_to_type))
+        } else {
+            can_cast_types(&this_type, cast_to_type)
+        };
+
+        if can_cast {
             match self {
                 Expr::ScalarSubquery(subquery) => {
                     Ok(Expr::ScalarSubquery(cast_subquery(subquery, cast_to_type)?))
