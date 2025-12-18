@@ -251,8 +251,19 @@ pub fn cast_with_options(
 ) -> Result<Arc<dyn PhysicalExpr>> {
     let expr_type = expr.data_type(input_schema)?;
     if expr_type == cast_type {
-        Ok(Arc::clone(&expr))
-    } else if can_cast_types(&expr_type, &cast_type) {
+        return Ok(Arc::clone(&expr));
+    }
+
+    // Check if cast is supported, with special handling for struct and union types.
+    let can_cast = match &expr_type {
+        // Union casting requires checking if any variant can cast to target.
+        Union(fields, _) => fields
+            .iter()
+            .any(|(_, f)| can_cast_types(f.data_type(), &cast_type)),
+        _ => can_cast_types(&expr_type, &cast_type),
+    };
+
+    if can_cast {
         Ok(Arc::new(CastExpr::new(expr, cast_type, cast_options)))
     } else if can_cast_struct_types(&expr_type, &cast_type) {
         // Allow struct-to-struct casts that pass name-based compatibility validation.
