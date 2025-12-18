@@ -19,18 +19,18 @@
 These are tests for union type comparison coercion
 
 when comparing a union type with a scalar type, it will:
-1. check if the scalar type matches any Union variant (must be an exact type match)
-2. if yes, coerce to the scalar type (triggers cast from Union to scalar)
-3. cast will extract values from the matching variant, non-matching variants become null
+1. check if the scalar type matches any Union variant (exact type match preferred)
+2. if no exact match, check if any variant can be cast to the scalar type
+3. if yes, coerce to the scalar type (triggers cast from Union to scalar)
+4. cast will extract values from the matching variant (and cast if needed), non-matching variants become null
 
 It's important to note that the scalar type matching is greedy, meaning if you have a Union type
 with variants of the same field, it will match by the smaller type id (since variants are sorted by type id)
 
 
 Some of the *current* limitations are:
-1. exact type matching only: Union(Int32, Utf8) compared with Int64 will fail because there's no exact Int64 variant
-    - we could probably fix this by first check for direct matches, if none then pick the first variant that can cast
-2. numeric literals default to int64
+1. numeric literals default to int64
+2. if multiple variants can cast to target type, picks the first castable variant (by type id order)
 
 */
 
@@ -384,11 +384,10 @@ async fn test_union_non_matching_variants_are_null() -> Result<()> {
     Ok(())
 }
 
-// todo! we should support this feature
-// when comparing Union(Int32, Utf8) with Int64, the coercion will fail
-// because theres no int64 variant in the union
+// tests cast-compatible variant matching
+// when comparing Union(Int32, Utf8) with Int64, it finds the Int32 variant and casts it
 #[tokio::test]
-async fn test_union_no_matching_variant_type() -> Result<()> {
+async fn test_union_cast_compatible_variant() -> Result<()> {
     let union_fields = UnionFields::new(
         vec![0, 1],
         vec![
@@ -422,29 +421,14 @@ async fn test_union_no_matching_variant_type() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_batch("test", batch)?;
 
+    // Int32 variant can be cast to Int64, so this should work
     let df = ctx
         .sql("SELECT id FROM test WHERE val = CAST(10 AS BIGINT)")
-        .await
-        .unwrap();
+        .await?;
+    let results = df.collect().await?;
 
-    // Unexpected: query planning succeeded
-    // This might happen if there's implicit casting happening
-    // Let's check if execution fails
-    let exec_res = df.collect().await;
-
-    match exec_res {
-        Ok(_res) => {
-            // query succeeded - this means some coercion is happening
-            todo!("if you see this you should change this to a correct assertion");
-        }
-        Err(e) => {
-            assert!(
-                e.to_string().contains(
-                    "Cannot infer common argument type for comparison operation"
-                )
-            );
-        }
-    }
+    let expected = ["+----+", "| id |", "+----+", "| 1  |", "+----+"];
+    assert_batches_eq!(expected, &results);
 
     Ok(())
 }

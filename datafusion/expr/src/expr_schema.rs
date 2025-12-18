@@ -680,7 +680,7 @@ impl ExprSchemable for Expr {
         let can_cast = if let DataType::Union(fields, _) = &this_type {
             fields
                 .iter()
-                .any(|(_, field)| field.data_type() == cast_to_type)
+                .any(|(_, field)| can_cast_types(field.data_type(), cast_to_type))
         } else {
             can_cast_types(&this_type, cast_to_type)
         };

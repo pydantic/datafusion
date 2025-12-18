@@ -20,7 +20,7 @@
 use arrow::buffer::NullBuffer;
 use arrow::{
     array::{Array, ArrayRef, Date32Array, Date64Array, NullArray},
-    compute::{CastOptions, cast_with_options, max, min},
+    compute::{CastOptions, can_cast_types, cast_with_options, max, min},
     datatypes::DataType,
     error::ArrowError,
     util::pretty::pretty_format_columns,
@@ -306,14 +306,14 @@ impl ColumnarValue {
 
 /// casts a union array to a target type by extracting values from the matching variant
 ///
-/// since we require exact type matching, this "cast" is really just extracting values from
-/// whichever union child array matches the target type
+/// first attempts to find an exact type match, then falls back to a cast-compatible variant
+/// if the variant type differs from the target type, performs an actual cast
 ///
 /// Note: rows where the active variant differs gets returned as NULL
 fn cast_union_array(
     array: &dyn Array,
     to_type: &DataType,
-    _cast_options: &CastOptions,
+    cast_options: &CastOptions,
 ) -> Result<ArrayRef, ArrowError> {
     use arrow::array::*;
     use arrow::datatypes::UnionMode;
@@ -332,16 +332,22 @@ fn cast_union_array(
     let len = union_array.len();
     let type_ids = union_array.type_ids();
 
+    // we do 2 separate passes, first to find any exact matches and second to find any cast-compatible matches
     let matching_type_id = fields
         .iter()
-        .find(|(_, f)| f.data_type() == to_type)
-        .map(|(i, _)| i);
+        .find_map(|(i, f)| (f.data_type() == to_type).then_some(i))
+        .or_else(|| {
+            fields
+                .iter()
+                .find_map(|(i, f)| can_cast_types(f.data_type(), to_type).then_some(i))
+        });
 
     let Some(match_id) = matching_type_id else {
         return Ok(new_null_array(to_type, len));
     };
 
     let matching_child = union_array.child(match_id);
+    let needs_cast = matching_child.data_type() != to_type;
 
     // build indices array and null mask in one pass
     let mut indices = Vec::with_capacity(len);
@@ -366,7 +372,11 @@ fn cast_union_array(
     }
 
     let indices_array = UInt32Array::from(indices);
-    let result = arrow::compute::take(matching_child, &indices_array, None)?;
+    let mut result = arrow::compute::take(matching_child, &indices_array, None)?;
+
+    if needs_cast {
+        result = cast_with_options(&result, to_type, cast_options)?;
+    }
 
     let null_buffer = NullBuffer::from(null_mask);
     let result_with_nulls = make_array(
