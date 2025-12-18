@@ -21,7 +21,7 @@
 //!
 //! ## Usage
 //! ```bash
-//! cargo run --example query_planning -- [all|analyzer_rule|expr_api|optimizer_rule|parse_sql_expr|plan_to_sql|planner_api|pruning|thread_pools]
+//! cargo run --example query_planning -- [all|analyzer_rule|expr_api|optimizer_rule|parse_sql_expr|plan_to_sql|planner_api|pruning|subtree_materialize|thread_pools]
 //! ```
 //!
 //! Each subcommand runs a corresponding example:
@@ -33,6 +33,7 @@
 //! - `plan_to_sql` — generate SQL from DataFusion `Expr` and `LogicalPlan`
 //! - `planner_api` — APIs to manipulate logical and physical plans
 //! - `pruning` — APIs to manipulate logical and physical plans
+//! - `subtree_materialize` — identify and materialize query subtrees to parquet files
 //! - `thread_pools` — demonstrate TrackConsumersPool for memory tracking and debugging with enhanced error messages and shows how to implement memory-aware ExecutionPlan with memory reservation and spilling
 
 mod analyzer_rule;
@@ -42,6 +43,7 @@ mod parse_sql_expr;
 mod plan_to_sql;
 mod planner_api;
 mod pruning;
+mod subtree_materialize;
 mod thread_pools;
 
 use datafusion::error::{DataFusionError, Result};
@@ -59,6 +61,7 @@ enum ExampleKind {
     PlanToSql,
     PlannerApi,
     Pruning,
+    SubtreeMaterialize,
     ThreadPools,
 }
 
@@ -84,6 +87,9 @@ impl ExampleKind {
             ExampleKind::PlanToSql => plan_to_sql::plan_to_sql_examples().await?,
             ExampleKind::PlannerApi => planner_api::planner_api().await?,
             ExampleKind::Pruning => pruning::pruning().await?,
+            ExampleKind::SubtreeMaterialize => {
+                subtree_materialize::subtree_materialize().await?
+            }
             ExampleKind::ThreadPools => thread_pools::thread_pools().await?,
         }
         Ok(())

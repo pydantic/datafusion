@@ -64,6 +64,7 @@ pub mod optimize_unions;
 pub mod optimizer;
 pub mod propagate_empty_relation;
 pub mod push_down_filter;
+pub mod push_down_group_by_expr;
 pub mod push_down_limit;
 pub mod replace_distinct_aggregate;
 pub mod scalar_subquery_to_join;
