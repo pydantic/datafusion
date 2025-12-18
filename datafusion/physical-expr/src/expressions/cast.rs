@@ -240,10 +240,10 @@ pub fn cast_with_options(
     // special handling for union types
     // Union casting requires exact match because we can't pass type ids through the coercion system
     // and there can be duplicate tag ids
-    // using `can_cast_types` would allow Union(Int32) -> Int64
-    // but `cast_union_array` requires exact matching
     let can_cast = if let Union(fields, _) = &expr_type {
-        fields.iter().any(|(_, f)| f.data_type() == &cast_type)
+        fields
+            .iter()
+            .any(|(_, f)| can_cast_types(f.data_type(), &cast_type))
     } else {
         can_cast_types(&expr_type, &cast_type)
     };

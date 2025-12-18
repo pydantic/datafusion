@@ -1280,13 +1280,10 @@ fn union_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> 
                 .equals_datatype(rhs_type)
                 .then_some(lhs_type.clone())
         }
-        (Union(fields, _), opaque) | (opaque, Union(fields, _)) => {
-            let has_exact_match = fields
-                .iter()
-                .any(|(_, field)| field.data_type().equals_datatype(opaque));
-
-            has_exact_match.then_some(opaque.clone())
-        }
+        (Union(fields, _), opaque) | (opaque, Union(fields, _)) => fields
+            .iter()
+            .any(|(_, f)| can_cast_types(f.data_type(), opaque))
+            .then_some(opaque.clone()),
         _ => None,
     }
 }
