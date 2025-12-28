@@ -30,10 +30,36 @@ use std::fmt;
 pub struct Column {
     /// relation/table reference.
     pub relation: Option<TableReference>,
-    /// field/column name.
+    /// Field/column name.
     pub name: String,
     /// Original source code location, if known
     pub spans: Spans,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ColumnPathSegment {
+    /// A field in a struct
+    Field(String),
+    /// An index in a list/array
+    Index(usize),
+}
+
+impl From<&str> for ColumnPathSegment {
+    fn from(s: &str) -> Self {
+        ColumnPathSegment::Field(s.to_string())
+    }
+}
+
+impl From<String> for ColumnPathSegment {
+    fn from(s: String) -> Self {
+        ColumnPathSegment::Field(s)
+    }
+}
+
+impl From<usize> for ColumnPathSegment {
+    fn from(i: usize) -> Self {
+        ColumnPathSegment::Index(i)
+    }
 }
 
 impl fmt::Debug for Column {

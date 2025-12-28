@@ -1879,12 +1879,8 @@ mod tests {
         let tests: Vec<(Expr, &str)> = vec![
             ((col("a") + col("b")).gt(lit(4)), r#"((a + b) > 4)"#),
             (
-                Expr::Column(Column {
-                    relation: Some(TableReference::partial("a", "b")),
-                    name: "c".to_string(),
-                    spans: Spans::new(),
-                })
-                .gt(lit(4)),
+                Expr::Column(Column::new(Some(TableReference::partial("a", "b")), "c"))
+                    .gt(lit(4)),
                 r#"(b.c > 4)"#,
             ),
             (
@@ -2256,11 +2252,10 @@ mod tests {
             ),
             (
                 Expr::Unnest(Unnest {
-                    expr: Box::new(Expr::Column(Column {
-                        relation: Some(TableReference::partial("schema", "table")),
-                        name: "array_col".to_string(),
-                        spans: Spans::new(),
-                    })),
+                    expr: Box::new(Expr::Column(Column::new(
+                        Some(TableReference::partial("schema", "table")),
+                        "array_col",
+                    ))),
                 }),
                 r#"UNNEST("table".array_col)"#,
             ),
