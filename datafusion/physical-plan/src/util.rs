@@ -21,10 +21,7 @@ use datafusion_common::{
     HashMap,
     tree_node::{Transformed, TreeNodeRecursion, TreeNodeRewriter},
 };
-use datafusion_physical_expr::{
-    PhysicalExpr,
-    expressions::Column,
-};
+use datafusion_physical_expr::{PhysicalExpr, expressions::Column};
 
 /// Rewrite column references in a physical expr according to a mapping.
 ///
@@ -32,7 +29,7 @@ use datafusion_physical_expr::{
 /// with the corresponding expression found in the `column_map`.
 ///
 /// If a column is found in the map, it is replaced by the mapped expression.
-/// If a column is NOT found in the ma an error is returned.
+/// If a column is NOT found in the map, it is left unchanged.
 pub struct PhysicalColumnRewriter {
     /// Mapping from original column to new column.
     pub column_map: HashMap<Column, Arc<dyn PhysicalExpr>>,
@@ -60,11 +57,8 @@ impl TreeNodeRewriter for PhysicalColumnRewriter {
                     true,
                     TreeNodeRecursion::Jump,
                 ));
-            } else {
-                return Err(datafusion_common::error::DataFusionError::Plan(
-                    format!("Column {:?} not found in column map", column),
-                ));
             }
+            // Column not in map - leave unchanged
         }
         Ok(Transformed::no(node))
     }
@@ -158,7 +152,7 @@ mod tests {
 
         assert_eq!(
             format!("{}", result.data),
-            "(42 + replaced_b) * (c - d) + e"
+            "(42 + replaced_b) * (c@2 - d@3) + e@4"
         );
 
         Ok(())
@@ -192,7 +186,7 @@ mod tests {
 
         assert_eq!(
             format!("{}", result.data),
-            "a + b + 100 + new_col@5 + d + e"
+            "a@0 + b@1 + 100 + new_col@5 + d@3 + e@4"
         );
 
         Ok(())
@@ -253,7 +247,7 @@ mod tests {
 
         // Verify transformation occurred
         assert!(result.transformed);
-        assert_eq!(format!("{}", result.data), "(10 + b) * (20 - d) + 30");
+        assert_eq!(format!("{}", result.data), "(10 + b@1) * (20 - d@3) + 30");
 
         Ok(())
     }
@@ -307,7 +301,7 @@ mod tests {
 
         assert_eq!(
             format!("{}", result.data),
-            "5 * a@0 + 3 - another_col@7 + b"
+            "5 * a@0 + 3 - another_col@7 + b@1"
         );
 
         // Verify transformation occurred

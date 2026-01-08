@@ -1634,10 +1634,10 @@ mod tests {
 
         let pushed_filters = &description.parent_filters()[0];
         assert!(matches!(pushed_filters[0].discriminant, PushedDown::No));
-        // The column shouldn't be found in the alias map, so it should become UnKnownColumn
+        // The column shouldn't be found in the alias map, so it's left unchanged
         assert_eq!(
             format!("{}", pushed_filters[0].predicate),
-            "unknown_col > 5"
+            "unknown_col@1 > 5"
         );
 
         Ok(())
