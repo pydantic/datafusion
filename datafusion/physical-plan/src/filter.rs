@@ -562,22 +562,15 @@ impl ExecutionPlan for FilterExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        // Only push down projections that are trivial AND provide benefit (narrow schema or have field accessors)
-        let input_field_count = projection.input().schema().fields().len();
-        if projection
-            .projection_expr()
-            .should_push_through_operator(input_field_count)
+        // Each column in the predicate expression must exist after the projection
+        if let Some(new_predicate) =
+            update_expr(self.predicate(), projection.expr(), false)?
         {
-            // Each column in the predicate expression must exist after the projection.
-            if let Some(new_predicate) =
-                update_expr(self.predicate(), projection.expr(), false)?
-            {
-                return FilterExecBuilder::from(self)
-                    .with_input(make_with_child(projection, self.input())?)
-                    .with_predicate(new_predicate)
-                    .build()
-                    .map(|e| Some(Arc::new(e) as _));
-            }
+            return FilterExecBuilder::from(self)
+                .with_input(make_with_child(projection, self.input())?)
+                .with_predicate(new_predicate)
+                .build()
+                .map(|e| Some(Arc::new(e) as _));
         }
         try_embed_projection(projection, self)
     }

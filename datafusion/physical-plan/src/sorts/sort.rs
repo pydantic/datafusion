@@ -1391,15 +1391,6 @@ impl ExecutionPlan for SortExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        // Only push down projections that are trivial AND provide benefit (narrow schema or have field accessors)
-        let input_field_count = projection.input().schema().fields().len();
-        if !projection
-            .projection_expr()
-            .should_push_through_operator(input_field_count)
-        {
-            return Ok(None);
-        }
-
         let Some(updated_exprs) = update_ordering(self.expr.clone(), projection.expr())?
         else {
             return Ok(None);

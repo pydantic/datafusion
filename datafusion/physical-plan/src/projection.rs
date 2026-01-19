@@ -258,7 +258,9 @@ impl ExecutionPlan for ProjectionExec {
         // If expressions are all trivial (columns, literals, or field accessors),
         // then all computations in this projection are reorder or rename,
         // and projection would not benefit from the repartition.
-        vec![!self.projection_expr().is_trivial()]
+        vec![
+            self.projection_expr().iter().all(|p| p.expr.triviality().is_trivial())
+        ]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -639,6 +641,13 @@ pub fn remove_unnecessary_projections(
             if is_projection_removable(projection) {
                 return Ok(Transformed::yes(Arc::clone(projection.input())));
             }
+
+            // Check if projection should be pushed through the operator below.
+            // This centralizes the benefit check so individual operators don't need to do it.
+            if !should_push_through_operator(projection) {
+                return Ok(Transformed::no(plan));
+            }
+
             // If it does, check if we can push it under its child(ren):
             projection
                 .input()
@@ -647,6 +656,31 @@ pub fn remove_unnecessary_projections(
             return Ok(Transformed::no(plan));
         };
     Ok(maybe_modified.map_or_else(|| Transformed::no(plan), Transformed::yes))
+}
+
+/// Determines whether a projection should be pushed through its child operator.
+///
+/// A projection should be pushed through when it is:
+/// 1. Trivial (no expensive computations to duplicate)
+/// 2. AND provides some benefit:
+///    - Either narrows the schema (fewer output columns than input columns)
+///    - Or has beneficial expressions like field accessors that reduce data size
+///
+/// This uses the same logic as `TrivialExprExtractor` to identify beneficial expressions:
+/// - Columns are neutral (no cost/benefit)
+/// - Literals are non-beneficial (they add data)
+/// - TrivialExpr (like `get_field`) are beneficial (they reduce data)
+fn should_push_through_operator(projection: &ProjectionExec) -> bool {
+    let exprs = projection.projection_expr();
+    let input_field_count = projection.input().schema().fields().len();
+
+    // All expressions must be trivial (no expensive computations)
+    let all_trivial = exprs.iter().all(|p| p.expr.triviality().is_trivial());
+
+    // Check if projection narrows schema
+    let narrows_schema = exprs.as_ref().len() < input_field_count;
+    
+    all_trivial || narrows_schema
 }
 
 /// Compare the inputs and outputs of the projection. All expressions must be
