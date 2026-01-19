@@ -30,7 +30,7 @@ use arrow::{
 };
 use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::{Result, ScalarValue};
-use datafusion_expr::Expr;
+use datafusion_expr::{ArgTriviality, Expr};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::interval_arithmetic::Interval;
 use datafusion_expr_common::sort_properties::{ExprProperties, SortProperties};
@@ -135,8 +135,8 @@ impl PhysicalExpr for Literal {
         std::fmt::Display::fmt(self, f)
     }
 
-    fn is_trivial(&self) -> bool {
-        true
+    fn triviality(&self) -> ArgTriviality {
+        ArgTriviality::Literal
     }
 }
 

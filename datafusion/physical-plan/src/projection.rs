@@ -947,7 +947,7 @@ fn try_unifying_projections(
     // beneficial as caching mechanism for non-trivial computations.
     // See discussion in: https://github.com/apache/datafusion/issues/8296
     if column_ref_map.iter().any(|(column, count)| {
-        *count > 1 && !&child.expr()[column.index()].expr.is_trivial()
+        *count > 1 && !&child.expr()[column.index()].expr.triviality().is_trivial()
     }) {
         return Ok(None);
     }

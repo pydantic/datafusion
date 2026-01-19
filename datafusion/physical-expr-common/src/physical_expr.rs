@@ -37,6 +37,7 @@ use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::interval_arithmetic::Interval;
 use datafusion_expr_common::sort_properties::ExprProperties;
 use datafusion_expr_common::statistics::Distribution;
+use datafusion_expr_common::triviality::ArgTriviality;
 
 use itertools::izip;
 
@@ -431,18 +432,18 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
         false
     }
 
-    /// Returns true if this expression is trivial (cheap to evaluate).
+    /// Returns the triviality classification of this expression.
     ///
     /// Trivial expressions include:
-    /// - Column references
-    /// - Literal values
-    /// - Struct field access via `get_field`
+    /// - Column references (`ArgTriviality::Column`)
+    /// - Literal values (`ArgTriviality::Literal`)
+    /// - Struct field access via `get_field` (`ArgTriviality::TrivialExpr`)
     /// - Nested combinations of field accessors (e.g., `col['a']['b']`)
     ///
     /// This is used to identify expressions that are cheap to duplicate or
     /// don't benefit from caching/partitioning optimizations.
-    fn is_trivial(&self) -> bool {
-        false
+    fn triviality(&self) -> ArgTriviality {
+        ArgTriviality::NonTrivial
     }
 }
 

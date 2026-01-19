@@ -27,7 +27,7 @@ use std::sync::Arc;
 use crate::expr_fn::binary_expr;
 use crate::function::WindowFunctionSimplification;
 use crate::logical_plan::Subquery;
-use crate::{AggregateUDF, Volatility};
+use crate::{AggregateUDF, ArgTriviality, Volatility};
 use crate::{ExprSchemable, Operator, Signature, WindowFrame, WindowUDF};
 
 use arrow::datatypes::{DataType, Field, FieldRef};
@@ -1933,25 +1933,29 @@ impl Expr {
         }
     }
 
-    /// Returns true if this expression is trivial (cheap to evaluate).
+    /// Returns the triviality classification of this expression.
     ///
     /// Trivial expressions include column references, literals, and nested
     /// field access via `get_field`.
     ///
     /// # Example
     /// ```
-    /// # use datafusion_expr::col;
+    /// # use datafusion_expr::{col, ArgTriviality};
     /// let expr = col("foo");
-    /// assert!(expr.is_trivial());
+    /// assert!(expr.triviality().is_trivial());
     /// ```
-    pub fn is_trivial(&self) -> bool {
+    pub fn triviality(&self) -> ArgTriviality {
         match self {
-            Expr::Column(_) | Expr::Literal(_, _) => true,
+            Expr::Column(_) => ArgTriviality::Column,
+            Expr::Literal(_, _) => ArgTriviality::Literal,
             Expr::ScalarFunction(func) => {
-                func.func.is_trivial()
-                    && func.args.first().is_some_and(|arg| arg.is_trivial())
+                // Classify each argument's triviality for context-aware decision making
+                let arg_trivialities: Vec<ArgTriviality> =
+                    func.args.iter().map(|arg| arg.triviality()).collect();
+
+                func.func.triviality_with_args(&arg_trivialities)
             }
-            _ => false,
+            _ => ArgTriviality::NonTrivial,
         }
     }
 

@@ -33,8 +33,8 @@ use datafusion_common::{
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::simplify::ExprSimplifyResult;
 use datafusion_expr::{
-    ColumnarValue, Documentation, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF,
-    ScalarUDFImpl, Signature, Volatility,
+    ArgTriviality, ColumnarValue, Documentation, Expr, ReturnFieldArgs,
+    ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use datafusion_macros::user_doc;
 
@@ -500,8 +500,25 @@ impl ScalarUDFImpl for GetFieldFunc {
         self.doc()
     }
 
-    fn is_trivial(&self) -> bool {
-        true
+    fn triviality(&self, args: &[ArgTriviality]) -> ArgTriviality {
+        // get_field is only trivial if:
+        // 1. The struct/map argument is trivial (column, literal, or trivial expression)
+        // 2. All key arguments are literals (static field access, not dynamic per-row lookup)
+        if args.is_empty() {
+            return ArgTriviality::NonTrivial;
+        }
+
+        // Check if the base (struct/map) argument is trivial
+        let base_trivial = args[0].is_trivial();
+
+        // All key arguments (after the first) must be literals for static field access
+        let keys_literal = args.iter().skip(1).all(|a| *a == ArgTriviality::Literal);
+
+        if base_trivial && keys_literal {
+            ArgTriviality::TrivialExpr
+        } else {
+            ArgTriviality::NonTrivial
+        }
     }
 }
 
@@ -545,5 +562,72 @@ mod tests {
         assert_eq!(result_array.as_ref(), &expected as &dyn Array);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_triviality_with_args_literal_key() {
+        let func = GetFieldFunc::new();
+
+        // get_field(col, 'literal') -> trivial (static field access)
+        let args = vec![ArgTriviality::Column, ArgTriviality::Literal];
+        assert_eq!(func.triviality(&args), ArgTriviality::TrivialExpr);
+
+        // get_field(col, 'a', 'b') -> trivial (nested static field access)
+        let args = vec![
+            ArgTriviality::Column,
+            ArgTriviality::Literal,
+            ArgTriviality::Literal,
+        ];
+        assert_eq!(func.triviality(&args), ArgTriviality::TrivialExpr);
+
+        // get_field(get_field(col, 'a'), 'b') represented as TrivialExpr for base
+        let args = vec![ArgTriviality::TrivialExpr, ArgTriviality::Literal];
+        assert_eq!(func.triviality(&args), ArgTriviality::TrivialExpr);
+    }
+
+    #[test]
+    fn test_triviality_with_args_column_key() {
+        let func = GetFieldFunc::new();
+
+        // get_field(col, other_col) -> NOT trivial (dynamic per-row lookup)
+        let args = vec![ArgTriviality::Column, ArgTriviality::Column];
+        assert_eq!(func.triviality(&args), ArgTriviality::NonTrivial);
+
+        // get_field(col, 'a', other_col) -> NOT trivial (dynamic nested lookup)
+        let args = vec![
+            ArgTriviality::Column,
+            ArgTriviality::Literal,
+            ArgTriviality::Column,
+        ];
+        assert_eq!(func.triviality(&args), ArgTriviality::NonTrivial);
+    }
+
+    #[test]
+    fn test_triviality_with_args_non_trivial() {
+        let func = GetFieldFunc::new();
+
+        // get_field(non_trivial_expr, 'literal') -> NOT trivial
+        let args = vec![ArgTriviality::NonTrivial, ArgTriviality::Literal];
+        assert_eq!(func.triviality(&args), ArgTriviality::NonTrivial);
+
+        // get_field(col, non_trivial_expr) -> NOT trivial
+        let args = vec![ArgTriviality::Column, ArgTriviality::NonTrivial];
+        assert_eq!(func.triviality(&args), ArgTriviality::NonTrivial);
+    }
+
+    #[test]
+    fn test_triviality_with_args_edge_cases() {
+        let func = GetFieldFunc::new();
+
+        // Empty args -> NOT trivial
+        assert_eq!(func.triviality(&[]), ArgTriviality::NonTrivial);
+
+        // Just base, no key -> TrivialExpr (not a valid call but should handle gracefully)
+        let args = vec![ArgTriviality::Column];
+        assert_eq!(func.triviality(&args), ArgTriviality::TrivialExpr);
+
+        // Literal base with literal key -> trivial
+        let args = vec![ArgTriviality::Literal, ArgTriviality::Literal];
+        assert_eq!(func.triviality(&args), ArgTriviality::TrivialExpr);
     }
 }

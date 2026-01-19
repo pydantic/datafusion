@@ -29,7 +29,7 @@ use arrow::{
 };
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Result, internal_err, plan_err};
-use datafusion_expr::ColumnarValue;
+use datafusion_expr::{ArgTriviality, ColumnarValue};
 
 /// Represents the column at a given index in a RecordBatch
 ///
@@ -147,8 +147,8 @@ impl PhysicalExpr for Column {
         write!(f, "{}", self.name)
     }
 
-    fn is_trivial(&self) -> bool {
-        true
+    fn triviality(&self) -> ArgTriviality {
+        ArgTriviality::Column
     }
 }
 

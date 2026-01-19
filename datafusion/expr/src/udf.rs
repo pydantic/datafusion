@@ -30,6 +30,7 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::{ExprSchema, Result, ScalarValue, not_impl_err};
 use datafusion_expr_common::dyn_eq::{DynEq, DynHash};
 use datafusion_expr_common::interval_arithmetic::Interval;
+use datafusion_expr_common::triviality::ArgTriviality;
 use std::any::Any;
 use std::cmp::Ordering;
 use std::fmt::Debug;
@@ -122,9 +123,15 @@ impl ScalarUDF {
         Self { inner: fun }
     }
 
-    /// Returns true if this function is trivial (cheap to evaluate).
-    pub fn is_trivial(&self) -> bool {
-        self.inner.is_trivial()
+    /// Returns the triviality classification of this function given its arguments' triviality.
+    ///
+    /// This allows functions to make context-dependent decisions about triviality.
+    /// For example, `get_field(struct_col, 'field_name')` is trivial (static field
+    /// lookup), but `get_field(struct_col, key_col)` is not (dynamic per-row lookup).
+    ///
+    /// See [`ScalarUDFImpl::triviality_with_args`] for more details.
+    pub fn triviality_with_args(&self, args: &[ArgTriviality]) -> ArgTriviality {
+        self.inner.triviality(args)
     }
 
     /// Return the underlying [`ScalarUDFImpl`] trait object for this function
@@ -852,7 +859,11 @@ pub trait ScalarUDFImpl: Debug + DynEq + DynHash + Send + Sync {
         None
     }
 
-    /// Returns true if this function is trivial (cheap to evaluate).
+    /// Returns the triviality classification of this function given its arguments' triviality.
+    ///
+    /// This method allows functions to make context-dependent decisions about
+    /// whether they are trivial. The default implementation returns `NonTrivial`
+    /// (conservative default).
     ///
     /// Trivial functions are lightweight accessor functions like `get_field`
     /// (struct field access) that simply access nested data within a column
@@ -860,8 +871,18 @@ pub trait ScalarUDFImpl: Debug + DynEq + DynHash + Send + Sync {
     ///
     /// This is used to identify expressions that are cheap to duplicate or
     /// don't benefit from caching/partitioning optimizations.
-    fn is_trivial(&self) -> bool {
-        false
+    ///
+    /// # Example
+    ///
+    /// `get_field(struct_col, 'field_name')` with a literal key is trivial (static
+    /// field lookup), but `get_field(struct_col, key_col)` with a column key is
+    /// not trivial (dynamic per-row lookup).
+    ///
+    /// # Arguments
+    ///
+    /// * `args` - Classification of each argument's triviality
+    fn triviality(&self, _args: &[ArgTriviality]) -> ArgTriviality {
+        ArgTriviality::NonTrivial
     }
 }
 
@@ -982,8 +1003,8 @@ impl ScalarUDFImpl for AliasedScalarUDFImpl {
         self.inner.documentation()
     }
 
-    fn is_trivial(&self) -> bool {
-        self.inner.is_trivial()
+    fn triviality(&self, args: &[ArgTriviality]) -> ArgTriviality {
+        self.inner.triviality(args)
     }
 }
 

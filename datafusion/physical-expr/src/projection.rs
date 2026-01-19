@@ -279,7 +279,7 @@ impl ProjectionExprs {
 
     /// Checks if all of the projection expressions are trivial.
     pub fn is_trivial(&self) -> bool {
-        self.exprs.iter().all(|p| p.expr.is_trivial())
+        self.exprs.iter().all(|p| p.expr.triviality().is_trivial())
     }
 
     /// Classifies a single expression for pushdown benefit.
@@ -298,7 +298,7 @@ impl ProjectionExprs {
             return PushdownBenefit::Neutral;
         }
 
-        if expr.is_trivial() {
+        if expr.triviality().is_trivial() {
             // Trivial non-column expressions (field accessors) reduce data - push
             PushdownBenefit::Beneficial
         } else {
@@ -366,12 +366,13 @@ impl ProjectionExprs {
         // Must provide some benefit:
         // - Either narrows schema (fewer output columns than input columns)
         // - Or has field accessors that reduce data size
-        // - Or has literals that can be absorbed by datasource
+        // Note: literals are NOT pushed through because they expand into full arrays
+        // downstream, increasing data size. However, literals as arguments to trivial
+        // functions (like get_field keys) are fine since they're just accessors.
         let narrows_schema = self.exprs.len() < input_field_count;
         let has_beneficial_exprs = self.benefits_from_pushdown();
-        let has_literals = self.exprs.iter().any(|p| p.expr.as_any().is::<Literal>());
 
-        narrows_schema || has_beneficial_exprs || has_literals
+        narrows_schema || has_beneficial_exprs
     }
 
     /// Attempts to split this projection into beneficial and non-beneficial parts.

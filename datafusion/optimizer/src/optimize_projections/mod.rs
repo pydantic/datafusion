@@ -531,6 +531,7 @@ fn merge_consecutive_projections(proj: Projection) -> Result<Transformed<Project
     if column_referral_map.into_iter().any(|(col, usage)| {
         usage > 1
             && !prev_projection.expr[prev_projection.schema.index_of_column(col).unwrap()]
+                .triviality()
                 .is_trivial()
     }) {
         // no change
