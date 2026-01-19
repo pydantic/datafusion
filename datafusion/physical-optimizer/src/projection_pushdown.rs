@@ -117,8 +117,7 @@ fn try_split_projection(
     };
 
     let input_schema = projection.input().schema();
-    let mut extractor =
-        TrivialExprExtractor::new(input_schema.as_ref(), alias_generator);
+    let mut extractor = TrivialExprExtractor::new(input_schema.as_ref(), alias_generator);
 
     // Extract trivial sub-expressions from each projection expression
     let mut outer_exprs = Vec::new();
@@ -197,10 +196,7 @@ impl<'a> TrivialExprExtractor<'a> {
     ///
     /// Walks the expression tree top-down and replaces beneficial trivial
     /// sub-expressions with column references to the inner projection.
-    fn extract(
-        &mut self,
-        expr: Arc<dyn PhysicalExpr>,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
+    fn extract(&mut self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
         // Top-down: check self first, then recurse to children
         if matches!(expr.triviality(), ArgTriviality::TrivialExpr) {
             // Extract this entire sub-tree
@@ -251,18 +247,13 @@ impl<'a> TrivialExprExtractor<'a> {
     }
 
     /// Collects columns from outer expressions that need to be passed through inner projection.
-    fn collect_columns_needed(
-        &mut self,
-        outer_exprs: &[ProjectionExpr],
-    ) -> Result<()> {
+    fn collect_columns_needed(&mut self, outer_exprs: &[ProjectionExpr]) -> Result<()> {
         for proj in outer_exprs {
             proj.expr.apply(|e| {
                 if let Some(col) = e.as_any().downcast_ref::<Column>() {
                     // Check if this column references an extracted expression (by alias)
-                    let is_extracted = self
-                        .extracted
-                        .values()
-                        .any(|alias| alias == col.name());
+                    let is_extracted =
+                        self.extracted.values().any(|alias| alias == col.name());
 
                     if !is_extracted && !self.columns_needed.contains_key(&col.index()) {
                         // This is an original input column - need to pass it through

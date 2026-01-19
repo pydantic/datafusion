@@ -47,6 +47,7 @@ use datafusion_common::tree_node::{
 };
 use datafusion_common::{JoinSide, Result, internal_err};
 use datafusion_execution::TaskContext;
+use datafusion_expr::ArgTriviality;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::projection::Projector;
 use datafusion_physical_expr::utils::collect_columns;
@@ -259,7 +260,9 @@ impl ExecutionPlan for ProjectionExec {
         // then all computations in this projection are reorder or rename,
         // and projection would not benefit from the repartition.
         vec![
-            self.projection_expr().iter().all(|p| p.expr.triviality().is_trivial())
+            !self.projection_expr()
+                .iter()
+                .all(|p| p.expr.triviality().is_trivial()),
         ]
     }
 
@@ -679,8 +682,9 @@ fn should_push_through_operator(projection: &ProjectionExec) -> bool {
 
     // Check if projection narrows schema
     let narrows_schema = exprs.as_ref().len() < input_field_count;
-    
-    all_trivial || narrows_schema
+    let is_all_columns = exprs.iter().all(|p| matches!(p.expr.triviality(), ArgTriviality::Column));
+
+    all_trivial || (is_all_columns && narrows_schema)
 }
 
 /// Compare the inputs and outputs of the projection. All expressions must be

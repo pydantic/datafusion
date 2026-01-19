@@ -1123,7 +1123,7 @@ impl ExecutionPlan for RepartitionExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        // Check if projection benefits from partitioning
+        // If pushdown is not beneficial or applicable, break it.
         if projection.benefits_from_input_partitioning()[0] {
             return Ok(None);
         }
