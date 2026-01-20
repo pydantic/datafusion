@@ -47,6 +47,7 @@ use datafusion_common::tree_node::{
 };
 use datafusion_common::{JoinSide, Result, internal_err};
 use datafusion_execution::TaskContext;
+use datafusion_expr_common::triviality::ArgTriviality;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::projection::Projector;
 use datafusion_physical_expr::utils::collect_columns;
@@ -258,10 +259,12 @@ impl ExecutionPlan for ProjectionExec {
         // If expressions are all trivial (columns, literals, or field accessors),
         // then all computations in this projection are reorder or rename,
         // and projection would not benefit from the repartition.
+        // An expression is "cheap" if it's not NonTrivial (i.e., Column, Literal, or TrivialExpr).
         vec![
-            !self.projection_expr()
+            !self
+                .projection_expr()
                 .iter()
-                .all(|p| p.expr.triviality().is_trivial()),
+                .all(|p| !matches!(p.expr.triviality(), ArgTriviality::NonTrivial)),
         ]
     }
 
@@ -644,12 +647,6 @@ pub fn remove_unnecessary_projections(
                 return Ok(Transformed::yes(Arc::clone(projection.input())));
             }
 
-            // Check if projection should be pushed through the child operator.
-            // This centralizes the decision based on cardinality effect.
-            if !should_push_through_operator(projection, projection.input().as_ref()) {
-                return Ok(Transformed::no(plan));
-            }
-
             // Try to push the projection under its child(ren). Each operator's
             // try_swapping_with_projection handles the operator-specific logic.
             projection
@@ -659,36 +656,6 @@ pub fn remove_unnecessary_projections(
             return Ok(Transformed::no(plan));
         };
     Ok(maybe_modified.map_or_else(|| Transformed::no(plan), Transformed::yes))
-}
-
-/// Determines whether a projection should be pushed through its child operator.
-///
-/// The decision is based on:
-/// 1. Whether the projection has compute cost (trivial vs non-trivial expressions)
-/// 2. The child operator's cardinality effect (does it expand or reduce data?)
-///
-/// - Trivial projections (columns, literals, get_field): Always push - no compute cost
-/// - Non-trivial projections: Only push past operators that expand data (GreaterEqual),
-///   not those that reduce it (would compute on more rows before reduction)
-///
-/// Using `cardinality_effect()`:
-/// - `GreaterEqual` = operator expands or maintains rows → safe to push non-trivial
-/// - `Equal` = same row count → safe to push trivial only
-/// - `LowerEqual` = operator reduces rows → DON'T push non-trivial
-/// - `Unknown` = treated same as Equal for safety
-fn should_push_through_operator(projection: &ProjectionExec, child: &dyn ExecutionPlan) -> bool {
-    let exprs = projection.projection_expr();
-
-    let all_trivial = exprs.iter().all(|p| p.expr.triviality().is_trivial());
-
-    if all_trivial {
-        // No compute cost - always push closer to source
-        return true;
-    }
-
-    // Non-trivial projection (has computations) - only push if child expands data
-    // so we compute on fewer rows before the expansion
-    matches!(child.cardinality_effect(), CardinalityEffect::GreaterEqual)
 }
 
 /// Compare the inputs and outputs of the projection. All expressions must be
@@ -726,7 +693,10 @@ pub fn is_trivial_or_narrows_schema(projection: &ProjectionExec) -> bool {
     let exprs = projection.expr();
 
     // Check if all expressions are trivial (no compute cost)
-    let all_trivial = exprs.iter().all(|p| p.expr.triviality().is_trivial());
+    // An expression is "cheap" if it's not NonTrivial (i.e., Column, Literal, or TrivialExpr).
+    let all_trivial = exprs
+        .iter()
+        .all(|p| !matches!(p.expr.triviality(), ArgTriviality::NonTrivial));
 
     if all_trivial {
         return true;
@@ -1008,7 +978,11 @@ fn try_unifying_projections(
     // beneficial as caching mechanism for non-trivial computations.
     // See discussion in: https://github.com/apache/datafusion/issues/8296
     if column_ref_map.iter().any(|(column, count)| {
-        *count > 1 && !&child.expr()[column.index()].expr.triviality().is_trivial()
+        *count > 1
+            && matches!(
+                child.expr()[column.index()].expr.triviality(),
+                ArgTriviality::NonTrivial
+            )
     }) {
         return Ok(None);
     }

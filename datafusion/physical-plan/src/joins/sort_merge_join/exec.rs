@@ -34,8 +34,8 @@ use crate::joins::utils::{
 };
 use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use crate::projection::{
-    ProjectionExec, is_trivial_or_narrows_schema, join_allows_pushdown, join_table_borders,
-    new_join_children, physical_to_column_exprs, update_join_on,
+    ProjectionExec, join_allows_pushdown, join_table_borders, new_join_children,
+    physical_to_column_exprs, update_join_on,
 };
 use crate::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
@@ -551,12 +551,6 @@ impl ExecutionPlan for SortMergeJoinExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        // Only push through joins if trivial or narrows schema
-        // (joins often filter rows, so avoid computing non-trivial exprs before join)
-        if !is_trivial_or_narrows_schema(projection) {
-            return Ok(None);
-        }
-
         // Convert projected PhysicalExpr's to columns. If not possible, we cannot proceed.
         let Some(projection_as_columns) = physical_to_column_exprs(projection.expr())
         else {

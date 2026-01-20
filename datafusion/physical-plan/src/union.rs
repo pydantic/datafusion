@@ -348,13 +348,18 @@ impl ExecutionPlan for UnionExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // If the projection doesn't narrow the schema, we shouldn't try to push it down.
+        if projection.expr().len() >= projection.input().schema().fields().len() {
+            return Ok(None);
+        }
+
         let new_children = self
             .children()
             .into_iter()
             .map(|child| make_with_child(projection, child))
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Some(UnionExec::try_new(new_children)?))
+        Ok(Some(UnionExec::try_new(new_children.clone())?))
     }
 
     fn gather_filters_for_pushdown(

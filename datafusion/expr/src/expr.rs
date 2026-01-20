@@ -1942,7 +1942,7 @@ impl Expr {
     /// ```
     /// # use datafusion_expr::{col, ArgTriviality};
     /// let expr = col("foo");
-    /// assert!(expr.triviality().is_trivial());
+    /// assert_eq!(expr.triviality(), ArgTriviality::Column);
     /// ```
     pub fn triviality(&self) -> ArgTriviality {
         match self {

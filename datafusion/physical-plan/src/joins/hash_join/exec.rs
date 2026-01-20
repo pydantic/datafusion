@@ -44,8 +44,8 @@ use crate::joins::utils::{
 use crate::joins::{JoinOn, JoinOnRef, PartitionMode, SharedBitmapBuilder};
 use crate::metrics::{Count, MetricBuilder};
 use crate::projection::{
-    EmbeddedProjection, JoinData, ProjectionExec, is_trivial_or_narrows_schema,
-    try_embed_projection, try_pushdown_through_join,
+    EmbeddedProjection, JoinData, ProjectionExec, try_embed_projection,
+    try_pushdown_through_join,
 };
 use crate::repartition::REPARTITION_RANDOM_STATE;
 use crate::spill::get_record_batch_memory_size;
@@ -1250,12 +1250,6 @@ impl ExecutionPlan for HashJoinExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        // Only push through joins if trivial or narrows schema
-        // (joins often filter rows, so avoid computing non-trivial exprs before join)
-        if !is_trivial_or_narrows_schema(projection) {
-            return Ok(None);
-        }
-
         // TODO: currently if there is projection in HashJoinExec, we can't push down projection to left or right input. Maybe we can pushdown the mixed projection later.
         if self.contains_projection() {
             return Ok(None);

@@ -44,21 +44,3 @@ pub enum ArgTriviality {
     /// For example, `min(col1 + col2)` is non-trivial because it requires per-row computation.
     NonTrivial,
 }
-
-impl ArgTriviality {
-    /// Returns true if this triviality classification indicates a trivial
-    /// (cheap to evaluate) expression.
-    ///
-    /// Note that only `ArgTriviality::TrivialExpr` is considered trivial here.
-    /// Literal and `Column` are not considered trivial because they
-    /// depend on context (e.g. a literal constant may be expensive to compute
-    /// if it has to be broadcast to many rows).
-    /// 
-    /// For example, operations like `get_field(struct_col, 'field_name')` are
-    /// trivial because they can be evaluated in O(1) time per batch of data,
-    /// whereas `min(col1 + col2)` is non-trivial because it requires O(n) time
-    /// per batch of data.
-    pub fn is_trivial(&self) -> bool {
-        matches!(self, ArgTriviality::TrivialExpr)
-    }
-}
