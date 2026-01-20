@@ -47,7 +47,6 @@ use datafusion_common::tree_node::{
 };
 use datafusion_common::{JoinSide, Result, internal_err};
 use datafusion_execution::TaskContext;
-use datafusion_expr::ArgTriviality;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::projection::Projector;
 use datafusion_physical_expr::utils::collect_columns;
@@ -645,13 +644,14 @@ pub fn remove_unnecessary_projections(
                 return Ok(Transformed::yes(Arc::clone(projection.input())));
             }
 
-            // Check if projection should be pushed through the operator below.
-            // This centralizes the benefit check so individual operators don't need to do it.
-            if !should_push_through_operator(projection) {
+            // Check if projection should be pushed through the child operator.
+            // This centralizes the decision based on cardinality effect.
+            if !should_push_through_operator(projection, projection.input().as_ref()) {
                 return Ok(Transformed::no(plan));
             }
 
-            // If it does, check if we can push it under its child(ren):
+            // Try to push the projection under its child(ren). Each operator's
+            // try_swapping_with_projection handles the operator-specific logic.
             projection
                 .input()
                 .try_swapping_with_projection(projection)?
@@ -663,28 +663,32 @@ pub fn remove_unnecessary_projections(
 
 /// Determines whether a projection should be pushed through its child operator.
 ///
-/// A projection should be pushed through when it is:
-/// 1. Trivial (no expensive computations to duplicate)
-/// 2. AND provides some benefit:
-///    - Either narrows the schema (fewer output columns than input columns)
-///    - Or has beneficial expressions like field accessors that reduce data size
+/// The decision is based on:
+/// 1. Whether the projection has compute cost (trivial vs non-trivial expressions)
+/// 2. The child operator's cardinality effect (does it expand or reduce data?)
 ///
-/// This uses the same logic as `TrivialExprExtractor` to identify beneficial expressions:
-/// - Columns are neutral (no cost/benefit)
-/// - Literals are non-beneficial (they add data)
-/// - TrivialExpr (like `get_field`) are beneficial (they reduce data)
-fn should_push_through_operator(projection: &ProjectionExec) -> bool {
+/// - Trivial projections (columns, literals, get_field): Always push - no compute cost
+/// - Non-trivial projections: Only push past operators that expand data (GreaterEqual),
+///   not those that reduce it (would compute on more rows before reduction)
+///
+/// Using `cardinality_effect()`:
+/// - `GreaterEqual` = operator expands or maintains rows → safe to push non-trivial
+/// - `Equal` = same row count → safe to push trivial only
+/// - `LowerEqual` = operator reduces rows → DON'T push non-trivial
+/// - `Unknown` = treated same as Equal for safety
+fn should_push_through_operator(projection: &ProjectionExec, child: &dyn ExecutionPlan) -> bool {
     let exprs = projection.projection_expr();
-    let input_field_count = projection.input().schema().fields().len();
 
-    // All expressions must be trivial (no expensive computations)
     let all_trivial = exprs.iter().all(|p| p.expr.triviality().is_trivial());
 
-    // Check if projection narrows schema
-    let narrows_schema = exprs.as_ref().len() < input_field_count;
-    let is_all_columns = exprs.iter().all(|p| matches!(p.expr.triviality(), ArgTriviality::Column));
+    if all_trivial {
+        // No compute cost - always push closer to source
+        return true;
+    }
 
-    all_trivial || (is_all_columns && narrows_schema)
+    // Non-trivial projection (has computations) - only push if child expands data
+    // so we compute on fewer rows before the expansion
+    matches!(child.cardinality_effect(), CardinalityEffect::GreaterEqual)
 }
 
 /// Compare the inputs and outputs of the projection. All expressions must be
@@ -712,6 +716,25 @@ pub fn all_alias_free_columns(exprs: &[ProjectionExpr]) -> bool {
             .map(|column| column.name() == proj_expr.alias)
             .unwrap_or(false)
     })
+}
+
+/// Returns true if the projection is safe to push through operators that may
+/// filter rows (like joins). This is true when:
+/// - All expressions are trivial (no compute cost), OR
+/// - All expressions are columns AND the projection narrows the schema
+pub fn is_trivial_or_narrows_schema(projection: &ProjectionExec) -> bool {
+    let exprs = projection.expr();
+
+    // Check if all expressions are trivial (no compute cost)
+    let all_trivial = exprs.iter().all(|p| p.expr.triviality().is_trivial());
+
+    if all_trivial {
+        return true;
+    }
+
+    // Check if all columns AND projection narrows schema (drops columns without computation)
+    all_alias_free_columns(exprs)
+        && exprs.len() < projection.input().schema().fields().len()
 }
 
 /// Updates a source provider's projected columns according to the given

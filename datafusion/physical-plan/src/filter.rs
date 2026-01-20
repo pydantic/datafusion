@@ -35,8 +35,8 @@ use crate::filter_pushdown::{
 };
 use crate::metrics::{MetricBuilder, MetricType};
 use crate::projection::{
-    EmbeddedProjection, ProjectionExec, ProjectionExpr, make_with_child,
-    try_embed_projection, update_expr,
+    EmbeddedProjection, ProjectionExec, ProjectionExpr, make_with_child, try_embed_projection,
+    update_expr,
 };
 use crate::{
     DisplayFormatType, ExecutionPlan,

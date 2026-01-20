@@ -28,8 +28,8 @@ use super::utils::{
 use crate::execution_plan::{EmissionType, boundedness_from_children};
 use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use crate::projection::{
-    ProjectionExec, join_allows_pushdown, join_table_borders, new_join_children,
-    physical_to_column_exprs,
+    ProjectionExec, is_trivial_or_narrows_schema, join_allows_pushdown, join_table_borders,
+    new_join_children, physical_to_column_exprs,
 };
 use crate::{
     ColumnStatistics, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
@@ -375,6 +375,12 @@ impl ExecutionPlan for CrossJoinExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // Only push through joins if trivial or narrows schema
+        // (joins often filter rows, so avoid computing non-trivial exprs before join)
+        if !is_trivial_or_narrows_schema(projection) {
+            return Ok(None);
+        }
+
         // Convert projected PhysicalExpr's to columns. If not possible, we cannot proceed.
         let Some(projection_as_columns) = physical_to_column_exprs(projection.expr())
         else {

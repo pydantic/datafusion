@@ -40,8 +40,8 @@ use crate::metrics::{
     Count, ExecutionPlanMetricsSet, MetricBuilder, MetricType, MetricsSet, RatioMetrics,
 };
 use crate::projection::{
-    EmbeddedProjection, JoinData, ProjectionExec, try_embed_projection,
-    try_pushdown_through_join,
+    EmbeddedProjection, JoinData, ProjectionExec, is_trivial_or_narrows_schema,
+    try_embed_projection, try_pushdown_through_join,
 };
 use crate::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
@@ -587,6 +587,12 @@ impl ExecutionPlan for NestedLoopJoinExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // Only push through joins if trivial or narrows schema
+        // (joins often filter rows, so avoid computing non-trivial exprs before join)
+        if !is_trivial_or_narrows_schema(projection) {
+            return Ok(None);
+        }
+
         // TODO: currently if there is projection in NestedLoopJoinExec, we can't push down projection to left or right input. Maybe we can pushdown the mixed projection later.
         if self.contains_projection() {
             return Ok(None);
