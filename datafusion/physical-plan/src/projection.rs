@@ -47,7 +47,7 @@ use datafusion_common::tree_node::{
 };
 use datafusion_common::{JoinSide, Result, internal_err};
 use datafusion_execution::TaskContext;
-use datafusion_expr_common::triviality::ArgTriviality;
+use datafusion_expr::ArgTriviality;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::projection::Projector;
 use datafusion_physical_expr::utils::collect_columns;
