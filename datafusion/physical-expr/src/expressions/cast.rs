@@ -234,12 +234,25 @@ pub fn cast_with_options(
 ) -> Result<Arc<dyn PhysicalExpr>> {
     let expr_type = expr.data_type(input_schema)?;
     if expr_type == cast_type {
-        Ok(Arc::clone(&expr))
-    } else if can_cast_types(&expr_type, &cast_type) {
-        Ok(Arc::new(CastExpr::new(expr, cast_type, cast_options)))
-    } else {
-        not_impl_err!("Unsupported CAST from {expr_type} to {cast_type}")
+        return Ok(Arc::clone(&expr));
     }
+
+    // special handling for union types
+    // Union casting requires exact match because we can't pass type ids through the coercion system
+    // and there can be duplicate tag ids
+    let can_cast = if let Union(fields, _) = &expr_type {
+        fields
+            .iter()
+            .any(|(_, f)| can_cast_types(f.data_type(), &cast_type))
+    } else {
+        can_cast_types(&expr_type, &cast_type)
+    };
+
+    if !can_cast {
+        return not_impl_err!("Unsupported CAST from {expr_type} to {cast_type}");
+    }
+
+    Ok(Arc::new(CastExpr::new(expr, cast_type, cast_options)))
 }
 
 /// Return a PhysicalExpression representing `expr` casted to

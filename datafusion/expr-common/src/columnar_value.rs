@@ -17,10 +17,12 @@
 
 //! [`ColumnarValue`] represents the result of evaluating an expression.
 
+use arrow::buffer::NullBuffer;
 use arrow::{
     array::{Array, ArrayRef, Date32Array, Date64Array, NullArray},
-    compute::{CastOptions, kernels, max, min},
+    compute::{CastOptions, can_cast_types, cast_with_options, max, min},
     datatypes::DataType,
+    error::ArrowError,
     util::pretty::pretty_format_columns,
 };
 use datafusion_common::internal_datafusion_err;
@@ -284,17 +286,105 @@ impl ColumnarValue {
         match self {
             ColumnarValue::Array(array) => {
                 ensure_date_array_timestamp_bounds(array, cast_type)?;
-                Ok(ColumnarValue::Array(kernels::cast::cast_with_options(
-                    array,
-                    cast_type,
-                    &cast_options,
-                )?))
+
+                let out = match array.data_type() {
+                    // todo: upstream this to arrow
+                    DataType::Union(_, _) => {
+                        cast_union_array(array, cast_type, &cast_options)?
+                    }
+                    _ => cast_with_options(array, cast_type, &cast_options)?,
+                };
+
+                Ok(ColumnarValue::Array(out))
             }
             ColumnarValue::Scalar(scalar) => Ok(ColumnarValue::Scalar(
                 scalar.cast_to_with_options(cast_type, &cast_options)?,
             )),
         }
     }
+}
+
+/// casts a union array to a target type by extracting values from the matching variant
+///
+/// first attempts to find an exact type match, then falls back to a cast-compatible variant
+/// if the variant type differs from the target type, performs an actual cast
+///
+/// Note: rows where the active variant differs gets returned as NULL
+fn cast_union_array(
+    array: &dyn Array,
+    to_type: &DataType,
+    cast_options: &CastOptions,
+) -> Result<ArrayRef, ArrowError> {
+    use arrow::array::*;
+    use arrow::datatypes::UnionMode;
+
+    let union_array = array
+        .as_any()
+        .downcast_ref::<UnionArray>()
+        .ok_or_else(|| ArrowError::CastError("expected UnionArray".to_string()))?;
+
+    let DataType::Union(fields, mode) = union_array.data_type() else {
+        return Err(ArrowError::CastError(
+            "expected Union data type".to_string(),
+        ));
+    };
+
+    let len = union_array.len();
+    let type_ids = union_array.type_ids();
+
+    // we do 2 separate passes, first to find any exact matches and second to find any cast-compatible matches
+    let matching_type_id = fields
+        .iter()
+        .find_map(|(i, f)| (f.data_type() == to_type).then_some(i))
+        .or_else(|| {
+            fields
+                .iter()
+                .find_map(|(i, f)| can_cast_types(f.data_type(), to_type).then_some(i))
+        });
+
+    let Some(match_id) = matching_type_id else {
+        return Ok(new_null_array(to_type, len));
+    };
+
+    let matching_child = union_array.child(match_id);
+    let needs_cast = matching_child.data_type() != to_type;
+
+    // build indices array and null mask in one pass
+    let mut indices = Vec::with_capacity(len);
+    let mut null_mask = Vec::with_capacity(len);
+
+    for (i, &type_id) in type_ids.iter().enumerate() {
+        if type_id == match_id {
+            let o = match mode {
+                UnionMode::Sparse => i,
+                UnionMode::Dense => union_array.value_offset(i),
+            };
+            indices.push(o as u32);
+            null_mask.push(true);
+        } else {
+            // a dummy index
+            indices.push(0);
+            null_mask.push(false);
+        }
+    }
+
+    let indices_array = UInt32Array::from(indices);
+    let mut result = arrow::compute::take(matching_child, &indices_array, None)?;
+
+    if needs_cast {
+        result = cast_with_options(&result, to_type, cast_options)?;
+    }
+
+    let null_buffer = NullBuffer::from(null_mask);
+    let result_with_nulls = make_array(
+        result
+            .to_data()
+            .into_builder()
+            .nulls(Some(null_buffer))
+            .build()?,
+    );
+
+    Ok(result_with_nulls)
 }
 
 fn ensure_date_array_timestamp_bounds(

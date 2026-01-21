@@ -886,6 +886,7 @@ pub fn comparison_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<D
         .or_else(|| binary_coercion(lhs_type, rhs_type))
         .or_else(|| struct_coercion(lhs_type, rhs_type))
         .or_else(|| map_coercion(lhs_type, rhs_type))
+        .or_else(|| union_coercion(lhs_type, rhs_type))
 }
 
 /// Similar to [`comparison_coercion`] but prefers numeric if compares with
@@ -1282,6 +1283,25 @@ fn map_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
                 },
             )
         }
+        _ => None,
+    }
+}
+
+fn union_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
+    use arrow::datatypes::DataType::*;
+
+    match (lhs_type, rhs_type) {
+        (Union(_, _), Union(_, _)) => {
+            // note: we'll start with a simple equality check, deferring complex cases in later work
+            // for example: when a union is a subset of another union...
+            lhs_type
+                .equals_datatype(rhs_type)
+                .then_some(lhs_type.clone())
+        }
+        (Union(fields, _), opaque) | (opaque, Union(fields, _)) => fields
+            .iter()
+            .any(|(_, f)| can_cast_types(f.data_type(), opaque))
+            .then_some(opaque.clone()),
         _ => None,
     }
 }
