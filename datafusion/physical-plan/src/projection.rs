@@ -685,26 +685,29 @@ pub fn all_alias_free_columns(exprs: &[ProjectionExpr]) -> bool {
     })
 }
 
-/// Returns true if the projection is safe to push through operators that may
-/// filter rows (like filters and joins). This is true when:
-/// - All expressions are TrivialExpr (like get_field), OR
+/// Returns true if the projection is safe to push through operators like Sort.
+/// This is true when:
+/// - All expressions are trivial (Column or TrivialExpr like get_field), OR
 /// - The projection narrows the schema (drops columns)
 ///
 /// This helper identifies *beneficial* expressions to push: trivial projections
-/// that are cheap and preserve row counts. Standalone literals or arbitrary
-/// computations are not beneficial to push below filters since it is cheaper
-/// to evaluate them after filtering reduces the row count.
+/// that are cheap and don't add data. Literals or arbitrary computations are
+/// not beneficial to push below Sort since they would increase the data volume
+/// that Sort needs to process.
 pub fn is_trivial_or_narrows_schema(projection: &ProjectionExec) -> bool {
     let exprs = projection.expr();
 
-    // Check if all expressions declared themselves as TrivialExpr
-    // (e.g., get_field(col, 'foo') returns TrivialExpr because it handles
-    // the recursion into its children and determined it's trivial)
-    let all_trivial_expr = exprs
-        .iter()
-        .all(|p| matches!(p.expr.triviality(), ArgTriviality::TrivialExpr));
+    // Check if all expressions are trivial (Column or TrivialExpr)
+    // Column: simple column reference, no computation
+    // TrivialExpr: expressions like get_field(col, 'foo') that are cheap field accessors
+    let all_trivial = exprs.iter().all(|p| {
+        matches!(
+            p.expr.triviality(),
+            ArgTriviality::Column | ArgTriviality::TrivialExpr
+        )
+    });
 
-    if all_trivial_expr {
+    if all_trivial {
         return true;
     }
 

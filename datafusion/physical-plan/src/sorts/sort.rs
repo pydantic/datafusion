@@ -1393,10 +1393,10 @@ impl ExecutionPlan for SortExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        // When SortExec has a fetch (TopK), it acts as a filter reducing rows.
-        // Only push projections that are trivial or narrow the schema to avoid
-        // evaluating expressions (like literals) on all input rows.
-        if self.fetch.is_some() && !is_trivial_or_narrows_schema(projection) {
+        // Only push projections that are trivial (column refs, field accessors) or
+        // narrow the schema (drop columns). Non-trivial projections that don't narrow
+        // the schema would cause Sort to process more data than necessary.
+        if !is_trivial_or_narrows_schema(projection) {
             return Ok(None);
         }
 
@@ -2716,6 +2716,188 @@ mod tests {
 
         // The reserved memory for the sliced batch should be less than that of the full batch
         assert!(reserved > sliced_reserved);
+
+        Ok(())
+    }
+
+    /// Tests that TopK (SortExec with fetch) does not allow non-trivial projections
+    /// to be pushed through it when they don't narrow the schema.
+    #[test]
+    fn test_topk_blocks_non_trivial_projection() -> Result<()> {
+        use crate::empty::EmptyExec;
+        use crate::projection::ProjectionExec;
+        use datafusion_expr::Operator;
+        use datafusion_physical_expr::expressions::BinaryExpr;
+        use datafusion_physical_expr::projection::ProjectionExpr;
+
+        // Create schema with two columns
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+
+        // Create SortExec with fetch (TopK)
+        let sort_expr = PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)));
+        let sort_exec = SortExec::new([sort_expr].into(), input).with_fetch(Some(10));
+
+        // Create a projection that:
+        // 1. Does NOT narrow the schema (same number of columns)
+        // 2. Has a non-trivial expression (literal + column)
+        let projection_exprs = vec![
+            ProjectionExpr::new(Arc::new(Column::new("a", 0)), "a".to_string()),
+            ProjectionExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("b", 1)),
+                    Operator::Plus,
+                    Arc::new(Literal::new(ScalarValue::Int32(Some(100)))),
+                )),
+                "b_plus_100".to_string(),
+            ),
+        ];
+
+        let projection =
+            ProjectionExec::try_new(projection_exprs, Arc::new(sort_exec.clone()))?;
+
+        // TopK should NOT swap with this projection because:
+        // - It has fetch (is TopK)
+        // - The projection doesn't narrow the schema (2 cols -> 2 cols)
+        // - The projection has non-trivial expressions
+        let result = sort_exec.try_swapping_with_projection(&projection)?;
+        assert!(
+            result.is_none(),
+            "TopK should not swap with non-trivial, non-narrowing projection"
+        );
+
+        Ok(())
+    }
+
+    /// Tests that TopK allows projections that narrow the schema to be pushed through.
+    #[test]
+    fn test_topk_allows_narrowing_projection() -> Result<()> {
+        use crate::empty::EmptyExec;
+        use crate::projection::ProjectionExec;
+        use datafusion_expr::Operator;
+        use datafusion_physical_expr::expressions::BinaryExpr;
+        use datafusion_physical_expr::projection::ProjectionExpr;
+
+        // Create schema with three columns
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("c", DataType::Int32, false),
+        ]));
+        let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+
+        // Create SortExec with fetch (TopK)
+        let sort_expr = PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)));
+        let sort_exec = SortExec::new([sort_expr].into(), input).with_fetch(Some(10));
+
+        // Create a projection that narrows the schema (3 cols -> 2 cols)
+        // Even though it has non-trivial expressions, it should be allowed
+        let projection_exprs = vec![
+            ProjectionExpr::new(Arc::new(Column::new("a", 0)), "a".to_string()),
+            ProjectionExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("b", 1)),
+                    Operator::Plus,
+                    Arc::new(Literal::new(ScalarValue::Int32(Some(100)))),
+                )),
+                "b_plus_100".to_string(),
+            ),
+        ];
+
+        let projection =
+            ProjectionExec::try_new(projection_exprs, Arc::new(sort_exec.clone()))?;
+
+        // TopK SHOULD allow this projection because it narrows the schema
+        let result = sort_exec.try_swapping_with_projection(&projection)?;
+        assert!(
+            result.is_some(),
+            "TopK should allow projection that narrows schema"
+        );
+
+        Ok(())
+    }
+
+    /// Tests that regular Sort (without fetch) also blocks non-trivial, non-narrowing projections.
+    /// This is because pushing such projections would cause Sort to process more data.
+    #[test]
+    fn test_sort_without_fetch_blocks_non_trivial_projection() -> Result<()> {
+        use crate::empty::EmptyExec;
+        use crate::projection::ProjectionExec;
+        use datafusion_expr::Operator;
+        use datafusion_physical_expr::expressions::BinaryExpr;
+        use datafusion_physical_expr::projection::ProjectionExpr;
+
+        // Create schema with two columns
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+
+        // Create SortExec WITHOUT fetch (regular Sort, not TopK)
+        let sort_expr = PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)));
+        let sort_exec = SortExec::new([sort_expr].into(), input);
+
+        // Create a projection that does NOT narrow the schema and has non-trivial expressions
+        let projection_exprs = vec![
+            ProjectionExpr::new(Arc::new(Column::new("a", 0)), "a".to_string()),
+            ProjectionExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("b", 1)),
+                    Operator::Plus,
+                    Arc::new(Literal::new(ScalarValue::Int32(Some(100)))),
+                )),
+                "b_plus_100".to_string(),
+            ),
+        ];
+
+        let projection =
+            ProjectionExec::try_new(projection_exprs, Arc::new(sort_exec.clone()))?;
+
+        // Regular Sort should ALSO block non-trivial, non-narrowing projections
+        // to avoid sorting more data than necessary
+        let result = sort_exec.try_swapping_with_projection(&projection)?;
+        assert!(
+            result.is_none(),
+            "Regular Sort should block non-trivial, non-narrowing projection"
+        );
+
+        Ok(())
+    }
+
+    /// Tests that Sort allows column-only projections to be pushed through.
+    #[test]
+    fn test_sort_allows_column_only_projection() -> Result<()> {
+        use crate::empty::EmptyExec;
+        use crate::projection::ProjectionExec;
+        use datafusion_physical_expr::projection::ProjectionExpr;
+
+        // Create schema with two columns
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+
+        // Create SortExec
+        let sort_expr = PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)));
+        let sort_exec = SortExec::new([sort_expr].into(), input);
+
+        // Create a projection with only column references (trivial)
+        let projection_exprs = vec![
+            ProjectionExpr::new(Arc::new(Column::new("a", 0)), "a".to_string()),
+            ProjectionExpr::new(Arc::new(Column::new("b", 1)), "b".to_string()),
+        ];
+
+        let projection =
+            ProjectionExec::try_new(projection_exprs, Arc::new(sort_exec.clone()))?;
+
+        // Sort should allow column-only projections (they are trivial)
+        let result = sort_exec.try_swapping_with_projection(&projection)?;
+        assert!(result.is_some(), "Sort should allow column-only projection");
 
         Ok(())
     }
