@@ -501,15 +501,17 @@ impl ScalarUDFImpl for GetFieldFunc {
     }
 
     fn triviality(&self, args: &[ArgTriviality]) -> ArgTriviality {
-        // get_field is only trivial if:
-        // 1. The struct/map argument is a column
+        // get_field is trivial if:
+        // 1. The struct/map argument is a Column or TrivialExpr (not Literal or NonTrivial)
         // 2. All key arguments are literals (static field access, not dynamic per-row lookup)
+        //
+        // Literal base is not considered trivial because it would be constant-folded anyway.
         if args.is_empty() {
             return ArgTriviality::NonTrivial;
         }
 
-        // Check if the base (struct/map) argument is a column
-        if args[0] != ArgTriviality::Column {
+        // Check if the base (struct/map) argument is Column or TrivialExpr
+        if !matches!(args[0], ArgTriviality::Column | ArgTriviality::TrivialExpr) {
             return ArgTriviality::NonTrivial;
         }
 
@@ -628,8 +630,8 @@ mod tests {
         let args = vec![ArgTriviality::Column];
         assert_eq!(func.triviality(&args), ArgTriviality::TrivialExpr);
 
-        // Literal base with literal key -> trivial
+        // Literal base with literal key -> NOT trivial (would be constant-folded)
         let args = vec![ArgTriviality::Literal, ArgTriviality::Literal];
-        assert_eq!(func.triviality(&args), ArgTriviality::TrivialExpr);
+        assert_eq!(func.triviality(&args), ArgTriviality::NonTrivial);
     }
 }
