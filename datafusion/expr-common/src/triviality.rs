@@ -26,7 +26,7 @@
 /// For example, `get_field(struct_col, 'field_name')` is trivial (static field
 /// lookup), but `get_field(struct_col, key_col)` is not (dynamic per-row lookup).
 ///
-/// [`ScalarUDFImpl::triviality_with_args`]: crate::ScalarUDFImpl::triviality_with_args
+/// [`ScalarUDFImpl::triviality_with_args`]: datafusion_expr::ScalarUDFImpl::triviality_with_args
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArgTriviality {
     /// Argument is a literal constant value or an expression that can be
