@@ -249,7 +249,7 @@ impl ExecutionPlan for CoalescePartitionsExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        // CoalescePartitionsExec always has a single child, so zero indexing is safe
+        // CoalescePartitionsExec always has a single child, so zero indexing is safe.
         make_with_child(projection, projection.input().children()[0]).map(|e| {
             if self.fetch.is_some() {
                 let mut plan = CoalescePartitionsExec::new(e);

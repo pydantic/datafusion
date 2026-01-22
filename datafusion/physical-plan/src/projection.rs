@@ -690,10 +690,10 @@ pub fn all_alias_free_columns(exprs: &[ProjectionExpr]) -> bool {
 /// - All expressions are TrivialExpr (like get_field), OR
 /// - The projection narrows the schema (drops columns)
 ///
-/// Note: We only check for `TrivialExpr`, not `Column` or `Literal` directly.
-/// Functions like `get_field(col, 'foo')` handle their children internally via
-/// `ScalarUDFImpl::triviality()` and return `TrivialExpr` when appropriate.
-/// A standalone `Literal` would need broadcast to N rows, so it stays above filters.
+/// This helper identifies *beneficial* expressions to push: trivial projections
+/// that are cheap and preserve row counts. Standalone literals or arbitrary
+/// computations are not beneficial to push below filters since it is cheaper
+/// to evaluate them after filtering reduces the row count.
 pub fn is_trivial_or_narrows_schema(projection: &ProjectionExec) -> bool {
     let exprs = projection.expr();
 

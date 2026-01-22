@@ -34,7 +34,7 @@ pub enum ArgTriviality {
     Literal,
     /// Argument is a simple column reference.
     Column,
-    /// Argument is a complex expressions that declares itself trivial.
+    /// Argument is a complex expression that declares itself trivial.
     /// For example, if `get_field(struct_col, 'field_name')` is implemented as a
     /// trivial expression, then it would return this variant.
     /// Then `other_trivial_function(get_field(...), 42)` could also be classified as

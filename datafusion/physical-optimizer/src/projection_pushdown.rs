@@ -124,7 +124,7 @@ fn try_split_projection(
     let mut has_extractions = false;
 
     for proj_expr in projection.expr() {
-        // If this is already an expressions from an extraction don't try to re-extract it (would cause infinite recursion)
+        // If this is already an expression from an extraction don't try to re-extract it (would cause infinite recursion)
         if proj_expr.alias.starts_with("__extracted") {
             outer_exprs.push(proj_expr.clone());
             continue;
