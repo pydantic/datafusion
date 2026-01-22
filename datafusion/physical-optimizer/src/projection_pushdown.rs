@@ -223,8 +223,8 @@ impl<'a> TrivialExprExtractor<'a> {
         let mut any_changed = false;
 
         for child in children {
-            let new_child = self.extract(Arc::clone(&child))?;
-            if !Arc::ptr_eq(&new_child, &child) {
+            let new_child = self.extract(Arc::clone(child))?;
+            if !Arc::ptr_eq(&new_child, child) {
                 any_changed = true;
             }
             new_children.push(new_child);
