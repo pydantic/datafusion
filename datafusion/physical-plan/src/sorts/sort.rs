@@ -36,7 +36,9 @@ use crate::limit::LimitStream;
 use crate::metrics::{
     BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, SpillMetrics,
 };
-use crate::projection::{ProjectionExec, make_with_child, update_ordering};
+use crate::projection::{
+    ProjectionExec, is_trivial_or_narrows_schema, make_with_child, update_ordering,
+};
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
 use crate::spill::get_record_batch_memory_size;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
@@ -1391,6 +1393,13 @@ impl ExecutionPlan for SortExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // When SortExec has a fetch (TopK), it acts as a filter reducing rows.
+        // Only push projections that are trivial or narrow the schema to avoid
+        // evaluating expressions (like literals) on all input rows.
+        if self.fetch.is_some() && !is_trivial_or_narrows_schema(projection) {
+            return Ok(None);
+        }
+
         let Some(updated_exprs) = update_ordering(self.expr.clone(), projection.expr())?
         else {
             return Ok(None);
