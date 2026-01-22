@@ -129,7 +129,7 @@ impl ScalarUDF {
     /// For example, `get_field(struct_col, 'field_name')` is trivial (static field
     /// lookup), but `get_field(struct_col, key_col)` is not (dynamic per-row lookup).
     ///
-    /// See [`ScalarUDFImpl::triviality_with_args`] for more details.
+    /// See [`ScalarUDFImpl::triviality`] for more details.
     pub fn triviality_with_args(&self, args: &[ArgTriviality]) -> ArgTriviality {
         self.inner.triviality(args)
     }
