@@ -19,7 +19,7 @@
 
 /// Classification of argument triviality for scalar functions.
 ///
-/// This enum is used by [`ScalarUDFImpl::triviality_with_args`] to allow
+/// This enum is used by [`ScalarUDFImpl::triviality`] to allow
 /// functions to make context-dependent decisions about whether they are
 /// trivial based on the nature of their arguments.
 ///
