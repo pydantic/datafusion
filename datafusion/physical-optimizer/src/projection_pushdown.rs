@@ -129,6 +129,16 @@ fn try_split_projection(
             outer_exprs.push(proj_expr.clone());
             continue;
         }
+
+        // Only extract from non-trivial expressions. If the entire expression is
+        // already TrivialExpr (like `get_field(col, 'foo')`), it can be pushed as-is.
+        // We only need to split when there's a non-trivial expression with trivial
+        // sub-expressions (like `get_field(col, 'foo') + 1`).
+        if matches!(proj_expr.expr.triviality(), ArgTriviality::TrivialExpr) {
+            outer_exprs.push(proj_expr.clone());
+            continue;
+        }
+
         let rewritten = extractor.extract(Arc::clone(&proj_expr.expr))?;
         if !Arc::ptr_eq(&rewritten, &proj_expr.expr) {
             has_extractions = true;

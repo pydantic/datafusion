@@ -35,8 +35,8 @@ use crate::filter_pushdown::{
 };
 use crate::metrics::{MetricBuilder, MetricType};
 use crate::projection::{
-    EmbeddedProjection, ProjectionExec, ProjectionExpr, make_with_child,
-    try_embed_projection, update_expr,
+    EmbeddedProjection, ProjectionExec, ProjectionExpr, is_trivial_or_narrows_schema,
+    make_with_child, try_embed_projection, update_expr,
 };
 use crate::{
     DisplayFormatType, ExecutionPlan,
@@ -562,8 +562,10 @@ impl ExecutionPlan for FilterExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        // If the projection does not narrow the schema, we should not try to push it down:
-        if projection.expr().len() < projection.input().schema().fields().len() {
+        // Push projection through filter if:
+        // - It narrows the schema (drops columns), OR
+        // - It's trivial (columns, literals, or cheap expressions like get_field)
+        if is_trivial_or_narrows_schema(projection) {
             // Each column in the predicate expression must exist after the projection.
             if let Some(new_predicate) =
                 update_expr(self.predicate(), projection.expr(), false)?

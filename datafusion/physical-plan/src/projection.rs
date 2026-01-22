@@ -686,25 +686,31 @@ pub fn all_alias_free_columns(exprs: &[ProjectionExpr]) -> bool {
 }
 
 /// Returns true if the projection is safe to push through operators that may
-/// filter rows (like joins). This is true when:
-/// - All expressions are trivial (no compute cost), OR
-/// - All expressions are columns AND the projection narrows the schema
+/// filter rows (like filters and joins). This is true when:
+/// - All expressions are TrivialExpr (like get_field), OR
+/// - The projection narrows the schema (drops columns)
+///
+/// Note: We only check for `TrivialExpr`, not `Column` or `Literal` directly.
+/// Functions like `get_field(col, 'foo')` handle their children internally via
+/// `ScalarUDFImpl::triviality()` and return `TrivialExpr` when appropriate.
+/// A standalone `Literal` would need broadcast to N rows, so it stays above filters.
 pub fn is_trivial_or_narrows_schema(projection: &ProjectionExec) -> bool {
     let exprs = projection.expr();
 
-    // Check if all expressions are trivial (no compute cost)
-    // An expression is "cheap" if it's not NonTrivial (i.e., Column, Literal, or TrivialExpr).
-    let all_trivial = exprs
+    // Check if all expressions declared themselves as TrivialExpr
+    // (e.g., get_field(col, 'foo') returns TrivialExpr because it handles
+    // the recursion into its children and determined it's trivial)
+    let all_trivial_expr = exprs
         .iter()
-        .all(|p| !matches!(p.expr.triviality(), ArgTriviality::NonTrivial));
+        .all(|p| matches!(p.expr.triviality(), ArgTriviality::TrivialExpr));
 
-    if all_trivial {
+    if all_trivial_expr {
         return true;
     }
 
-    // Check if all columns AND projection narrows schema (drops columns without computation)
-    all_alias_free_columns(exprs)
-        && exprs.len() < projection.input().schema().fields().len()
+    // Check if projection narrows schema (drops columns)
+    // This preserves the original filter pushdown behavior
+    exprs.len() < projection.input().schema().fields().len()
 }
 
 /// Updates a source provider's projected columns according to the given
@@ -973,18 +979,20 @@ fn try_unifying_projections(
             })
             .unwrap();
     });
-    // Merging these projections is not beneficial, e.g
-    // If an expression is not trivial and it is referred more than 1, unifies projections will be
-    // beneficial as caching mechanism for non-trivial computations.
-    // See discussion in: https://github.com/apache/datafusion/issues/8296
-    if column_ref_map.iter().any(|(column, count)| {
-        *count > 1
-            && matches!(
-                child.expr()[column.index()].expr.triviality(),
-                ArgTriviality::NonTrivial
-            )
-    }) {
-        return Ok(None);
+    // Don't merge if:
+    // 1. A non-trivial expression is referenced more than once (caching benefit)
+    //    See discussion in: https://github.com/apache/datafusion/issues/8296
+    // 2. The child projection has TrivialExpr (like get_field) that should be pushed
+    //    down to the data source separately
+    for (column, count) in column_ref_map.iter() {
+        let triviality = child.expr()[column.index()].expr.triviality();
+        // Don't merge if multi-referenced non-trivial (caching)
+        if (*count > 1 && matches!(triviality, ArgTriviality::NonTrivial))
+            // Don't merge if child has TrivialExpr (should push to source)
+            || matches!(triviality, ArgTriviality::TrivialExpr)
+        {
+            return Ok(None);
+        }
     }
     for proj_expr in projection.expr() {
         // If there is no match in the input projection, we cannot unify these
