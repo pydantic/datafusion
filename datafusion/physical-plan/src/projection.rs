@@ -20,7 +20,7 @@
 //! of a projection on table `t1` where the expressions `a`, `b`, and `a+b` are the
 //! projection expressions. `SELECT` without `FROM` will only evaluate expressions.
 
-use super::expressions::{Column, Literal};
+use super::expressions::Column;
 use super::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use super::{
     DisplayAs, ExecutionPlanProperties, PlanProperties, RecordBatchStream,
@@ -47,6 +47,7 @@ use datafusion_common::tree_node::{
 };
 use datafusion_common::{JoinSide, Result, internal_err};
 use datafusion_execution::TaskContext;
+use datafusion_expr::ArgTriviality;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::projection::Projector;
 use datafusion_physical_expr::utils::collect_columns;
@@ -255,18 +256,16 @@ impl ExecutionPlan for ProjectionExec {
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        let all_simple_exprs =
-            self.projector
-                .projection()
-                .as_ref()
+        // If expressions are all trivial (columns, literals, or field accessors),
+        // then all computations in this projection are reorder or rename,
+        // and projection would not benefit from the repartition.
+        // An expression is "cheap" if it's not NonTrivial (i.e., Column, Literal, or TrivialExpr).
+        vec![
+            !self
+                .projection_expr()
                 .iter()
-                .all(|proj_expr| {
-                    proj_expr.expr.as_any().is::<Column>()
-                        || proj_expr.expr.as_any().is::<Literal>()
-                });
-        // If expressions are all either column_expr or Literal, then all computations in this projection are reorder or rename,
-        // and projection would not benefit from the repartition, benefits_from_input_partitioning will return false.
-        vec![!all_simple_exprs]
+                .all(|p| !matches!(p.expr.triviality(), ArgTriviality::NonTrivial)),
+        ]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -647,7 +646,9 @@ pub fn remove_unnecessary_projections(
             if is_projection_removable(projection) {
                 return Ok(Transformed::yes(Arc::clone(projection.input())));
             }
-            // If it does, check if we can push it under its child(ren):
+
+            // Try to push the projection under its child(ren). Each operator's
+            // try_swapping_with_projection handles the operator-specific logic.
             projection
                 .input()
                 .try_swapping_with_projection(projection)?
@@ -684,6 +685,37 @@ pub fn all_alias_free_columns(exprs: &[ProjectionExpr]) -> bool {
     })
 }
 
+/// Returns true if the projection is safe to push through operators like Sort.
+/// This is true when:
+/// - All expressions are trivial (Column or TrivialExpr like get_field), OR
+/// - The projection narrows the schema (drops columns)
+///
+/// This helper identifies *beneficial* expressions to push: trivial projections
+/// that are cheap and don't add data. Literals or arbitrary computations are
+/// not beneficial to push below Sort since they would increase the data volume
+/// that Sort needs to process.
+pub fn is_trivial_or_narrows_schema(projection: &ProjectionExec) -> bool {
+    let exprs = projection.expr();
+
+    // Check if all expressions are trivial (Column or TrivialExpr)
+    // Column: simple column reference, no computation
+    // TrivialExpr: expressions like get_field(col, 'foo') that are cheap field accessors
+    let all_trivial = exprs.iter().all(|p| {
+        matches!(
+            p.expr.triviality(),
+            ArgTriviality::Column | ArgTriviality::TrivialExpr
+        )
+    });
+
+    if all_trivial {
+        return true;
+    }
+
+    // Check if projection narrows schema (drops columns)
+    // This preserves the original filter pushdown behavior
+    exprs.len() < projection.input().schema().fields().len()
+}
+
 /// Updates a source provider's projected columns according to the given
 /// projection operator's expressions. To use this function safely, one must
 /// ensure that all expressions are `Column` expressions without aliases.
@@ -711,13 +743,6 @@ pub fn make_with_child(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     ProjectionExec::try_new(projection.expr().to_vec(), Arc::clone(child))
         .map(|e| Arc::new(e) as _)
-}
-
-/// Returns `true` if all the expressions in the argument are `Column`s.
-pub fn all_columns(exprs: &[ProjectionExpr]) -> bool {
-    exprs
-        .iter()
-        .all(|proj_expr| proj_expr.expr.as_any().is::<Column>())
 }
 
 /// Updates the given lexicographic ordering according to given projected
@@ -957,14 +982,20 @@ fn try_unifying_projections(
             })
             .unwrap();
     });
-    // Merging these projections is not beneficial, e.g
-    // If an expression is not trivial and it is referred more than 1, unifies projections will be
-    // beneficial as caching mechanism for non-trivial computations.
-    // See discussion in: https://github.com/apache/datafusion/issues/8296
-    if column_ref_map.iter().any(|(column, count)| {
-        *count > 1 && !is_expr_trivial(&Arc::clone(&child.expr()[column.index()].expr))
-    }) {
-        return Ok(None);
+    // Don't merge if:
+    // 1. A non-trivial expression is referenced more than once (caching benefit)
+    //    See discussion in: https://github.com/apache/datafusion/issues/8296
+    // 2. The child projection has TrivialExpr (like get_field) that should be pushed
+    //    down to the data source separately
+    for (column, count) in column_ref_map.iter() {
+        let triviality = child.expr()[column.index()].expr.triviality();
+        // Don't merge if multi-referenced non-trivial (caching)
+        if (*count > 1 && matches!(triviality, ArgTriviality::NonTrivial))
+            // Don't merge if child has TrivialExpr (should push to source)
+            || matches!(triviality, ArgTriviality::TrivialExpr)
+        {
+            return Ok(None);
+        }
     }
     for proj_expr in projection.expr() {
         // If there is no match in the input projection, we cannot unify these
@@ -1070,13 +1101,6 @@ fn new_columns_for_join_on(
         })
         .collect::<Vec<_>>();
     (new_columns.len() == hash_join_on.len()).then_some(new_columns)
-}
-
-/// Checks if the given expression is trivial.
-/// An expression is considered trivial if it is either a `Column` or a `Literal`.
-fn is_expr_trivial(expr: &Arc<dyn PhysicalExpr>) -> bool {
-    expr.as_any().downcast_ref::<Column>().is_some()
-        || expr.as_any().downcast_ref::<Literal>().is_some()
 }
 
 #[cfg(test)]

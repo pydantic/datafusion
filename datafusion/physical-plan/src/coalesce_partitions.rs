@@ -249,10 +249,6 @@ impl ExecutionPlan for CoalescePartitionsExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        // If the projection does not narrow the schema, we should not try to push it down:
-        if projection.expr().len() >= projection.input().schema().fields().len() {
-            return Ok(None);
-        }
         // CoalescePartitionsExec always has a single child, so zero indexing is safe.
         make_with_child(projection, projection.input().children()[0]).map(|e| {
             if self.fetch.is_some() {
