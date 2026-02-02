@@ -235,14 +235,14 @@ query TT
 EXPLAIN SELECT id, s['value'] FROM simple_struct WHERE id > 2;
 ----
 logical_plan
-01)Projection: simple_struct.id, __leaf_1 AS simple_struct.s[value]
+01)Projection: simple_struct.id, __datafusion_extracted_1 AS simple_struct.s[value]
 02)--Filter: simple_struct.id > Int64(2)
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_1, simple_struct.id
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(2)]
 physical_plan
-01)ProjectionExec: expr=[id@1 as id, __leaf_1@0 as simple_struct.s[value]]
+01)ProjectionExec: expr=[id@1 as id, __datafusion_extracted_1@0 as simple_struct.s[value]]
 02)--FilterExec: id@1 > 2
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, id], file_type=parquet, predicate=id@0 > 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 2, required_guarantees=[]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet, predicate=id@0 > 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 2, required_guarantees=[]
 
 # Verify correctness
 query II
@@ -260,14 +260,14 @@ query TT
 EXPLAIN SELECT id, s['value'] + 1 FROM simple_struct WHERE id > 2;
 ----
 logical_plan
-01)Projection: simple_struct.id, __leaf_1 + Int64(1) AS simple_struct.s[value] + Int64(1)
+01)Projection: simple_struct.id, __datafusion_extracted_1 + Int64(1) AS simple_struct.s[value] + Int64(1)
 02)--Filter: simple_struct.id > Int64(2)
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_1, simple_struct.id
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(2)]
 physical_plan
-01)ProjectionExec: expr=[id@1 as id, __leaf_1@0 + 1 as simple_struct.s[value] + Int64(1)]
+01)ProjectionExec: expr=[id@1 as id, __datafusion_extracted_1@0 + 1 as simple_struct.s[value] + Int64(1)]
 02)--FilterExec: id@1 > 2
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, id], file_type=parquet, predicate=id@0 > 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 2, required_guarantees=[]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet, predicate=id@0 > 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 2, required_guarantees=[]
 
 # Verify correctness
 query II
@@ -285,14 +285,14 @@ query TT
 EXPLAIN SELECT id, s['label'] FROM simple_struct WHERE s['value'] > 150;
 ----
 logical_plan
-01)Projection: simple_struct.id, __leaf_2 AS simple_struct.s[label]
-02)--Filter: __leaf_1 > Int64(150)
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_1, simple_struct.id, get_field(simple_struct.s, Utf8("label")) AS __leaf_2
+01)Projection: simple_struct.id, __datafusion_extracted_2 AS simple_struct.s[label]
+02)--Filter: __datafusion_extracted_1 > Int64(150)
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id, get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_2
 04)------TableScan: simple_struct projection=[id, s], partial_filters=[get_field(simple_struct.s, Utf8("value")) > Int64(150)]
 physical_plan
-01)ProjectionExec: expr=[id@0 as id, __leaf_2@1 as simple_struct.s[label]]
-02)--FilterExec: __leaf_1@0 > 150, projection=[id@1, __leaf_2@2]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, id, get_field(s@1, label) as __leaf_2], file_type=parquet
+01)ProjectionExec: expr=[id@0 as id, __datafusion_extracted_2@1 as simple_struct.s[label]]
+02)--FilterExec: __datafusion_extracted_1@0 > 150, projection=[id@1, __datafusion_extracted_2@2]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id, get_field(s@1, label) as __datafusion_extracted_2], file_type=parquet
 
 # Verify correctness
 query IT
@@ -559,15 +559,15 @@ EXPLAIN SELECT id, s['value'] FROM simple_struct WHERE id > 1 ORDER BY s['value'
 ----
 logical_plan
 01)Sort: simple_struct.s[value] ASC NULLS LAST
-02)--Projection: simple_struct.id, __leaf_1 AS simple_struct.s[value]
+02)--Projection: simple_struct.id, __datafusion_extracted_1 AS simple_struct.s[value]
 03)----Filter: simple_struct.id > Int64(1)
-04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_1, simple_struct.id
+04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
 05)--------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1)]
 physical_plan
 01)SortExec: expr=[simple_struct.s[value]@1 ASC NULLS LAST], preserve_partitioning=[false]
-02)--ProjectionExec: expr=[id@1 as id, __leaf_1@0 as simple_struct.s[value]]
+02)--ProjectionExec: expr=[id@1 as id, __datafusion_extracted_1@0 as simple_struct.s[value]]
 03)----FilterExec: id@1 > 1
-04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, id], file_type=parquet, predicate=id@0 > 1, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1, required_guarantees=[]
+04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet, predicate=id@0 > 1, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1, required_guarantees=[]
 
 # Verify correctness
 query II
@@ -587,15 +587,15 @@ EXPLAIN SELECT id, s['value'] FROM simple_struct WHERE id > 1 ORDER BY s['value'
 ----
 logical_plan
 01)Sort: simple_struct.s[value] ASC NULLS LAST, fetch=2
-02)--Projection: simple_struct.id, __leaf_1 AS simple_struct.s[value]
+02)--Projection: simple_struct.id, __datafusion_extracted_1 AS simple_struct.s[value]
 03)----Filter: simple_struct.id > Int64(1)
-04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_1, simple_struct.id
+04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
 05)--------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1)]
 physical_plan
 01)SortExec: TopK(fetch=2), expr=[simple_struct.s[value]@1 ASC NULLS LAST], preserve_partitioning=[false]
-02)--ProjectionExec: expr=[id@1 as id, __leaf_1@0 as simple_struct.s[value]]
+02)--ProjectionExec: expr=[id@1 as id, __datafusion_extracted_1@0 as simple_struct.s[value]]
 03)----FilterExec: id@1 > 1
-04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, id], file_type=parquet, predicate=id@0 > 1, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1, required_guarantees=[]
+04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet, predicate=id@0 > 1, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1, required_guarantees=[]
 
 # Verify correctness
 query II
@@ -613,15 +613,15 @@ EXPLAIN SELECT id, s['value'] + 1 FROM simple_struct WHERE id > 1 ORDER BY id LI
 ----
 logical_plan
 01)Sort: simple_struct.id ASC NULLS LAST, fetch=2
-02)--Projection: simple_struct.id, __leaf_1 + Int64(1) AS simple_struct.s[value] + Int64(1)
+02)--Projection: simple_struct.id, __datafusion_extracted_1 + Int64(1) AS simple_struct.s[value] + Int64(1)
 03)----Filter: simple_struct.id > Int64(1)
-04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_1, simple_struct.id
+04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
 05)--------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1)]
 physical_plan
 01)SortExec: TopK(fetch=2), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
-02)--ProjectionExec: expr=[id@1 as id, __leaf_1@0 + 1 as simple_struct.s[value] + Int64(1)]
+02)--ProjectionExec: expr=[id@1 as id, __datafusion_extracted_1@0 + 1 as simple_struct.s[value] + Int64(1)]
 03)----FilterExec: id@1 > 1
-04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, id], file_type=parquet, predicate=id@0 > 1 AND DynamicFilter [ empty ], pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1, required_guarantees=[]
+04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet, predicate=id@0 > 1 AND DynamicFilter [ empty ], pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1, required_guarantees=[]
 
 # Verify correctness
 query II
@@ -753,17 +753,17 @@ EXPLAIN SELECT id, s['value'] FROM multi_struct WHERE id > 2 ORDER BY id;
 ----
 logical_plan
 01)Sort: multi_struct.id ASC NULLS LAST
-02)--Projection: multi_struct.id, __leaf_1 AS multi_struct.s[value]
+02)--Projection: multi_struct.id, __datafusion_extracted_1 AS multi_struct.s[value]
 03)----Filter: multi_struct.id > Int64(2)
-04)------Projection: get_field(multi_struct.s, Utf8("value")) AS __leaf_1, multi_struct.id
+04)------Projection: get_field(multi_struct.s, Utf8("value")) AS __datafusion_extracted_1, multi_struct.id
 05)--------TableScan: multi_struct projection=[id, s], partial_filters=[multi_struct.id > Int64(2)]
 physical_plan
 01)SortPreservingMergeExec: [id@0 ASC NULLS LAST]
 02)--SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]
-03)----ProjectionExec: expr=[id@1 as id, __leaf_1@0 as multi_struct.s[value]]
+03)----ProjectionExec: expr=[id@1 as id, __datafusion_extracted_1@0 as multi_struct.s[value]]
 04)------FilterExec: id@1 > 2
 05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=3
-06)----------DataSourceExec: file_groups={3 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part1.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part2.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part3.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part4.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part5.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, id], file_type=parquet, predicate=id@0 > 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 2, required_guarantees=[]
+06)----------DataSourceExec: file_groups={3 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part1.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part2.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part3.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part4.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part5.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet, predicate=id@0 > 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 2, required_guarantees=[]
 
 # Verify correctness
 query II
@@ -781,14 +781,14 @@ query TT
 EXPLAIN SELECT s['label'], SUM(s['value']) FROM multi_struct GROUP BY s['label'];
 ----
 logical_plan
-01)Aggregate: groupBy=[[__leaf_1 AS multi_struct.s[label]]], aggr=[[sum(__leaf_2) AS sum(multi_struct.s[value])]]
-02)--Projection: get_field(multi_struct.s, Utf8("label")) AS __leaf_1, get_field(multi_struct.s, Utf8("value")) AS __leaf_2
+01)Aggregate: groupBy=[[__datafusion_extracted_1 AS multi_struct.s[label]]], aggr=[[sum(__datafusion_extracted_2) AS sum(multi_struct.s[value])]]
+02)--Projection: get_field(multi_struct.s, Utf8("label")) AS __datafusion_extracted_1, get_field(multi_struct.s, Utf8("value")) AS __datafusion_extracted_2
 03)----TableScan: multi_struct projection=[s]
 physical_plan
 01)AggregateExec: mode=FinalPartitioned, gby=[multi_struct.s[label]@0 as multi_struct.s[label]], aggr=[sum(multi_struct.s[value])]
 02)--RepartitionExec: partitioning=Hash([multi_struct.s[label]@0], 4), input_partitions=3
-03)----AggregateExec: mode=Partial, gby=[__leaf_1@0 as multi_struct.s[label]], aggr=[sum(multi_struct.s[value])]
-04)------DataSourceExec: file_groups={3 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part1.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part2.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part3.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part4.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part5.parquet]]}, projection=[get_field(s@1, label) as __leaf_1, get_field(s@1, value) as __leaf_2], file_type=parquet
+03)----AggregateExec: mode=Partial, gby=[__datafusion_extracted_1@0 as multi_struct.s[label]], aggr=[sum(multi_struct.s[value])]
+04)------DataSourceExec: file_groups={3 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part1.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part2.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part3.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part4.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part5.parquet]]}, projection=[get_field(s@1, label) as __datafusion_extracted_1, get_field(s@1, value) as __datafusion_extracted_2], file_type=parquet
 
 # Verify correctness
 query TI
@@ -839,14 +839,14 @@ query TT
 EXPLAIN SELECT id, s['label'] FROM nullable_struct WHERE s['value'] IS NOT NULL;
 ----
 logical_plan
-01)Projection: nullable_struct.id, __leaf_2 AS nullable_struct.s[label]
-02)--Filter: __leaf_1 IS NOT NULL
-03)----Projection: get_field(nullable_struct.s, Utf8("value")) AS __leaf_1, nullable_struct.id, get_field(nullable_struct.s, Utf8("label")) AS __leaf_2
+01)Projection: nullable_struct.id, __datafusion_extracted_2 AS nullable_struct.s[label]
+02)--Filter: __datafusion_extracted_1 IS NOT NULL
+03)----Projection: get_field(nullable_struct.s, Utf8("value")) AS __datafusion_extracted_1, nullable_struct.id, get_field(nullable_struct.s, Utf8("label")) AS __datafusion_extracted_2
 04)------TableScan: nullable_struct projection=[id, s], partial_filters=[get_field(nullable_struct.s, Utf8("value")) IS NOT NULL]
 physical_plan
-01)ProjectionExec: expr=[id@0 as id, __leaf_2@1 as nullable_struct.s[label]]
-02)--FilterExec: __leaf_1@0 IS NOT NULL, projection=[id@1, __leaf_2@2]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/nullable.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, id, get_field(s@1, label) as __leaf_2], file_type=parquet
+01)ProjectionExec: expr=[id@0 as id, __datafusion_extracted_2@1 as nullable_struct.s[label]]
+02)--FilterExec: __datafusion_extracted_1@0 IS NOT NULL, projection=[id@1, __datafusion_extracted_2@2]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/nullable.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id, get_field(s@1, label) as __datafusion_extracted_2], file_type=parquet
 
 # Verify correctness
 query IT
@@ -964,30 +964,29 @@ EXPLAIN SELECT (id + s['value']) * (id + s['value']) as id_and_value FROM simple
 ----
 logical_plan
 01)Projection: __common_expr_1 * __common_expr_1 AS id_and_value
-02)--Projection: simple_struct.id + __leaf_2 AS __common_expr_1
+02)--Projection: simple_struct.id + __datafusion_extracted_2 AS __common_expr_1
 03)----Filter: simple_struct.id > Int64(2)
-04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
+04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_2, simple_struct.id
 05)--------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(2)]
 physical_plan
 01)ProjectionExec: expr=[__common_expr_1@0 * __common_expr_1@0 as id_and_value]
-02)--ProjectionExec: expr=[id@1 + __leaf_2@0 as __common_expr_1]
+02)--ProjectionExec: expr=[id@1 + __datafusion_extracted_2@0 as __common_expr_1]
 03)----FilterExec: id@1 > 2
-04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_2, id], file_type=parquet, predicate=id@0 > 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 2, required_guarantees=[]
+04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_2, id], file_type=parquet, predicate=id@0 > 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 2, required_guarantees=[]
 
 
 query TT
 EXPLAIN SELECT s['value'] + s['value'] as doubled FROM simple_struct WHERE id > 2;
 ----
 logical_plan
-01)Projection: __common_expr_1 + __common_expr_1 AS doubled
-02)--Projection: __leaf_2 AS __common_expr_1
-03)----Filter: simple_struct.id > Int64(2)
-04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
-05)--------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(2)]
+01)Projection: __datafusion_extracted_2 + __datafusion_extracted_2 AS doubled
+02)--Filter: simple_struct.id > Int64(2)
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __common_expr_1 AS __datafusion_extracted_2, simple_struct.id
+04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(2)]
 physical_plan
-01)ProjectionExec: expr=[__leaf_2@0 + __leaf_2@0 as doubled]
-02)--FilterExec: id@1 > 2, projection=[__leaf_2@0]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_2, id], file_type=parquet, predicate=id@0 > 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 2, required_guarantees=[]
+01)ProjectionExec: expr=[__datafusion_extracted_2@0 + __datafusion_extracted_2@0 as doubled]
+02)--FilterExec: id@1 > 2, projection=[__datafusion_extracted_2@0]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_2, id], file_type=parquet, predicate=id@0 > 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 2, required_guarantees=[]
 
 # Verify correctness
 query I
@@ -1005,14 +1004,14 @@ query TT
 EXPLAIN SELECT s['value'], s['label'] FROM simple_struct WHERE id > 2;
 ----
 logical_plan
-01)Projection: __leaf_1 AS simple_struct.s[value], __leaf_2 AS simple_struct.s[label]
+01)Projection: __datafusion_extracted_1 AS simple_struct.s[value], __datafusion_extracted_2 AS simple_struct.s[label]
 02)--Filter: simple_struct.id > Int64(2)
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_1, get_field(simple_struct.s, Utf8("label")) AS __leaf_2, simple_struct.id
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_2, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(2)]
 physical_plan
-01)ProjectionExec: expr=[__leaf_1@0 as simple_struct.s[value], __leaf_2@1 as simple_struct.s[label]]
-02)--FilterExec: id@2 > 2, projection=[__leaf_1@0, __leaf_2@1]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, get_field(s@1, label) as __leaf_2, id], file_type=parquet, predicate=id@0 > 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 2, required_guarantees=[]
+01)ProjectionExec: expr=[__datafusion_extracted_1@0 as simple_struct.s[value], __datafusion_extracted_2@1 as simple_struct.s[label]]
+02)--FilterExec: id@2 > 2, projection=[__datafusion_extracted_1@0, __datafusion_extracted_2@1]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, get_field(s@1, label) as __datafusion_extracted_2, id], file_type=parquet, predicate=id@0 > 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 2, required_guarantees=[]
 
 # Verify correctness
 query IT
@@ -1055,14 +1054,14 @@ query TT
 EXPLAIN SELECT s['value'] * 2 + length(s['label']) as score FROM simple_struct WHERE id > 1;
 ----
 logical_plan
-01)Projection: __leaf_1 * Int64(2) + CAST(character_length(__leaf_2) AS length(get_field(simple_struct.s, Utf8("label"))) AS Int64) AS score
+01)Projection: __datafusion_extracted_1 * Int64(2) + CAST(character_length(__datafusion_extracted_2) AS length(get_field(simple_struct.s, Utf8("label"))) AS Int64) AS score
 02)--Filter: simple_struct.id > Int64(1)
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_1, get_field(simple_struct.s, Utf8("label")) AS __leaf_2, simple_struct.id
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_2, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1)]
 physical_plan
-01)ProjectionExec: expr=[__leaf_1@0 * 2 + CAST(character_length(__leaf_2@1) AS Int64) as score]
-02)--FilterExec: id@2 > 1, projection=[__leaf_1@0, __leaf_2@1]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, get_field(s@1, label) as __leaf_2, id], file_type=parquet, predicate=id@0 > 1, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1, required_guarantees=[]
+01)ProjectionExec: expr=[__datafusion_extracted_1@0 * 2 + CAST(character_length(__datafusion_extracted_2@1) AS Int64) as score]
+02)--FilterExec: id@2 > 1, projection=[__datafusion_extracted_1@0, __datafusion_extracted_2@1]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, get_field(s@1, label) as __datafusion_extracted_2, id], file_type=parquet, predicate=id@0 > 1, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1, required_guarantees=[]
 
 # Verify correctness
 query I
@@ -1132,14 +1131,14 @@ query TT
 EXPLAIN SELECT id, s['value'] FROM simple_struct WHERE id > 1;
 ----
 logical_plan
-01)Projection: simple_struct.id, __leaf_1 AS simple_struct.s[value]
+01)Projection: simple_struct.id, __datafusion_extracted_1 AS simple_struct.s[value]
 02)--Filter: simple_struct.id > Int64(1)
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_1, simple_struct.id
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1)]
 physical_plan
-01)ProjectionExec: expr=[id@1 as id, __leaf_1@0 as simple_struct.s[value]]
+01)ProjectionExec: expr=[id@1 as id, __datafusion_extracted_1@0 as simple_struct.s[value]]
 02)--FilterExec: id@1 > 1
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, id], file_type=parquet, predicate=id@0 > 1, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1, required_guarantees=[]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet, predicate=id@0 > 1, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1, required_guarantees=[]
 
 # Verify correctness
 query II
@@ -1152,14 +1151,14 @@ query TT
 EXPLAIN SELECT s['value'] FROM simple_struct WHERE id > 1 AND (id < 4 OR id = 5);
 ----
 logical_plan
-01)Projection: __leaf_1 AS simple_struct.s[value]
+01)Projection: __datafusion_extracted_1 AS simple_struct.s[value]
 02)--Filter: simple_struct.id > Int64(1) AND (simple_struct.id < Int64(4) OR simple_struct.id = Int64(5))
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_1, simple_struct.id
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1), simple_struct.id < Int64(4) OR simple_struct.id = Int64(5)]
 physical_plan
-01)ProjectionExec: expr=[__leaf_1@0 as simple_struct.s[value]]
-02)--FilterExec: id@1 > 1 AND (id@1 < 4 OR id@1 = 5), projection=[__leaf_1@0]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, id], file_type=parquet, predicate=id@0 > 1 AND (id@0 < 4 OR id@0 = 5), pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1 AND (id_null_count@1 != row_count@2 AND id_min@3 < 4 OR id_null_count@1 != row_count@2 AND id_min@3 <= 5 AND 5 <= id_max@0), required_guarantees=[]
+01)ProjectionExec: expr=[__datafusion_extracted_1@0 as simple_struct.s[value]]
+02)--FilterExec: id@1 > 1 AND (id@1 < 4 OR id@1 = 5), projection=[__datafusion_extracted_1@0]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet, predicate=id@0 > 1 AND (id@0 < 4 OR id@0 = 5), pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1 AND (id_null_count@1 != row_count@2 AND id_min@3 < 4 OR id_null_count@1 != row_count@2 AND id_min@3 <= 5 AND 5 <= id_max@0), required_guarantees=[]
 
 # Verify correctness - should return rows where (id > 1) AND ((id < 4) OR (id = 5))
 # That's: id=2,3 (1<id<4) and id=5 (id=5 from second branch)
@@ -1174,14 +1173,14 @@ query TT
 EXPLAIN SELECT s['value'] FROM simple_struct WHERE id > 1 AND id < 5;
 ----
 logical_plan
-01)Projection: __leaf_1 AS simple_struct.s[value]
+01)Projection: __datafusion_extracted_1 AS simple_struct.s[value]
 02)--Filter: simple_struct.id > Int64(1) AND simple_struct.id < Int64(5)
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_1, simple_struct.id
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1), simple_struct.id < Int64(5)]
 physical_plan
-01)ProjectionExec: expr=[__leaf_1@0 as simple_struct.s[value]]
-02)--FilterExec: id@1 > 1 AND id@1 < 5, projection=[__leaf_1@0]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, id], file_type=parquet, predicate=id@0 > 1 AND id@0 < 5, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1 AND id_null_count@1 != row_count@2 AND id_min@3 < 5, required_guarantees=[]
+01)ProjectionExec: expr=[__datafusion_extracted_1@0 as simple_struct.s[value]]
+02)--FilterExec: id@1 > 1 AND id@1 < 5, projection=[__datafusion_extracted_1@0]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet, predicate=id@0 > 1 AND id@0 < 5, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1 AND id_null_count@1 != row_count@2 AND id_min@3 < 5, required_guarantees=[]
 
 # Verify correctness - should return rows where 1 < id < 5 (id=2,3,4)
 query I
@@ -1195,14 +1194,14 @@ query TT
 EXPLAIN SELECT s['value'], s['label'], id FROM simple_struct WHERE id > 1;
 ----
 logical_plan
-01)Projection: __leaf_1 AS simple_struct.s[value], __leaf_2 AS simple_struct.s[label], simple_struct.id
+01)Projection: __datafusion_extracted_1 AS simple_struct.s[value], __datafusion_extracted_2 AS simple_struct.s[label], simple_struct.id
 02)--Filter: simple_struct.id > Int64(1)
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_1, get_field(simple_struct.s, Utf8("label")) AS __leaf_2, simple_struct.id
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_2, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1)]
 physical_plan
-01)ProjectionExec: expr=[__leaf_1@0 as simple_struct.s[value], __leaf_2@1 as simple_struct.s[label], id@2 as id]
+01)ProjectionExec: expr=[__datafusion_extracted_1@0 as simple_struct.s[value], __datafusion_extracted_2@1 as simple_struct.s[label], id@2 as id]
 02)--FilterExec: id@2 > 1
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, get_field(s@1, label) as __leaf_2, id], file_type=parquet, predicate=id@0 > 1, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1, required_guarantees=[]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, get_field(s@1, label) as __datafusion_extracted_2, id], file_type=parquet, predicate=id@0 > 1, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1, required_guarantees=[]
 
 # Verify correctness - note that id is now at index 2 in the augmented projection
 query ITI
@@ -1216,14 +1215,14 @@ query TT
 EXPLAIN SELECT s['value'] FROM simple_struct WHERE length(s['label']) > 4;
 ----
 logical_plan
-01)Projection: __leaf_2 AS simple_struct.s[value]
-02)--Filter: character_length(__leaf_1) > Int32(4)
-03)----Projection: get_field(simple_struct.s, Utf8("label")) AS __leaf_1, get_field(simple_struct.s, Utf8("value")) AS __leaf_2
+01)Projection: __datafusion_extracted_2 AS simple_struct.s[value]
+02)--Filter: character_length(__datafusion_extracted_1) > Int32(4)
+03)----Projection: get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_1, get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_2
 04)------TableScan: simple_struct projection=[s], partial_filters=[character_length(get_field(simple_struct.s, Utf8("label"))) > Int32(4)]
 physical_plan
-01)ProjectionExec: expr=[__leaf_2@0 as simple_struct.s[value]]
-02)--FilterExec: character_length(__leaf_1@0) > 4, projection=[__leaf_2@1]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, label) as __leaf_1, get_field(s@1, value) as __leaf_2], file_type=parquet
+01)ProjectionExec: expr=[__datafusion_extracted_2@0 as simple_struct.s[value]]
+02)--FilterExec: character_length(__datafusion_extracted_1@0) > 4, projection=[__datafusion_extracted_2@1]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, label) as __datafusion_extracted_1, get_field(s@1, value) as __datafusion_extracted_2], file_type=parquet
 
 # Verify correctness - filter on rows where label length > 4 (all have length 5, except 'one' has 3)
 # Wait, from the data: alpha(5), beta(4), gamma(5), delta(5), epsilon(7)
@@ -1250,13 +1249,13 @@ EXPLAIN SELECT id FROM simple_struct ORDER BY s['value'];
 ----
 logical_plan
 01)Projection: simple_struct.id
-02)--Sort: __leaf_1 ASC NULLS LAST
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_1, simple_struct.id
+02)--Sort: __datafusion_extracted_1 ASC NULLS LAST
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s]
 physical_plan
 01)ProjectionExec: expr=[id@1 as id]
-02)--SortExec: expr=[__leaf_1@0 ASC NULLS LAST], preserve_partitioning=[false]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, id], file_type=parquet
+02)--SortExec: expr=[__datafusion_extracted_1@0 ASC NULLS LAST], preserve_partitioning=[false]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet
 
 # Verify correctness
 query I
@@ -1279,13 +1278,13 @@ EXPLAIN SELECT id, s['value'] FROM simple_struct ORDER BY id, s['label'];
 ----
 logical_plan
 01)Projection: simple_struct.id, simple_struct.s[value]
-02)--Sort: simple_struct.id ASC NULLS LAST, __leaf_2 ASC NULLS LAST
-03)----Projection: get_field(simple_struct.s, Utf8("label")) AS __leaf_2, simple_struct.id, get_field(simple_struct.s, Utf8("value")) AS simple_struct.s[value]
+02)--Sort: simple_struct.id ASC NULLS LAST, __datafusion_extracted_2 ASC NULLS LAST
+03)----Projection: get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_2, simple_struct.id, get_field(simple_struct.s, Utf8("value")) AS simple_struct.s[value]
 04)------TableScan: simple_struct projection=[id, s]
 physical_plan
 01)ProjectionExec: expr=[id@1 as id, simple_struct.s[value]@2 as simple_struct.s[value]]
-02)--SortExec: expr=[id@1 ASC NULLS LAST, __leaf_2@0 ASC NULLS LAST], preserve_partitioning=[false]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, label) as __leaf_2, id, get_field(s@1, value) as simple_struct.s[value]], file_type=parquet
+02)--SortExec: expr=[id@1 ASC NULLS LAST, __datafusion_extracted_2@0 ASC NULLS LAST], preserve_partitioning=[false]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, label) as __datafusion_extracted_2, id, get_field(s@1, value) as simple_struct.s[value]], file_type=parquet
 
 # Verify correctness
 query II
@@ -1307,13 +1306,13 @@ EXPLAIN SELECT id FROM simple_struct ORDER BY s['value'] LIMIT 2;
 ----
 logical_plan
 01)Projection: simple_struct.id
-02)--Sort: __leaf_1 ASC NULLS LAST, fetch=2
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_1, simple_struct.id
+02)--Sort: __datafusion_extracted_1 ASC NULLS LAST, fetch=2
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s]
 physical_plan
 01)ProjectionExec: expr=[id@1 as id]
-02)--SortExec: TopK(fetch=2), expr=[__leaf_1@0 ASC NULLS LAST], preserve_partitioning=[false]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, id], file_type=parquet
+02)--SortExec: TopK(fetch=2), expr=[__datafusion_extracted_1@0 ASC NULLS LAST], preserve_partitioning=[false]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet
 
 # Verify correctness
 query I
@@ -1333,13 +1332,13 @@ EXPLAIN SELECT id FROM simple_struct ORDER BY s['value'] * 2;
 ----
 logical_plan
 01)Projection: simple_struct.id
-02)--Sort: __leaf_1 * Int64(2) ASC NULLS LAST
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_1, simple_struct.id
+02)--Sort: __datafusion_extracted_1 * Int64(2) ASC NULLS LAST
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s]
 physical_plan
 01)ProjectionExec: expr=[id@1 as id]
-02)--SortExec: expr=[__leaf_1@0 * 2 ASC NULLS LAST], preserve_partitioning=[false]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_1, id], file_type=parquet
+02)--SortExec: expr=[__datafusion_extracted_1@0 * 2 ASC NULLS LAST], preserve_partitioning=[false]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet
 
 # Verify correctness
 query I
