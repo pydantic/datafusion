@@ -1291,10 +1291,38 @@ impl OptimizerRule for PushDownFilter {
 ///  Filter(foo=5)
 ///   ...
 /// ```
+/// Check if a projection is a `__leaf_*` extraction projection
+/// (created by ExtractLeafExpressions).
+///
+/// These projections should not have filters pushed through them because doing so
+/// would rewrite the filter expressions back to their original form (e.g., rewriting
+/// `__leaf_1 > 150` back to `get_field(s,'value') > 150`), which undoes the extraction
+/// and prevents proper pushdown of field access expressions.
+fn is_leaf_extraction_projection(proj: &Projection) -> bool {
+    proj.expr.iter().any(|e| {
+        if let Expr::Alias(alias) = e {
+            alias.name.starts_with("__leaf")
+        } else {
+            false
+        }
+    })
+}
+
 fn rewrite_projection(
     predicates: Vec<Expr>,
     mut projection: Projection,
 ) -> Result<(Transformed<LogicalPlan>, Option<Expr>)> {
+    // Don't push filters through __leaf_* extraction projections.
+    // These are created by ExtractLeafExpressions and should remain stable.
+    // Pushing filters through would rewrite expressions like `__leaf_1 > 150` back to
+    // `get_field(s,'value') > 150`, undoing the extraction.
+    if is_leaf_extraction_projection(&projection) {
+        return Ok((
+            Transformed::no(LogicalPlan::Projection(projection)),
+            conjunction(predicates),
+        ));
+    }
+
     // A projection is filter-commutable if it do not contain volatile predicates or contain volatile
     // predicates that are not used in the filter. However, we should re-writes all predicate expressions.
     // collect projection.
@@ -4218,6 +4246,63 @@ mod tests {
             @r"
         Filter: Boolean(false)
           TestUserNode
+        "
+        )
+    }
+
+    /// Test that filters are NOT pushed through __leaf_* extraction projections.
+    /// These projections are created by ExtractLeafExpressions and pushing filters
+    /// through would rewrite expressions back to their original form.
+    #[test]
+    fn filter_not_pushed_through_leaf_extraction_projection() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        // Create a projection with __leaf_* expressions, simulating ExtractLeafExpressions output
+        let extraction_proj = LogicalPlanBuilder::from(table_scan)
+            .project(vec![
+                col("a").alias("__leaf_1"),
+                col("b").alias("__leaf_2"),
+                col("c"),
+            ])?
+            .build()?;
+
+        // Put a filter above the extraction projection
+        let plan = LogicalPlanBuilder::from(extraction_proj)
+            .filter(col("__leaf_1").eq(lit(1i64)))?
+            .build()?;
+
+        // Filter should NOT be pushed through the __leaf_* projection
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: __leaf_1 = Int64(1)
+          Projection: test.a AS __leaf_1, test.b AS __leaf_2, test.c
+            TableScan: test
+        "
+        )
+    }
+
+    /// Test that filters ARE pushed through regular projections (not __leaf_* ones).
+    #[test]
+    fn filter_pushed_through_regular_projection() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        // Create a regular projection without __leaf_* expressions
+        let proj = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("a").alias("x"), col("b").alias("y"), col("c")])?
+            .build()?;
+
+        // Put a filter above the projection
+        let plan = LogicalPlanBuilder::from(proj)
+            .filter(col("x").eq(lit(1i64)))?
+            .build()?;
+
+        // Filter SHOULD be pushed through the regular projection
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a AS x, test.b AS y, test.c
+          TableScan: test, full_filters=[test.a = Int64(1)]
         "
         )
     }

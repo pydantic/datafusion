@@ -502,10 +502,10 @@ fn is_fully_extracted(proj: &Projection) -> bool {
 
 /// If the target is a leaf projection, return it for merging.
 fn get_leaf_projection(target: &Arc<LogicalPlan>) -> Option<&Projection> {
-    if let LogicalPlan::Projection(p) = target.as_ref() {
-        if is_leaf_projection(p) {
-            return Some(p);
-        }
+    if let LogicalPlan::Projection(p) = target.as_ref()
+        && is_leaf_projection(p)
+    {
+        return Some(p);
     }
     None
 }
@@ -522,11 +522,11 @@ fn merge_into_leaf_projection(
         .expr
         .iter()
         .filter_map(|e| {
-            if let Expr::Alias(alias) = e {
-                if alias.name.starts_with("__leaf") {
-                    let schema_name = alias.expr.schema_name().to_string();
-                    return Some((schema_name, alias.name.clone()));
-                }
+            if let Expr::Alias(alias) = e
+                && alias.name.starts_with("__leaf")
+            {
+                let schema_name = alias.expr.schema_name().to_string();
+                return Some((schema_name, alias.name.clone()));
             }
             None
         })
