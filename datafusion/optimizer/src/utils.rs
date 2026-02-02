@@ -36,6 +36,26 @@ use std::sync::Arc;
 /// as it was initially placed here and then moved elsewhere.
 pub use datafusion_expr::expr_rewriter::NamePreserver;
 
+use datafusion_expr::Projection;
+
+/// Prefix used by ExtractLeafExpressions for extracted expression aliases.
+/// Uses a unique prefix to avoid collision with user-defined column names.
+pub const EXTRACTED_EXPR_PREFIX: &str = "__datafusion_extracted";
+
+/// Returns true if the projection contains extracted leaf expressions
+/// (created by ExtractLeafExpressions optimizer rule).
+///
+/// These projections have aliases starting with `__datafusion_extracted`.
+pub fn is_extracted_expr_projection(proj: &Projection) -> bool {
+    proj.expr.iter().any(|e| {
+        if let Expr::Alias(alias) = e {
+            alias.name.starts_with(EXTRACTED_EXPR_PREFIX)
+        } else {
+            false
+        }
+    })
+}
+
 /// Returns true if `expr` contains all columns in `schema_cols`
 pub(crate) fn has_all_column_refs(expr: &Expr, schema_cols: &HashSet<Column>) -> bool {
     let column_refs = expr.column_refs();
