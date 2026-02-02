@@ -104,9 +104,8 @@ query TT
 EXPLAIN SELECT id, s['value'] FROM simple_struct;
 ----
 logical_plan
-01)Projection: simple_struct.id AS id, __leaf_2 AS simple_struct.s[value]
-02)--Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
-03)----TableScan: simple_struct projection=[id, s]
+01)Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")) AS simple_struct.s[value]
+02)--TableScan: simple_struct projection=[id, s]
 physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, value) as simple_struct.s[value]], file_type=parquet
 
 # Verify correctness
@@ -145,9 +144,8 @@ query TT
 EXPLAIN SELECT id, s['value'], s['label'] FROM simple_struct;
 ----
 logical_plan
-01)Projection: simple_struct.id AS id, __leaf_3 AS simple_struct.s[value], __leaf_4 AS simple_struct.s[label]
-02)--Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_3, get_field(simple_struct.s, Utf8("label")) AS __leaf_4, simple_struct.id
-03)----TableScan: simple_struct projection=[id, s]
+01)Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")) AS simple_struct.s[value], get_field(simple_struct.s, Utf8("label")) AS simple_struct.s[label]
+02)--TableScan: simple_struct projection=[id, s]
 physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, value) as simple_struct.s[value], get_field(s@1, label) as simple_struct.s[label]], file_type=parquet
 
 # Verify correctness
@@ -168,9 +166,8 @@ query TT
 EXPLAIN SELECT id, nested['outer']['inner'] FROM nested_struct;
 ----
 logical_plan
-01)Projection: nested_struct.id AS id, __leaf_2 AS nested_struct.nested[outer][inner]
-02)--Projection: get_field(nested_struct.nested, Utf8("outer"), Utf8("inner")) AS __leaf_2, nested_struct.id
-03)----TableScan: nested_struct projection=[id, nested]
+01)Projection: nested_struct.id, get_field(nested_struct.nested, Utf8("outer"), Utf8("inner")) AS nested_struct.nested[outer][inner]
+02)--TableScan: nested_struct projection=[id, nested]
 physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/nested.parquet]]}, projection=[id, get_field(nested@1, outer, inner) as nested_struct.nested[outer][inner]], file_type=parquet
 
 # Verify correctness
@@ -189,9 +186,8 @@ query TT
 EXPLAIN SELECT id, s['value'] + 1 FROM simple_struct;
 ----
 logical_plan
-01)Projection: simple_struct.id AS id, __leaf_2 + Int64(1) AS simple_struct.s[value] + Int64(1)
-02)--Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
-03)----TableScan: simple_struct projection=[id, s]
+01)Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")) + Int64(1) AS simple_struct.s[value] + Int64(1)
+02)--TableScan: simple_struct projection=[id, s]
 physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, value) + 1 as simple_struct.s[value] + Int64(1)], file_type=parquet
 
 # Verify correctness
@@ -212,9 +208,8 @@ query TT
 EXPLAIN SELECT id, s['label'] || '_suffix' FROM simple_struct;
 ----
 logical_plan
-01)Projection: simple_struct.id AS id, __leaf_2 || Utf8("_suffix") AS simple_struct.s[label] || Utf8("_suffix")
-02)--Projection: get_field(simple_struct.s, Utf8("label")) AS __leaf_2, simple_struct.id
-03)----TableScan: simple_struct projection=[id, s]
+01)Projection: simple_struct.id, get_field(simple_struct.s, Utf8("label")) || Utf8("_suffix") AS simple_struct.s[label] || Utf8("_suffix")
+02)--TableScan: simple_struct projection=[id, s]
 physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, label) || _suffix as simple_struct.s[label] || Utf8("_suffix")], file_type=parquet
 
 # Verify correctness
@@ -240,7 +235,7 @@ query TT
 EXPLAIN SELECT id, s['value'] FROM simple_struct WHERE id > 2;
 ----
 logical_plan
-01)Projection: simple_struct.id AS id, __leaf_2 AS simple_struct.s[value]
+01)Projection: simple_struct.id, __leaf_2 AS simple_struct.s[value]
 02)--Filter: simple_struct.id > Int64(2)
 03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(2)]
@@ -265,7 +260,7 @@ query TT
 EXPLAIN SELECT id, s['value'] + 1 FROM simple_struct WHERE id > 2;
 ----
 logical_plan
-01)Projection: simple_struct.id AS id, __leaf_2 + Int64(1) AS simple_struct.s[value] + Int64(1)
+01)Projection: simple_struct.id, __leaf_2 + Int64(1) AS simple_struct.s[value] + Int64(1)
 02)--Filter: simple_struct.id > Int64(2)
 03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(2)]
@@ -290,15 +285,15 @@ query TT
 EXPLAIN SELECT id, s['label'] FROM simple_struct WHERE s['value'] > 150;
 ----
 logical_plan
-01)Projection: simple_struct.id AS id, get_field(simple_struct.s, Utf8("label")) AS simple_struct.s[label]
-02)--Projection: simple_struct.s, simple_struct.id
+01)Projection: simple_struct.id, __leaf_5 AS simple_struct.s[label]
+02)--Projection: simple_struct.id, get_field(simple_struct.s, Utf8("label")) AS __leaf_5
 03)----Filter: __leaf_4 > Int64(150)
-04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_4, simple_struct.s, simple_struct.id
+04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_4, simple_struct.id, simple_struct.s
 05)--------TableScan: simple_struct projection=[id, s], partial_filters=[get_field(simple_struct.s, Utf8("value")) > Int64(150)]
 physical_plan
-01)ProjectionExec: expr=[id@1 as id, get_field(s@0, label) as simple_struct.s[label]]
-02)--FilterExec: __leaf_4@0 > 150, projection=[s@1, id@2]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_4, s, id], file_type=parquet
+01)ProjectionExec: expr=[id@0 as id, get_field(s@1, label) as simple_struct.s[label]]
+02)--FilterExec: __leaf_4@0 > 150, projection=[id@1, s@2]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_4, id, s], file_type=parquet
 
 # Verify correctness
 query IT
@@ -322,9 +317,8 @@ EXPLAIN SELECT id, s['value'] FROM simple_struct ORDER BY id;
 ----
 logical_plan
 01)Sort: simple_struct.id ASC NULLS LAST
-02)--Projection: simple_struct.id AS id, __leaf_2 AS simple_struct.s[value]
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
-04)------TableScan: simple_struct projection=[id, s]
+02)--Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")) AS simple_struct.s[value]
+03)----TableScan: simple_struct projection=[id, s]
 physical_plan
 01)SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
 02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, value) as simple_struct.s[value]], file_type=parquet
@@ -348,9 +342,8 @@ EXPLAIN SELECT id, s['value'] + 1 FROM simple_struct ORDER BY id;
 ----
 logical_plan
 01)Sort: simple_struct.id ASC NULLS LAST
-02)--Projection: simple_struct.id AS id, __leaf_2 + Int64(1) AS simple_struct.s[value] + Int64(1)
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
-04)------TableScan: simple_struct projection=[id, s]
+02)--Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")) + Int64(1) AS simple_struct.s[value] + Int64(1)
+03)----TableScan: simple_struct projection=[id, s]
 physical_plan
 01)SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
 02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, value) + 1 as simple_struct.s[value] + Int64(1)], file_type=parquet
@@ -374,9 +367,8 @@ EXPLAIN SELECT id, s['value'] FROM simple_struct ORDER BY s['value'];
 ----
 logical_plan
 01)Sort: simple_struct.s[value] ASC NULLS LAST
-02)--Projection: simple_struct.id AS id, __leaf_2 AS simple_struct.s[value]
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
-04)------TableScan: simple_struct projection=[id, s]
+02)--Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")) AS simple_struct.s[value]
+03)----TableScan: simple_struct projection=[id, s]
 physical_plan
 01)SortExec: expr=[simple_struct.s[value]@1 ASC NULLS LAST], preserve_partitioning=[false]
 02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, value) as simple_struct.s[value]], file_type=parquet
@@ -449,9 +441,8 @@ EXPLAIN SELECT id, s['value'] FROM simple_struct ORDER BY id LIMIT 3;
 ----
 logical_plan
 01)Sort: simple_struct.id ASC NULLS LAST, fetch=3
-02)--Projection: simple_struct.id AS id, __leaf_2 AS simple_struct.s[value]
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
-04)------TableScan: simple_struct projection=[id, s]
+02)--Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")) AS simple_struct.s[value]
+03)----TableScan: simple_struct projection=[id, s]
 physical_plan
 01)SortExec: TopK(fetch=3), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
 02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, value) as simple_struct.s[value]], file_type=parquet, predicate=DynamicFilter [ empty ]
@@ -473,9 +464,8 @@ EXPLAIN SELECT id, s['value'] + 1 FROM simple_struct ORDER BY id LIMIT 3;
 ----
 logical_plan
 01)Sort: simple_struct.id ASC NULLS LAST, fetch=3
-02)--Projection: simple_struct.id AS id, __leaf_2 + Int64(1) AS simple_struct.s[value] + Int64(1)
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
-04)------TableScan: simple_struct projection=[id, s]
+02)--Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")) + Int64(1) AS simple_struct.s[value] + Int64(1)
+03)----TableScan: simple_struct projection=[id, s]
 physical_plan
 01)SortExec: TopK(fetch=3), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
 02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, value) + 1 as simple_struct.s[value] + Int64(1)], file_type=parquet, predicate=DynamicFilter [ empty ]
@@ -497,9 +487,8 @@ EXPLAIN SELECT id, s['value'], s['label'] FROM simple_struct ORDER BY id LIMIT 3
 ----
 logical_plan
 01)Sort: simple_struct.id ASC NULLS LAST, fetch=3
-02)--Projection: simple_struct.id AS id, __leaf_3 AS simple_struct.s[value], __leaf_4 AS simple_struct.s[label]
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_3, get_field(simple_struct.s, Utf8("label")) AS __leaf_4, simple_struct.id
-04)------TableScan: simple_struct projection=[id, s]
+02)--Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")) AS simple_struct.s[value], get_field(simple_struct.s, Utf8("label")) AS simple_struct.s[label]
+03)----TableScan: simple_struct projection=[id, s]
 physical_plan
 01)SortExec: TopK(fetch=3), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
 02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, value) as simple_struct.s[value], get_field(s@1, label) as simple_struct.s[label]], file_type=parquet, predicate=DynamicFilter [ empty ]
@@ -521,9 +510,8 @@ EXPLAIN SELECT id, nested['outer']['inner'] FROM nested_struct ORDER BY id LIMIT
 ----
 logical_plan
 01)Sort: nested_struct.id ASC NULLS LAST, fetch=2
-02)--Projection: nested_struct.id AS id, __leaf_2 AS nested_struct.nested[outer][inner]
-03)----Projection: get_field(nested_struct.nested, Utf8("outer"), Utf8("inner")) AS __leaf_2, nested_struct.id
-04)------TableScan: nested_struct projection=[id, nested]
+02)--Projection: nested_struct.id, get_field(nested_struct.nested, Utf8("outer"), Utf8("inner")) AS nested_struct.nested[outer][inner]
+03)----TableScan: nested_struct projection=[id, nested]
 physical_plan
 01)SortExec: TopK(fetch=2), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
 02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/nested.parquet]]}, projection=[id, get_field(nested@1, outer, inner) as nested_struct.nested[outer][inner]], file_type=parquet, predicate=DynamicFilter [ empty ]
@@ -544,9 +532,8 @@ EXPLAIN SELECT id, s['label'] || '_suffix' FROM simple_struct ORDER BY id LIMIT 
 ----
 logical_plan
 01)Sort: simple_struct.id ASC NULLS LAST, fetch=3
-02)--Projection: simple_struct.id AS id, __leaf_2 || Utf8("_suffix") AS simple_struct.s[label] || Utf8("_suffix")
-03)----Projection: get_field(simple_struct.s, Utf8("label")) AS __leaf_2, simple_struct.id
-04)------TableScan: simple_struct projection=[id, s]
+02)--Projection: simple_struct.id, get_field(simple_struct.s, Utf8("label")) || Utf8("_suffix") AS simple_struct.s[label] || Utf8("_suffix")
+03)----TableScan: simple_struct projection=[id, s]
 physical_plan
 01)SortExec: TopK(fetch=3), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
 02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, label) || _suffix as simple_struct.s[label] || Utf8("_suffix")], file_type=parquet, predicate=DynamicFilter [ empty ]
@@ -573,7 +560,7 @@ EXPLAIN SELECT id, s['value'] FROM simple_struct WHERE id > 1 ORDER BY s['value'
 ----
 logical_plan
 01)Sort: simple_struct.s[value] ASC NULLS LAST
-02)--Projection: simple_struct.id AS id, __leaf_2 AS simple_struct.s[value]
+02)--Projection: simple_struct.id, __leaf_2 AS simple_struct.s[value]
 03)----Filter: simple_struct.id > Int64(1)
 04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
 05)--------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1)]
@@ -601,7 +588,7 @@ EXPLAIN SELECT id, s['value'] FROM simple_struct WHERE id > 1 ORDER BY s['value'
 ----
 logical_plan
 01)Sort: simple_struct.s[value] ASC NULLS LAST, fetch=2
-02)--Projection: simple_struct.id AS id, __leaf_2 AS simple_struct.s[value]
+02)--Projection: simple_struct.id, __leaf_2 AS simple_struct.s[value]
 03)----Filter: simple_struct.id > Int64(1)
 04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
 05)--------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1)]
@@ -627,7 +614,7 @@ EXPLAIN SELECT id, s['value'] + 1 FROM simple_struct WHERE id > 1 ORDER BY id LI
 ----
 logical_plan
 01)Sort: simple_struct.id ASC NULLS LAST, fetch=2
-02)--Projection: simple_struct.id AS id, __leaf_2 + Int64(1) AS simple_struct.s[value] + Int64(1)
+02)--Projection: simple_struct.id, __leaf_2 + Int64(1) AS simple_struct.s[value] + Int64(1)
 03)----Filter: simple_struct.id > Int64(1)
 04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
 05)--------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1)]
@@ -693,9 +680,8 @@ EXPLAIN SELECT id, s['value'] FROM multi_struct ORDER BY id;
 ----
 logical_plan
 01)Sort: multi_struct.id ASC NULLS LAST
-02)--Projection: multi_struct.id AS id, __leaf_2 AS multi_struct.s[value]
-03)----Projection: get_field(multi_struct.s, Utf8("value")) AS __leaf_2, multi_struct.id
-04)------TableScan: multi_struct projection=[id, s]
+02)--Projection: multi_struct.id, get_field(multi_struct.s, Utf8("value")) AS multi_struct.s[value]
+03)----TableScan: multi_struct projection=[id, s]
 physical_plan
 01)SortPreservingMergeExec: [id@0 ASC NULLS LAST]
 02)--SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]
@@ -720,9 +706,8 @@ EXPLAIN SELECT id, s['value'] FROM multi_struct ORDER BY id LIMIT 3;
 ----
 logical_plan
 01)Sort: multi_struct.id ASC NULLS LAST, fetch=3
-02)--Projection: multi_struct.id AS id, __leaf_2 AS multi_struct.s[value]
-03)----Projection: get_field(multi_struct.s, Utf8("value")) AS __leaf_2, multi_struct.id
-04)------TableScan: multi_struct projection=[id, s]
+02)--Projection: multi_struct.id, get_field(multi_struct.s, Utf8("value")) AS multi_struct.s[value]
+03)----TableScan: multi_struct projection=[id, s]
 physical_plan
 01)SortPreservingMergeExec: [id@0 ASC NULLS LAST], fetch=3
 02)--SortExec: TopK(fetch=3), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]
@@ -745,9 +730,8 @@ EXPLAIN SELECT id, s['value'] + 1 FROM multi_struct ORDER BY id LIMIT 3;
 ----
 logical_plan
 01)Sort: multi_struct.id ASC NULLS LAST, fetch=3
-02)--Projection: multi_struct.id AS id, __leaf_2 + Int64(1) AS multi_struct.s[value] + Int64(1)
-03)----Projection: get_field(multi_struct.s, Utf8("value")) AS __leaf_2, multi_struct.id
-04)------TableScan: multi_struct projection=[id, s]
+02)--Projection: multi_struct.id, get_field(multi_struct.s, Utf8("value")) + Int64(1) AS multi_struct.s[value] + Int64(1)
+03)----TableScan: multi_struct projection=[id, s]
 physical_plan
 01)SortPreservingMergeExec: [id@0 ASC NULLS LAST], fetch=3
 02)--SortExec: TopK(fetch=3), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]
@@ -770,7 +754,7 @@ EXPLAIN SELECT id, s['value'] FROM multi_struct WHERE id > 2 ORDER BY id;
 ----
 logical_plan
 01)Sort: multi_struct.id ASC NULLS LAST
-02)--Projection: multi_struct.id AS id, __leaf_2 AS multi_struct.s[value]
+02)--Projection: multi_struct.id, __leaf_2 AS multi_struct.s[value]
 03)----Filter: multi_struct.id > Int64(2)
 04)------Projection: get_field(multi_struct.s, Utf8("value")) AS __leaf_2, multi_struct.id
 05)--------TableScan: multi_struct projection=[id, s], partial_filters=[multi_struct.id > Int64(2)]
@@ -798,16 +782,14 @@ query TT
 EXPLAIN SELECT s['label'], SUM(s['value']) FROM multi_struct GROUP BY s['label'];
 ----
 logical_plan
-01)Projection: __leaf_1 AS multi_struct.s[label], sum(__leaf_2) AS sum(multi_struct.s[value])
-02)--Aggregate: groupBy=[[__leaf_1]], aggr=[[sum(__leaf_2)]]
-03)----Projection: get_field(multi_struct.s, Utf8("label")) AS __leaf_1, get_field(multi_struct.s, Utf8("value")) AS __leaf_2
-04)------TableScan: multi_struct projection=[s]
+01)Aggregate: groupBy=[[__leaf_1 AS multi_struct.s[label]]], aggr=[[sum(__leaf_2) AS sum(multi_struct.s[value])]]
+02)--Projection: get_field(multi_struct.s, Utf8("label")) AS __leaf_1, get_field(multi_struct.s, Utf8("value")) AS __leaf_2
+03)----TableScan: multi_struct projection=[s]
 physical_plan
-01)ProjectionExec: expr=[__leaf_1@0 as multi_struct.s[label], sum(__leaf_2)@1 as sum(multi_struct.s[value])]
-02)--AggregateExec: mode=FinalPartitioned, gby=[__leaf_1@0 as __leaf_1], aggr=[sum(__leaf_2)]
-03)----RepartitionExec: partitioning=Hash([__leaf_1@0], 4), input_partitions=3
-04)------AggregateExec: mode=Partial, gby=[__leaf_1@0 as __leaf_1], aggr=[sum(__leaf_2)]
-05)--------DataSourceExec: file_groups={3 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part1.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part2.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part3.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part4.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part5.parquet]]}, projection=[get_field(s@1, label) as __leaf_1, get_field(s@1, value) as __leaf_2], file_type=parquet
+01)AggregateExec: mode=FinalPartitioned, gby=[multi_struct.s[label]@0 as multi_struct.s[label]], aggr=[sum(multi_struct.s[value])]
+02)--RepartitionExec: partitioning=Hash([multi_struct.s[label]@0], 4), input_partitions=3
+03)----AggregateExec: mode=Partial, gby=[__leaf_1@0 as multi_struct.s[label]], aggr=[sum(multi_struct.s[value])]
+04)------DataSourceExec: file_groups={3 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part1.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part2.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part3.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part4.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/multi/part5.parquet]]}, projection=[get_field(s@1, label) as __leaf_1, get_field(s@1, value) as __leaf_2], file_type=parquet
 
 # Verify correctness
 query TI
@@ -836,9 +818,8 @@ query TT
 EXPLAIN SELECT id, s['value'] FROM nullable_struct;
 ----
 logical_plan
-01)Projection: nullable_struct.id AS id, __leaf_2 AS nullable_struct.s[value]
-02)--Projection: get_field(nullable_struct.s, Utf8("value")) AS __leaf_2, nullable_struct.id
-03)----TableScan: nullable_struct projection=[id, s]
+01)Projection: nullable_struct.id, get_field(nullable_struct.s, Utf8("value")) AS nullable_struct.s[value]
+02)--TableScan: nullable_struct projection=[id, s]
 physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/nullable.parquet]]}, projection=[id, get_field(s@1, value) as nullable_struct.s[value]], file_type=parquet
 
 # Verify correctness (NULL struct returns NULL field)
@@ -859,15 +840,15 @@ query TT
 EXPLAIN SELECT id, s['label'] FROM nullable_struct WHERE s['value'] IS NOT NULL;
 ----
 logical_plan
-01)Projection: nullable_struct.id AS id, get_field(nullable_struct.s, Utf8("label")) AS nullable_struct.s[label]
-02)--Projection: nullable_struct.s, nullable_struct.id
+01)Projection: nullable_struct.id, __leaf_5 AS nullable_struct.s[label]
+02)--Projection: nullable_struct.id, get_field(nullable_struct.s, Utf8("label")) AS __leaf_5
 03)----Filter: __leaf_4 IS NOT NULL
-04)------Projection: get_field(nullable_struct.s, Utf8("value")) AS __leaf_4, nullable_struct.s, nullable_struct.id
+04)------Projection: get_field(nullable_struct.s, Utf8("value")) AS __leaf_4, nullable_struct.id, nullable_struct.s
 05)--------TableScan: nullable_struct projection=[id, s], partial_filters=[get_field(nullable_struct.s, Utf8("value")) IS NOT NULL]
 physical_plan
-01)ProjectionExec: expr=[id@1 as id, get_field(s@0, label) as nullable_struct.s[label]]
-02)--FilterExec: __leaf_4@0 IS NOT NULL, projection=[s@1, id@2]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/nullable.parquet]]}, projection=[get_field(s@1, value) as __leaf_4, s, id], file_type=parquet
+01)ProjectionExec: expr=[id@0 as id, get_field(s@1, label) as nullable_struct.s[label]]
+02)--FilterExec: __leaf_4@0 IS NOT NULL, projection=[id@1, s@2]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/nullable.parquet]]}, projection=[get_field(s@1, value) as __leaf_4, id, s], file_type=parquet
 
 # Verify correctness
 query IT
@@ -886,11 +867,9 @@ EXPLAIN SELECT id, s['value'], s['value'] + 10, s['label'] FROM simple_struct OR
 ----
 logical_plan
 01)Sort: simple_struct.id ASC NULLS LAST, fetch=3
-02)--Projection: simple_struct.id AS id, __common_expr_1 AS simple_struct.s[value], __common_expr_1 + Int64(10) AS simple_struct.s[value] + Int64(10), __leaf_5 AS simple_struct.s[label]
-03)----Projection: get_field(simple_struct.s, Utf8("label")) AS __leaf_5, simple_struct.id, __common_expr_1
-04)------Projection: __leaf_4 AS __common_expr_1, simple_struct.id AS id, simple_struct.s AS s
-05)--------Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_4, simple_struct.s, simple_struct.id
-06)----------TableScan: simple_struct projection=[id, s]
+02)--Projection: simple_struct.id, __common_expr_1 AS simple_struct.s[value], __common_expr_1 + Int64(10) AS simple_struct.s[value] + Int64(10), get_field(simple_struct.s, Utf8("label")) AS simple_struct.s[label]
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __common_expr_1, simple_struct.id, simple_struct.s
+04)------TableScan: simple_struct projection=[id, s]
 physical_plan
 01)SortExec: TopK(fetch=3), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
 02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, value) as simple_struct.s[value], get_field(s@1, value) + 10 as simple_struct.s[value] + Int64(10), get_field(s@1, label) as simple_struct.s[label]], file_type=parquet, predicate=DynamicFilter [ empty ]
@@ -1005,13 +984,20 @@ logical_plan
 01)Projection: __common_expr_1 + __common_expr_1 AS doubled
 02)--Projection: __leaf_3 AS __common_expr_1
 03)----Filter: simple_struct.id > Int64(2)
-04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_3
-05)--------TableScan: simple_struct projection=[s], partial_filters=[simple_struct.id > Int64(2)]
-physical_plan_error Schema error: No field named simple_struct.id. Valid fields are __leaf_3.
+04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_3, simple_struct.id
+05)--------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(2)]
+physical_plan
+01)ProjectionExec: expr=[__leaf_3@0 + __leaf_3@0 as doubled]
+02)--FilterExec: id@1 > 2, projection=[__leaf_3@0]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_3, id], file_type=parquet, predicate=id@0 > 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 2, required_guarantees=[]
 
 # Verify correctness
-query error DataFusion error: Schema error: No field named simple_struct\.id\. Valid fields are __leaf_3\.
+query I
 SELECT s['value'] + s['value'] as doubled FROM simple_struct WHERE id > 2 ORDER BY doubled;
+----
+300
+500
+600
 
 ###
 # Test 9.3: Projection with only get_field expressions through Filter
@@ -1023,13 +1009,20 @@ EXPLAIN SELECT s['value'], s['label'] FROM simple_struct WHERE id > 2;
 logical_plan
 01)Projection: __leaf_3 AS simple_struct.s[value], __leaf_4 AS simple_struct.s[label]
 02)--Filter: simple_struct.id > Int64(2)
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_3, get_field(simple_struct.s, Utf8("label")) AS __leaf_4
-04)------TableScan: simple_struct projection=[s], partial_filters=[simple_struct.id > Int64(2)]
-physical_plan_error Schema error: No field named simple_struct.id. Valid fields are __leaf_3, __leaf_4.
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_3, get_field(simple_struct.s, Utf8("label")) AS __leaf_4, simple_struct.id
+04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(2)]
+physical_plan
+01)ProjectionExec: expr=[__leaf_3@0 as simple_struct.s[value], __leaf_4@1 as simple_struct.s[label]]
+02)--FilterExec: id@2 > 2, projection=[__leaf_3@0, __leaf_4@1]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_3, get_field(s@1, label) as __leaf_4, id], file_type=parquet, predicate=id@0 > 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 2, required_guarantees=[]
 
 # Verify correctness
-query error DataFusion error: Schema error: No field named simple_struct\.id\. Valid fields are __leaf_3, __leaf_4\.
+query IT
 SELECT s['value'], s['label'] FROM simple_struct WHERE id > 2 ORDER BY s['value'];
+----
+150 gamma
+250 epsilon
+300 delta
 
 ###
 # Test 9.4: Mixed column reference with get_field in expression through TopK
@@ -1041,9 +1034,8 @@ EXPLAIN SELECT id, s['value'] + id as combined FROM simple_struct ORDER BY id LI
 ----
 logical_plan
 01)Sort: simple_struct.id ASC NULLS LAST, fetch=3
-02)--Projection: simple_struct.id AS id, __leaf_2 + simple_struct.id AS combined
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
-04)------TableScan: simple_struct projection=[id, s]
+02)--Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")) + simple_struct.id AS combined
+03)----TableScan: simple_struct projection=[id, s]
 physical_plan
 01)SortExec: TopK(fetch=3), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
 02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, value) + id@0 as combined], file_type=parquet, predicate=DynamicFilter [ empty ]
@@ -1067,13 +1059,21 @@ EXPLAIN SELECT s['value'] * 2 + length(s['label']) as score FROM simple_struct W
 logical_plan
 01)Projection: __leaf_3 * Int64(2) + CAST(character_length(__leaf_4) AS Int64) AS score
 02)--Filter: simple_struct.id > Int64(1)
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_3, get_field(simple_struct.s, Utf8("label")) AS __leaf_4
-04)------TableScan: simple_struct projection=[s], partial_filters=[simple_struct.id > Int64(1)]
-physical_plan_error Schema error: No field named simple_struct.id. Valid fields are __leaf_3, __leaf_4.
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_3, get_field(simple_struct.s, Utf8("label")) AS __leaf_4, simple_struct.id
+04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1)]
+physical_plan
+01)ProjectionExec: expr=[__leaf_3@0 * 2 + CAST(character_length(__leaf_4@1) AS Int64) as score]
+02)--FilterExec: id@2 > 1, projection=[__leaf_3@0, __leaf_4@1]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_3, get_field(s@1, label) as __leaf_4, id], file_type=parquet, predicate=id@0 > 1, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1, required_guarantees=[]
 
 # Verify correctness
-query error DataFusion error: Schema error: No field named simple_struct\.id\. Valid fields are __leaf_3, __leaf_4\.
+query I
 SELECT s['value'] * 2 + length(s['label']) as score FROM simple_struct WHERE id > 1 ORDER BY score;
+----
+305
+404
+507
+605
 
 
 #####################
@@ -1090,9 +1090,8 @@ EXPLAIN SELECT id, 42 as answer, s['label'] FROM simple_struct ORDER BY id LIMIT
 ----
 logical_plan
 01)Sort: simple_struct.id ASC NULLS LAST, fetch=2
-02)--Projection: simple_struct.id AS id, Int64(42) AS answer, __leaf_2 AS simple_struct.s[label]
-03)----Projection: get_field(simple_struct.s, Utf8("label")) AS __leaf_2, simple_struct.id
-04)------TableScan: simple_struct projection=[id, s]
+02)--Projection: simple_struct.id, Int64(42) AS answer, get_field(simple_struct.s, Utf8("label")) AS simple_struct.s[label]
+03)----TableScan: simple_struct projection=[id, s]
 physical_plan
 01)SortExec: TopK(fetch=2), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
 02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, 42 as answer, get_field(s@1, label) as simple_struct.s[label]], file_type=parquet, predicate=DynamicFilter [ empty ]
@@ -1114,9 +1113,8 @@ EXPLAIN SELECT id, s['value'] + 100, s['label'] || '_test' FROM simple_struct OR
 ----
 logical_plan
 01)Sort: simple_struct.id ASC NULLS LAST, fetch=2
-02)--Projection: simple_struct.id AS id, __leaf_3 + Int64(100) AS simple_struct.s[value] + Int64(100), __leaf_4 || Utf8("_test") AS simple_struct.s[label] || Utf8("_test")
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_3, get_field(simple_struct.s, Utf8("label")) AS __leaf_4, simple_struct.id
-04)------TableScan: simple_struct projection=[id, s]
+02)--Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")) + Int64(100) AS simple_struct.s[value] + Int64(100), get_field(simple_struct.s, Utf8("label")) || Utf8("_test") AS simple_struct.s[label] || Utf8("_test")
+03)----TableScan: simple_struct projection=[id, s]
 physical_plan
 01)SortExec: TopK(fetch=2), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
 02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, value) + 100 as simple_struct.s[value] + Int64(100), get_field(s@1, label) || _test as simple_struct.s[label] || Utf8("_test")], file_type=parquet, predicate=DynamicFilter [ empty ]
@@ -1136,7 +1134,7 @@ query TT
 EXPLAIN SELECT id, s['value'] FROM simple_struct WHERE id > 1;
 ----
 logical_plan
-01)Projection: simple_struct.id AS id, __leaf_2 AS simple_struct.s[value]
+01)Projection: simple_struct.id, __leaf_2 AS simple_struct.s[value]
 02)--Filter: simple_struct.id > Int64(1)
 03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1)]
@@ -1158,14 +1156,21 @@ EXPLAIN SELECT s['value'] FROM simple_struct WHERE id > 1 AND (id < 4 OR id = 5)
 logical_plan
 01)Projection: __leaf_2 AS simple_struct.s[value]
 02)--Filter: simple_struct.id > Int64(1) AND (simple_struct.id < Int64(4) OR simple_struct.id = Int64(5))
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2
-04)------TableScan: simple_struct projection=[s], partial_filters=[simple_struct.id > Int64(1), simple_struct.id < Int64(4) OR simple_struct.id = Int64(5)]
-physical_plan_error Schema error: No field named simple_struct.id. Valid fields are __leaf_2.
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
+04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1), simple_struct.id < Int64(4) OR simple_struct.id = Int64(5)]
+physical_plan
+01)ProjectionExec: expr=[__leaf_2@0 as simple_struct.s[value]]
+02)--FilterExec: id@1 > 1 AND (id@1 < 4 OR id@1 = 5), projection=[__leaf_2@0]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_2, id], file_type=parquet, predicate=id@0 > 1 AND (id@0 < 4 OR id@0 = 5), pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1 AND (id_null_count@1 != row_count@2 AND id_min@3 < 4 OR id_null_count@1 != row_count@2 AND id_min@3 <= 5 AND 5 <= id_max@0), required_guarantees=[]
 
 # Verify correctness - should return rows where (id > 1) AND ((id < 4) OR (id = 5))
 # That's: id=2,3 (1<id<4) and id=5 (id=5 from second branch)
-query error DataFusion error: Schema error: No field named simple_struct\.id\. Valid fields are __leaf_2\.
+query I
 SELECT s['value'] FROM simple_struct WHERE id > 1 AND (id < 4 OR id = 5) ORDER BY s['value'];
+----
+150
+200
+250
 
 query TT
 EXPLAIN SELECT s['value'] FROM simple_struct WHERE id > 1 AND id < 5;
@@ -1173,19 +1178,26 @@ EXPLAIN SELECT s['value'] FROM simple_struct WHERE id > 1 AND id < 5;
 logical_plan
 01)Projection: __leaf_2 AS simple_struct.s[value]
 02)--Filter: simple_struct.id > Int64(1) AND simple_struct.id < Int64(5)
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2
-04)------TableScan: simple_struct projection=[s], partial_filters=[simple_struct.id > Int64(1), simple_struct.id < Int64(5)]
-physical_plan_error Schema error: No field named simple_struct.id. Valid fields are __leaf_2.
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
+04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1), simple_struct.id < Int64(5)]
+physical_plan
+01)ProjectionExec: expr=[__leaf_2@0 as simple_struct.s[value]]
+02)--FilterExec: id@1 > 1 AND id@1 < 5, projection=[__leaf_2@0]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __leaf_2, id], file_type=parquet, predicate=id@0 > 1 AND id@0 < 5, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 1 AND id_null_count@1 != row_count@2 AND id_min@3 < 5, required_guarantees=[]
 
 # Verify correctness - should return rows where 1 < id < 5 (id=2,3,4)
-query error DataFusion error: Schema error: No field named simple_struct\.id\. Valid fields are __leaf_2\.
+query I
 SELECT s['value'] FROM simple_struct WHERE id > 1 AND id < 5 ORDER BY s['value'];
+----
+150
+200
+300
 
 query TT
 EXPLAIN SELECT s['value'], s['label'], id FROM simple_struct WHERE id > 1;
 ----
 logical_plan
-01)Projection: __leaf_3 AS simple_struct.s[value], __leaf_4 AS simple_struct.s[label], simple_struct.id AS id
+01)Projection: __leaf_3 AS simple_struct.s[value], __leaf_4 AS simple_struct.s[label], simple_struct.id
 02)--Filter: simple_struct.id > Int64(1)
 03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_3, get_field(simple_struct.s, Utf8("label")) AS __leaf_4, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(1)]
@@ -1206,8 +1218,8 @@ query TT
 EXPLAIN SELECT s['value'] FROM simple_struct WHERE length(s['label']) > 4;
 ----
 logical_plan
-01)Projection: get_field(simple_struct.s, Utf8("value")) AS simple_struct.s[value]
-02)--Projection: simple_struct.s
+01)Projection: __leaf_5 AS simple_struct.s[value]
+02)--Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_5
 03)----Filter: character_length(__leaf_4) > Int32(4)
 04)------Projection: get_field(simple_struct.s, Utf8("label")) AS __leaf_4, simple_struct.s
 05)--------TableScan: simple_struct projection=[s], partial_filters=[character_length(get_field(simple_struct.s, Utf8("label"))) > Int32(4)]
@@ -1352,9 +1364,8 @@ EXPLAIN SELECT id, s['value'] FROM simple_struct ORDER BY id, s['value'];
 ----
 logical_plan
 01)Sort: simple_struct.id ASC NULLS LAST, simple_struct.s[value] ASC NULLS LAST
-02)--Projection: simple_struct.id AS id, __leaf_2 AS simple_struct.s[value]
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __leaf_2, simple_struct.id
-04)------TableScan: simple_struct projection=[id, s]
+02)--Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")) AS simple_struct.s[value]
+03)----TableScan: simple_struct projection=[id, s]
 physical_plan
 01)SortExec: expr=[id@0 ASC NULLS LAST, simple_struct.s[value]@1 ASC NULLS LAST], preserve_partitioning=[false]
 02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, value) as simple_struct.s[value]], file_type=parquet

@@ -55,6 +55,7 @@ use std::sync::Arc;
 use datafusion_common::alias::AliasGenerator;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{Column, DFSchema, Result};
+use datafusion_expr::expr_rewriter::NamePreserver;
 use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_expr::{Expr, ExpressionPlacement, Filter, Limit, Projection, Sort};
 
@@ -140,6 +141,10 @@ fn extract_from_plan(
 ///
 /// These nodes don't change the schema, so we can extract expressions
 /// and push them down to existing leaf projections or create new ones.
+///
+/// Uses CSE's two-level pattern:
+/// 1. Inner extraction projection with ALL columns passed through
+/// 2. Outer recovery projection to restore original schema
 fn extract_from_schema_preserving(
     plan: LogicalPlan,
     alias_generator: &Arc<AliasGenerator>,
@@ -168,17 +173,11 @@ fn extract_from_schema_preserving(
         return Ok(transformed);
     }
 
-    // Need all input columns for pass-through since schema-preserving nodes
-    // don't change the output schema
-    for col in target_schema.columns() {
-        extractor.columns_needed.insert(col);
-    }
-
-    // If target is a __leaf projection, merge into it; otherwise create new projection
+    // Build extraction projection with ALL columns (CSE-style)
     let extraction_proj = if let Some(existing_proj) = get_leaf_projection(&target) {
         merge_into_leaf_projection(existing_proj, &extractor)?
     } else {
-        extractor.build_projection(target)?
+        extractor.build_projection_with_all_columns(target)?
     };
 
     // Rebuild the path from target back up to our node's input
@@ -200,17 +199,10 @@ fn extract_from_schema_preserving(
         .data
         .with_new_exprs(transformed.data.expressions(), new_inputs)?;
 
-    // Add outer projection to restore original schema
-    let original_schema_exprs: Vec<Expr> = input_schema
-        .columns()
-        .into_iter()
-        .map(Expr::Column)
-        .collect();
+    // Use CSE's pattern: add recovery projection to restore original schema
+    let recovered = build_recover_project_plan(input_schema.as_ref(), new_plan)?;
 
-    let outer_projection =
-        Projection::try_new(original_schema_exprs, Arc::new(new_plan))?;
-
-    Ok(Transformed::yes(LogicalPlan::Projection(outer_projection)))
+    Ok(Transformed::yes(recovered))
 }
 
 /// Extracts `MoveTowardsLeafNodes` sub-expressions from Aggregate nodes.
@@ -219,7 +211,7 @@ fn extract_from_schema_preserving(
 /// - Group-by expressions (full expressions or sub-expressions)
 /// - Arguments inside aggregate functions (NOT the aggregate function itself)
 ///
-/// With BottomUp, we push extractions down to existing leaf projections if possible.
+/// Uses CSE's two-level pattern with NamePreserver for stable name handling.
 fn extract_from_aggregate(
     plan: LogicalPlan,
     alias_generator: &Arc<AliasGenerator>,
@@ -228,8 +220,18 @@ fn extract_from_aggregate(
         return Ok(Transformed::no(plan));
     };
 
-    // Capture original output schema for restoration
-    let original_schema = Arc::clone(&agg.schema);
+    // Save original expression names using NamePreserver (like CSE)
+    let name_preserver = NamePreserver::new_for_projection();
+    let saved_group_names: Vec<_> = agg
+        .group_expr
+        .iter()
+        .map(|e| name_preserver.save(e))
+        .collect();
+    let saved_aggr_names: Vec<_> = agg
+        .aggr_expr
+        .iter()
+        .map(|e| name_preserver.save(e))
+        .collect();
 
     // Find where to place extractions
     let (target, path) = find_extraction_target(&agg.input);
@@ -265,54 +267,48 @@ fn extract_from_aggregate(
         return Ok(Transformed::no(LogicalPlan::Aggregate(agg)));
     }
 
-    // Track columns needed by the aggregate (for pass-through)
-    for expr in new_group_by.iter().chain(new_aggr.iter()) {
-        for col in expr.column_refs() {
-            extractor.columns_needed.insert(col.clone());
-        }
-    }
-
-    // Build extraction projection at target
+    // Build extraction projection with ALL columns (CSE-style)
     let extraction_proj = if let Some(existing_proj) = get_leaf_projection(&target) {
         merge_into_leaf_projection(existing_proj, &extractor)?
     } else {
-        extractor.build_projection(target)?
+        extractor.build_projection_with_all_columns(target)?
     };
 
     // Rebuild path from target back up
     let rebuilt_input = rebuild_path(path, LogicalPlan::Projection(extraction_proj))?;
 
-    // Create new Aggregate with transformed expressions
-    let new_agg = datafusion_expr::logical_plan::Aggregate::try_new(
-        Arc::new(rebuilt_input),
-        new_group_by,
-        new_aggr,
-    )?;
-
-    // Create outer projection to restore original schema names
-    let outer_exprs: Vec<Expr> = original_schema
-        .iter()
-        .zip(new_agg.schema.columns())
-        .map(|((original_qual, original_field), new_col)| {
-            // Map from new schema column to original schema name, preserving qualifier
-            Expr::Column(new_col)
-                .alias_qualified(original_qual.cloned(), original_field.name())
-        })
+    // Restore names in group-by expressions using NamePreserver
+    let restored_group_expr: Vec<Expr> = new_group_by
+        .into_iter()
+        .zip(saved_group_names)
+        .map(|(expr, saved)| saved.restore(expr))
         .collect();
 
-    let outer_projection =
-        Projection::try_new(outer_exprs, Arc::new(LogicalPlan::Aggregate(new_agg)))?;
+    // Restore names in aggregate expressions using NamePreserver
+    let restored_aggr_expr: Vec<Expr> = new_aggr
+        .into_iter()
+        .zip(saved_aggr_names)
+        .map(|(expr, saved)| saved.restore(expr))
+        .collect();
 
-    Ok(Transformed::yes(LogicalPlan::Projection(outer_projection)))
+    // Create new Aggregate with restored names
+    // (no outer projection needed if names are properly preserved)
+    let new_agg = datafusion_expr::logical_plan::Aggregate::try_new(
+        Arc::new(rebuilt_input),
+        restored_group_expr,
+        restored_aggr_expr,
+    )?;
+
+    Ok(Transformed::yes(LogicalPlan::Aggregate(new_agg)))
 }
 
 /// Extracts `MoveTowardsLeafNodes` sub-expressions from Projection nodes.
 ///
-/// Unlike Filter/Sort which are schema-preserving, Projection defines its output
-/// schema. We must preserve the original output column names via an outer projection.
+/// Uses CSE's two-level pattern (outer + inner projections only):
+/// - Inner projection: extraction with ALL columns passed through
+/// - Outer projection: rewritten expressions with restored names
 ///
-/// With BottomUp traversal, we push extractions all the way down to scan nodes,
-/// merging into existing `__leaf_*` projections when possible.
+/// This avoids the unstable 3-level structure that gets broken by OptimizeProjections.
 fn extract_from_projection(
     plan: LogicalPlan,
     alias_generator: &Arc<AliasGenerator>,
@@ -332,8 +328,9 @@ fn extract_from_projection(
         return Ok(Transformed::no(LogicalPlan::Projection(proj)));
     }
 
-    // Capture original output schema for restoration
-    let original_schema = Arc::clone(&proj.schema);
+    // Save original expression names using NamePreserver (like CSE)
+    let name_preserver = NamePreserver::new_for_projection();
+    let saved_names: Vec<_> = proj.expr.iter().map(|e| name_preserver.save(e)).collect();
 
     // Find where to place extractions (look down through schema-preserving nodes)
     let (target, path) = find_extraction_target(&proj.input);
@@ -358,33 +355,24 @@ fn extract_from_projection(
         return Ok(Transformed::no(LogicalPlan::Projection(proj)));
     }
 
-    // Build extraction projection at target
+    // Build extraction projection with ALL columns (CSE-style)
     let extraction_proj = if let Some(existing_proj) = get_leaf_projection(&target) {
         merge_into_leaf_projection(existing_proj, &extractor)?
     } else {
-        extractor.build_projection(target)?
+        extractor.build_projection_with_all_columns(target)?
     };
 
     // Rebuild path from target back up
     let rebuilt_input = rebuild_path(path, LogicalPlan::Projection(extraction_proj))?;
 
-    // Create new projection with rewritten expressions
-    let middle_projection = Projection::try_new(new_exprs, Arc::new(rebuilt_input))?;
-
-    // Create outer projection to restore original schema names
-    let outer_exprs: Vec<Expr> = original_schema
-        .iter()
-        .zip(middle_projection.schema.columns())
-        .map(|((original_qual, original_field), new_col)| {
-            Expr::Column(new_col)
-                .alias_qualified(original_qual.cloned(), original_field.name())
-        })
+    // Create outer projection with rewritten exprs + restored names
+    let final_exprs: Vec<Expr> = new_exprs
+        .into_iter()
+        .zip(saved_names)
+        .map(|(expr, saved_name)| saved_name.restore(expr))
         .collect();
 
-    let outer_projection = Projection::try_new(
-        outer_exprs,
-        Arc::new(LogicalPlan::Projection(middle_projection)),
-    )?;
+    let outer_projection = Projection::try_new(final_exprs, Arc::new(rebuilt_input))?;
 
     Ok(Transformed::yes(LogicalPlan::Projection(outer_projection)))
 }
@@ -573,23 +561,6 @@ fn merge_into_leaf_projection(
     Projection::try_new(proj_exprs, Arc::clone(&existing.input))
 }
 
-/// Gets existing __leaf aliases from a leaf projection.
-/// Returns a map of expression schema_name -> alias.
-fn get_existing_leaf_aliases(proj: &Projection) -> IndexMap<String, String> {
-    proj.expr
-        .iter()
-        .filter_map(|e| {
-            if let Expr::Alias(alias) = e {
-                if alias.name.starts_with("__leaf") {
-                    let schema_name = alias.expr.schema_name().to_string();
-                    return Some((schema_name, alias.name.clone()));
-                }
-            }
-            None
-        })
-        .collect()
-}
-
 /// Rebuilds the path from extraction projection back up to original input.
 ///
 /// Takes a list of nodes (in top-to-bottom order from input towards target)
@@ -639,6 +610,19 @@ fn rebuild_path(path: Vec<LogicalPlan>, new_bottom: LogicalPlan) -> Result<Logic
     }
 
     Ok(current)
+}
+
+/// Build projection to restore original schema (like CSE's build_recover_project_plan).
+///
+/// This adds a projection that selects only the columns from the original schema,
+/// hiding any intermediate `__leaf_*` columns that were added during extraction.
+fn build_recover_project_plan(
+    schema: &DFSchema,
+    input: LogicalPlan,
+) -> Result<LogicalPlan> {
+    let col_exprs: Vec<Expr> = schema.iter().map(Expr::from).collect();
+    let projection = Projection::try_new(col_exprs, Arc::new(input))?;
+    Ok(LogicalPlan::Projection(projection))
 }
 
 /// Extracts `MoveTowardsLeafNodes` sub-expressions from larger expressions.
@@ -726,21 +710,24 @@ impl<'a> LeafExpressionExtractor<'a> {
         !self.extracted.is_empty()
     }
 
-    /// Builds projection with extracted expressions + pass-through columns.
-    fn build_projection(&self, input: Arc<LogicalPlan>) -> Result<Projection> {
+    /// Builds projection with extracted expressions + ALL input columns (CSE-style).
+    ///
+    /// Passes through ALL columns from the input schema. This ensures nothing
+    /// gets lost during optimizer merges and produces a stable 2-level structure.
+    fn build_projection_with_all_columns(
+        &self,
+        input: Arc<LogicalPlan>,
+    ) -> Result<Projection> {
         let mut proj_exprs = Vec::new();
 
-        // Add extracted expressions with their aliases
+        // 1. Add extracted expressions with their aliases
         for (_, (expr, alias)) in &self.extracted {
             proj_exprs.push(expr.clone().alias(alias));
         }
 
-        // Add pass-through columns that are in the input schema
-        for col in &self.columns_needed {
-            // Only add if the column exists in the input schema
-            if self.input_schema.has_column(col) {
-                proj_exprs.push(Expr::Column(col.clone()));
-            }
+        // 2. Add ALL columns from input schema (not just columns_needed)
+        for (qualifier, field) in self.input_schema.iter() {
+            proj_exprs.push(Expr::from((qualifier, field)));
         }
 
         Projection::try_new(proj_exprs, input)
@@ -873,9 +860,8 @@ mod tests {
         // Projection expressions with MoveTowardsLeafNodes are extracted
         assert_optimized_plan_equal!(plan, @r#"
         Projection: __leaf_1 AS mock_leaf(test.user,Utf8("name"))
-          Projection: __leaf_1
-            Projection: mock_leaf(test.user, Utf8("name")) AS __leaf_1, test.user
-              TableScan: test
+          Projection: mock_leaf(test.user, Utf8("name")) AS __leaf_1, test.user
+            TableScan: test
         "#)
     }
 
@@ -893,10 +879,9 @@ mod tests {
 
         // The mock_leaf sub-expression is extracted
         assert_optimized_plan_equal!(plan, @r#"
-        Projection: has_name AS has_name
-          Projection: __leaf_1 IS NOT NULL AS has_name
-            Projection: mock_leaf(test.user, Utf8("name")) AS __leaf_1, test.user
-              TableScan: test
+        Projection: __leaf_1 IS NOT NULL AS has_name
+          Projection: mock_leaf(test.user, Utf8("name")) AS __leaf_1, test.user
+            TableScan: test
         "#)
     }
 
@@ -965,11 +950,11 @@ mod tests {
             .build()?;
 
         // Group-by expression is MoveTowardsLeafNodes, so it gets extracted
+        // With NamePreserver, names are preserved directly on the aggregate
         assert_optimized_plan_equal!(plan, @r#"
-        Projection: __leaf_1 AS mock_leaf(test.user,Utf8("status")), COUNT(Int32(1)) AS COUNT(Int32(1))
-          Aggregate: groupBy=[[__leaf_1]], aggr=[[COUNT(Int32(1))]]
-            Projection: mock_leaf(test.user, Utf8("status")) AS __leaf_1, test.user
-              TableScan: test
+        Aggregate: groupBy=[[__leaf_1 AS mock_leaf(test.user,Utf8("status"))]], aggr=[[COUNT(Int32(1))]]
+          Projection: mock_leaf(test.user, Utf8("status")) AS __leaf_1, test.user
+            TableScan: test
         "#)
     }
 
@@ -987,11 +972,11 @@ mod tests {
             .build()?;
 
         // Aggregate argument is MoveTowardsLeafNodes, so it gets extracted
+        // With NamePreserver, names are preserved directly on the aggregate
         assert_optimized_plan_equal!(plan, @r#"
-        Projection: test.user AS user, COUNT(__leaf_1) AS COUNT(mock_leaf(test.user,Utf8("value")))
-          Aggregate: groupBy=[[test.user]], aggr=[[COUNT(__leaf_1)]]
-            Projection: mock_leaf(test.user, Utf8("value")) AS __leaf_1, test.user
-              TableScan: test
+        Aggregate: groupBy=[[test.user]], aggr=[[COUNT(__leaf_1) AS COUNT(mock_leaf(test.user,Utf8("value")))]]
+          Projection: mock_leaf(test.user, Utf8("value")) AS __leaf_1, test.user
+            TableScan: test
         "#)
     }
 
@@ -1009,11 +994,10 @@ mod tests {
         // Both extractions end up in a single projection above the TableScan.
         assert_optimized_plan_equal!(plan, @r#"
         Projection: __leaf_2 AS mock_leaf(test.user,Utf8("name"))
-          Projection: __leaf_2
-            Projection: __leaf_1, test.user, __leaf_2
-              Filter: __leaf_1 = Utf8("active")
-                Projection: mock_leaf(test.user, Utf8("status")) AS __leaf_1, test.user, mock_leaf(test.user, Utf8("name")) AS __leaf_2
-                  TableScan: test
+          Projection: __leaf_1, test.user, __leaf_2
+            Filter: __leaf_1 = Utf8("active")
+              Projection: mock_leaf(test.user, Utf8("status")) AS __leaf_1, test.user, mock_leaf(test.user, Utf8("name")) AS __leaf_2
+                TableScan: test
         "#)
     }
 
@@ -1026,10 +1010,9 @@ mod tests {
 
         // Original alias "username" should be preserved in outer projection
         assert_optimized_plan_equal!(plan, @r#"
-        Projection: username AS username
-          Projection: __leaf_1 AS username
-            Projection: mock_leaf(test.user, Utf8("name")) AS __leaf_1, test.user
-              TableScan: test
+        Projection: __leaf_1 AS username
+          Projection: mock_leaf(test.user, Utf8("name")) AS __leaf_1, test.user
+            TableScan: test
         "#)
     }
 
@@ -1050,12 +1033,11 @@ mod tests {
         // Filter's s['value'] -> __leaf_1
         // Projection's s['label'] -> __leaf_2
         assert_optimized_plan_equal!(plan, @r#"
-        Projection: test.user AS user, __leaf_2 AS mock_leaf(test.user,Utf8("label"))
-          Projection: test.user, __leaf_2
-            Projection: __leaf_1, test.user, __leaf_2
-              Filter: __leaf_1 > Int32(150)
-                Projection: mock_leaf(test.user, Utf8("value")) AS __leaf_1, test.user, mock_leaf(test.user, Utf8("label")) AS __leaf_2
-                  TableScan: test
+        Projection: test.user, __leaf_2 AS mock_leaf(test.user,Utf8("label"))
+          Projection: __leaf_1, test.user, __leaf_2
+            Filter: __leaf_1 > Int32(150)
+              Projection: mock_leaf(test.user, Utf8("value")) AS __leaf_1, test.user, mock_leaf(test.user, Utf8("label")) AS __leaf_2
+                TableScan: test
         "#)
     }
 
@@ -1067,13 +1049,11 @@ mod tests {
             .project(vec![field.clone(), field.clone().alias("name2")])?
             .build()?;
 
-        // Same expression should be extracted only once.
-        // The second column keeps its alias "name2" through the projection chain.
+        // Same expression should be extracted only once
         assert_optimized_plan_equal!(plan, @r#"
-        Projection: __leaf_1 AS mock_leaf(test.user,Utf8("name")), name2 AS name2
-          Projection: __leaf_1, __leaf_1 AS name2
-            Projection: mock_leaf(test.user, Utf8("name")) AS __leaf_1, test.user
-              TableScan: test
+        Projection: __leaf_1 AS mock_leaf(test.user,Utf8("name")), __leaf_1 AS name2
+          Projection: mock_leaf(test.user, Utf8("name")) AS __leaf_1, test.user
+            TableScan: test
         "#)
     }
 }

@@ -244,9 +244,8 @@ query TT
 explain select column1.c0 from t;
 ----
 logical_plan
-01)Projection: __leaf_2 AS t.column1[c0]
-02)--Projection: get_field(t.column1, Utf8("c0")) AS __leaf_2
-03)----TableScan: t projection=[column1]
+01)Projection: get_field(t.column1, Utf8("c0")) AS t.column1[c0]
+02)--TableScan: t projection=[column1]
 physical_plan
 01)ProjectionExec: expr=[get_field(column1@0, c0) as t.column1[c0]]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
