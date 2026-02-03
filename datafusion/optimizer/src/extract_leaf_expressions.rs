@@ -850,7 +850,7 @@ impl<'a> LeafExpressionExtractor<'a> {
         let extraction_proj = build_extraction_projection_impl(
             &pairs,
             &self.columns_needed,
-            &target,
+            target,
             self.input_schema,
         )?;
         rebuild_path(path, LogicalPlan::Projection(extraction_proj))
