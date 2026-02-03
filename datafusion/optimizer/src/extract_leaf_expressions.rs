@@ -732,6 +732,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::optimize_projections::OptimizeProjections;
     use crate::test::*;
     use crate::{OptimizerContext, assert_optimized_plan_eq_snapshot};
     use arrow::datatypes::DataType;
@@ -801,6 +802,14 @@ mod tests {
         ))
     }
 
+    /// Asserts that the optimized plan matches the expected snapshot.
+    ///
+    /// This applies the `ExtractLeafExpressions` and `OptimizeProjections` rules
+    /// to the given plan and compares the result to the expected snapshot.
+    ///
+    /// The use of `OptimizeProjections` gives us a bit more of a realistic scenario
+    /// otherwise the optimized plans will look very different from what an actual integration
+    /// test would produce.
     macro_rules! assert_optimized_plan_equal {
         (
             $plan:expr,
@@ -808,8 +817,22 @@ mod tests {
         ) => {{
             let optimizer_ctx = OptimizerContext::new().with_max_passes(1);
             let rules: Vec<Arc<dyn crate::OptimizerRule + Send + Sync>> =
-                vec![Arc::new(ExtractLeafExpressions::new())];
-            assert_optimized_plan_eq_snapshot!(optimizer_ctx, rules, $plan, @ $expected,)
+                vec![Arc::new(ExtractLeafExpressions::new()), Arc::new(OptimizeProjections::new())];
+            assert_optimized_plan_eq_snapshot!(optimizer_ctx, rules, $plan.clone(), @ $expected,)
+        }};
+    }
+
+    /// Apply just the OptimizeProjections rule for testing purposes.
+    /// This is essentially what the plans would look like without our extraction.
+    macro_rules! assert_plan_eq_snapshot {
+        (
+            $plan:expr,
+            @ $expected:literal $(,)?
+        ) => {{
+            let optimizer_ctx = OptimizerContext::new().with_max_passes(1);
+            let rules: Vec<Arc<dyn crate::OptimizerRule + Send + Sync>> =
+                vec![Arc::new(OptimizeProjections::new())];
+            assert_optimized_plan_eq_snapshot!(optimizer_ctx, rules, $plan.clone(), @ $expected,)
         }};
     }
 
@@ -820,12 +843,17 @@ mod tests {
             .filter(mock_leaf(col("user"), "status").eq(lit("active")))?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Filter: mock_leaf(test.user, Utf8("status")) = Utf8("active")
+          TableScan: test projection=[user]
+        "#)?;
+
         // Note: An outer projection is added to preserve the original schema
         assert_optimized_plan_equal!(plan, @r#"
         Projection: test.user
           Filter: __datafusion_extracted_1 = Utf8("active")
             Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, test.user
-              TableScan: test
+              TableScan: test projection=[user]
         "#)
     }
 
@@ -836,10 +864,15 @@ mod tests {
             .filter(col("a").eq(lit(1)))?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r"
+        Filter: test.a = Int32(1)
+          TableScan: test projection=[a, b, c]
+        ")?;
+
         // No extraction should happen for simple columns
         assert_optimized_plan_equal!(plan, @r"
         Filter: test.a = Int32(1)
-          TableScan: test
+          TableScan: test projection=[a, b, c]
         ")
     }
 
@@ -850,11 +883,15 @@ mod tests {
             .project(vec![mock_leaf(col("user"), "name")])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Projection: mock_leaf(test.user, Utf8("name"))
+          TableScan: test projection=[user]
+        "#)?;
+
         // Projection expressions with MoveTowardsLeafNodes are extracted
         assert_optimized_plan_equal!(plan, @r#"
-        Projection: __datafusion_extracted_1 AS mock_leaf(test.user,Utf8("name"))
-          Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
-            TableScan: test
+        Projection: mock_leaf(test.user, Utf8("name")) AS mock_leaf(test.user,Utf8("name"))
+          TableScan: test projection=[user]
         "#)
     }
 
@@ -870,11 +907,15 @@ mod tests {
             ])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Projection: mock_leaf(test.user, Utf8("name")) IS NOT NULL AS has_name
+          TableScan: test projection=[user]
+        "#)?;
+
         // The mock_leaf sub-expression is extracted
         assert_optimized_plan_equal!(plan, @r#"
-        Projection: __datafusion_extracted_1 IS NOT NULL AS has_name
-          Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
-            TableScan: test
+        Projection: mock_leaf(test.user, Utf8("name")) IS NOT NULL AS has_name
+          TableScan: test projection=[user]
         "#)
     }
 
@@ -886,11 +927,10 @@ mod tests {
             .project(vec![col("a"), col("b")])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @"TableScan: test projection=[a, b]")?;
+
         // No extraction needed
-        assert_optimized_plan_equal!(plan, @r"
-        Projection: test.a, test.b
-          TableScan: test
-        ")
+        assert_optimized_plan_equal!(plan, @"TableScan: test projection=[a, b]")
     }
 
     #[test]
@@ -907,12 +947,17 @@ mod tests {
             )?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Filter: mock_leaf(test.user, Utf8("name")) IS NOT NULL AND mock_leaf(test.user, Utf8("name")) IS NULL
+          TableScan: test projection=[user]
+        "#)?;
+
         // Same expression should be extracted only once
         assert_optimized_plan_equal!(plan, @r#"
         Projection: test.user
           Filter: __datafusion_extracted_1 IS NOT NULL AND __datafusion_extracted_1 IS NULL
             Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
-              TableScan: test
+              TableScan: test projection=[user]
         "#)
     }
 
@@ -925,11 +970,16 @@ mod tests {
             .filter(mock_leaf(col("user"), "name").eq(lit("test")))?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Filter: mock_leaf(test.user, Utf8("name")) = Utf8("test")
+          TableScan: test projection=[user]
+        "#)?;
+
         assert_optimized_plan_equal!(plan, @r#"
         Projection: test.user
           Filter: __datafusion_extracted_1 = Utf8("test")
             Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
-              TableScan: test
+              TableScan: test projection=[user]
         "#)
     }
 
@@ -942,12 +992,17 @@ mod tests {
             .aggregate(vec![mock_leaf(col("user"), "status")], vec![count(lit(1))])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Aggregate: groupBy=[[mock_leaf(test.user, Utf8("status"))]], aggr=[[COUNT(Int32(1))]]
+          TableScan: test projection=[user]
+        "#)?;
+
         // Group-by expression is MoveTowardsLeafNodes, so it gets extracted
         // With NamePreserver, names are preserved directly on the aggregate
         assert_optimized_plan_equal!(plan, @r#"
         Aggregate: groupBy=[[__datafusion_extracted_1 AS mock_leaf(test.user,Utf8("status"))]], aggr=[[COUNT(Int32(1))]]
-          Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, test.user
-            TableScan: test
+          Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1
+            TableScan: test projection=[user]
         "#)
     }
 
@@ -964,12 +1019,17 @@ mod tests {
             )?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Aggregate: groupBy=[[test.user]], aggr=[[COUNT(mock_leaf(test.user, Utf8("value")))]]
+          TableScan: test projection=[user]
+        "#)?;
+
         // Aggregate argument is MoveTowardsLeafNodes, so it gets extracted
         // With NamePreserver, names are preserved directly on the aggregate
         assert_optimized_plan_equal!(plan, @r#"
         Aggregate: groupBy=[[test.user]], aggr=[[COUNT(__datafusion_extracted_1) AS COUNT(mock_leaf(test.user,Utf8("value")))]]
           Projection: mock_leaf(test.user, Utf8("value")) AS __datafusion_extracted_1, test.user
-            TableScan: test
+            TableScan: test projection=[user]
         "#)
     }
 
@@ -981,16 +1041,21 @@ mod tests {
             .project(vec![mock_leaf(col("user"), "name")])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Projection: mock_leaf(test.user, Utf8("name"))
+          Filter: mock_leaf(test.user, Utf8("status")) = Utf8("active")
+            TableScan: test projection=[user]
+        "#)?;
+
         // Both filter and projection extractions.
         // BottomUp order: Filter is processed first (gets __datafusion_extracted_1),
         // then Projection merges its extraction into the same extracted projection (gets __datafusion_extracted_2).
         // Both extractions end up in a single projection above the TableScan.
         assert_optimized_plan_equal!(plan, @r#"
         Projection: __datafusion_extracted_2 AS mock_leaf(test.user,Utf8("name"))
-          Projection: __datafusion_extracted_1, test.user, __datafusion_extracted_2
-            Filter: __datafusion_extracted_1 = Utf8("active")
-              Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, test.user, mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_2
-                TableScan: test
+          Filter: __datafusion_extracted_1 = Utf8("active")
+            Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_2
+              TableScan: test projection=[user]
         "#)
     }
 
@@ -1001,11 +1066,15 @@ mod tests {
             .project(vec![mock_leaf(col("user"), "name").alias("username")])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Projection: mock_leaf(test.user, Utf8("name")) AS username
+          TableScan: test projection=[user]
+        "#)?;
+
         // Original alias "username" should be preserved in outer projection
         assert_optimized_plan_equal!(plan, @r#"
-        Projection: __datafusion_extracted_1 AS username
-          Projection: mock_leaf(test.user, Utf8("name")) AS username AS __datafusion_extracted_1, test.user
-            TableScan: test
+        Projection: mock_leaf(test.user, Utf8("name")) AS username
+          TableScan: test projection=[user]
         "#)
     }
 
@@ -1022,15 +1091,20 @@ mod tests {
             .project(vec![col("user"), mock_leaf(col("user"), "label")])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Projection: test.user, mock_leaf(test.user, Utf8("label"))
+          Filter: mock_leaf(test.user, Utf8("value")) > Int32(150)
+            TableScan: test projection=[user]
+        "#)?;
+
         // BottomUp should merge both extractions into a single projection above TableScan.
         // Filter's s['value'] -> __datafusion_extracted_1
         // Projection's s['label'] -> __datafusion_extracted_2
         assert_optimized_plan_equal!(plan, @r#"
         Projection: test.user, __datafusion_extracted_2 AS mock_leaf(test.user,Utf8("label"))
-          Projection: __datafusion_extracted_1, test.user, __datafusion_extracted_2
-            Filter: __datafusion_extracted_1 > Int32(150)
-              Projection: mock_leaf(test.user, Utf8("value")) AS __datafusion_extracted_1, test.user, mock_leaf(test.user, Utf8("label")) AS __datafusion_extracted_2
-                TableScan: test
+          Filter: __datafusion_extracted_1 > Int32(150)
+            Projection: mock_leaf(test.user, Utf8("value")) AS __datafusion_extracted_1, test.user, mock_leaf(test.user, Utf8("label")) AS __datafusion_extracted_2
+              TableScan: test projection=[user]
         "#)
     }
 
@@ -1042,11 +1116,15 @@ mod tests {
             .project(vec![field.clone(), field.clone().alias("name2")])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Projection: mock_leaf(test.user, Utf8("name")), mock_leaf(test.user, Utf8("name")) AS name2
+          TableScan: test projection=[user]
+        "#)?;
+
         // Same expression should be extracted only once
         assert_optimized_plan_equal!(plan, @r#"
-        Projection: __datafusion_extracted_1 AS mock_leaf(test.user,Utf8("name")), __datafusion_extracted_2 AS name2
-          Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, mock_leaf(test.user, Utf8("name")) AS name2 AS __datafusion_extracted_2, test.user
-            TableScan: test
+        Projection: mock_leaf(test.user, Utf8("name")) AS mock_leaf(test.user,Utf8("name")), mock_leaf(test.user, Utf8("name")) AS name2
+          TableScan: test projection=[user]
         "#)
     }
 
@@ -1066,12 +1144,18 @@ mod tests {
             .project(vec![mock_leaf(col("user"), "name")])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Projection: mock_leaf(test.user, Utf8("name"))
+          Sort: test.user ASC NULLS FIRST
+            TableScan: test projection=[user]
+        "#)?;
+
         // Extraction projection should be placed below the Sort
         assert_optimized_plan_equal!(plan, @r#"
         Projection: __datafusion_extracted_1 AS mock_leaf(test.user,Utf8("name"))
           Sort: test.user ASC NULLS FIRST
             Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
-              TableScan: test
+              TableScan: test projection=[user]
         "#)
     }
 
@@ -1087,12 +1171,18 @@ mod tests {
             .project(vec![mock_leaf(col("user"), "name")])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Projection: mock_leaf(test.user, Utf8("name"))
+          Limit: skip=0, fetch=10
+            TableScan: test projection=[user]
+        "#)?;
+
         // Extraction projection should be placed below the Limit
         assert_optimized_plan_equal!(plan, @r#"
         Projection: __datafusion_extracted_1 AS mock_leaf(test.user,Utf8("name"))
           Limit: skip=0, fetch=10
-            Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
-              TableScan: test
+            Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1
+              TableScan: test projection=[user]
         "#)
     }
 
@@ -1111,11 +1201,16 @@ mod tests {
             )?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Aggregate: groupBy=[[test.user]], aggr=[[COUNT(mock_leaf(test.user, Utf8("value"))) AS cnt]]
+          TableScan: test projection=[user]
+        "#)?;
+
         // The aliased aggregate should have its inner expression extracted
         assert_optimized_plan_equal!(plan, @r#"
         Aggregate: groupBy=[[test.user]], aggr=[[COUNT(__datafusion_extracted_1) AS cnt]]
           Projection: mock_leaf(test.user, Utf8("value")) AS __datafusion_extracted_1, test.user
-            TableScan: test
+            TableScan: test projection=[user]
         "#)
     }
 
@@ -1131,10 +1226,15 @@ mod tests {
             .aggregate(vec![col("a")], vec![count(col("b"))])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r"
+        Aggregate: groupBy=[[test.a]], aggr=[[COUNT(test.b)]]
+          TableScan: test projection=[a, b]
+        ")?;
+
         // Should return unchanged (no extraction needed)
         assert_optimized_plan_equal!(plan, @r"
         Aggregate: groupBy=[[test.a]], aggr=[[COUNT(test.b)]]
-          TableScan: test
+          TableScan: test projection=[a, b]
         ")
     }
 
@@ -1152,10 +1252,15 @@ mod tests {
             ])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_manual, test.user
+          TableScan: test projection=[user]
+        "#)?;
+
         // Should return unchanged because projection already contains extracted expressions
         assert_optimized_plan_equal!(plan, @r#"
         Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_manual, test.user
-          TableScan: test
+          TableScan: test projection=[user]
         "#)
     }
 
@@ -1174,14 +1279,20 @@ mod tests {
             .filter(mock_leaf(col("user"), "name").is_not_null())?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Filter: mock_leaf(test.user, Utf8("name")) IS NOT NULL
+          Filter: mock_leaf(test.user, Utf8("status")) = Utf8("active")
+            TableScan: test projection=[user]
+        "#)?;
+
         // Both extractions should end up in a single extracted expression projection
         assert_optimized_plan_equal!(plan, @r#"
         Projection: test.user
           Filter: __datafusion_extracted_2 IS NOT NULL
-            Projection: __datafusion_extracted_1, test.user, __datafusion_extracted_2
+            Projection: test.user, __datafusion_extracted_2
               Filter: __datafusion_extracted_1 = Utf8("active")
                 Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, test.user, mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_2
-                  TableScan: test
+                  TableScan: test projection=[user]
         "#)
     }
 
@@ -1199,12 +1310,16 @@ mod tests {
             .project(vec![mock_leaf(col("user"), "name")])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Projection: mock_leaf(test.user, Utf8("name"))
+          TableScan: test projection=[user]
+        "#)?;
+
         // Extraction should push through the passthrough projection
         assert_optimized_plan_equal!(plan, @r#"
         Projection: __datafusion_extracted_1 AS mock_leaf(test.user,Utf8("name"))
-          Projection: __datafusion_extracted_1, test.user
-            Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
-              TableScan: test
+          Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1
+            TableScan: test projection=[user]
         "#)
     }
 
@@ -1218,10 +1333,15 @@ mod tests {
             .project(vec![col("a").alias("x"), col("b")])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r"
+        Projection: test.a AS x, test.b
+          TableScan: test projection=[a, b]
+        ")?;
+
         // Should return unchanged (no extraction needed)
         assert_optimized_plan_equal!(plan, @r"
         Projection: test.a AS x, test.b
-          TableScan: test
+          TableScan: test projection=[a, b]
         ")
     }
 
@@ -1236,10 +1356,15 @@ mod tests {
             .project(vec![(col("a") + col("b")).alias("sum")])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r"
+        Projection: test.a + test.b AS sum
+          TableScan: test projection=[a, b]
+        ")?;
+
         // Should return unchanged (no extraction needed)
         assert_optimized_plan_equal!(plan, @r"
         Projection: test.a + test.b AS sum
-          TableScan: test
+          TableScan: test projection=[a, b]
         ")
     }
 
@@ -1258,13 +1383,19 @@ mod tests {
             .aggregate(vec![mock_leaf(col("user"), "name")], vec![count(lit(1))])?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Aggregate: groupBy=[[mock_leaf(test.user, Utf8("name"))]], aggr=[[COUNT(Int32(1))]]
+          Filter: mock_leaf(test.user, Utf8("status")) = Utf8("active")
+            TableScan: test projection=[user]
+        "#)?;
+
         // Both extractions should be in a single extracted projection
         assert_optimized_plan_equal!(plan, @r#"
         Aggregate: groupBy=[[__datafusion_extracted_2 AS mock_leaf(test.user,Utf8("name"))]], aggr=[[COUNT(Int32(1))]]
-          Projection: __datafusion_extracted_1, test.user, __datafusion_extracted_2
+          Projection: __datafusion_extracted_2
             Filter: __datafusion_extracted_1 = Utf8("active")
-              Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, test.user, mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_2
-                TableScan: test
+              Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_2
+                TableScan: test projection=[user]
         "#)
     }
 
@@ -1282,15 +1413,21 @@ mod tests {
             .filter(mock_leaf(col("b"), "y").eq(lit(2)))?
             .build()?;
 
+        assert_plan_eq_snapshot!(plan, @r#"
+        Filter: mock_leaf(test.b, Utf8("y")) = Int32(2)
+          Filter: mock_leaf(test.a, Utf8("x")) = Int32(1)
+            TableScan: test projection=[a, b, c]
+        "#)?;
+
         // Both extractions should be in a single extracted projection,
         // with both 'a' and 'b' columns passed through
         assert_optimized_plan_equal!(plan, @r#"
         Projection: test.a, test.b, test.c
           Filter: __datafusion_extracted_2 = Int32(2)
-            Projection: __datafusion_extracted_1, test.a, test.b, test.c, __datafusion_extracted_2
+            Projection: test.a, test.b, test.c, __datafusion_extracted_2
               Filter: __datafusion_extracted_1 = Int32(1)
                 Projection: mock_leaf(test.a, Utf8("x")) AS __datafusion_extracted_1, test.a, test.b, test.c, mock_leaf(test.b, Utf8("y")) AS __datafusion_extracted_2
-                  TableScan: test
+                  TableScan: test projection=[a, b, c]
         "#)
     }
 }
