@@ -52,6 +52,7 @@
 //! **Projection Nodes** (merge through):
 //! - Replace column refs with underlying expressions from the child projection
 
+use arrow::datatypes::Schema;
 use indexmap::{IndexMap, IndexSet};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -740,6 +741,86 @@ fn extract_from_projection(
     let outer_projection = Projection::try_new(final_exprs, Arc::new(rebuilt_input))?;
 
     Ok(Transformed::yes(LogicalPlan::Projection(outer_projection)))
+}
+
+
+/// Split a projection's expressions into extracted and remainder sets.
+/// For example, given a projection with expressions: [get_field(col('a'), 'x') AS ex1, get_field(col('b'), 'y') + 1 AS ex2]
+/// This would produce:
+/// - extracted: [get_field(col('a'), 'x') as __datafusion_extracted_1, get_field(col('b'), 'y') as __datafusion_extracted_2]
+/// - remainder: [col('__datafusion_extracted_1') as ex1, col('__datafusion_extracted_2') + 1 as ex2]
+#[derive(Debug)]
+struct SplitProjection {
+    /// The remainder expressions.
+    /// In our example this would be `[col('__datafusion_extracted_1'), col('__datafusion_extracted_2') + 1]`
+    remainder: Vec<Expr>,
+    /// The extracted expressions.
+    /// In our example this would be `[get_field(col('a'), 'x') as __datafusion_extracted_1, get_field(col('b'), 'y') as __datafusion_extracted_2]`
+    extracted: Vec<Expr>,
+}
+
+/// Result of attempting to split a projection.
+#[derive(Debug)]
+enum SplitResult {
+    /// No expressions could be extracted.
+    /// For example if the input projection was `[col('a'), col('b') + 1]`
+    None,
+    /// All expressions were extracted.
+    /// For example if the input projection was `[get_field(col('a'), 'x'), get_field(col('b'), 'y')]`
+    All,
+    /// Some expressions subtrees were extracted.
+    /// For example if the input projection was `[get_field(col('a'), 'x') * 2, col('b') + 1]`
+    /// This would extract `get_field(col('a'), 'x')` and leave the rest in the remainder.
+    Partial(SplitProjection),
+}
+
+fn split_projection(
+    exprs: &[Expr],
+    schema: &DFSchema,
+    alias_generator: &Arc<AliasGenerator>,
+) -> Result<SplitResult> {
+    let mut extractor = LeafExpressionExtractor::new(schema, alias_generator);
+
+    // Save names so we can restore them on the remainder expressions
+    let name_preserver = NamePreserver::new_for_projection();
+    let saved_names: Vec<_> = exprs.iter().map(|e| name_preserver.save(e)).collect();
+
+    // Extract from each expression
+    let mut rewritten = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        let transformed = extractor.extract(expr.clone())?;
+        rewritten.push(transformed.data);
+    }
+
+    // Nothing extracted → None
+    if !extractor.has_extractions() {
+        return Ok(SplitResult::None);
+    }
+
+    // Check if every rewritten expression is a bare Column (meaning the
+    // entire original was MoveTowardsLeafNodes and got fully replaced)
+    let all_columns = rewritten.iter().all(|e| matches!(e, Expr::Column(_)));
+    if all_columns {
+        return Ok(SplitResult::All);
+    }
+
+    // Partial: build remainder (restore names) and extracted (alias each)
+    let remainder: Vec<Expr> = rewritten
+        .into_iter()
+        .zip(saved_names)
+        .map(|(expr, saved)| saved.restore(expr))
+        .collect();
+
+    let extracted: Vec<Expr> = extractor
+        .extracted
+        .values()
+        .map(|(expr, alias)| expr.clone().alias(alias))
+        .collect();
+
+    Ok(SplitResult::Partial(SplitProjection {
+        remainder,
+        extracted,
+    }))
 }
 
 /// Try to merge projection through child projection when ALL expressions are MoveTowardsLeafNodes.
@@ -1999,5 +2080,252 @@ mod tests {
                 Projection: mock_leaf(right.user, Utf8("id")) AS __datafusion_extracted_3, right.user
                   TableScan: right projection=[user]
         "#)
+    }
+
+    // =========================================================================
+    // split_projection tests
+    // =========================================================================
+
+    fn test_schema() -> DFSchema {
+        test_table_scan_with_struct()
+            .unwrap()
+            .schema()
+            .as_ref()
+            .clone()
+    }
+
+    #[test]
+    fn test_split_projection_all_columns() -> Result<()> {
+        let schema = test_schema();
+        let alias_gen = Arc::new(AliasGenerator::new());
+        let result = split_projection(&[col("user")], &schema, &alias_gen)?;
+        assert!(matches!(result, SplitResult::None), "expected None, got {result:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_projection_arithmetic_no_extraction() -> Result<()> {
+        let schema = test_schema();
+        let alias_gen = Arc::new(AliasGenerator::new());
+        let result =
+            split_projection(&[col("user").is_not_null()], &schema, &alias_gen)?;
+        assert!(matches!(result, SplitResult::None), "expected None, got {result:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_projection_single_leaf_returns_all() -> Result<()> {
+        let schema = test_schema();
+        let alias_gen = Arc::new(AliasGenerator::new());
+        let result =
+            split_projection(&[mock_leaf(col("user"), "x")], &schema, &alias_gen)?;
+        assert!(matches!(result, SplitResult::All), "expected All, got {result:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_projection_multiple_leaves_returns_all() -> Result<()> {
+        let schema = test_schema();
+        let alias_gen = Arc::new(AliasGenerator::new());
+        let result = split_projection(
+            &[mock_leaf(col("user"), "x"), mock_leaf(col("user"), "y")],
+            &schema,
+            &alias_gen,
+        )?;
+        assert!(matches!(result, SplitResult::All), "expected All, got {result:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_projection_aliased_leaf_returns_all() -> Result<()> {
+        let schema = test_schema();
+        let alias_gen = Arc::new(AliasGenerator::new());
+        let result = split_projection(
+            &[mock_leaf(col("user"), "x").alias("foo")],
+            &schema,
+            &alias_gen,
+        )?;
+        // Alias is transparent to placement(), so the entire
+        // `mock_leaf(col("user"), "x").alias("foo")` has MoveTowardsLeafNodes
+        // placement and gets fully replaced with a Column → All.
+        assert!(matches!(result, SplitResult::All), "expected All, got {result:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_projection_partial_simple() -> Result<()> {
+        let schema = test_schema();
+        let alias_gen = Arc::new(AliasGenerator::new());
+        let result = split_projection(
+            &[mock_leaf(col("user"), "x") + lit(1)],
+            &schema,
+            &alias_gen,
+        )?;
+        assert!(
+            matches!(result, SplitResult::Partial(_)),
+            "expected Partial, got {result:?}"
+        );
+        if let SplitResult::Partial(split) = result {
+            assert_eq!(split.extracted.len(), 1);
+            assert_eq!(split.remainder.len(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_projection_partial_mixed() -> Result<()> {
+        let schema = test_schema();
+        let alias_gen = Arc::new(AliasGenerator::new());
+        let result = split_projection(
+            &[col("user"), mock_leaf(col("user"), "y") + lit(1)],
+            &schema,
+            &alias_gen,
+        )?;
+        assert!(
+            matches!(result, SplitResult::Partial(_)),
+            "expected Partial, got {result:?}"
+        );
+        if let SplitResult::Partial(split) = result {
+            assert_eq!(split.extracted.len(), 1);
+            assert_eq!(split.remainder.len(), 2);
+            // First remainder is the passthrough column
+            assert!(
+                matches!(&split.remainder[0], Expr::Column(_)),
+                "expected Column, got {:?}",
+                split.remainder[0]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_projection_deduplication() -> Result<()> {
+        let schema = test_schema();
+        let alias_gen = Arc::new(AliasGenerator::new());
+        let leaf = mock_leaf(col("user"), "x");
+        // Same leaf used in two different expressions
+        let result = split_projection(
+            &[leaf.clone() + lit(1), leaf + lit(2)],
+            &schema,
+            &alias_gen,
+        )?;
+        assert!(
+            matches!(result, SplitResult::Partial(_)),
+            "expected Partial, got {result:?}"
+        );
+        if let SplitResult::Partial(split) = result {
+            // Only 1 extracted despite being used in two exprs
+            assert_eq!(split.extracted.len(), 1);
+            assert_eq!(split.remainder.len(), 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_projection_docstring_example() -> Result<()> {
+        // Validates the docstring example:
+        // input: [get_field(col('a'), 'x') AS ex1, get_field(col('b'), 'y') + 1 AS ex2]
+        // extracted: [get_field(col('a'), 'x') as __datafusion_extracted_1, get_field(col('b'), 'y') as __datafusion_extracted_2]
+        // remainder: [col('__datafusion_extracted_1') as ex1, col('__datafusion_extracted_2') + 1 as ex2]
+        let schema = test_schema();
+        let alias_gen = Arc::new(AliasGenerator::new());
+        let result = split_projection(
+            &[
+                mock_leaf(col("user"), "x").alias("ex1"),
+                (mock_leaf(col("user"), "y") + lit(1)).alias("ex2"),
+            ],
+            &schema,
+            &alias_gen,
+        )?;
+        assert!(
+            matches!(result, SplitResult::Partial(_)),
+            "expected Partial, got {result:?}"
+        );
+        if let SplitResult::Partial(split) = result {
+            assert_eq!(split.extracted.len(), 2);
+            assert_eq!(split.remainder.len(), 2);
+            // Both remainders should preserve their original aliases
+            assert!(
+                matches!(&split.remainder[0], Expr::Alias(a) if a.name == "ex1"),
+                "expected alias 'ex1', got {:?}",
+                split.remainder[0]
+            );
+            assert!(
+                matches!(&split.remainder[1], Expr::Alias(a) if a.name == "ex2"),
+                "expected alias 'ex2', got {:?}",
+                split.remainder[1]
+            );
+            // Each extracted should be aliased with the extracted prefix
+            for e in &split.extracted {
+                assert!(
+                    matches!(e, Expr::Alias(a) if a.name.starts_with(EXTRACTED_EXPR_PREFIX)),
+                    "expected extracted alias prefix, got {e:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_projection_skip_already_extracted() -> Result<()> {
+        let schema = test_schema();
+        let alias_gen = Arc::new(AliasGenerator::new());
+        // Expression already aliased with extracted prefix should be skipped
+        let result = split_projection(
+            &[mock_leaf(col("user"), "x")
+                .alias(format!("{EXTRACTED_EXPR_PREFIX}_manual"))],
+            &schema,
+            &alias_gen,
+        )?;
+        assert!(
+            matches!(result, SplitResult::None),
+            "expected None (skip already extracted), got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_projection_multiple_extractions_from_one_expr() -> Result<()> {
+        let schema = test_schema();
+        let alias_gen = Arc::new(AliasGenerator::new());
+        // One expression containing two different MoveTowardsLeafNodes sub-expressions
+        let result = split_projection(
+            &[mock_leaf(col("user"), "x") + mock_leaf(col("user"), "y")],
+            &schema,
+            &alias_gen,
+        )?;
+        assert!(
+            matches!(result, SplitResult::Partial(_)),
+            "expected Partial, got {result:?}"
+        );
+        if let SplitResult::Partial(split) = result {
+            assert_eq!(split.extracted.len(), 2);
+            assert_eq!(split.remainder.len(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_projection_preserves_original_alias() -> Result<()> {
+        let schema = test_schema();
+        let alias_gen = Arc::new(AliasGenerator::new());
+        let result = split_projection(
+            &[(mock_leaf(col("user"), "x") + lit(1)).alias("my_name")],
+            &schema,
+            &alias_gen,
+        )?;
+        assert!(
+            matches!(result, SplitResult::Partial(_)),
+            "expected Partial, got {result:?}"
+        );
+        if let SplitResult::Partial(split) = result {
+            assert_eq!(split.remainder.len(), 1);
+            assert!(
+                matches!(&split.remainder[0], Expr::Alias(a) if a.name == "my_name"),
+                "expected alias 'my_name', got {:?}",
+                split.remainder[0]
+            );
+        }
+        Ok(())
     }
 }
