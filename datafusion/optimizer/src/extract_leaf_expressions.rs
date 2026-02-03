@@ -183,16 +183,7 @@ fn extract_from_schema_preserving(
         return Ok(transformed);
     }
 
-    // Build extraction projection with ALL columns (CSE-style)
-    let extraction_proj = if let LogicalPlan::Projection(existing_proj) = target.as_ref()
-    {
-        merge_into_extracted_projection(existing_proj, &extractor)?
-    } else {
-        extractor.build_projection_with_all_columns(target)?
-    };
-
-    // Rebuild the path from target back up to our node's input
-    let rebuilt_input = rebuild_path(path, LogicalPlan::Projection(extraction_proj))?;
+    let rebuilt_input = extractor.build_extraction_projection(target, path)?;
 
     // Create the node with new input
     let new_inputs: Vec<LogicalPlan> = std::iter::once(rebuilt_input)
@@ -298,32 +289,14 @@ fn extract_from_join(
 
     // Build left extraction projection if needed
     let new_left = if left_extractor.has_extractions() {
-        let extraction_proj =
-            if let LogicalPlan::Projection(existing_proj) = left_target.as_ref() {
-                merge_into_extracted_projection(existing_proj, &left_extractor)?
-            } else {
-                left_extractor.build_projection_with_all_columns(left_target)?
-            };
-        Arc::new(rebuild_path(
-            left_path,
-            LogicalPlan::Projection(extraction_proj),
-        )?)
+        Arc::new(left_extractor.build_extraction_projection(left_target, left_path)?)
     } else {
         Arc::clone(&join.left)
     };
 
     // Build right extraction projection if needed
     let new_right = if right_extractor.has_extractions() {
-        let extraction_proj =
-            if let LogicalPlan::Projection(existing_proj) = right_target.as_ref() {
-                merge_into_extracted_projection(existing_proj, &right_extractor)?
-            } else {
-                right_extractor.build_projection_with_all_columns(right_target)?
-            };
-        Arc::new(rebuild_path(
-            right_path,
-            LogicalPlan::Projection(extraction_proj),
-        )?)
+        Arc::new(right_extractor.build_extraction_projection(right_target, right_path)?)
     } else {
         Arc::clone(&join.right)
     };
@@ -520,16 +493,7 @@ fn extract_from_aggregate(
         return Ok(Transformed::no(LogicalPlan::Aggregate(agg)));
     }
 
-    // Build extraction projection with ALL columns (CSE-style)
-    let extraction_proj = if let LogicalPlan::Projection(existing_proj) = target.as_ref()
-    {
-        merge_into_extracted_projection(existing_proj, &extractor)?
-    } else {
-        extractor.build_projection_with_all_columns(target)?
-    };
-
-    // Rebuild path from target back up
-    let rebuilt_input = rebuild_path(path, LogicalPlan::Projection(extraction_proj))?;
+    let rebuilt_input = extractor.build_extraction_projection(target, path)?;
 
     // Restore names in group-by expressions using NamePreserver
     let restored_group_expr: Vec<Expr> = new_group_by
@@ -890,78 +854,6 @@ fn find_extraction_target(
     }
 }
 
-/// Merges new extractions into an existing extracted expression projection.
-fn merge_into_extracted_projection(
-    existing: &Projection,
-    extractor: &LeafExpressionExtractor,
-) -> Result<Projection> {
-    let mut proj_exprs = existing.expr.clone();
-
-    // Build a map of existing expressions (by schema_name) to their aliases
-    let existing_extractions: IndexMap<String, String> = existing
-        .expr
-        .iter()
-        .filter_map(|e| {
-            if let Expr::Alias(alias) = e
-                && alias.name.starts_with(EXTRACTED_EXPR_PREFIX)
-            {
-                let schema_name = alias.expr.schema_name().to_string();
-                return Some((schema_name, alias.name.clone()));
-            }
-            None
-        })
-        .collect();
-
-    // Resolve column references through the projection's rename mapping
-    let replace_map = build_projection_replace_map(existing);
-
-    // Add new extracted expressions, resolving column refs through the projection
-    for (_schema_name, (expr, alias)) in &extractor.extracted {
-        let resolved = replace_cols_by_name(expr.clone().alias(alias), &replace_map)?;
-        let resolved_schema_name = if let Expr::Alias(a) = &resolved {
-            a.expr.schema_name().to_string()
-        } else {
-            resolved.schema_name().to_string()
-        };
-        if !existing_extractions.contains_key(&resolved_schema_name) {
-            proj_exprs.push(resolved);
-        }
-    }
-
-    // Add any new pass-through columns that aren't already in the projection.
-    // We check against existing.input.schema() (the projection's source) rather than
-    // extractor.input_schema (the projection's output) because columns produced by
-    // alias expressions (e.g., CSE's __common_expr_N) exist in the output but not
-    // the input, and cannot be added as pass-through Column references.
-    let existing_cols: IndexSet<Column> = existing
-        .expr
-        .iter()
-        .filter_map(|e| {
-            if let Expr::Column(c) = e {
-                Some(c.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let input_schema = existing.input.schema();
-    for col in &extractor.columns_needed {
-        let col_expr = Expr::Column(col.clone());
-        let resolved = replace_cols_by_name(col_expr, &replace_map)?;
-        if let Expr::Column(resolved_col) = &resolved {
-            if !existing_cols.contains(resolved_col)
-                && input_schema.has_column(resolved_col)
-            {
-                proj_exprs.push(Expr::Column(resolved_col.clone()));
-            }
-        }
-        // If resolved to non-column expr, it's already computed by existing projection
-    }
-
-    Projection::try_new(proj_exprs, Arc::clone(&existing.input))
-}
-
 /// Rebuilds the path from extraction projection back up to original input.
 ///
 /// Takes a list of nodes (in top-to-bottom order from input towards target)
@@ -1102,27 +994,98 @@ impl<'a> LeafExpressionExtractor<'a> {
         !self.extracted.is_empty()
     }
 
-    /// Builds projection with extracted expressions + ALL input columns (CSE-style).
+    /// Builds an extraction projection and rebuilds the path back up.
     ///
-    /// Passes through ALL columns from the input schema. This ensures nothing
-    /// gets lost during optimizer merges and produces a stable 2-level structure.
-    fn build_projection_with_all_columns(
+    /// If the target is already a `Projection`, merges into it; otherwise
+    /// creates a new projection that passes through all input columns.
+    /// Then rebuilds the intermediate nodes in `path` on top of the new
+    /// projection.
+    fn build_extraction_projection(
         &self,
-        input: Arc<LogicalPlan>,
-    ) -> Result<Projection> {
-        let mut proj_exprs = Vec::new();
+        target: Arc<LogicalPlan>,
+        path: Vec<Arc<LogicalPlan>>,
+    ) -> Result<LogicalPlan> {
+        let extraction_proj = if let LogicalPlan::Projection(existing) = target.as_ref() {
+            // Merge into existing projection
+            let mut proj_exprs = existing.expr.clone();
 
-        // 1. Add extracted expressions with their aliases
-        for (_, (expr, alias)) in &self.extracted {
-            proj_exprs.push(expr.clone().alias(alias));
-        }
+            // Build a map of existing expressions (by schema_name) to their aliases
+            let existing_extractions: IndexMap<String, String> = existing
+                .expr
+                .iter()
+                .filter_map(|e| {
+                    if let Expr::Alias(alias) = e
+                        && alias.name.starts_with(EXTRACTED_EXPR_PREFIX)
+                    {
+                        let schema_name = alias.expr.schema_name().to_string();
+                        return Some((schema_name, alias.name.clone()));
+                    }
+                    None
+                })
+                .collect();
 
-        // 2. Add ALL columns from input schema (not just columns_needed)
-        for (qualifier, field) in self.input_schema.iter() {
-            proj_exprs.push(Expr::from((qualifier, field)));
-        }
+            // Resolve column references through the projection's rename mapping
+            let replace_map = build_projection_replace_map(existing);
 
-        Projection::try_new(proj_exprs, input)
+            // Add new extracted expressions, resolving column refs through the projection
+            for (_schema_name, (expr, alias)) in &self.extracted {
+                let resolved =
+                    replace_cols_by_name(expr.clone().alias(alias), &replace_map)?;
+                let resolved_schema_name = if let Expr::Alias(a) = &resolved {
+                    a.expr.schema_name().to_string()
+                } else {
+                    resolved.schema_name().to_string()
+                };
+                if !existing_extractions.contains_key(&resolved_schema_name) {
+                    proj_exprs.push(resolved);
+                }
+            }
+
+            // Add any new pass-through columns that aren't already in the projection.
+            // We check against existing.input.schema() (the projection's source) rather
+            // than self.input_schema (the projection's output) because columns produced
+            // by alias expressions (e.g., CSE's __common_expr_N) exist in the output but
+            // not the input, and cannot be added as pass-through Column references.
+            let existing_cols: IndexSet<Column> = existing
+                .expr
+                .iter()
+                .filter_map(|e| {
+                    if let Expr::Column(c) = e {
+                        Some(c.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let input_schema = existing.input.schema();
+            for col in &self.columns_needed {
+                let col_expr = Expr::Column(col.clone());
+                let resolved = replace_cols_by_name(col_expr, &replace_map)?;
+                if let Expr::Column(resolved_col) = &resolved {
+                    if !existing_cols.contains(resolved_col)
+                        && input_schema.has_column(resolved_col)
+                    {
+                        proj_exprs.push(Expr::Column(resolved_col.clone()));
+                    }
+                }
+                // If resolved to non-column expr, it's already computed by existing projection
+            }
+
+            Projection::try_new(proj_exprs, Arc::clone(&existing.input))?
+        } else {
+            // Build new projection with extracted expressions + all input columns
+            let mut proj_exprs = Vec::new();
+            for (_, (expr, alias)) in &self.extracted {
+                proj_exprs.push(expr.clone().alias(alias));
+            }
+            for (qualifier, field) in self.input_schema.iter() {
+                proj_exprs.push(Expr::from((qualifier, field)));
+            }
+            Projection::try_new(proj_exprs, target)?
+        };
+
+        rebuild_path(path, LogicalPlan::Projection(extraction_proj))
     }
 }
 
