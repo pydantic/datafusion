@@ -183,7 +183,7 @@ fn extract_from_schema_preserving(
         return Ok(transformed);
     }
 
-    let rebuilt_input = extractor.build_extraction_projection(target, path)?;
+    let rebuilt_input = extractor.build_extraction_projection(&target, path)?;
 
     // Create the node with new input
     let new_inputs: Vec<LogicalPlan> = std::iter::once(rebuilt_input)
@@ -289,14 +289,14 @@ fn extract_from_join(
 
     // Build left extraction projection if needed
     let new_left = if left_extractor.has_extractions() {
-        Arc::new(left_extractor.build_extraction_projection(left_target, left_path)?)
+        Arc::new(left_extractor.build_extraction_projection(&left_target, left_path)?)
     } else {
         Arc::clone(&join.left)
     };
 
     // Build right extraction projection if needed
     let new_right = if right_extractor.has_extractions() {
-        Arc::new(right_extractor.build_extraction_projection(right_target, right_path)?)
+        Arc::new(right_extractor.build_extraction_projection(&right_target, right_path)?)
     } else {
         Arc::clone(&join.right)
     };
@@ -493,7 +493,7 @@ fn extract_from_aggregate(
         return Ok(Transformed::no(LogicalPlan::Aggregate(agg)));
     }
 
-    let rebuilt_input = extractor.build_extraction_projection(target, path)?;
+    let rebuilt_input = extractor.build_extraction_projection(&target, path)?;
 
     // Restore names in group-by expressions using NamePreserver
     let restored_group_expr: Vec<Expr> = new_group_by
@@ -843,7 +843,7 @@ impl<'a> LeafExpressionExtractor<'a> {
     /// projection.
     fn build_extraction_projection(
         &self,
-        target: Arc<LogicalPlan>,
+        target: &Arc<LogicalPlan>,
         path: Vec<Arc<LogicalPlan>>,
     ) -> Result<LogicalPlan> {
         let pairs = self.extracted_pairs();
@@ -930,12 +930,11 @@ fn build_extraction_projection_impl(
         for col in columns_needed {
             let col_expr = Expr::Column(col.clone());
             let resolved = replace_cols_by_name(col_expr, &replace_map)?;
-            if let Expr::Column(resolved_col) = &resolved {
-                if !existing_cols.contains(resolved_col)
-                    && input_schema.has_column(resolved_col)
-                {
-                    proj_exprs.push(Expr::Column(resolved_col.clone()));
-                }
+            if let Expr::Column(resolved_col) = &resolved
+                && !existing_cols.contains(resolved_col)
+                && input_schema.has_column(resolved_col)
+            {
+                proj_exprs.push(Expr::Column(resolved_col.clone()));
             }
             // If resolved to non-column expr, it's already computed by existing projection
         }
