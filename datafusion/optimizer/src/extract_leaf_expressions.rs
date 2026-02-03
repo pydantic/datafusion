@@ -52,7 +52,6 @@
 //! **Projection Nodes** (merge through):
 //! - Replace column refs with underlying expressions from the child projection
 
-use arrow::datatypes::Schema;
 use indexmap::{IndexMap, IndexSet};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -151,20 +150,6 @@ fn extract_from_plan(
 // =============================================================================
 // Helper Functions for TopDown Traversal with Projection Merging
 // =============================================================================
-
-/// Checks if an expression contains any `MoveTowardsLeafNodes` sub-expressions.
-fn has_extractable_expressions(expr: &Expr) -> bool {
-    let mut found = false;
-    expr.apply(|e| {
-        if e.placement() == ExpressionPlacement::MoveTowardsLeafNodes {
-            found = true;
-            return Ok(TreeNodeRecursion::Stop);
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })
-    .ok();
-    found
-}
 
 /// Build replacement map from projection: column_name -> underlying_expr
 ///
@@ -598,12 +583,10 @@ fn extract_from_aggregate(
 
 /// Extracts `MoveTowardsLeafNodes` sub-expressions from Projection nodes.
 ///
-/// Uses TopDown traversal with projection merging:
-/// 1. If ALL expressions are `MoveTowardsLeafNodes`, push entire projection down
-/// 2. If input is a Projection, merge expressions through it
-/// 3. Otherwise, extract sub-expressions and push them down
-///
-/// Natural idempotency: merged expressions no longer have column refs matching projection outputs.
+/// Uses `split_projection` to classify expressions, then:
+/// - `None`: nothing to extract, return unchanged
+/// - `All`: try merging through child projection first, then extract
+/// - `Partial`: extract sub-expressions and push them down
 fn extract_from_projection(
     plan: LogicalPlan,
     alias_generator: &Arc<AliasGenerator>,
@@ -612,137 +595,48 @@ fn extract_from_projection(
         return Ok(Transformed::no(plan));
     };
 
-    // Count how many top-level expressions are MoveTowardsLeafNodes
-    let extractable_count = proj
-        .expr
-        .iter()
-        .filter(|e| e.placement() == ExpressionPlacement::MoveTowardsLeafNodes)
-        .count();
-
-    // Check if there are any extractable sub-expressions at all
-    let has_any_extractable = proj.expr.iter().any(|e| has_extractable_expressions(e));
-
-    // Case 1: Nothing to extract
-    if extractable_count == 0 && !has_any_extractable {
-        return Ok(Transformed::no(LogicalPlan::Projection(proj)));
-    }
-
-    // Case 2: ALL expressions are MoveTowardsLeafNodes - try to merge through child projection
-    if extractable_count == proj.expr.len() {
-        let result = push_projection_down(proj)?;
-        if result.transformed {
-            return Ok(result);
-        }
-        // If push_projection_down returned no (not a child projection), fall through
-        // to normal extraction logic
-        let LogicalPlan::Projection(proj) = result.data else {
-            return Ok(result);
-        };
-
-        // Continue with extraction for this projection
-        // (Fall through to Case 3 logic below)
-        let name_preserver = NamePreserver::new_for_projection();
-        let saved_names: Vec<_> =
-            proj.expr.iter().map(|e| name_preserver.save(e)).collect();
-
-        let (target, path) = find_extraction_target(&proj.input);
-
-        // If the target is the same as our input, no need to extract again
-        if Arc::ptr_eq(&target, &proj.input) {
-            return Ok(Transformed::no(LogicalPlan::Projection(proj)));
-        }
-
-        let target_schema = Arc::clone(target.schema());
-
-        let mut extractor =
-            LeafExpressionExtractor::new(target_schema.as_ref(), alias_generator);
-
-        let mut new_exprs = Vec::with_capacity(proj.expr.len());
-        let mut has_extractions = false;
-
-        for expr in &proj.expr {
-            let transformed = extractor.extract(expr.clone())?;
-            if transformed.transformed {
-                has_extractions = true;
-            }
-            new_exprs.push(transformed.data);
-        }
-
-        if !has_extractions {
-            return Ok(Transformed::no(LogicalPlan::Projection(proj)));
-        }
-
-        let extraction_proj =
-            if let LogicalPlan::Projection(existing_proj) = target.as_ref() {
-                merge_into_extracted_projection(existing_proj, &extractor)?
-            } else {
-                extractor.build_projection_with_all_columns(target)?
-            };
-
-        let rebuilt_input = rebuild_path(path, LogicalPlan::Projection(extraction_proj))?;
-
-        let final_exprs: Vec<Expr> = new_exprs
-            .into_iter()
-            .zip(saved_names)
-            .map(|(expr, saved_name)| saved_name.restore(expr))
-            .collect();
-
-        let outer_projection = Projection::try_new(final_exprs, Arc::new(rebuilt_input))?;
-
-        return Ok(Transformed::yes(LogicalPlan::Projection(outer_projection)));
-    }
-
-    // Case 3: Mixed - extract sub-expressions and push them down
-    // Save original expression names using NamePreserver (like CSE)
-    let name_preserver = NamePreserver::new_for_projection();
-    let saved_names: Vec<_> = proj.expr.iter().map(|e| name_preserver.save(e)).collect();
-
-    // Find where to place extractions (look down through schema-preserving nodes)
     let (target, path) = find_extraction_target(&proj.input);
     let target_schema = Arc::clone(target.schema());
 
-    let mut extractor =
-        LeafExpressionExtractor::new(target_schema.as_ref(), alias_generator);
+    match split_projection(&proj.expr, target_schema.as_ref(), alias_generator)? {
+        SplitResult::None => Ok(Transformed::no(LogicalPlan::Projection(proj))),
 
-    // Extract from projection expressions
-    let mut new_exprs = Vec::with_capacity(proj.expr.len());
-    let mut has_extractions = false;
-
-    for expr in &proj.expr {
-        let transformed = extractor.extract(expr.clone())?;
-        if transformed.transformed {
-            has_extractions = true;
+        SplitResult::All(split) => {
+            // Try merging into child projection first
+            let push_result = push_projection_down(proj)?;
+            if push_result.transformed {
+                return Ok(push_result);
+            }
+            let LogicalPlan::Projection(proj) = push_result.data else {
+                return Ok(push_result);
+            };
+            // If the target is the same as our input, no need to extract
+            if Arc::ptr_eq(&target, &proj.input) {
+                return Ok(Transformed::no(LogicalPlan::Projection(proj)));
+            }
+            build_split_projections(split, target, target_schema.as_ref(), path)
         }
-        new_exprs.push(transformed.data);
+
+        SplitResult::Partial(split) => {
+            build_split_projections(split, target, target_schema.as_ref(), path)
+        }
     }
-
-    if !has_extractions {
-        return Ok(Transformed::no(LogicalPlan::Projection(proj)));
-    }
-
-    // Build extraction projection with ALL columns (CSE-style)
-    let extraction_proj = if let LogicalPlan::Projection(existing_proj) = target.as_ref()
-    {
-        merge_into_extracted_projection(existing_proj, &extractor)?
-    } else {
-        extractor.build_projection_with_all_columns(target)?
-    };
-
-    // Rebuild path from target back up
-    let rebuilt_input = rebuild_path(path, LogicalPlan::Projection(extraction_proj))?;
-
-    // Create outer projection with rewritten exprs + restored names
-    let final_exprs: Vec<Expr> = new_exprs
-        .into_iter()
-        .zip(saved_names)
-        .map(|(expr, saved_name)| saved_name.restore(expr))
-        .collect();
-
-    let outer_projection = Projection::try_new(final_exprs, Arc::new(rebuilt_input))?;
-
-    Ok(Transformed::yes(LogicalPlan::Projection(outer_projection)))
 }
 
+/// Builds the extraction projection and outer projection from a `SplitProjection`.
+///
+/// Shared between the `All` and `Partial` paths of `extract_from_projection`.
+fn build_split_projections(
+    split: SplitProjection,
+    target: Arc<LogicalPlan>,
+    target_schema: &DFSchema,
+    path: Vec<Arc<LogicalPlan>>,
+) -> Result<Transformed<LogicalPlan>> {
+    let extraction_proj = split.build_extraction_projection(&target, target_schema)?;
+    let rebuilt_input = rebuild_path(path, LogicalPlan::Projection(extraction_proj))?;
+    let outer = Projection::try_new(split.remainder, Arc::new(rebuilt_input))?;
+    Ok(Transformed::yes(LogicalPlan::Projection(outer)))
+}
 
 /// Split a projection's expressions into extracted and remainder sets.
 /// For example, given a projection with expressions: [get_field(col('a'), 'x') AS ex1, get_field(col('b'), 'y') + 1 AS ex2]
@@ -757,6 +651,88 @@ struct SplitProjection {
     /// The extracted expressions.
     /// In our example this would be `[get_field(col('a'), 'x') as __datafusion_extracted_1, get_field(col('b'), 'y') as __datafusion_extracted_2]`
     extracted: Vec<Expr>,
+    /// Columns referenced by the extracted expressions (needed for pass-through)
+    columns_needed: IndexSet<Column>,
+}
+
+impl SplitProjection {
+    /// Build the extraction projection to insert above the target node.
+    ///
+    /// If the target is an existing projection, merges into it (dedup by schema_name,
+    /// add pass-through columns_needed). Otherwise builds a fresh projection with
+    /// extracted expressions + ALL input schema columns.
+    fn build_extraction_projection(
+        &self,
+        target: &Arc<LogicalPlan>,
+        input_schema: &DFSchema,
+    ) -> Result<Projection> {
+        if let LogicalPlan::Projection(existing_proj) = target.as_ref() {
+            // Merge into existing projection
+            let mut proj_exprs = existing_proj.expr.clone();
+
+            // Build a map of existing extractions (by schema_name)
+            let existing_extractions: IndexMap<String, String> = existing_proj
+                .expr
+                .iter()
+                .filter_map(|e| {
+                    if let Expr::Alias(alias) = e
+                        && alias.name.starts_with(EXTRACTED_EXPR_PREFIX)
+                    {
+                        let schema_name = alias.expr.schema_name().to_string();
+                        return Some((schema_name, alias.name.clone()));
+                    }
+                    None
+                })
+                .collect();
+
+            // Add new extracted expressions not already present
+            for expr in &self.extracted {
+                if let Expr::Alias(alias) = expr {
+                    let schema_name = alias.expr.schema_name().to_string();
+                    if !existing_extractions.contains_key(&schema_name) {
+                        proj_exprs.push(expr.clone());
+                    }
+                } else {
+                    proj_exprs.push(expr.clone());
+                }
+            }
+
+            // Add pass-through columns not already in the projection
+            let existing_cols: IndexSet<Column> = existing_proj
+                .expr
+                .iter()
+                .filter_map(|e| {
+                    if let Expr::Column(c) = e {
+                        Some(c.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let proj_input_schema = existing_proj.input.schema();
+            for col in &self.columns_needed {
+                if !existing_cols.contains(col) && proj_input_schema.has_column(col) {
+                    proj_exprs.push(Expr::Column(col.clone()));
+                }
+            }
+
+            Projection::try_new(proj_exprs, Arc::clone(&existing_proj.input))
+        } else {
+            // Build fresh projection: extracted + ALL input columns
+            let mut proj_exprs = Vec::new();
+
+            for expr in &self.extracted {
+                proj_exprs.push(expr.clone());
+            }
+
+            for (qualifier, field) in input_schema.iter() {
+                proj_exprs.push(Expr::from((qualifier, field)));
+            }
+
+            Projection::try_new(proj_exprs, Arc::clone(target))
+        }
+    }
 }
 
 /// Result of attempting to split a projection.
@@ -767,7 +743,7 @@ enum SplitResult {
     None,
     /// All expressions were extracted.
     /// For example if the input projection was `[get_field(col('a'), 'x'), get_field(col('b'), 'y')]`
-    All,
+    All(SplitProjection),
     /// Some expressions subtrees were extracted.
     /// For example if the input projection was `[get_field(col('a'), 'x') * 2, col('b') + 1]`
     /// This would extract `get_field(col('a'), 'x')` and leave the rest in the remainder.
@@ -797,19 +773,7 @@ fn split_projection(
         return Ok(SplitResult::None);
     }
 
-    // Check if every rewritten expression is a bare Column (meaning the
-    // entire original was MoveTowardsLeafNodes and got fully replaced)
-    let all_columns = rewritten.iter().all(|e| matches!(e, Expr::Column(_)));
-    if all_columns {
-        return Ok(SplitResult::All);
-    }
-
-    // Partial: build remainder (restore names) and extracted (alias each)
-    let remainder: Vec<Expr> = rewritten
-        .into_iter()
-        .zip(saved_names)
-        .map(|(expr, saved)| saved.restore(expr))
-        .collect();
+    let columns_needed = extractor.columns_needed.clone();
 
     let extracted: Vec<Expr> = extractor
         .extracted
@@ -817,10 +781,28 @@ fn split_projection(
         .map(|(expr, alias)| expr.clone().alias(alias))
         .collect();
 
-    Ok(SplitResult::Partial(SplitProjection {
+    // Check if every rewritten expression is a bare Column (meaning the
+    // entire original was MoveTowardsLeafNodes and got fully replaced)
+    let all_columns = rewritten.iter().all(|e| matches!(e, Expr::Column(_)));
+
+    // Build remainder (restore names)
+    let remainder: Vec<Expr> = rewritten
+        .into_iter()
+        .zip(saved_names)
+        .map(|(expr, saved)| saved.restore(expr))
+        .collect();
+
+    let split = SplitProjection {
         remainder,
         extracted,
-    }))
+        columns_needed,
+    };
+
+    if all_columns {
+        Ok(SplitResult::All(split))
+    } else {
+        Ok(SplitResult::Partial(split))
+    }
 }
 
 /// Try to merge projection through child projection when ALL expressions are MoveTowardsLeafNodes.
@@ -948,14 +930,6 @@ fn find_extraction_target(
             }
         }
     }
-}
-
-/// Returns true if the projection only has column references (nothing to extract).
-fn is_fully_extracted(proj: &Projection) -> bool {
-    proj.expr.iter().all(|e| {
-        matches!(e, Expr::Column(_))
-            || matches!(e, Expr::Alias(a) if matches!(a.expr.as_ref(), Expr::Column(_)))
-    })
 }
 
 /// Merges new extractions into an existing extracted expression projection.
@@ -2099,7 +2073,10 @@ mod tests {
         let schema = test_schema();
         let alias_gen = Arc::new(AliasGenerator::new());
         let result = split_projection(&[col("user")], &schema, &alias_gen)?;
-        assert!(matches!(result, SplitResult::None), "expected None, got {result:?}");
+        assert!(
+            matches!(result, SplitResult::None),
+            "expected None, got {result:?}"
+        );
         Ok(())
     }
 
@@ -2107,9 +2084,11 @@ mod tests {
     fn test_split_projection_arithmetic_no_extraction() -> Result<()> {
         let schema = test_schema();
         let alias_gen = Arc::new(AliasGenerator::new());
-        let result =
-            split_projection(&[col("user").is_not_null()], &schema, &alias_gen)?;
-        assert!(matches!(result, SplitResult::None), "expected None, got {result:?}");
+        let result = split_projection(&[col("user").is_not_null()], &schema, &alias_gen)?;
+        assert!(
+            matches!(result, SplitResult::None),
+            "expected None, got {result:?}"
+        );
         Ok(())
     }
 
@@ -2119,7 +2098,10 @@ mod tests {
         let alias_gen = Arc::new(AliasGenerator::new());
         let result =
             split_projection(&[mock_leaf(col("user"), "x")], &schema, &alias_gen)?;
-        assert!(matches!(result, SplitResult::All), "expected All, got {result:?}");
+        assert!(
+            matches!(result, SplitResult::All(_)),
+            "expected All, got {result:?}"
+        );
         Ok(())
     }
 
@@ -2132,7 +2114,10 @@ mod tests {
             &schema,
             &alias_gen,
         )?;
-        assert!(matches!(result, SplitResult::All), "expected All, got {result:?}");
+        assert!(
+            matches!(result, SplitResult::All(_)),
+            "expected All, got {result:?}"
+        );
         Ok(())
     }
 
@@ -2148,7 +2133,10 @@ mod tests {
         // Alias is transparent to placement(), so the entire
         // `mock_leaf(col("user"), "x").alias("foo")` has MoveTowardsLeafNodes
         // placement and gets fully replaced with a Column → All.
-        assert!(matches!(result, SplitResult::All), "expected All, got {result:?}");
+        assert!(
+            matches!(result, SplitResult::All(_)),
+            "expected All, got {result:?}"
+        );
         Ok(())
     }
 
