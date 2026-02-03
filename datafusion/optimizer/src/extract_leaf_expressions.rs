@@ -58,7 +58,7 @@ use std::sync::Arc;
 
 use datafusion_common::alias::AliasGenerator;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion_common::{Column, DFSchema, Result, qualified_name};
+use datafusion_common::{Column, DFSchema, Result};
 use datafusion_expr::expr_rewriter::NamePreserver;
 use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_expr::{Expr, ExpressionPlacement, Filter, Limit, Projection, Sort};
@@ -145,31 +145,6 @@ fn extract_from_plan(
         // Everything else passes through unchanged
         _ => Ok(Transformed::no(plan)),
     }
-}
-
-// =============================================================================
-// Helper Functions for TopDown Traversal with Projection Merging
-// =============================================================================
-
-/// Build replacement map from projection: column_name -> underlying_expr
-///
-/// For each output column in the projection, maps its qualified name to the
-/// unaliased underlying expression. This allows replacing column references
-/// with the expressions that compute them.
-fn build_projection_replace_map(projection: &Projection) -> HashMap<String, Expr> {
-    projection
-        .schema
-        .iter()
-        .zip(projection.expr.iter())
-        .map(|((qualifier, field), expr)| {
-            let expr = expr.clone().unalias();
-            let key = match qualifier {
-                Some(q) => qualified_name(Some(q), field.name()),
-                None => qualified_name(None, field.name()),
-            };
-            (key, expr)
-        })
-        .collect()
 }
 
 /// Extracts from schema-preserving nodes (Filter, Sort, Limit).
@@ -600,23 +575,13 @@ fn extract_from_projection(
 
     match split_projection(&proj.expr, target_schema.as_ref(), alias_generator)? {
         SplitResult::None => Ok(Transformed::no(LogicalPlan::Projection(proj))),
-
         SplitResult::All(split) => {
-            // Try merging into child projection first
-            let push_result = push_projection_down(proj)?;
-            if push_result.transformed {
-                return Ok(push_result);
-            }
-            let LogicalPlan::Projection(proj) = push_result.data else {
-                return Ok(push_result);
-            };
             // If the target is the same as our input, no need to extract
             if Arc::ptr_eq(&target, &proj.input) {
                 return Ok(Transformed::no(LogicalPlan::Projection(proj)));
             }
             build_split_projections(split, target, target_schema.as_ref(), path)
         }
-
         SplitResult::Partial(split) => {
             build_split_projections(split, target, target_schema.as_ref(), path)
         }
@@ -685,19 +650,26 @@ impl SplitProjection {
                 })
                 .collect();
 
-            // Add new extracted expressions not already present
+            // Resolve column references through the projection's rename mapping
+            let replace_map = build_projection_replace_map(existing_proj);
+
+            // Add new extracted expressions not already present,
+            // resolving column refs through the child projection
             for expr in &self.extracted {
-                if let Expr::Alias(alias) = expr {
+                let resolved = replace_cols_by_name(expr.clone(), &replace_map)?;
+                let should_add = if let Expr::Alias(alias) = &resolved {
                     let schema_name = alias.expr.schema_name().to_string();
-                    if !existing_extractions.contains_key(&schema_name) {
-                        proj_exprs.push(expr.clone());
-                    }
+                    !existing_extractions.contains_key(&schema_name)
                 } else {
-                    proj_exprs.push(expr.clone());
+                    true
+                };
+                if should_add {
+                    proj_exprs.push(resolved);
                 }
             }
 
-            // Add pass-through columns not already in the projection
+            // Add pass-through columns not already in the projection,
+            // resolving through the rename mapping
             let existing_cols: IndexSet<Column> = existing_proj
                 .expr
                 .iter()
@@ -712,9 +684,16 @@ impl SplitProjection {
 
             let proj_input_schema = existing_proj.input.schema();
             for col in &self.columns_needed {
-                if !existing_cols.contains(col) && proj_input_schema.has_column(col) {
-                    proj_exprs.push(Expr::Column(col.clone()));
+                let col_expr = Expr::Column(col.clone());
+                let resolved = replace_cols_by_name(col_expr, &replace_map)?;
+                if let Expr::Column(resolved_col) = &resolved {
+                    if !existing_cols.contains(resolved_col)
+                        && proj_input_schema.has_column(resolved_col)
+                    {
+                        proj_exprs.push(Expr::Column(resolved_col.clone()));
+                    }
                 }
+                // If resolved to non-column expr, it's already computed by existing projection
             }
 
             Projection::try_new(proj_exprs, Arc::clone(&existing_proj.input))
@@ -805,43 +784,6 @@ fn split_projection(
     }
 }
 
-/// Try to merge projection through child projection when ALL expressions are MoveTowardsLeafNodes.
-///
-/// This handles the special case where a projection contains only leaf-pushable
-/// expressions (like `get_field`) and the child is also a Projection. We merge
-/// by replacing column refs with the underlying expressions from the child.
-///
-/// For other node types (Filter, Sort, Limit, barriers), we return Transformed::no
-/// to let the normal extraction logic handle them.
-fn push_projection_down(proj: Projection) -> Result<Transformed<LogicalPlan>> {
-    match proj.input.as_ref() {
-        // Merge into child projection - replace column refs with underlying expressions
-        LogicalPlan::Projection(child_proj) => {
-            let replace_map = build_projection_replace_map(child_proj);
-            let merged_exprs: Vec<Expr> = proj
-                .expr
-                .iter()
-                .map(|e| replace_cols_by_name(e.clone(), &replace_map))
-                .collect::<Result<_>>()?;
-
-            // Check if merge actually changed anything (natural idempotency)
-            if merged_exprs == proj.expr {
-                return Ok(Transformed::no(LogicalPlan::Projection(proj)));
-            }
-
-            // Create merged projection with child's input
-            let merged_proj =
-                Projection::try_new(merged_exprs, Arc::clone(&child_proj.input))?;
-
-            // Return yes - the optimizer will continue recursively on the new projection
-            Ok(Transformed::yes(LogicalPlan::Projection(merged_proj)))
-        }
-
-        // For all other node types, let normal extraction logic handle
-        _ => Ok(Transformed::no(LogicalPlan::Projection(proj))),
-    }
-}
-
 /// Extracts `MoveTowardsLeafNodes` sub-expressions from aggregate function arguments.
 ///
 /// This extracts from inside the aggregate (e.g., from `sum(get_field(x, 'y'))`
@@ -888,6 +830,22 @@ fn extract_from_aggregate_args(
 // =============================================================================
 // Helper Functions for Extraction Targeting
 // =============================================================================
+
+/// Build a replacement map from a projection: output_column_name -> underlying_expr.
+///
+/// This is used to resolve column references through a renaming projection.
+/// For example, if a projection has `user AS x`, this maps `x` -> `col("user")`.
+fn build_projection_replace_map(projection: &Projection) -> HashMap<String, Expr> {
+    projection
+        .schema
+        .iter()
+        .zip(projection.expr.iter())
+        .map(|((qualifier, field), expr)| {
+            let key = Column::from((qualifier, field)).flat_name();
+            (key, expr.clone().unalias())
+        })
+        .collect()
+}
 
 /// Traverses down through schema-preserving nodes to find where to place extractions.
 ///
@@ -954,10 +912,19 @@ fn merge_into_extracted_projection(
         })
         .collect();
 
-    // Add new extracted expressions, but only if not already present
-    for (schema_name, (expr, alias)) in &extractor.extracted {
-        if !existing_extractions.contains_key(schema_name) {
-            proj_exprs.push(expr.clone().alias(alias));
+    // Resolve column references through the projection's rename mapping
+    let replace_map = build_projection_replace_map(existing);
+
+    // Add new extracted expressions, resolving column refs through the projection
+    for (_schema_name, (expr, alias)) in &extractor.extracted {
+        let resolved = replace_cols_by_name(expr.clone().alias(alias), &replace_map)?;
+        let resolved_schema_name = if let Expr::Alias(a) = &resolved {
+            a.expr.schema_name().to_string()
+        } else {
+            resolved.schema_name().to_string()
+        };
+        if !existing_extractions.contains_key(&resolved_schema_name) {
+            proj_exprs.push(resolved);
         }
     }
 
@@ -980,9 +947,16 @@ fn merge_into_extracted_projection(
 
     let input_schema = existing.input.schema();
     for col in &extractor.columns_needed {
-        if !existing_cols.contains(col) && input_schema.has_column(col) {
-            proj_exprs.push(Expr::Column(col.clone()));
+        let col_expr = Expr::Column(col.clone());
+        let resolved = replace_cols_by_name(col_expr, &replace_map)?;
+        if let Expr::Column(resolved_col) = &resolved {
+            if !existing_cols.contains(resolved_col)
+                && input_schema.has_column(resolved_col)
+            {
+                proj_exprs.push(Expr::Column(resolved_col.clone()));
+            }
         }
+        // If resolved to non-column expr, it's already computed by existing projection
     }
 
     Projection::try_new(proj_exprs, Arc::clone(&existing.input))
@@ -2315,5 +2289,62 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    // =========================================================================
+    // Column-rename through intermediate node tests
+    // =========================================================================
+
+    /// Projection with leaf expr above Filter above renaming Projection.
+    /// Tests that column refs are resolved through the rename in
+    /// build_extraction_projection (extract_from_projection path).
+    #[test]
+    fn test_extract_through_filter_with_column_rename() -> Result<()> {
+        let table_scan = test_table_scan_with_struct()?;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("user").alias("x")])?
+            .filter(col("x").is_not_null())?
+            .project(vec![mock_leaf(col("x"), "a")])?
+            .build()?;
+        assert_optimized_plan_equal!(plan, @r#"
+        Projection: __datafusion_extracted_1 AS mock_leaf(x,Utf8("a"))
+          Filter: x IS NOT NULL
+            Projection: test.user AS x, mock_leaf(test.user, Utf8("a")) AS __datafusion_extracted_1
+              TableScan: test projection=[user]
+        "#)
+    }
+
+    /// Same as above but with a partial extraction (leaf + arithmetic).
+    #[test]
+    fn test_extract_partial_through_filter_with_column_rename() -> Result<()> {
+        let table_scan = test_table_scan_with_struct()?;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("user").alias("x")])?
+            .filter(col("x").is_not_null())?
+            .project(vec![mock_leaf(col("x"), "a").is_not_null()])?
+            .build()?;
+        assert_optimized_plan_equal!(plan, @r#"
+        Projection: __datafusion_extracted_1 IS NOT NULL AS mock_leaf(x,Utf8("a")) IS NOT NULL
+          Filter: x IS NOT NULL
+            Projection: test.user AS x, mock_leaf(test.user, Utf8("a")) AS __datafusion_extracted_1
+              TableScan: test projection=[user]
+        "#)
+    }
+
+    /// Tests merge_into_extracted_projection path (schema-preserving extraction)
+    /// through a renaming projection.
+    #[test]
+    fn test_extract_from_filter_above_renaming_projection() -> Result<()> {
+        let table_scan = test_table_scan_with_struct()?;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("user").alias("x")])?
+            .filter(mock_leaf(col("x"), "a").eq(lit("active")))?
+            .build()?;
+        assert_optimized_plan_equal!(plan, @r#"
+        Projection: x
+          Filter: __datafusion_extracted_1 = Utf8("active")
+            Projection: test.user AS x, mock_leaf(test.user, Utf8("a")) AS __datafusion_extracted_1
+              TableScan: test projection=[user]
+        "#)
     }
 }
