@@ -60,7 +60,7 @@ use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_expr::{Expr, ExpressionPlacement, Filter, Limit, Projection, Sort};
 
 use crate::optimizer::ApplyOrder;
-use crate::utils::{EXTRACTED_EXPR_PREFIX, is_extracted_expr_projection};
+use crate::utils::{EXTRACTED_EXPR_PREFIX, has_all_column_refs, is_extracted_expr_projection};
 use crate::{OptimizerConfig, OptimizerRule};
 
 /// Extracts `MoveTowardsLeafNodes` sub-expressions from all nodes into projections.
@@ -135,6 +135,7 @@ fn extract_from_plan(
         // Schema-transforming nodes need special handling
         LogicalPlan::Aggregate(_) => extract_from_aggregate(plan, alias_generator),
         LogicalPlan::Projection(_) => extract_from_projection(plan, alias_generator),
+        LogicalPlan::Join(_) => extract_from_join(plan, alias_generator),
 
         // Everything else passes through unchanged
         _ => Ok(Transformed::no(plan)),
@@ -207,6 +208,236 @@ fn extract_from_schema_preserving(
     let recovered = build_recover_project_plan(input_schema.as_ref(), new_plan)?;
 
     Ok(Transformed::yes(recovered))
+}
+
+/// Extracts `MoveTowardsLeafNodes` sub-expressions from Join nodes.
+///
+/// For Joins, we extract from:
+/// - `on` expressions: pairs of (left_key, right_key) for equijoin
+/// - `filter` expression: non-equi join conditions
+///
+/// Each expression is routed to the appropriate side (left or right) based on
+/// which columns it references. Expressions referencing columns from both sides
+/// cannot have sub-expressions extracted (they must remain in the filter).
+fn extract_from_join(
+    plan: LogicalPlan,
+    alias_generator: &Arc<AliasGenerator>,
+) -> Result<Transformed<LogicalPlan>> {
+    let LogicalPlan::Join(join) = plan else {
+        return Ok(Transformed::no(plan));
+    };
+
+    let left_schema = join.left.schema();
+    let right_schema = join.right.schema();
+
+    // Create extractors for left and right sides
+    // Find extraction targets for each side (look through schema-preserving nodes)
+    let (left_target, left_path) = find_extraction_target(&join.left);
+    let (right_target, right_path) = find_extraction_target(&join.right);
+
+    let left_target_schema = Arc::clone(left_target.schema());
+    let right_target_schema = Arc::clone(right_target.schema());
+
+    let mut left_extractor =
+        LeafExpressionExtractor::new(left_target_schema.as_ref(), alias_generator);
+    let mut right_extractor =
+        LeafExpressionExtractor::new(right_target_schema.as_ref(), alias_generator);
+
+    // Build column checker to route expressions to correct side
+    let mut column_checker = ColumnChecker::new(left_schema.as_ref(), right_schema.as_ref());
+
+    // Extract from `on` expressions (equijoin keys)
+    let mut new_on = Vec::with_capacity(join.on.len());
+    let mut any_extracted = false;
+
+    for (left_key, right_key) in &join.on {
+        // Left key should reference only left columns
+        let new_left = left_extractor.extract(left_key.clone())?;
+        if new_left.transformed {
+            any_extracted = true;
+        }
+
+        // Right key should reference only right columns
+        let new_right = right_extractor.extract(right_key.clone())?;
+        if new_right.transformed {
+            any_extracted = true;
+        }
+
+        new_on.push((new_left.data, new_right.data));
+    }
+
+    // Extract from `filter` expression
+    let new_filter = if let Some(ref filter) = join.filter {
+        let extracted = extract_from_join_filter(
+            filter.clone(),
+            &mut column_checker,
+            &mut left_extractor,
+            &mut right_extractor,
+        )?;
+        if extracted.transformed {
+            any_extracted = true;
+        }
+        Some(extracted.data)
+    } else {
+        None
+    };
+
+    if !any_extracted {
+        return Ok(Transformed::no(LogicalPlan::Join(join)));
+    }
+
+    // Save original schema before modifying inputs
+    let original_schema = Arc::clone(&join.schema);
+
+    // Build left extraction projection if needed
+    let new_left = if left_extractor.has_extractions() {
+        let extraction_proj = if let Some(existing_proj) = get_extracted_projection(&left_target) {
+            merge_into_extracted_projection(existing_proj, &left_extractor)?
+        } else {
+            left_extractor.build_projection_with_all_columns(left_target)?
+        };
+        Arc::new(rebuild_path(left_path, LogicalPlan::Projection(extraction_proj))?)
+    } else {
+        Arc::clone(&join.left)
+    };
+
+    // Build right extraction projection if needed
+    let new_right = if right_extractor.has_extractions() {
+        let extraction_proj = if let Some(existing_proj) = get_extracted_projection(&right_target) {
+            merge_into_extracted_projection(existing_proj, &right_extractor)?
+        } else {
+            right_extractor.build_projection_with_all_columns(right_target)?
+        };
+        Arc::new(rebuild_path(right_path, LogicalPlan::Projection(extraction_proj))?)
+    } else {
+        Arc::clone(&join.right)
+    };
+
+    // Create new Join with updated inputs and expressions
+    let new_join = datafusion_expr::logical_plan::Join::try_new(
+        new_left,
+        new_right,
+        new_on,
+        new_filter,
+        join.join_type,
+        join.join_constraint,
+        join.null_equality,
+        join.null_aware,
+    )?;
+
+    // Add recovery projection to restore original schema
+    // This hides the intermediate extracted expression columns
+    let recovered = build_recover_project_plan(original_schema.as_ref(), LogicalPlan::Join(new_join))?;
+
+    Ok(Transformed::yes(recovered))
+}
+
+/// Extracts `MoveTowardsLeafNodes` sub-expressions from a join filter expression.
+///
+/// For each sub-expression, determines if it references only left, only right,
+/// or both columns, and routes extractions accordingly.
+fn extract_from_join_filter(
+    filter: Expr,
+    column_checker: &mut ColumnChecker,
+    left_extractor: &mut LeafExpressionExtractor,
+    right_extractor: &mut LeafExpressionExtractor,
+) -> Result<Transformed<Expr>> {
+    filter.transform_down(|expr| {
+        // Skip expressions already aliased with extracted expression pattern
+        if let Expr::Alias(alias) = &expr
+            && alias.name.starts_with(EXTRACTED_EXPR_PREFIX)
+        {
+            return Ok(Transformed {
+                data: expr,
+                transformed: false,
+                tnr: TreeNodeRecursion::Jump,
+            });
+        }
+
+        match expr.placement() {
+            ExpressionPlacement::MoveTowardsLeafNodes => {
+                // Check which side this expression belongs to
+                if column_checker.is_left_only(&expr) {
+                    // Extract to left side
+                    let col_ref = left_extractor.add_extracted(expr)?;
+                    Ok(Transformed::yes(col_ref))
+                } else if column_checker.is_right_only(&expr) {
+                    // Extract to right side
+                    let col_ref = right_extractor.add_extracted(expr)?;
+                    Ok(Transformed::yes(col_ref))
+                } else {
+                    // References both sides - cannot extract, keep in place
+                    // This shouldn't typically happen for MoveTowardsLeafNodes expressions
+                    // but we handle it gracefully
+                    Ok(Transformed::no(expr))
+                }
+            }
+            ExpressionPlacement::Column => {
+                // Track columns for pass-through on appropriate side
+                if let Expr::Column(col) = &expr {
+                    if column_checker.is_left_only(&expr) {
+                        left_extractor.columns_needed.insert(col.clone());
+                    } else if column_checker.is_right_only(&expr) {
+                        right_extractor.columns_needed.insert(col.clone());
+                    }
+                }
+                Ok(Transformed::no(expr))
+            }
+            _ => {
+                // Continue recursing into children
+                Ok(Transformed::no(expr))
+            }
+        }
+    })
+}
+
+/// Evaluates the columns referenced in the given expression to see if they refer
+/// only to the left or right columns of a join.
+struct ColumnChecker<'a> {
+    left_schema: &'a DFSchema,
+    left_columns: Option<std::collections::HashSet<Column>>,
+    right_schema: &'a DFSchema,
+    right_columns: Option<std::collections::HashSet<Column>>,
+}
+
+impl<'a> ColumnChecker<'a> {
+    fn new(left_schema: &'a DFSchema, right_schema: &'a DFSchema) -> Self {
+        Self {
+            left_schema,
+            left_columns: None,
+            right_schema,
+            right_columns: None,
+        }
+    }
+
+    /// Return true if the expression references only columns from the left side
+    fn is_left_only(&mut self, predicate: &Expr) -> bool {
+        if self.left_columns.is_none() {
+            self.left_columns = Some(schema_columns(self.left_schema));
+        }
+        has_all_column_refs(predicate, self.left_columns.as_ref().unwrap())
+    }
+
+    /// Return true if the expression references only columns from the right side
+    fn is_right_only(&mut self, predicate: &Expr) -> bool {
+        if self.right_columns.is_none() {
+            self.right_columns = Some(schema_columns(self.right_schema));
+        }
+        has_all_column_refs(predicate, self.right_columns.as_ref().unwrap())
+    }
+}
+
+/// Returns all columns in the schema (both qualified and unqualified forms)
+fn schema_columns(schema: &DFSchema) -> std::collections::HashSet<Column> {
+    schema
+        .iter()
+        .flat_map(|(qualifier, field)| {
+            [
+                Column::new(qualifier.cloned(), field.name()),
+                Column::new_unqualified(field.name()),
+            ]
+        })
+        .collect()
 }
 
 /// Extracts `MoveTowardsLeafNodes` sub-expressions from Aggregate nodes.
@@ -1428,6 +1659,212 @@ mod tests {
               Filter: __datafusion_extracted_1 = Int32(1)
                 Projection: mock_leaf(test.a, Utf8("x")) AS __datafusion_extracted_1, test.a, test.b, test.c, mock_leaf(test.b, Utf8("y")) AS __datafusion_extracted_2
                   TableScan: test projection=[a, b, c]
+        "#)
+    }
+
+    // =========================================================================
+    // Join extraction tests
+    // =========================================================================
+
+    /// Create a second table scan with struct field for join tests
+    fn test_table_scan_with_struct_named(name: &str) -> Result<LogicalPlan> {
+        use arrow::datatypes::Schema;
+        let schema = Schema::new(test_table_scan_with_struct_fields());
+        datafusion_expr::logical_plan::table_scan(Some(name), &schema, None)?.build()
+    }
+
+    /// Extraction from equijoin keys (`on` expressions).
+    /// Each key expression is routed to its respective side.
+    #[test]
+    fn test_extract_from_join_on() -> Result<()> {
+        use datafusion_expr::JoinType;
+
+        let left = test_table_scan_with_struct()?;
+        let right = test_table_scan_with_struct_named("right")?;
+
+        // Join on mock_leaf(left.user, "id") = mock_leaf(right.user, "id")
+        let plan = LogicalPlanBuilder::from(left)
+            .join_with_expr_keys(
+                right,
+                JoinType::Inner,
+                (
+                    vec![mock_leaf(col("user"), "id")],
+                    vec![mock_leaf(col("user"), "id")],
+                ),
+                None,
+            )?
+            .build()?;
+
+        assert_plan_eq_snapshot!(plan, @r#"
+        Inner Join: mock_leaf(test.user, Utf8("id")) = mock_leaf(right.user, Utf8("id"))
+          TableScan: test projection=[user]
+          TableScan: right projection=[user]
+        "#)?;
+
+        // Both left and right keys should be extracted into their respective sides
+        // A recovery projection is added to restore the original schema
+        assert_optimized_plan_equal!(plan, @r#"
+        Projection: test.user, right.user
+          Inner Join: __datafusion_extracted_1 = __datafusion_extracted_2
+            Projection: mock_leaf(test.user, Utf8("id")) AS __datafusion_extracted_1, test.user
+              TableScan: test projection=[user]
+            Projection: mock_leaf(right.user, Utf8("id")) AS __datafusion_extracted_2, right.user
+              TableScan: right projection=[user]
+        "#)
+    }
+
+    /// Extraction from non-equi join filter.
+    /// Filter sub-expressions are routed based on column references.
+    #[test]
+    fn test_extract_from_join_filter() -> Result<()> {
+        use datafusion_expr::JoinType;
+
+        let left = test_table_scan_with_struct()?;
+        let right = test_table_scan_with_struct_named("right")?;
+
+        // Join with filter: mock_leaf(left.user, "status") = 'active'
+        let plan = LogicalPlanBuilder::from(left)
+            .join_on(
+                right,
+                JoinType::Inner,
+                vec![
+                    col("test.user").eq(col("right.user")),
+                    mock_leaf(col("test.user"), "status").eq(lit("active")),
+                ],
+            )?
+            .build()?;
+
+        assert_plan_eq_snapshot!(plan, @r#"
+        Inner Join:  Filter: test.user = right.user AND mock_leaf(test.user, Utf8("status")) = Utf8("active")
+          TableScan: test projection=[user]
+          TableScan: right projection=[user]
+        "#)?;
+
+        // Left-side expression should be extracted to left input
+        // A recovery projection is added to restore the original schema
+        assert_optimized_plan_equal!(plan, @r#"
+        Projection: test.user, right.user
+          Inner Join:  Filter: test.user = right.user AND __datafusion_extracted_1 = Utf8("active")
+            Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, test.user
+              TableScan: test projection=[user]
+            TableScan: right projection=[user]
+        "#)
+    }
+
+    /// Extraction from both left and right sides of a join.
+    /// Tests that expressions are correctly routed to each side.
+    #[test]
+    fn test_extract_from_join_both_sides() -> Result<()> {
+        use datafusion_expr::JoinType;
+
+        let left = test_table_scan_with_struct()?;
+        let right = test_table_scan_with_struct_named("right")?;
+
+        // Join with filters on both sides
+        let plan = LogicalPlanBuilder::from(left)
+            .join_on(
+                right,
+                JoinType::Inner,
+                vec![
+                    col("test.user").eq(col("right.user")),
+                    mock_leaf(col("test.user"), "status").eq(lit("active")),
+                    mock_leaf(col("right.user"), "role").eq(lit("admin")),
+                ],
+            )?
+            .build()?;
+
+        assert_plan_eq_snapshot!(plan, @r#"
+        Inner Join:  Filter: test.user = right.user AND mock_leaf(test.user, Utf8("status")) = Utf8("active") AND mock_leaf(right.user, Utf8("role")) = Utf8("admin")
+          TableScan: test projection=[user]
+          TableScan: right projection=[user]
+        "#)?;
+
+        // Each side should have its own extraction projection
+        // A recovery projection is added to restore the original schema
+        assert_optimized_plan_equal!(plan, @r#"
+        Projection: test.user, right.user
+          Inner Join:  Filter: test.user = right.user AND __datafusion_extracted_1 = Utf8("active") AND __datafusion_extracted_2 = Utf8("admin")
+            Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, test.user
+              TableScan: test projection=[user]
+            Projection: mock_leaf(right.user, Utf8("role")) AS __datafusion_extracted_2, right.user
+              TableScan: right projection=[user]
+        "#)
+    }
+
+    /// Join with no MoveTowardsLeafNodes expressions returns unchanged.
+    #[test]
+    fn test_extract_from_join_no_extraction() -> Result<()> {
+        use datafusion_expr::JoinType;
+
+        let left = test_table_scan()?;
+        let right = test_table_scan_with_name("right")?;
+
+        // Simple equijoin on columns (no MoveTowardsLeafNodes expressions)
+        let plan = LogicalPlanBuilder::from(left)
+            .join(
+                right,
+                JoinType::Inner,
+                (vec!["a"], vec!["a"]),
+                None,
+            )?
+            .build()?;
+
+        assert_plan_eq_snapshot!(plan, @r"
+        Inner Join: test.a = right.a
+          TableScan: test projection=[a, b, c]
+          TableScan: right projection=[a, b, c]
+        ")?;
+
+        // Should return unchanged (no extraction needed)
+        assert_optimized_plan_equal!(plan, @r"
+        Inner Join: test.a = right.a
+          TableScan: test projection=[a, b, c]
+          TableScan: right projection=[a, b, c]
+        ")
+    }
+
+    /// Join followed by filter with extraction.
+    /// Tests extraction from filter above a join that also has extractions.
+    #[test]
+    fn test_extract_from_filter_above_join() -> Result<()> {
+        use datafusion_expr::JoinType;
+
+        let left = test_table_scan_with_struct()?;
+        let right = test_table_scan_with_struct_named("right")?;
+
+        // Join with extraction in on clause, then filter with extraction
+        let plan = LogicalPlanBuilder::from(left)
+            .join_with_expr_keys(
+                right,
+                JoinType::Inner,
+                (
+                    vec![mock_leaf(col("user"), "id")],
+                    vec![mock_leaf(col("user"), "id")],
+                ),
+                None,
+            )?
+            .filter(mock_leaf(col("test.user"), "status").eq(lit("active")))?
+            .build()?;
+
+        assert_plan_eq_snapshot!(plan, @r#"
+        Filter: mock_leaf(test.user, Utf8("status")) = Utf8("active")
+          Inner Join: mock_leaf(test.user, Utf8("id")) = mock_leaf(right.user, Utf8("id"))
+            TableScan: test projection=[user]
+            TableScan: right projection=[user]
+        "#)?;
+
+        // Join keys are extracted to respective sides
+        // Filter expression is extracted above the join's recovery projection
+        // (The filter extraction creates its own projection above the join)
+        assert_optimized_plan_equal!(plan, @r#"
+        Projection: test.user, right.user
+          Filter: __datafusion_extracted_3 = Utf8("active")
+            Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_3, test.user, right.user
+              Inner Join: __datafusion_extracted_1 = __datafusion_extracted_2
+                Projection: mock_leaf(test.user, Utf8("id")) AS __datafusion_extracted_1, test.user
+                  TableScan: test projection=[user]
+                Projection: mock_leaf(right.user, Utf8("id")) AS __datafusion_extracted_2, right.user
+                  TableScan: right projection=[user]
         "#)
     }
 }
