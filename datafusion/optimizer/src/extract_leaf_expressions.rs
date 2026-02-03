@@ -60,7 +60,9 @@ use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_expr::{Expr, ExpressionPlacement, Filter, Limit, Projection, Sort};
 
 use crate::optimizer::ApplyOrder;
-use crate::utils::{EXTRACTED_EXPR_PREFIX, has_all_column_refs, is_extracted_expr_projection};
+use crate::utils::{
+    EXTRACTED_EXPR_PREFIX, has_all_column_refs, is_extracted_expr_projection,
+};
 use crate::{OptimizerConfig, OptimizerRule};
 
 /// Extracts `MoveTowardsLeafNodes` sub-expressions from all nodes into projections.
@@ -244,7 +246,8 @@ fn extract_from_join(
         LeafExpressionExtractor::new(right_target_schema.as_ref(), alias_generator);
 
     // Build column checker to route expressions to correct side
-    let mut column_checker = ColumnChecker::new(left_schema.as_ref(), right_schema.as_ref());
+    let mut column_checker =
+        ColumnChecker::new(left_schema.as_ref(), right_schema.as_ref());
 
     // Extract from `on` expressions (equijoin keys)
     let mut new_on = Vec::with_capacity(join.on.len());
@@ -291,24 +294,32 @@ fn extract_from_join(
 
     // Build left extraction projection if needed
     let new_left = if left_extractor.has_extractions() {
-        let extraction_proj = if let Some(existing_proj) = get_extracted_projection(&left_target) {
-            merge_into_extracted_projection(existing_proj, &left_extractor)?
-        } else {
-            left_extractor.build_projection_with_all_columns(left_target)?
-        };
-        Arc::new(rebuild_path(left_path, LogicalPlan::Projection(extraction_proj))?)
+        let extraction_proj =
+            if let Some(existing_proj) = get_extracted_projection(&left_target) {
+                merge_into_extracted_projection(existing_proj, &left_extractor)?
+            } else {
+                left_extractor.build_projection_with_all_columns(left_target)?
+            };
+        Arc::new(rebuild_path(
+            left_path,
+            LogicalPlan::Projection(extraction_proj),
+        )?)
     } else {
         Arc::clone(&join.left)
     };
 
     // Build right extraction projection if needed
     let new_right = if right_extractor.has_extractions() {
-        let extraction_proj = if let Some(existing_proj) = get_extracted_projection(&right_target) {
-            merge_into_extracted_projection(existing_proj, &right_extractor)?
-        } else {
-            right_extractor.build_projection_with_all_columns(right_target)?
-        };
-        Arc::new(rebuild_path(right_path, LogicalPlan::Projection(extraction_proj))?)
+        let extraction_proj =
+            if let Some(existing_proj) = get_extracted_projection(&right_target) {
+                merge_into_extracted_projection(existing_proj, &right_extractor)?
+            } else {
+                right_extractor.build_projection_with_all_columns(right_target)?
+            };
+        Arc::new(rebuild_path(
+            right_path,
+            LogicalPlan::Projection(extraction_proj),
+        )?)
     } else {
         Arc::clone(&join.right)
     };
@@ -327,7 +338,10 @@ fn extract_from_join(
 
     // Add recovery projection to restore original schema
     // This hides the intermediate extracted expression columns
-    let recovered = build_recover_project_plan(original_schema.as_ref(), LogicalPlan::Join(new_join))?;
+    let recovered = build_recover_project_plan(
+        original_schema.as_ref(),
+        LogicalPlan::Join(new_join),
+    )?;
 
     Ok(Transformed::yes(recovered))
 }
@@ -1801,12 +1815,7 @@ mod tests {
 
         // Simple equijoin on columns (no MoveTowardsLeafNodes expressions)
         let plan = LogicalPlanBuilder::from(left)
-            .join(
-                right,
-                JoinType::Inner,
-                (vec!["a"], vec!["a"]),
-                None,
-            )?
+            .join(right, JoinType::Inner, (vec!["a"], vec!["a"]), None)?
             .build()?;
 
         assert_plan_eq_snapshot!(plan, @r"
