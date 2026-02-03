@@ -61,7 +61,7 @@ use datafusion_expr::Projection;
 ///
 /// [`ExtractLeafExpressions`]: crate::extract_leaf_expressions::ExtractLeafExpressions
 /// [`PushDownFilter`]: crate::push_down_filter::PushDownFilter
-pub const EXTRACTED_EXPR_PREFIX: &str = "__datafusion_extracted";
+pub(crate) const EXTRACTED_EXPR_PREFIX: &str = "__datafusion_extracted";
 
 /// Checks if a projection contains extracted leaf expressions.
 ///
@@ -101,7 +101,7 @@ pub const EXTRACTED_EXPR_PREFIX: &str = "__datafusion_extracted";
 ///
 /// [`ExtractLeafExpressions`]: crate::extract_leaf_expressions::ExtractLeafExpressions
 /// [`PushDownFilter`]: crate::push_down_filter::PushDownFilter
-pub fn is_extracted_expr_projection(proj: &Projection) -> bool {
+pub(crate) fn is_extracted_expr_projection(proj: &Projection) -> bool {
     proj.expr.iter().any(|e| {
         if let Expr::Alias(alias) = e {
             alias.name.starts_with(EXTRACTED_EXPR_PREFIX)
