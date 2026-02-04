@@ -274,16 +274,6 @@ fn routing_extract(
     })
 }
 
-/// Returns true if the expression is a bare column reference or an alias wrapping
-/// only column references (recursively).
-fn is_column_or_alias_of_column(expr: &Expr) -> bool {
-    match expr {
-        Expr::Column(_) => true,
-        Expr::Alias(alias) => is_column_or_alias_of_column(&alias.expr),
-        _ => false,
-    }
-}
-
 /// Returns all columns in the schema (both qualified and unqualified forms)
 fn schema_columns(schema: &DFSchema) -> std::collections::HashSet<Column> {
     schema
@@ -736,6 +726,7 @@ fn try_push_input(input: &LogicalPlan) -> Result<Option<LogicalPlan>> {
             )?))
         }
         // Merge into existing projection, future runs will try to re-extract and push down further
+        // TODO: actually push *through* existing projections?
         LogicalPlan::Projection(_) => {
             let target_schema = Arc::clone(proj_input.schema());
             let merged = build_extraction_projection_impl(
@@ -748,6 +739,7 @@ fn try_push_input(input: &LogicalPlan) -> Result<Option<LogicalPlan>> {
             Ok(Some(merged_plan))
         }
         // Barrier node - can't push further
+        // TODO: push through aggregations (just the groub by keys?), through joins (do we extract each expression into sub-expressions referencing only one side?)
         _ => Ok(None),
     }
 }
