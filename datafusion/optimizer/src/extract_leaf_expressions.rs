@@ -160,8 +160,10 @@ fn extract_from_plan(
     let owned_inputs: Vec<LogicalPlan> = inputs.into_iter().cloned().collect();
 
     // Build per-input schemas (kept alive for extractor borrows)
-    let input_schemas: Vec<Arc<DFSchema>> =
-        owned_inputs.iter().map(|i| Arc::clone(i.schema())).collect();
+    let input_schemas: Vec<Arc<DFSchema>> = owned_inputs
+        .iter()
+        .map(|i| Arc::clone(i.schema()))
+        .collect();
 
     // Build per-input extractors
     let mut extractors: Vec<LeafExpressionExtractor> = input_schemas
@@ -251,9 +253,7 @@ fn routing_extract(
 
         match e.placement() {
             ExpressionPlacement::MoveTowardsLeafNodes => {
-                if let Some(idx) =
-                    find_owning_input(&e, input_column_sets)
-                {
+                if let Some(idx) = find_owning_input(&e, input_column_sets) {
                     let col_ref = extractors[idx].add_extracted(e)?;
                     Ok(Transformed::yes(col_ref))
                 } else {
@@ -263,9 +263,7 @@ fn routing_extract(
             }
             ExpressionPlacement::Column => {
                 if let Expr::Column(col) = &e {
-                    if let Some(idx) =
-                        find_owning_input(&e, input_column_sets)
-                    {
+                    if let Some(idx) = find_owning_input(&e, input_column_sets) {
                         extractors[idx].columns_needed.insert(col.clone());
                     }
                 }
@@ -422,12 +420,11 @@ fn build_recovery_projection(
 
     if orig_len == new_len {
         // Same number of fields — check if schemas are identical
-        let schemas_match = original_schema
-            .iter()
-            .zip(new_schema.iter())
-            .all(|((orig_q, orig_f), (new_q, new_f))| {
+        let schemas_match = original_schema.iter().zip(new_schema.iter()).all(
+            |((orig_q, orig_f), (new_q, new_f))| {
                 orig_f.name() == new_f.name() && orig_q == new_q
-            });
+            },
+        );
         if schemas_match {
             return Ok(input);
         }
@@ -437,16 +434,12 @@ fn build_recovery_projection(
         let mut proj_exprs = Vec::with_capacity(orig_len);
         for (i, (orig_qualifier, orig_field)) in original_schema.iter().enumerate() {
             let (new_qualifier, new_field) = new_schema.qualified_field(i);
-            if orig_field.name() == new_field.name()
-                && orig_qualifier == new_qualifier
-            {
+            if orig_field.name() == new_field.name() && orig_qualifier == new_qualifier {
                 proj_exprs.push(Expr::from((orig_qualifier, orig_field)));
             } else {
-                let new_col =
-                    Expr::Column(Column::from((new_qualifier, new_field)));
+                let new_col = Expr::Column(Column::from((new_qualifier, new_field)));
                 proj_exprs.push(
-                    new_col
-                        .alias_qualified(orig_qualifier.cloned(), orig_field.name()),
+                    new_col.alias_qualified(orig_qualifier.cloned(), orig_field.name()),
                 );
             }
         }
@@ -528,7 +521,6 @@ impl<'a> LeafExpressionExtractor<'a> {
             Arc::clone(input),
         )?))
     }
-
 }
 
 /// Build an extraction projection above the target node.
@@ -669,23 +661,23 @@ impl OptimizerRule for PushDownLeafProjections {
 }
 
 /// Returns true if the projection is a pushable extraction projection:
-/// all expressions are Column or aliased with EXTRACTED_EXPR_PREFIX,
-/// and at least one has EXTRACTED_EXPR_PREFIX.
+/// - All expressions should be pushed down in the plan
+/// - There is at least one expression that needs pushing (not just columns/aliases, to avoid unnecessary work)
 fn should_push_projection(proj: &Projection) -> bool {
-    let mut has_extracted = false;
+    let mut worth_pushing = false;
     for expr in &proj.expr {
-        if !expr.placement().should_push_to_leaves() {
+        let placement = expr.placement();
+        // If any expressions should *not* be pushed we can't push the projection
+        if !placement.should_push_to_leaves() {
             return false;
         }
-        // TODO: can we remove this match here, or make it a bit more general?
-        match expr {
-            Expr::Alias(alias) if alias.name.starts_with(EXTRACTED_EXPR_PREFIX) => {
-                has_extracted = true;
-            }
-            _ => {}
+        // But it's also not worth pushing the projection if it's just columns / aliases
+        // We want to look for at least one expression that needs pushing
+        if matches!(placement, ExpressionPlacement::MoveTowardsLeafNodes) {
+            worth_pushing = true;
         }
     }
-    has_extracted
+    worth_pushing
 }
 
 /// Extracts the (expr, alias) pairs and column pass-throughs from a pushable
