@@ -719,19 +719,6 @@ fn try_push_input(input: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     let (pairs, columns_needed) = extract_from_pushable_projection(proj);
     let proj_input = Arc::clone(&proj.input);
 
-    // Check if the input to this projection is a schema-preserving node
-    let input_output_schema = proj_input.schema();
-    let input_input_schema = match proj_input.inputs() {
-        inputs if inputs.len() == 1 => inputs[0].schema(),
-        // If the input has 0 or >1 inputs, we can't push through it
-        _ => return Ok(None),
-    };
-    if input_output_schema != input_input_schema {
-        // Schema-preserving node detected
-    } else {
-        return Ok(None);
-    }
-
     match proj_input.as_ref() {
         // Push through schema-preserving nodes
         LogicalPlan::Filter(_) | LogicalPlan::Sort(_) | LogicalPlan::Limit(_) => {
@@ -748,7 +735,7 @@ fn try_push_input(input: &LogicalPlan) -> Result<Option<LogicalPlan>> {
                 LogicalPlan::Projection(extraction),
             )?))
         }
-        // Merge into existing projection, then try to push the merged result further
+        // Merge into existing projection, future runs will try to re-extract and push down further
         LogicalPlan::Projection(_) => {
             let target_schema = Arc::clone(proj_input.schema());
             let merged = build_extraction_projection_impl(
@@ -758,11 +745,7 @@ fn try_push_input(input: &LogicalPlan) -> Result<Option<LogicalPlan>> {
                 target_schema.as_ref(),
             )?;
             let merged_plan = LogicalPlan::Projection(merged);
-            // After merging, the result may still be pushable through nodes below
-            match try_push_input(&merged_plan)? {
-                Some(pushed_further) => Ok(Some(pushed_further)),
-                None => Ok(Some(merged_plan)),
-            }
+            Ok(Some(merged_plan))
         }
         // Barrier node - can't push further
         _ => Ok(None),

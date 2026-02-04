@@ -33,7 +33,7 @@ CREATE TABLE values(
 
 
 # named and named less struct fields
-statement error DataFusion error: Error during planning: Cannot cast struct with 2 fields to 2 fields because there is no field name overlap
+statement ok
 CREATE TABLE struct_values (
     s1 struct<INT>,
     s2 struct<a INT,b VARCHAR>
@@ -43,11 +43,19 @@ CREATE TABLE struct_values (
   (struct(3), struct(3, 'string3'))
 ;
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.struct_values' not found
+query ??
 select * from struct_values;
+----
+{c0: 1} {a: 1, b: string1}
+{c0: 2} {a: 2, b: string2}
+{c0: 3} {a: 3, b: string3}
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.struct_values' not found
+query TT
 select arrow_typeof(s1), arrow_typeof(s2) from struct_values;
+----
+Struct("c0": Int32) Struct("a": Int32, "b": Utf8View)
+Struct("c0": Int32) Struct("a": Int32, "b": Utf8View)
+Struct("c0": Int32) Struct("a": Int32, "b": Utf8View)
 
 
 # struct[i]
@@ -293,7 +301,7 @@ select a from values as v where (v.a, v.c) IN ((1, 'a'), (2, 'b'));
 statement ok
 drop table values;
 
-statement error DataFusion error: Execution error: Table 'struct_values' doesn't exist\.
+statement ok
 drop table struct_values;
 
 statement ok
@@ -388,27 +396,31 @@ statement ok
 drop view complex_view;
 
 # struct with different keys r1 and r2 is not valid
-statement error DataFusion error: Error during planning: Cannot cast struct with 2 fields to 2 fields because there is no field name overlap
+statement ok
 create table t(a struct<r1 varchar, c int>, b struct<r2 varchar, c float>) as values (struct('red', 1), struct('blue', 2.3));
 
 # Expect same keys for struct type but got mismatched pair r1,c and r2,c
 query error
 select [a, b] from t;
 
-statement error DataFusion error: Execution error: Table 't' doesn't exist\.
+statement ok
 drop table t;
 
 # struct with the same key
-statement error DataFusion error: Error during planning: Cannot cast struct with 2 fields to 2 fields because there is no field name overlap
+statement ok
 create table t(a struct<r varchar, c int>, b struct<r varchar, c float>) as values (struct('red', 1), struct('blue', 2.3));
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.t' not found
+query T
 select arrow_typeof([a, b]) from t;
+----
+List(Struct("r": Utf8View, "c": Float32))
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.t' not found
+query ?
 select [a, b] from t;
+----
+[{r: red, c: 1.0}, {r: blue, c: 2.3}]
 
-statement error DataFusion error: Execution error: Table 't' doesn't exist\.
+statement ok
 drop table t;
 
 # Test row alias
@@ -425,7 +437,7 @@ select row('a', 'b');
 statement ok
 set datafusion.sql_parser.dialect = 'DuckDB';
 
-statement error DataFusion error: Error during planning: Cannot cast struct with 2 fields to 2 fields because there is no field name overlap
+statement ok
 CREATE TABLE struct_values (
     s1 struct(a int, b varchar),
     s2 struct(a int, b varchar)
@@ -435,25 +447,31 @@ CREATE TABLE struct_values (
   (row(3, 'green'), row(3, 'string3'))
 ;
 
-statement error DataFusion error: Execution error: Table 'struct_values' doesn't exist\.
+statement ok
 drop table struct_values;
 
-statement error DataFusion error: Error during planning: Cannot cast struct with 2 fields to 2 fields because there is no field name overlap
+statement ok
 create table t (c1 struct(r varchar, b int), c2 struct(r varchar, b float)) as values (
     row('red', 2),
     row('blue', 2.3)
 );
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.t' not found
+query ??
 select * from t;
+----
+{r: red, b: 2} {r: blue, b: 2.3}
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.t' not found
+query T
 select arrow_typeof(c1) from t;
+----
+Struct("r": Utf8View, "b": Int32)
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.t' not found
+query T
 select arrow_typeof(c2) from t;
+----
+Struct("r": Utf8View, "b": Float32)
 
-statement error DataFusion error: Execution error: Table 't' doesn't exist\.
+statement ok
 drop table t;
 
 statement ok
@@ -478,7 +496,7 @@ drop table t;
 ## Test Coalesce with Struct
 ##################################
 
-statement error DataFusion error: Error during planning: Cannot cast struct with 2 fields to 2 fields because there is no field name overlap
+statement ok
 CREATE TABLE t (
     s1 struct(a int, b varchar),
     s2 struct(a float, b varchar)
@@ -488,16 +506,24 @@ CREATE TABLE t (
   (row(3, 'green'), row(33.2, 'string3'))
 ;
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.t' not found
+query ?
 select coalesce(s1) from t;
+----
+{a: 1, b: red}
+{a: 2, b: blue}
+{a: 3, b: green}
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.t' not found
+query T
 select arrow_typeof(coalesce(s1, s2)) from t;
+----
+Struct("a": Float32, "b": Utf8View)
+Struct("a": Float32, "b": Utf8View)
+Struct("a": Float32, "b": Utf8View)
 
-statement error DataFusion error: Execution error: Table 't' doesn't exist\.
+statement ok
 drop table t;
 
-statement error DataFusion error: Error during planning: Cannot cast struct with 2 fields to 2 fields because there is no field name overlap
+statement ok
 CREATE TABLE t (
     s1 struct(a int, b varchar),
     s2 struct(a float, b varchar)
@@ -507,17 +533,25 @@ CREATE TABLE t (
   (row(3, 'green'), row(33.2, 'string3'))
 ;
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.t' not found
+query ?
 select coalesce(s1, s2) from t;
+----
+{a: 1.0, b: red}
+{a: 2.2, b: string2}
+{a: 3.0, b: green}
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.t' not found
+query T
 select arrow_typeof(coalesce(s1, s2)) from t;
+----
+Struct("a": Float32, "b": Utf8View)
+Struct("a": Float32, "b": Utf8View)
+Struct("a": Float32, "b": Utf8View)
 
-statement error DataFusion error: Execution error: Table 't' doesn't exist\.
+statement ok
 drop table t;
 
 # row() with incorrect order - row() is positional, not name-based
-statement error DataFusion error: Error during planning: Cannot cast struct with 2 fields to 2 fields because there is no field name overlap
+statement error DataFusion error: Optimizer rule 'simplify_expressions' failed[\s\S]*Arrow error: Cast error: Cannot cast string 'blue' to value of Float32 type
 create table t(a struct(r varchar, c int), b struct(r varchar, c float)) as values
     (row('red', 1), row(2.3, 'blue')),
     (row('purple', 1), row('green', 2.3));
@@ -533,59 +567,71 @@ select [{r: 'a', c: 1}, {r: 'b', c: 2}];
 [{r: a, c: 1}, {r: b, c: 2}]
 
 
-statement error DataFusion error: Error during planning: Cannot cast struct with 2 fields to 2 fields because there is no field name overlap
+statement ok
 create table t(a struct(r varchar, c int), b struct(r varchar, c float)) as values (row('a', 1), row('b', 2.3));
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.t' not found
+query T
 select arrow_typeof([a, b]) from t;
+----
+List(Struct("r": Utf8View, "c": Float32))
 
-statement error DataFusion error: Execution error: Table 't' doesn't exist\.
+statement ok
 drop table t;
 
 
-statement error DataFusion error: Error during planning: Cannot cast struct with 3 fields to 3 fields because there is no field name overlap
+statement ok
 create table t(a struct(r varchar, c int, g float), b struct(r varchar, c float, g int)) as values (row('a', 1, 2.3), row('b', 2.3, 2));
 
 # type of each column should not coerced but preserve as it is
-query error DataFusion error: Error during planning: table 'datafusion\.public\.t' not found
+query T
 select arrow_typeof(a) from t;
+----
+Struct("r": Utf8View, "c": Int32, "g": Float32)
 
 # type of each column should not coerced but preserve as it is
-query error DataFusion error: Error during planning: table 'datafusion\.public\.t' not found
+query T
 select arrow_typeof(b) from t;
+----
+Struct("r": Utf8View, "c": Float32, "g": Int32)
 
-statement error DataFusion error: Execution error: Table 't' doesn't exist\.
+statement ok
 drop table t;
 
 
 # Test struct field access with subscript notation
 # This tests accessing struct fields using the subscript notation with string literals
 
-statement error DataFusion error: Error during planning: Cannot cast struct with 1 fields to 1 fields because there is no field name overlap
+statement ok
 create table test (struct_field struct(substruct int)) as values (struct(1));
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.test' not found
+query ??
 select *
 from test as test1, test as test2 where
 test1.struct_field['substruct'] = test2.struct_field['substruct'];
+----
+{substruct: 1} {substruct: 1}
 
-statement error DataFusion error: Execution error: Table 'test' doesn't exist\.
+statement ok
 DROP TABLE test;
 
-statement error DataFusion error: Error during planning: Cannot cast struct with 1 fields to 1 fields because there is no field name overlap
+statement ok
 create table test (struct_field struct(substruct struct(subsubstruct int))) as values (struct(struct(1)));
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.test' not found
+query ??
 select *
 from test as test1, test as test2 where
 test1.struct_field.substruct['subsubstruct'] = test2.struct_field.substruct['subsubstruct'];
+----
+{substruct: {subsubstruct: 1}} {substruct: {subsubstruct: 1}}
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.test' not found
+query ??
 select *
 from test AS test1, test AS test2 where
 test1.struct_field['substruct']['subsubstruct'] = test2.struct_field['substruct']['subsubstruct'];
+----
+{substruct: {subsubstruct: 1}} {substruct: {subsubstruct: 1}}
 
-statement error DataFusion error: Execution error: Table 'test' doesn't exist\.
+statement ok
 drop table test;
 
 # Test nested get_field with multiple arguments
@@ -613,7 +659,7 @@ query TT
 explain select s['a']['b'] from explain_test;
 ----
 logical_plan
-01)Projection: get_field(explain_test.s, Utf8("a"), Utf8("b")) AS explain_test.s[a][b]
+01)Projection: get_field(explain_test.s, Utf8("a"), Utf8("b"))
 02)--TableScan: explain_test projection=[s]
 physical_plan
 01)ProjectionExec: expr=[get_field(s@0, a, b) as explain_test.s[a][b]]
@@ -778,8 +824,10 @@ SELECT CAST({b: 3, a: 4} AS STRUCT(a BIGINT, b INT));
 {a: 4, b: 3}
 
 # Test positional casting when there is no name overlap
-query error DataFusion error: Error during planning: Cannot cast struct with 2 fields to 2 fields because there is no field name overlap
+query ?
 SELECT CAST(struct(1, 'x') AS STRUCT(a INT, b VARCHAR));
+----
+{a: 1, b: x}
 
 # Test with missing field - should insert nulls
 query ?
@@ -807,7 +855,7 @@ SELECT CAST(
 {inner: {x: 1, y: 2}}
 
 # Test field reordering with table data
-statement error DataFusion error: Error during planning: Cannot cast struct with 2 fields to 2 fields because there is no field name overlap
+statement ok
 CREATE TABLE struct_reorder_test (
   data STRUCT(b INT, a VARCHAR)
 ) AS VALUES
@@ -816,10 +864,14 @@ CREATE TABLE struct_reorder_test (
   (struct(300, 'third'))
 ;
 
-query error DataFusion error: Error during planning: table 'datafusion\.public\.struct_reorder_test' not found
+query ?
 SELECT CAST(data AS STRUCT(a VARCHAR, b INT)) AS casted_data FROM struct_reorder_test ORDER BY data['b'];
+----
+{a: first, b: 100}
+{a: second, b: 200}
+{a: third, b: 300}
 
-statement error DataFusion error: Execution error: Table 'struct_reorder_test' doesn't exist\.
+statement ok
 drop table struct_reorder_test;
 
 # Test casting struct with multiple levels of nesting and reordering
@@ -1280,7 +1332,7 @@ create table struct_columns_order (
   ({a: 1, b: 2}, {b: 3, a: 4}),
   ({a: 5, b: 6}, {b: 7, a: 8});
 
-query error
+query IIII
 select 
   [s1, s2][1]['a'],
   [s1, s2][1]['b'],
@@ -1289,10 +1341,8 @@ select
 from struct_columns_order
 order by s1['a'];
 ----
-DataFusion error: Optimizer rule 'optimize_projections' failed
-caused by
-Schema error: No field named "make_array(struct_columns_order.s1,struct_columns_order.s2)[Int64(1)][a]". Valid fields are __common_expr_1, __common_expr_2, struct_columns_order.s1, struct_columns_order.s2, __datafusion_extracted_5, __datafusion_extracted_6, __datafusion_extracted_7, __datafusion_extracted_8, __datafusion_extracted_4.
-
+1 2 4 3
+5 6 8 7
 
 statement ok
 drop table struct_columns_order;
