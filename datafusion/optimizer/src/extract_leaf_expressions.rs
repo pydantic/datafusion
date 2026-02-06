@@ -30,10 +30,10 @@ use crate::push_down_filter::replace_cols_by_name;
 use crate::utils::{EXTRACTED_EXPR_PREFIX, has_all_column_refs};
 use crate::{OptimizerConfig, OptimizerRule};
 
-/// Extracts `MoveTowardsLeafNodes` sub-expressions from all nodes into projections.
+/// Extracts `MoveTowardsLeafNodes` sub-expressions from non-projection nodes into projections.
 ///
-/// This normalizes the plan so that all `MoveTowardsLeafNodes` computations (like field
-/// accessors) live in Projection nodes, making them eligible for pushdown.
+/// This handles Filter, Sort, Limit, Aggregate, and Join nodes. For Projection nodes,
+/// extraction and pushdown are handled by [`PushDownLeafProjections`].
 ///
 /// # Example
 ///
@@ -99,11 +99,9 @@ fn extract_from_plan(
     // expression rewriting.  Nodes like Window derive column names from
     // their expressions, so rewriting `get_field` inside a window function
     // changes the output schema and breaks the recovery projection.
-    let is_projection = matches!(&plan, LogicalPlan::Projection(_));
     if !matches!(
         &plan,
-        LogicalPlan::Projection(_)
-            | LogicalPlan::Aggregate(_)
+        LogicalPlan::Aggregate(_)
             | LogicalPlan::Filter(_)
             | LogicalPlan::Sort(_)
             | LogicalPlan::Limit(_)
@@ -167,45 +165,7 @@ fn extract_from_plan(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // For Projection nodes, combine the modified + recovery into a single projection.
-    // Instead of: Recovery(aliases) -> Modified(col refs) -> Extraction
-    // We create:  Combined(col refs with aliases) -> Extraction
-    //
-    // This avoids creating a trivial intermediate Modified projection that would
-    // just be eliminated by OptimizeProjections anyway.
-    if is_projection {
-        let combined_exprs: Vec<Expr> = original_schema
-            .iter()
-            .zip(transformed.data.expressions())
-            .map(|((qualifier, field), expr)| {
-                // If the expression already has the right name, keep it as-is.
-                // Otherwise, alias it to preserve the original schema.
-                let original_name = field.name();
-                let needs_alias = if let Expr::Column(col) = &expr {
-                    // For columns, compare the unqualified name directly.
-                    // schema_name() includes the qualifier (e.g. "test.user")
-                    // which would always differ from the field name ("user").
-                    col.name.as_str() != original_name
-                } else {
-                    let expr_name = expr.schema_name().to_string();
-                    original_name != &expr_name
-                };
-                if needs_alias {
-                    expr.clone()
-                        .alias_qualified(qualifier.cloned(), original_name)
-                } else {
-                    expr.clone()
-                }
-            })
-            .collect();
-        let new_plan = LogicalPlan::Projection(Projection::try_new(
-            combined_exprs,
-            Arc::new(new_inputs.into_iter().next().unwrap()),
-        )?);
-        return Ok(Transformed::yes(new_plan));
-    }
-
-    // For other plan types, rebuild and add recovery projection if schema changed
+    // Rebuild and add recovery projection if schema changed
     let new_plan = transformed
         .data
         .with_new_exprs(transformed.data.expressions(), new_inputs)?;
@@ -264,10 +224,10 @@ fn routing_extract(
                 }
             }
             ExpressionPlacement::Column => {
-                if let Expr::Column(col) = &e {
-                    if let Some(idx) = find_owning_input(&e, input_column_sets) {
-                        extractors[idx].columns_needed.insert(col.clone());
-                    }
+                if let Expr::Column(col) = &e
+                    && let Some(idx) = find_owning_input(&e, input_column_sets)
+                {
+                    extractors[idx].columns_needed.insert(col.clone());
                 }
                 Ok(Transformed::no(e))
             }
@@ -620,18 +580,20 @@ fn build_extraction_projection_impl(
 // Pass 2: PushDownLeafProjections
 // =============================================================================
 
-/// Pushes extraction projections (created by [`ExtractLeafExpressions`]) down
-/// through schema-preserving nodes towards leaf nodes.
+/// Pushes extraction projections down through schema-preserving nodes towards leaf nodes.
 ///
-/// This rule looks for projections where all expressions are either `Column`
-/// references or aliased with [`EXTRACTED_EXPR_PREFIX`]. When such a projection
-/// sits above a schema-preserving node (Filter, Sort, Limit), it pushes the
-/// projection down through those nodes. When it sits above an existing
-/// Projection, it merges into it.
+/// Handles two types of projections:
+/// - **Pure extraction projections** (all `__datafusion_extracted` aliases + columns):
+///   pushes through Filter/Sort/Limit, merges into existing projections, or routes
+///   into multi-input node inputs (Join, SubqueryAlias, etc.)
+/// - **Mixed projections** (containing `MoveTowardsLeafNodes` sub-expressions):
+///   splits into a recovery projection + pure extraction projection, then recursively
+///   pushes the extraction projection down.
 ///
 /// This is the second pass of a two-pass extraction pipeline:
-/// 1. [`ExtractLeafExpressions`] extracts sub-expressions into projections immediately below
-/// 2. [`PushDownLeafProjections`] pushes those projections down through schema-preserving nodes
+/// 1. [`ExtractLeafExpressions`] extracts sub-expressions from non-projection nodes
+/// 2. [`PushDownLeafProjections`] handles projection splitting/pushing and pushes
+///    extraction projections down through schema-preserving nodes
 #[derive(Default, Debug)]
 pub struct PushDownLeafProjections {}
 
@@ -653,38 +615,133 @@ impl OptimizerRule for PushDownLeafProjections {
     fn rewrite(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        match try_push_input(&plan)? {
+        let alias_generator = config.alias_generator();
+        match try_push_input(&plan, &alias_generator)? {
             Some(new_plan) => Ok(Transformed::yes(new_plan)),
             None => Ok(Transformed::no(plan)),
         }
     }
 }
 
-/// Returns true if the projection is a pushable extraction projection:
-/// - All expressions should be pushed down in the plan
-/// - There is at least one expression that needs pushing (not just columns/aliases, to avoid unnecessary work)
-fn should_push_projection(proj: &Projection) -> bool {
-    let mut worth_pushing = false;
+/// Returns true if ALL expressions are either `Alias(EXTRACTED_EXPR_PREFIX, ...)` or `Column`.
+/// This is the fast path for already-split extraction projections.
+fn is_pure_extraction_projection(proj: &Projection) -> bool {
+    let mut has_extraction = false;
     for expr in &proj.expr {
-        let placement = expr.placement();
-        // If any expressions should *not* be pushed we can't push the projection
-        if !placement.should_push_to_leaves() {
-            return false;
-        }
-        // But it's also not worth pushing the projection if it's just columns / aliases
-        // We want to look for at least one expression that needs pushing
-        if matches!(placement, ExpressionPlacement::MoveTowardsLeafNodes) {
-            worth_pushing = true;
+        match expr {
+            Expr::Alias(alias) if alias.name.starts_with(EXTRACTED_EXPR_PREFIX) => {
+                has_extraction = true;
+            }
+            Expr::Column(_) => {}
+            _ => return false,
         }
     }
-    worth_pushing
+    has_extraction
 }
 
-/// Extracts the (expr, alias) pairs and column pass-throughs from a pushable
-/// extraction projection.
-fn extract_from_pushable_projection(
+/// Returns true if ANY expression contains a `MoveTowardsLeafNodes` sub-expression,
+/// skipping already-extracted aliases via `TreeNodeRecursion::Jump`.
+/// This detects mixed projections that can benefit from splitting.
+fn has_pushable_leaf_subexpressions(proj: &Projection) -> bool {
+    for expr in &proj.expr {
+        let mut found = false;
+        // We ignore errors here - if traversal fails, treat as not pushable
+        let _ = expr.apply(|e| {
+            // Skip expressions already aliased with extracted expression pattern
+            if let Expr::Alias(alias) = e
+                && alias.name.starts_with(EXTRACTED_EXPR_PREFIX)
+            {
+                return Ok(TreeNodeRecursion::Jump);
+            }
+            if e.placement() == ExpressionPlacement::MoveTowardsLeafNodes {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+/// Splits a mixed Projection into a recovery projection + extraction projection.
+///
+/// Given a projection with mixed expressions (some containing `MoveTowardsLeafNodes`
+/// sub-expressions, some not), this function:
+/// 1. Extracts `MoveTowardsLeafNodes` sub-expressions into an extraction projection
+/// 2. Builds recovery expressions that reference the extracted aliases
+///
+/// Returns `(recovery_exprs, extraction_plan)` where:
+/// - `recovery_exprs`: expressions for the outer recovery projection
+/// - `extraction_plan`: a pure extraction projection (all `__extracted` aliases + columns)
+///
+/// Returns `None` if no extractions were found.
+fn split_projection_for_pushdown(
+    proj: &Projection,
+    alias_generator: &Arc<AliasGenerator>,
+) -> Result<Option<(Vec<Expr>, LogicalPlan)>> {
+    let input = &proj.input;
+    let input_schema = input.schema();
+
+    // Build single-input extractor
+    let mut extractors = vec![
+        LeafExpressionExtractor::new(input_schema.as_ref(), alias_generator),
+    ];
+
+    // Build single-input column set for routing
+    let input_column_sets = vec![schema_columns(input_schema.as_ref())];
+
+    // Transform each projection expression via routing_extract
+    let original_schema = proj.schema.as_ref();
+    let mut transformed_exprs = Vec::with_capacity(proj.expr.len());
+    for expr in &proj.expr {
+        let transformed =
+            routing_extract(expr.clone(), &mut extractors, &input_column_sets)?;
+        transformed_exprs.push(transformed.data);
+    }
+
+    let extractor = &extractors[0];
+    if !extractor.has_extractions() {
+        return Ok(None);
+    }
+
+    // Build extraction projection
+    let extraction_plan =
+        extractor.build_extraction_projection(&Arc::clone(input))?;
+
+    // Build recovery expressions by aliasing transformed expressions to preserve
+    // the original schema names
+    let recovery_exprs: Vec<Expr> = original_schema
+        .iter()
+        .zip(transformed_exprs.iter())
+        .map(|((qualifier, field), expr)| {
+            let original_name = field.name();
+            let needs_alias = if let Expr::Column(col) = expr {
+                col.name.as_str() != original_name
+            } else {
+                let expr_name = expr.schema_name().to_string();
+                original_name != &expr_name
+            };
+            if needs_alias {
+                expr.clone()
+                    .alias_qualified(qualifier.cloned(), original_name)
+            } else {
+                expr.clone()
+            }
+        })
+        .collect();
+
+    Ok(Some((recovery_exprs, extraction_plan)))
+}
+
+/// Extracts the (expr, alias) pairs and column pass-throughs from a pure
+/// extraction projection (one where all expressions are `__extracted` aliases
+/// or `Column` references).
+fn extract_from_pure_extraction_projection(
     proj: &Projection,
 ) -> (Vec<(Expr, String)>, IndexSet<Column>) {
     let mut pairs = Vec::new();
@@ -709,16 +766,32 @@ fn extract_from_pushable_projection(
 ///
 /// Returns `Some(new_subtree)` if the projection was pushed down or merged,
 /// `None` if the projection sits above a barrier and cannot be pushed.
-fn try_push_input(input: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+fn try_push_input(input: &LogicalPlan, alias_generator: &Arc<AliasGenerator>) -> Result<Option<LogicalPlan>> {
     let LogicalPlan::Projection(proj) = input else {
         return Ok(None);
     };
 
-    if !should_push_projection(proj) {
-        return Ok(None);
+    // Fast path: already a pure extraction projection (all __extracted aliases + columns)
+    if is_pure_extraction_projection(proj) {
+        return try_push_pure_extraction(proj, alias_generator);
     }
 
-    let (pairs, columns_needed) = extract_from_pushable_projection(proj);
+    // Split path: mixed projection with pushable leaf sub-expressions
+    if has_pushable_leaf_subexpressions(proj) {
+        return try_push_mixed_projection(proj, alias_generator);
+    }
+
+    Ok(None)
+}
+
+/// Pushes a pure extraction projection (all `__extracted` aliases + columns) down
+/// through schema-preserving nodes, merges into existing projections, or routes
+/// into multi-input nodes.
+fn try_push_pure_extraction(
+    proj: &Projection,
+    alias_generator: &Arc<AliasGenerator>,
+) -> Result<Option<LogicalPlan>> {
+    let (pairs, columns_needed) = extract_from_pure_extraction_projection(proj);
     let proj_input = Arc::clone(&proj.input);
 
     match proj_input.as_ref() {
@@ -758,17 +831,11 @@ fn try_push_input(input: &LogicalPlan) -> Result<Option<LogicalPlan>> {
             // still a pure extraction projection (only __extracted aliases + columns).
             // This handles: Extraction → Recovery(cols) → Filter → ... → TableScan
             // by pushing through the recovery projection AND the filter in one pass.
-            if let LogicalPlan::Projection(ref merged_proj) = merged_plan {
-                if should_push_projection(merged_proj) {
-                    let (new_pairs, new_cols) =
-                        extract_from_pushable_projection(merged_proj);
-                    // Only recurse if all expressions are captured
-                    // (prevents losing non-extracted aliases like `a AS x`)
-                    if new_pairs.len() + new_cols.len() == merged_proj.expr.len() {
-                        if let Some(pushed) = try_push_input(&merged_plan)? {
-                            return Ok(Some(pushed));
-                        }
-                    }
+            if let LogicalPlan::Projection(ref merged_proj) = merged_plan
+                && is_pure_extraction_projection(merged_proj)
+            {
+                if let Some(pushed) = try_push_input(&merged_plan, alias_generator)? {
+                    return Ok(Some(pushed));
                 }
             }
             Ok(Some(merged_plan))
@@ -778,8 +845,36 @@ fn try_push_input(input: &LogicalPlan) -> Result<Option<LogicalPlan>> {
         // Handles Joins (2 inputs), SubqueryAlias (1 input), etc.
         // Safely bails out for nodes that don't pass through extracted
         // columns (Aggregate, Window) via the output schema check.
-        _ => try_push_into_inputs(&pairs, &columns_needed, proj_input.as_ref()),
+        _ => try_push_into_inputs(&pairs, &columns_needed, proj_input.as_ref(), alias_generator),
     }
+}
+
+/// Splits a mixed projection into recovery + extraction, then recursively pushes
+/// the extraction projection down. The extraction projection is pure (all
+/// `__extracted` aliases + columns), so the recursive call hits the fast path.
+fn try_push_mixed_projection(
+    proj: &Projection,
+    alias_generator: &Arc<AliasGenerator>,
+) -> Result<Option<LogicalPlan>> {
+    let Some((recovery_exprs, extraction_plan)) =
+        split_projection_for_pushdown(proj, alias_generator)?
+    else {
+        return Ok(None);
+    };
+
+    // Recursively push the extraction projection down — it's pure, so it hits the fast path
+    let pushed = match try_push_input(&extraction_plan, alias_generator)? {
+        Some(pushed) => pushed,
+        None => extraction_plan,
+    };
+
+    // Build recovery projection on top of the pushed result
+    let recovery = LogicalPlan::Projection(Projection::try_new(
+        recovery_exprs,
+        Arc::new(pushed),
+    )?);
+
+    Ok(Some(recovery))
 }
 
 /// Pushes extraction expressions into a node's inputs by routing each
@@ -797,6 +892,7 @@ fn try_push_into_inputs(
     pairs: &[(Expr, String)],
     columns_needed: &IndexSet<Column>,
     node: &LogicalPlan,
+    alias_generator: &Arc<AliasGenerator>,
 ) -> Result<Option<LogicalPlan>> {
     let inputs = node.inputs();
     if inputs.is_empty() {
@@ -867,7 +963,7 @@ fn try_push_into_inputs(
             // this input (e.g., through Filter → existing extraction projection).
             // This ensures the input's output schema is stable and won't change
             // when the TopDown pass later visits children.
-            match try_push_input(&proj_plan)? {
+            match try_push_input(&proj_plan, alias_generator)? {
                 Some(pushed) => new_inputs.push(pushed),
                 None => new_inputs.push(proj_plan),
             }
@@ -1093,9 +1189,8 @@ mod tests {
         "#)?;
 
         assert_after_extract!(plan, @r#"
-        Projection: __datafusion_extracted_1 AS mock_leaf(test.user,Utf8("name"))
-          Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
-            TableScan: test projection=[user]
+        Projection: mock_leaf(test.user, Utf8("name"))
+          TableScan: test projection=[user]
         "#)?;
 
         // Projection expressions with MoveTowardsLeafNodes are extracted
@@ -1123,9 +1218,8 @@ mod tests {
         "#)?;
 
         assert_after_extract!(plan, @r#"
-        Projection: __datafusion_extracted_1 IS NOT NULL AS has_name
-          Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
-            TableScan: test projection=[user]
+        Projection: mock_leaf(test.user, Utf8("name")) IS NOT NULL AS has_name
+          TableScan: test projection=[user]
         "#)?;
 
         // The mock_leaf sub-expression is extracted
@@ -1296,20 +1390,19 @@ mod tests {
         "#)?;
 
         assert_after_extract!(plan, @r#"
-        Projection: __datafusion_extracted_1 AS mock_leaf(test.user,Utf8("name"))
-          Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
-            Projection: test.user
-              Filter: __datafusion_extracted_2 = Utf8("active")
-                Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_2, test.user
-                  TableScan: test projection=[user]
+        Projection: mock_leaf(test.user, Utf8("name"))
+          Projection: test.user
+            Filter: __datafusion_extracted_1 = Utf8("active")
+              Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, test.user
+                TableScan: test projection=[user]
         "#)?;
 
         // Both filter and projection extractions are pushed to a single
         // extraction projection above the TableScan.
         assert_optimized!(plan, @r#"
-        Projection: __datafusion_extracted_1 AS mock_leaf(test.user,Utf8("name"))
-          Filter: __datafusion_extracted_2 = Utf8("active")
-            Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_2, mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1
+        Projection: __datafusion_extracted_2 AS mock_leaf(test.user,Utf8("name"))
+          Filter: __datafusion_extracted_1 = Utf8("active")
+            Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_2
               TableScan: test projection=[user]
         "#)
     }
@@ -1327,9 +1420,8 @@ mod tests {
         "#)?;
 
         assert_after_extract!(plan, @r#"
-        Projection: __datafusion_extracted_1 AS username
-          Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
-            TableScan: test projection=[user]
+        Projection: mock_leaf(test.user, Utf8("name")) AS username
+          TableScan: test projection=[user]
         "#)?;
 
         // Original alias "username" should be preserved in outer projection
@@ -1359,19 +1451,18 @@ mod tests {
         "#)?;
 
         assert_after_extract!(plan, @r#"
-        Projection: test.user, __datafusion_extracted_1 AS mock_leaf(test.user,Utf8("label"))
-          Projection: mock_leaf(test.user, Utf8("label")) AS __datafusion_extracted_1, test.user
-            Projection: test.user
-              Filter: __datafusion_extracted_2 > Int32(150)
-                Projection: mock_leaf(test.user, Utf8("value")) AS __datafusion_extracted_2, test.user
-                  TableScan: test projection=[user]
+        Projection: test.user, mock_leaf(test.user, Utf8("label"))
+          Projection: test.user
+            Filter: __datafusion_extracted_1 > Int32(150)
+              Projection: mock_leaf(test.user, Utf8("value")) AS __datafusion_extracted_1, test.user
+                TableScan: test projection=[user]
         "#)?;
 
         // Both extractions merge into a single projection above TableScan.
         assert_optimized!(plan, @r#"
-        Projection: test.user, __datafusion_extracted_1 AS mock_leaf(test.user,Utf8("label"))
-          Filter: __datafusion_extracted_2 > Int32(150)
-            Projection: mock_leaf(test.user, Utf8("value")) AS __datafusion_extracted_2, test.user, mock_leaf(test.user, Utf8("label")) AS __datafusion_extracted_1
+        Projection: test.user, __datafusion_extracted_2 AS mock_leaf(test.user,Utf8("label"))
+          Filter: __datafusion_extracted_1 > Int32(150)
+            Projection: mock_leaf(test.user, Utf8("value")) AS __datafusion_extracted_1, test.user, mock_leaf(test.user, Utf8("label")) AS __datafusion_extracted_2
               TableScan: test projection=[user]
         "#)
     }
@@ -1390,9 +1481,8 @@ mod tests {
         "#)?;
 
         assert_after_extract!(plan, @r#"
-        Projection: __datafusion_extracted_1 AS mock_leaf(test.user,Utf8("name")), __datafusion_extracted_1 AS name2
-          Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
-            TableScan: test projection=[user]
+        Projection: mock_leaf(test.user, Utf8("name")), mock_leaf(test.user, Utf8("name")) AS name2
+          TableScan: test projection=[user]
         "#)?;
 
         // Same expression should be extracted only once
@@ -1425,12 +1515,11 @@ mod tests {
             TableScan: test projection=[user]
         "#)?;
 
-        // Stage 2: After extraction - projection created above Sort
+        // Stage 2: After extraction - projection untouched (extraction no longer handles projections)
         assert_after_extract!(plan, @r#"
-        Projection: __datafusion_extracted_1 AS mock_leaf(test.user,Utf8("name"))
-          Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
-            Sort: test.user ASC NULLS FIRST
-              TableScan: test projection=[user]
+        Projection: mock_leaf(test.user, Utf8("name"))
+          Sort: test.user ASC NULLS FIRST
+            TableScan: test projection=[user]
         "#)?;
 
         // Stage 3: After pushdown - extraction pushed through Sort
@@ -1469,12 +1558,11 @@ mod tests {
             TableScan: test projection=[user]
         "#)?;
 
-        // Stage 2: After extraction - projection created above Limit
+        // Stage 2: After extraction - projection untouched (extraction no longer handles projections)
         assert_after_extract!(plan, @r#"
-        Projection: __datafusion_extracted_1 AS mock_leaf(test.user,Utf8("name"))
-          Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
-            Limit: skip=0, fetch=10
-              TableScan: test projection=[user]
+        Projection: mock_leaf(test.user, Utf8("name"))
+          Limit: skip=0, fetch=10
+            TableScan: test projection=[user]
         "#)?;
 
         // Stage 3: After pushdown - extraction pushed through Limit
@@ -1650,9 +1738,8 @@ mod tests {
         "#)?;
 
         assert_after_extract!(plan, @r#"
-        Projection: __datafusion_extracted_1 AS mock_leaf(test.user,Utf8("name"))
-          Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
-            TableScan: test projection=[user]
+        Projection: mock_leaf(test.user, Utf8("name"))
+          TableScan: test projection=[user]
         "#)?;
 
         // Extraction should push through the passthrough projection
@@ -2072,14 +2159,12 @@ mod tests {
             TableScan: right projection=[id, user]
         "#)?;
 
-        // After extraction, get_field expressions are extracted into a
-        // projection sitting above the Join
+        // After extraction, projection is untouched (extraction no longer handles projections)
         assert_after_extract!(plan, @r#"
-        Projection: __datafusion_extracted_1 AS mock_leaf(test.user,Utf8("status")), __datafusion_extracted_2 AS mock_leaf(right.user,Utf8("role"))
-          Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, mock_leaf(right.user, Utf8("role")) AS __datafusion_extracted_2, test.id, test.user, right.id, right.user
-            Inner Join: test.id = right.id
-              TableScan: test projection=[id, user]
-              TableScan: right projection=[id, user]
+        Projection: mock_leaf(test.user, Utf8("status")), mock_leaf(right.user, Utf8("role"))
+          Inner Join: test.id = right.id
+            TableScan: test projection=[id, user]
+            TableScan: right projection=[id, user]
         "#)?;
 
         // After optimization, extraction projections push through the Join
@@ -2110,11 +2195,10 @@ mod tests {
             .project(vec![mock_leaf(col("x"), "a")])?
             .build()?;
         assert_after_extract!(plan, @r#"
-        Projection: __datafusion_extracted_1 AS mock_leaf(x,Utf8("a"))
-          Projection: mock_leaf(x, Utf8("a")) AS __datafusion_extracted_1, x
-            Filter: x IS NOT NULL
-              Projection: test.user AS x
-                TableScan: test projection=[user]
+        Projection: mock_leaf(x, Utf8("a"))
+          Filter: x IS NOT NULL
+            Projection: test.user AS x
+              TableScan: test projection=[user]
         "#)?;
 
         assert_optimized!(plan, @r#"
@@ -2135,11 +2219,10 @@ mod tests {
             .project(vec![mock_leaf(col("x"), "a").is_not_null()])?
             .build()?;
         assert_after_extract!(plan, @r#"
-        Projection: __datafusion_extracted_1 IS NOT NULL AS mock_leaf(x,Utf8("a")) IS NOT NULL
-          Projection: mock_leaf(x, Utf8("a")) AS __datafusion_extracted_1, x
-            Filter: x IS NOT NULL
-              Projection: test.user AS x
-                TableScan: test projection=[user]
+        Projection: mock_leaf(x, Utf8("a")) IS NOT NULL
+          Filter: x IS NOT NULL
+            Projection: test.user AS x
+              TableScan: test projection=[user]
         "#)?;
 
         assert_optimized!(plan, @r#"
