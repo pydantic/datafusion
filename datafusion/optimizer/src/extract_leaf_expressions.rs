@@ -820,8 +820,7 @@ fn try_push_into_inputs(
     }
 
     // Partition columns_needed by owning input
-    let mut per_input_columns: Vec<IndexSet<Column>> =
-        vec![IndexSet::new(); num_inputs];
+    let mut per_input_columns: Vec<IndexSet<Column>> = vec![IndexSet::new(); num_inputs];
     for col in columns_needed {
         let col_expr = Expr::Column(col.clone());
         match find_owning_input(&col_expr, &input_column_sets) {
@@ -2059,12 +2058,7 @@ mod tests {
         // SELECT mock_leaf(test.user, "status"), mock_leaf(right.user, "role")
         // FROM test JOIN right ON test.id = right.id
         let plan = LogicalPlanBuilder::from(left)
-            .join(
-                right,
-                JoinType::Inner,
-                (vec!["id"], vec!["id"]),
-                None,
-            )?
+            .join(right, JoinType::Inner, (vec!["id"], vec!["id"]), None)?
             .project(vec![
                 mock_leaf(col("test.user"), "status"),
                 mock_leaf(col("right.user"), "role"),
