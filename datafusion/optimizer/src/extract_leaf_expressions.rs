@@ -618,7 +618,7 @@ impl OptimizerRule for PushDownLeafProjections {
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         let alias_generator = config.alias_generator();
-        match try_push_input(&plan, &alias_generator)? {
+        match try_push_input(&plan, alias_generator)? {
             Some(new_plan) => Ok(Transformed::yes(new_plan)),
             None => Ok(Transformed::no(plan)),
         }
@@ -688,9 +688,10 @@ fn split_projection_for_pushdown(
     let input_schema = input.schema();
 
     // Build single-input extractor
-    let mut extractors = vec![
-        LeafExpressionExtractor::new(input_schema.as_ref(), alias_generator),
-    ];
+    let mut extractors = vec![LeafExpressionExtractor::new(
+        input_schema.as_ref(),
+        alias_generator,
+    )];
 
     // Build single-input column set for routing
     let input_column_sets = vec![schema_columns(input_schema.as_ref())];
@@ -710,8 +711,7 @@ fn split_projection_for_pushdown(
     }
 
     // Build extraction projection
-    let extraction_plan =
-        extractor.build_extraction_projection(&Arc::clone(input))?;
+    let extraction_plan = extractor.build_extraction_projection(&Arc::clone(input))?;
 
     // Build recovery expressions by aliasing transformed expressions to preserve
     // the original schema names
@@ -766,7 +766,10 @@ fn extract_from_pure_extraction_projection(
 ///
 /// Returns `Some(new_subtree)` if the projection was pushed down or merged,
 /// `None` if the projection sits above a barrier and cannot be pushed.
-fn try_push_input(input: &LogicalPlan, alias_generator: &Arc<AliasGenerator>) -> Result<Option<LogicalPlan>> {
+fn try_push_input(
+    input: &LogicalPlan,
+    alias_generator: &Arc<AliasGenerator>,
+) -> Result<Option<LogicalPlan>> {
     let LogicalPlan::Projection(proj) = input else {
         return Ok(None);
     };
@@ -833,10 +836,9 @@ fn try_push_pure_extraction(
             // by pushing through the recovery projection AND the filter in one pass.
             if let LogicalPlan::Projection(ref merged_proj) = merged_plan
                 && is_pure_extraction_projection(merged_proj)
+                && let Some(pushed) = try_push_input(&merged_plan, alias_generator)?
             {
-                if let Some(pushed) = try_push_input(&merged_plan, alias_generator)? {
-                    return Ok(Some(pushed));
-                }
+                return Ok(Some(pushed));
             }
             Ok(Some(merged_plan))
         }
@@ -845,7 +847,12 @@ fn try_push_pure_extraction(
         // Handles Joins (2 inputs), SubqueryAlias (1 input), etc.
         // Safely bails out for nodes that don't pass through extracted
         // columns (Aggregate, Window) via the output schema check.
-        _ => try_push_into_inputs(&pairs, &columns_needed, proj_input.as_ref(), alias_generator),
+        _ => try_push_into_inputs(
+            &pairs,
+            &columns_needed,
+            proj_input.as_ref(),
+            alias_generator,
+        ),
     }
 }
 
@@ -869,10 +876,8 @@ fn try_push_mixed_projection(
     };
 
     // Build recovery projection on top of the pushed result
-    let recovery = LogicalPlan::Projection(Projection::try_new(
-        recovery_exprs,
-        Arc::new(pushed),
-    )?);
+    let recovery =
+        LogicalPlan::Projection(Projection::try_new(recovery_exprs, Arc::new(pushed))?);
 
     Ok(Some(recovery))
 }
