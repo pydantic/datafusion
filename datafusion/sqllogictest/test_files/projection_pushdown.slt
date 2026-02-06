@@ -1524,15 +1524,17 @@ FROM simple_struct
 INNER JOIN join_right ON simple_struct.id = join_right.id;
 ----
 logical_plan
-01)Projection: simple_struct.id, get_field(simple_struct.s, Utf8("label")) AS simple_struct.s[label], get_field(join_right.s, Utf8("role")) AS join_right.s[role]
+01)Projection: simple_struct.id, __datafusion_extracted_1 AS simple_struct.s[label], __datafusion_extracted_2 AS join_right.s[role]
 02)--Inner Join: simple_struct.id = join_right.id
-03)----TableScan: simple_struct projection=[id, s]
-04)----TableScan: join_right projection=[id, s]
+03)----Projection: get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_1, simple_struct.id
+04)------TableScan: simple_struct projection=[id, s]
+05)----Projection: get_field(join_right.s, Utf8("role")) AS __datafusion_extracted_2, join_right.id
+06)------TableScan: join_right projection=[id, s]
 physical_plan
-01)ProjectionExec: expr=[id@0 as id, get_field(s@1, label) as simple_struct.s[label], get_field(s@2, role) as join_right.s[role]]
-02)--HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@0, s@1, s@3]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, s], file_type=parquet
-04)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/join_right.parquet]]}, projection=[id, s], file_type=parquet, predicate=DynamicFilter [ empty ]
+01)ProjectionExec: expr=[id@1 as id, __datafusion_extracted_1@0 as simple_struct.s[label], __datafusion_extracted_2@2 as join_right.s[role]]
+02)--HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@1, id@1)], projection=[__datafusion_extracted_1@0, id@1, __datafusion_extracted_2@2]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, label) as __datafusion_extracted_1, id], file_type=parquet
+04)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/join_right.parquet]]}, projection=[get_field(s@1, role) as __datafusion_extracted_2, id], file_type=parquet, predicate=DynamicFilter [ empty ]
 
 # Verify correctness
 query ITT
@@ -1590,19 +1592,20 @@ FROM simple_struct
 LEFT JOIN join_right ON simple_struct.id = join_right.id AND join_right.s['level'] > 5;
 ----
 logical_plan
-01)Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")) AS simple_struct.s[value], get_field(join_right.s, Utf8("level")) AS join_right.s[level]
+01)Projection: simple_struct.id, __datafusion_extracted_1 AS simple_struct.s[value], __datafusion_extracted_2 AS join_right.s[level]
 02)--Left Join: simple_struct.id = join_right.id
-03)----TableScan: simple_struct projection=[id, s]
-04)----Projection: join_right.id, join_right.s
-05)------Filter: __datafusion_extracted_3 > Int64(5)
-06)--------Projection: get_field(join_right.s, Utf8("level")) AS __datafusion_extracted_3, join_right.id, join_right.s
-07)----------TableScan: join_right projection=[id, s], partial_filters=[get_field(join_right.s, Utf8("level")) > Int64(5)]
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
+04)------TableScan: simple_struct projection=[id, s]
+05)----Projection: join_right.id, __datafusion_extracted_2
+06)------Filter: __datafusion_extracted_3 > Int64(5)
+07)--------Projection: get_field(join_right.s, Utf8("level")) AS __datafusion_extracted_3, join_right.id, get_field(join_right.s, Utf8("level")) AS __datafusion_extracted_2
+08)----------TableScan: join_right projection=[id, s], partial_filters=[get_field(join_right.s, Utf8("level")) > Int64(5)]
 physical_plan
-01)ProjectionExec: expr=[id@0 as id, get_field(s@1, value) as simple_struct.s[value], get_field(s@2, level) as join_right.s[level]]
-02)--HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0)], projection=[id@0, s@1, s@3]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, s], file_type=parquet
-04)----FilterExec: __datafusion_extracted_3@0 > 5, projection=[id@1, s@2]
-05)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/join_right.parquet]]}, projection=[get_field(s@1, level) as __datafusion_extracted_3, id, s], file_type=parquet
+01)ProjectionExec: expr=[id@1 as id, __datafusion_extracted_1@0 as simple_struct.s[value], __datafusion_extracted_2@2 as join_right.s[level]]
+02)--HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@1, id@0)], projection=[__datafusion_extracted_1@0, id@1, __datafusion_extracted_2@3]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet
+04)----FilterExec: __datafusion_extracted_3@0 > 5, projection=[id@1, __datafusion_extracted_2@2]
+05)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/join_right.parquet]]}, projection=[get_field(s@1, level) as __datafusion_extracted_3, id, get_field(s@1, level) as __datafusion_extracted_2], file_type=parquet
 
 # Verify correctness - left join with level > 5 condition
 # Only join_right rows with level > 5 are matched: id=1 (level=10), id=4 (level=8)
