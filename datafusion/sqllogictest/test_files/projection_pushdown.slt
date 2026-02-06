@@ -118,6 +118,24 @@ SELECT id, s['value'] FROM simple_struct ORDER BY id;
 4 300
 5 250
 
+query TT
+EXPLAIN SELECT s['label'] FROM simple_struct;
+----
+logical_plan
+01)Projection: get_field(simple_struct.s, Utf8("label")) AS simple_struct.s[label]
+02)--TableScan: simple_struct projection=[s]
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, label) as simple_struct.s[label]], file_type=parquet
+
+# Verify correctness
+query T
+SELECT s['label'] FROM simple_struct ORDER BY s['label'];
+----
+alpha
+beta
+delta
+epsilon
+gamma
+
 ###
 # Test 2.2: Multiple get_field expressions
 ###
@@ -1260,96 +1278,25 @@ SELECT id FROM simple_struct ORDER BY s['value'];
 query TT
 EXPLAIN SELECT id, s['value'] FROM simple_struct ORDER BY id, s['label'];
 ----
-initial_logical_plan
-01)Projection: simple_struct.id, simple_struct.s[value]
-02)--Sort: simple_struct.id ASC NULLS LAST, get_field(simple_struct.s, Utf8("label")) ASC NULLS LAST
-03)----Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")), simple_struct.s
-04)------TableScan: simple_struct
-logical_plan after resolve_grouping_function SAME TEXT AS ABOVE
-logical_plan after type_coercion SAME TEXT AS ABOVE
-analyzed_logical_plan SAME TEXT AS ABOVE
-logical_plan after rewrite_set_comparison SAME TEXT AS ABOVE
-logical_plan after optimize_unions SAME TEXT AS ABOVE
-logical_plan after simplify_expressions SAME TEXT AS ABOVE
-logical_plan after replace_distinct_aggregate SAME TEXT AS ABOVE
-logical_plan after eliminate_join SAME TEXT AS ABOVE
-logical_plan after decorrelate_predicate_subquery SAME TEXT AS ABOVE
-logical_plan after scalar_subquery_to_join SAME TEXT AS ABOVE
-logical_plan after decorrelate_lateral_join SAME TEXT AS ABOVE
-logical_plan after extract_equijoin_predicate SAME TEXT AS ABOVE
-logical_plan after eliminate_duplicated_expr SAME TEXT AS ABOVE
-logical_plan after eliminate_filter SAME TEXT AS ABOVE
-logical_plan after eliminate_cross_join SAME TEXT AS ABOVE
-logical_plan after eliminate_limit SAME TEXT AS ABOVE
-logical_plan after propagate_empty_relation SAME TEXT AS ABOVE
-logical_plan after filter_null_join_keys SAME TEXT AS ABOVE
-logical_plan after eliminate_outer_join SAME TEXT AS ABOVE
-logical_plan after push_down_limit SAME TEXT AS ABOVE
-logical_plan after push_down_filter SAME TEXT AS ABOVE
-logical_plan after single_distinct_aggregation_to_group_by SAME TEXT AS ABOVE
-logical_plan after eliminate_group_by_constant SAME TEXT AS ABOVE
-logical_plan after common_sub_expression_eliminate SAME TEXT AS ABOVE
-logical_plan after extract_leaf_expressions
-01)Projection: simple_struct.id, simple_struct.s[value]
-02)--Projection: simple_struct.id, simple_struct.s[value], simple_struct.s
-03)----Sort: simple_struct.id ASC NULLS LAST, __datafusion_extracted_1 ASC NULLS LAST
-04)------Projection: get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_1, simple_struct.id, simple_struct.s[value], simple_struct.s
-05)--------Projection: simple_struct.id, __datafusion_extracted_2 AS simple_struct.s[value], simple_struct.s
-06)----------Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_2, simple_struct.id, simple_struct.s
-07)------------TableScan: simple_struct
-logical_plan after push_down_leaf_projections
-01)Projection: simple_struct.id, simple_struct.s[value]
-02)--Projection: simple_struct.id, simple_struct.s[value], simple_struct.s
-03)----Sort: simple_struct.id ASC NULLS LAST, __datafusion_extracted_1 ASC NULLS LAST
-04)------Projection: simple_struct.id, __datafusion_extracted_2 AS simple_struct.s[value], simple_struct.s, get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_1, __datafusion_extracted_2
-05)--------Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_2, simple_struct.id, simple_struct.s
-06)----------TableScan: simple_struct
-logical_plan after optimize_projections
+logical_plan
 01)Projection: simple_struct.id, simple_struct.s[value]
 02)--Sort: simple_struct.id ASC NULLS LAST, __datafusion_extracted_1 ASC NULLS LAST
 03)----Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")) AS simple_struct.s[value], get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_1
 04)------TableScan: simple_struct projection=[id, s]
-logical_plan after rewrite_set_comparison SAME TEXT AS ABOVE
-logical_plan after optimize_unions SAME TEXT AS ABOVE
-logical_plan after simplify_expressions SAME TEXT AS ABOVE
-logical_plan after replace_distinct_aggregate SAME TEXT AS ABOVE
-logical_plan after eliminate_join SAME TEXT AS ABOVE
-logical_plan after decorrelate_predicate_subquery SAME TEXT AS ABOVE
-logical_plan after scalar_subquery_to_join SAME TEXT AS ABOVE
-logical_plan after decorrelate_lateral_join SAME TEXT AS ABOVE
-logical_plan after extract_equijoin_predicate SAME TEXT AS ABOVE
-logical_plan after eliminate_duplicated_expr SAME TEXT AS ABOVE
-logical_plan after eliminate_filter SAME TEXT AS ABOVE
-logical_plan after eliminate_cross_join SAME TEXT AS ABOVE
-logical_plan after eliminate_limit SAME TEXT AS ABOVE
-logical_plan after propagate_empty_relation SAME TEXT AS ABOVE
-logical_plan after filter_null_join_keys SAME TEXT AS ABOVE
-logical_plan after eliminate_outer_join SAME TEXT AS ABOVE
-logical_plan after push_down_limit SAME TEXT AS ABOVE
-logical_plan after push_down_filter SAME TEXT AS ABOVE
-logical_plan after single_distinct_aggregation_to_group_by SAME TEXT AS ABOVE
-logical_plan after eliminate_group_by_constant SAME TEXT AS ABOVE
-logical_plan after common_sub_expression_eliminate SAME TEXT AS ABOVE
-logical_plan after extract_leaf_expressions
-01)Projection: simple_struct.id, simple_struct.s[value]
-02)--Sort: simple_struct.id ASC NULLS LAST, __datafusion_extracted_1 ASC NULLS LAST
-03)----Projection: simple_struct.id, __datafusion_extracted_3 AS simple_struct.s[value], get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_1
-04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_3, simple_struct.id, simple_struct.s
-05)--------TableScan: simple_struct projection=[id, s]
-logical_plan after push_down_leaf_projections
-01)Projection: simple_struct.id, simple_struct.s[value]
-02)--Sort: simple_struct.id ASC NULLS LAST, __datafusion_extracted_1 ASC NULLS LAST
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_3, simple_struct.id, simple_struct.s, get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_1
-04)------TableScan: simple_struct projection=[id, s]
-logical_plan after Optimizer rule 'optimize_projections' failed Schema error: No field named "simple_struct.s[value]". Did you mean 'simple_struct.id'?.
+physical_plan
+01)ProjectionExec: expr=[id@0 as id, simple_struct.s[value]@1 as simple_struct.s[value]]
+02)--SortExec: expr=[id@0 ASC NULLS LAST, __datafusion_extracted_1@2 ASC NULLS LAST], preserve_partitioning=[false]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, get_field(s@1, value) as simple_struct.s[value], get_field(s@1, label) as __datafusion_extracted_1], file_type=parquet
 
 # Verify correctness
-query error
+query II
 SELECT id, s['value'] FROM simple_struct ORDER BY id, s['label'];
 ----
-DataFusion error: Optimizer rule 'optimize_projections' failed
-caused by
-Schema error: No field named "simple_struct.s[value]". Did you mean 'simple_struct.id'?.
+1 100
+2 200
+3 150
+4 300
+5 250
 
 
 ###
@@ -1433,17 +1380,262 @@ SELECT id, s['value'] FROM simple_struct ORDER BY id, s['value'];
 5 250
 
 #####################
-# Section 12: Cleanup
+# Section 12: Join Tests - get_field Extraction from Join Nodes
 #####################
 
+# Create a second table for join tests
 statement ok
-DROP TABLE simple_struct;
+COPY (
+    SELECT
+        column1 as id,
+        column2 as s
+    FROM VALUES
+        (1, {role: 'admin', level: 10}),
+        (2, {role: 'user', level: 5}),
+        (3, {role: 'guest', level: 1}),
+        (4, {role: 'admin', level: 8}),
+        (5, {role: 'user', level: 3})
+) TO 'test_files/scratch/projection_pushdown/join_right.parquet'
+STORED AS PARQUET;
 
 statement ok
-DROP TABLE nested_struct;
+CREATE EXTERNAL TABLE join_right STORED AS PARQUET
+LOCATION 'test_files/scratch/projection_pushdown/join_right.parquet';
 
-statement ok
-DROP TABLE nullable_struct;
+###
+# Test 12.1: Join with get_field in equijoin condition
+# Tests extraction from join ON clause - get_field on each side routed appropriately
+###
 
+query TT
+EXPLAIN SELECT simple_struct.id, join_right.id
+FROM simple_struct
+INNER JOIN join_right ON simple_struct.s['value'] = join_right.s['level'] * 10;
+----
+logical_plan
+01)Projection: simple_struct.id, join_right.id
+02)--Inner Join: __datafusion_extracted_1 = __datafusion_extracted_2 * Int64(10)
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
+04)------TableScan: simple_struct projection=[id, s]
+05)----Projection: get_field(join_right.s, Utf8("level")) AS __datafusion_extracted_2, join_right.id
+06)------TableScan: join_right projection=[id, s]
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(__datafusion_extracted_1@0, __datafusion_extracted_2 * Int64(10)@2)], projection=[id@1, id@3]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet
+03)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/join_right.parquet]]}, projection=[get_field(s@1, level) as __datafusion_extracted_2, id, get_field(s@1, level) * 10 as __datafusion_extracted_2 * Int64(10)], file_type=parquet
+
+# Verify correctness - value = level * 10
+# simple_struct: (1,100), (2,200), (3,150), (4,300), (5,250)
+# join_right: (1,10), (2,5), (3,1), (4,8), (5,3)
+# Matches: simple_struct.value=100 matches join_right.level*10=100 (level=10, id=1)
+query II
+SELECT simple_struct.id, join_right.id
+FROM simple_struct
+INNER JOIN join_right ON simple_struct.s['value'] = join_right.s['level'] * 10
+ORDER BY simple_struct.id;
+----
+1 1
+
+###
+# Test 12.2: Join with get_field in non-equi filter
+# Tests extraction from join filter expression - left side only
+###
+
+query TT
+EXPLAIN SELECT simple_struct.id, join_right.id
+FROM simple_struct
+INNER JOIN join_right ON simple_struct.id = join_right.id
+WHERE simple_struct.s['value'] > 150;
+----
+logical_plan
+01)Inner Join: simple_struct.id = join_right.id
+02)--Projection: simple_struct.id
+03)----Filter: __datafusion_extracted_1 > Int64(150)
+04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
+05)--------TableScan: simple_struct projection=[id, s], partial_filters=[get_field(simple_struct.s, Utf8("value")) > Int64(150)]
+06)--TableScan: join_right projection=[id]
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)]
+02)--FilterExec: __datafusion_extracted_1@0 > 150, projection=[id@1]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet
+04)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/join_right.parquet]]}, projection=[id], file_type=parquet, predicate=DynamicFilter [ empty ]
+
+# Verify correctness - id matches and value > 150
+query II
+SELECT simple_struct.id, join_right.id
+FROM simple_struct
+INNER JOIN join_right ON simple_struct.id = join_right.id
+WHERE simple_struct.s['value'] > 150
+ORDER BY simple_struct.id;
+----
+2 2
+4 4
+5 5
+
+###
+# Test 12.3: Join with get_field from both sides in filter
+# Tests extraction routing to both left and right inputs
+###
+
+query TT
+EXPLAIN SELECT simple_struct.id, join_right.id
+FROM simple_struct
+INNER JOIN join_right ON simple_struct.id = join_right.id
+WHERE simple_struct.s['value'] > 100 AND join_right.s['level'] > 3;
+----
+logical_plan
+01)Inner Join: simple_struct.id = join_right.id
+02)--Projection: simple_struct.id
+03)----Filter: __datafusion_extracted_1 > Int64(100)
+04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
+05)--------TableScan: simple_struct projection=[id, s], partial_filters=[get_field(simple_struct.s, Utf8("value")) > Int64(100)]
+06)--Projection: join_right.id
+07)----Filter: __datafusion_extracted_2 > Int64(3)
+08)------Projection: get_field(join_right.s, Utf8("level")) AS __datafusion_extracted_2, join_right.id
+09)--------TableScan: join_right projection=[id, s], partial_filters=[get_field(join_right.s, Utf8("level")) > Int64(3)]
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)]
+02)--FilterExec: __datafusion_extracted_1@0 > 100, projection=[id@1]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet
+04)--FilterExec: __datafusion_extracted_2@0 > 3, projection=[id@1]
+05)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/join_right.parquet]]}, projection=[get_field(s@1, level) as __datafusion_extracted_2, id], file_type=parquet
+
+# Verify correctness - id matches, value > 100, and level > 3
+# Matching ids where value > 100: 2(200), 3(150), 4(300), 5(250)
+# Of those, level > 3: 2(5), 4(8), 5(3) -> only 2 and 4
+query II
+SELECT simple_struct.id, join_right.id
+FROM simple_struct
+INNER JOIN join_right ON simple_struct.id = join_right.id
+WHERE simple_struct.s['value'] > 100 AND join_right.s['level'] > 3
+ORDER BY simple_struct.id;
+----
+2 2
+4 4
+
+###
+# Test 12.4: Join with get_field in SELECT projection
+# Tests that get_field in output columns pushes down through the join
+###
+
+query TT
+EXPLAIN SELECT simple_struct.id, simple_struct.s['label'], join_right.s['role']
+FROM simple_struct
+INNER JOIN join_right ON simple_struct.id = join_right.id;
+----
+logical_plan
+01)Projection: simple_struct.id, get_field(simple_struct.s, Utf8("label")) AS simple_struct.s[label], get_field(join_right.s, Utf8("role")) AS join_right.s[role]
+02)--Inner Join: simple_struct.id = join_right.id
+03)----TableScan: simple_struct projection=[id, s]
+04)----TableScan: join_right projection=[id, s]
+physical_plan
+01)ProjectionExec: expr=[id@0 as id, get_field(s@1, label) as simple_struct.s[label], get_field(s@2, role) as join_right.s[role]]
+02)--HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@0, s@1, s@3]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, s], file_type=parquet
+04)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/join_right.parquet]]}, projection=[id, s], file_type=parquet, predicate=DynamicFilter [ empty ]
+
+# Verify correctness
+query ITT
+SELECT simple_struct.id, simple_struct.s['label'], join_right.s['role']
+FROM simple_struct
+INNER JOIN join_right ON simple_struct.id = join_right.id
+ORDER BY simple_struct.id;
+----
+1 alpha admin
+2 beta user
+3 gamma guest
+4 delta admin
+5 epsilon user
+
+###
+# Test 12.5: Join without get_field (baseline - no extraction needed)
+# Verifies no unnecessary projections are added when there's nothing to extract
+###
+
+query TT
+EXPLAIN SELECT simple_struct.id, join_right.id
+FROM simple_struct
+INNER JOIN join_right ON simple_struct.id = join_right.id;
+----
+logical_plan
+01)Inner Join: simple_struct.id = join_right.id
+02)--TableScan: simple_struct projection=[id]
+03)--TableScan: join_right projection=[id]
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id], file_type=parquet
+03)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/join_right.parquet]]}, projection=[id], file_type=parquet, predicate=DynamicFilter [ empty ]
+
+# Verify correctness
+query II
+SELECT simple_struct.id, join_right.id
+FROM simple_struct
+INNER JOIN join_right ON simple_struct.id = join_right.id
+ORDER BY simple_struct.id;
+----
+1 1
+2 2
+3 3
+4 4
+5 5
+
+###
+# Test 12.6: Left Join with get_field extraction
+# Tests extraction works correctly with outer joins
+###
+
+query TT
+EXPLAIN SELECT simple_struct.id, simple_struct.s['value'], join_right.s['level']
+FROM simple_struct
+LEFT JOIN join_right ON simple_struct.id = join_right.id AND join_right.s['level'] > 5;
+----
+logical_plan
+01)Projection: simple_struct.id, get_field(simple_struct.s, Utf8("value")) AS simple_struct.s[value], get_field(join_right.s, Utf8("level")) AS join_right.s[level]
+02)--Left Join: simple_struct.id = join_right.id
+03)----TableScan: simple_struct projection=[id, s]
+04)----Projection: join_right.id, join_right.s
+05)------Filter: __datafusion_extracted_3 > Int64(5)
+06)--------Projection: get_field(join_right.s, Utf8("level")) AS __datafusion_extracted_3, join_right.id, join_right.s
+07)----------TableScan: join_right projection=[id, s], partial_filters=[get_field(join_right.s, Utf8("level")) > Int64(5)]
+physical_plan
+01)ProjectionExec: expr=[id@0 as id, get_field(s@1, value) as simple_struct.s[value], get_field(s@2, level) as join_right.s[level]]
+02)--HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0)], projection=[id@0, s@1, s@3]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[id, s], file_type=parquet
+04)----FilterExec: __datafusion_extracted_3@0 > 5, projection=[id@1, s@2]
+05)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/join_right.parquet]]}, projection=[get_field(s@1, level) as __datafusion_extracted_3, id, s], file_type=parquet
+
+# Verify correctness - left join with level > 5 condition
+# Only join_right rows with level > 5 are matched: id=1 (level=10), id=4 (level=8)
+query III
+SELECT simple_struct.id, simple_struct.s['value'], join_right.s['level']
+FROM simple_struct
+LEFT JOIN join_right ON simple_struct.id = join_right.id AND join_right.s['level'] > 5
+ORDER BY simple_struct.id;
+----
+1 100 10
+2 200 NULL
+3 150 NULL
+4 300 8
+5 250 NULL
+
+#####################
+# Section 13: RepartitionExec tests
+#####################
+
+# Set target partitions to 32 -> this forces a RepartitionExec
 statement ok
-DROP TABLE multi_struct;
+SET datafusion.execution.target_partitions = 32;
+
+query TT
+EXPLAIN SELECT s['value'] FROM simple_struct WHERE id > 2;
+----
+logical_plan
+01)Projection: __datafusion_extracted_1 AS simple_struct.s[value]
+02)--Filter: simple_struct.id > Int64(2)
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, simple_struct.id
+04)------TableScan: simple_struct projection=[id, s], partial_filters=[simple_struct.id > Int64(2)]
+physical_plan
+01)ProjectionExec: expr=[__datafusion_extracted_1@0 as simple_struct.s[value]]
+02)--FilterExec: id@1 > 2, projection=[__datafusion_extracted_1@0]
+03)----RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1
+04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id], file_type=parquet, predicate=id@0 > 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 > 2, required_guarantees=[]

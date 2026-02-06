@@ -727,8 +727,14 @@ fn try_push_input(input: &LogicalPlan) -> Result<Option<LogicalPlan>> {
                 LogicalPlan::Projection(extraction),
             )?))
         }
-        // Merge into existing projection, then try to push the result further down
-        LogicalPlan::Projection(_) => {
+        // Merge into existing projection, then try to push the result further down.
+        // Only merge when all outer expressions are captured (pairs + columns).
+        // Uncaptured expressions (e.g. `col AS __common_expr_1`) would be lost
+        // during the merge since build_extraction_projection_impl only knows
+        // about the captured pairs and columns.
+        LogicalPlan::Projection(_)
+            if pairs.len() + columns_needed.len() == proj.expr.len() =>
+        {
             let target_schema = Arc::clone(proj_input.schema());
             let merged = build_extraction_projection_impl(
                 &pairs,
