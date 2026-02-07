@@ -867,8 +867,8 @@ EXPLAIN SELECT id, s['value'], s['value'] + 10, s['label'] FROM simple_struct OR
 ----
 logical_plan
 01)Sort: simple_struct.id ASC NULLS LAST, fetch=3
-02)--Projection: simple_struct.id, __datafusion_extracted_7 AS simple_struct.s[value], __datafusion_extracted_7 + Int64(10) AS simple_struct.s[value] + Int64(10), get_field(simple_struct.s, Utf8("label")) AS simple_struct.s[label]
-03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_7, simple_struct.id, simple_struct.s
+02)--Projection: simple_struct.id, __datafusion_extracted_6 AS simple_struct.s[value], __datafusion_extracted_6 + Int64(10) AS simple_struct.s[value] + Int64(10), __datafusion_extracted_5 AS simple_struct.s[label]
+03)----Projection: get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_5, get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_6, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s]
 physical_plan
 01)SortExec: TopK(fetch=3), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
@@ -1598,14 +1598,14 @@ logical_plan
 04)------TableScan: simple_struct projection=[id, s]
 05)----Projection: join_right.id, __datafusion_extracted_3
 06)------Filter: __datafusion_extracted_1 > Int64(5)
-07)--------Projection: join_right.id, get_field(join_right.s, Utf8("level")) AS __datafusion_extracted_1, get_field(join_right.s, Utf8("level")) AS __datafusion_extracted_3
+07)--------Projection: get_field(join_right.s, Utf8("level")) AS __datafusion_extracted_1, join_right.id, get_field(join_right.s, Utf8("level")) AS __datafusion_extracted_3
 08)----------TableScan: join_right projection=[id, s], partial_filters=[get_field(join_right.s, Utf8("level")) > Int64(5)]
 physical_plan
 01)ProjectionExec: expr=[id@1 as id, __datafusion_extracted_2@0 as simple_struct.s[value], __datafusion_extracted_3@2 as join_right.s[level]]
 02)--HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@1, id@0)], projection=[__datafusion_extracted_2@0, id@1, __datafusion_extracted_3@3]
 03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/simple.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_2, id], file_type=parquet
-04)----FilterExec: __datafusion_extracted_1@1 > 5, projection=[id@0, __datafusion_extracted_3@2]
-05)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/join_right.parquet]]}, projection=[id, get_field(s@1, level) as __datafusion_extracted_1, get_field(s@1, level) as __datafusion_extracted_3], file_type=parquet
+04)----FilterExec: __datafusion_extracted_1@0 > 5, projection=[id@1, __datafusion_extracted_3@2]
+05)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/join_right.parquet]]}, projection=[get_field(s@1, level) as __datafusion_extracted_1, id, get_field(s@1, level) as __datafusion_extracted_3], file_type=parquet
 
 # Verify correctness - left join with level > 5 condition
 # Only join_right rows with level > 5 are matched: id=1 (level=10), id=4 (level=8)
