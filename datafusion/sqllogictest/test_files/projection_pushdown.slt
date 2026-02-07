@@ -868,7 +868,7 @@ EXPLAIN SELECT id, s['value'], s['value'] + 10, s['label'] FROM simple_struct OR
 logical_plan
 01)Sort: simple_struct.id ASC NULLS LAST, fetch=3
 02)--Projection: simple_struct.id, __datafusion_extracted_6 AS simple_struct.s[value], __datafusion_extracted_6 + Int64(10) AS simple_struct.s[value] + Int64(10), __datafusion_extracted_5 AS simple_struct.s[label]
-03)----Projection: get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_5, get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_6, simple_struct.id
+03)----Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_6, get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_5, simple_struct.id
 04)------TableScan: simple_struct projection=[id, s]
 physical_plan
 01)SortExec: TopK(fetch=3), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]

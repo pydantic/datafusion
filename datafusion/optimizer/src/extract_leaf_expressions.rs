@@ -657,14 +657,18 @@ fn split_and_push_projection(
     // ── Phase 1: Split ──────────────────────────────────────────────────
     // For each projection expression, collect extraction pairs and build
     // recovery expressions.
+    //
+    // Pre-existing `__extracted` aliases are inserted into the extractor's
+    // `IndexMap` with the **full** `Expr::Alias(…)` as the key, so the
+    // alias name participates in equality. This prevents collisions when
+    // CSE rewrites produce the same inner expression under different alias
+    // names (e.g. `__common_expr_4 AS __extracted_1` and
+    // `__common_expr_4 AS __extracted_3`). New extractions from
+    // `routing_extract` use bare (non-Alias) keys and get normal dedup.
+    //
+    // When building the final `extraction_pairs`, the Alias wrapper is
+    // stripped so consumers see the usual `(inner_expr, alias_name)` tuples.
 
-    // Pre-existing __extracted alias pairs. Kept in a Vec (not the extractor's
-    // IndexMap) because the same inner expression may appear under multiple
-    // alias names (e.g. after CSE rewrites), and the IndexMap would deduplicate them.
-    let mut preexisting_pairs: Vec<(Expr, String)> = Vec::new();
-
-    // Extractor for new extractions via routing_extract.
-    // Also tracks columns_needed for both pre-existing and new entries.
     let mut extractors = vec![LeafExpressionExtractor::new(
         input_schema.as_ref(),
         alias_generator,
@@ -680,16 +684,17 @@ fn split_and_push_projection(
         if let Expr::Alias(alias) = expr
             && alias.name.starts_with(EXTRACTED_EXPR_PREFIX)
         {
-            // Pre-existing __extracted aliases: track columns in the extractor
-            // but keep the pair in a separate Vec to avoid dedup.
-            let inner = *alias.expr.clone();
+            // Insert the full Alias expression as the key so that
+            // distinct alias names don't collide in the IndexMap.
             let alias_name = alias.name.clone();
 
-            for col_ref in inner.column_refs() {
+            for col_ref in alias.expr.column_refs() {
                 extractors[0].columns_needed.insert(col_ref.clone());
             }
 
-            preexisting_pairs.push((inner, alias_name.clone()));
+            extractors[0]
+                .extracted
+                .insert(expr.clone(), alias_name.clone());
             recovery_exprs.push(Expr::Column(Column::new_unqualified(&alias_name)));
         } else if let Expr::Column(col) = expr {
             // Plain column pass-through — track it in the extractor
@@ -733,12 +738,17 @@ fn split_and_push_projection(
         }
     }
 
-    // Combine pre-existing pairs with newly extracted pairs.
+    // Build extraction_pairs, stripping the Alias wrapper from pre-existing
+    // entries (they used the full Alias as the map key to avoid dedup).
     let extractor = &extractors[0];
-    let mut extraction_pairs: Vec<(Expr, String)> = preexisting_pairs;
-    for (e, a) in extractor.extracted.iter() {
-        extraction_pairs.push((e.clone(), a.clone()));
-    }
+    let extraction_pairs: Vec<(Expr, String)> = extractor
+        .extracted
+        .iter()
+        .map(|(e, a)| match e {
+            Expr::Alias(alias) => (*alias.expr.clone(), a.clone()),
+            _ => (e.clone(), a.clone()),
+        })
+        .collect();
     let columns_needed = &extractor.columns_needed;
 
     // If no extractions found, nothing to do
