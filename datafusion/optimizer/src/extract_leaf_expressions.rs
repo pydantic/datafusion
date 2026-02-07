@@ -873,9 +873,42 @@ fn try_push_into_inputs(
     let mut per_input_columns: Vec<IndexSet<Column>> = vec![IndexSet::new(); num_inputs];
 
     if broadcast {
-        for idx in 0..num_inputs {
-            per_input_pairs[idx] = pairs.to_vec();
-            per_input_columns[idx] = columns_needed.clone();
+        // Union output schema and each input schema have the same fields by
+        // index but may differ in qualifiers (e.g. output `s` vs input
+        // `simple_struct.s`). Remap pairs/columns to each input's space.
+        let union_schema = node.schema();
+        for (idx, input_schema) in input_schemas.iter().enumerate() {
+            let mut remap = HashMap::new();
+            for ((out_q, out_f), (in_q, in_f)) in
+                union_schema.iter().zip(input_schema.iter())
+            {
+                remap.insert(
+                    qualified_name(out_q, out_f.name()),
+                    Expr::Column(Column::new(in_q.cloned(), in_f.name())),
+                );
+            }
+            per_input_pairs[idx] = pairs
+                .iter()
+                .map(|(expr, alias)| {
+                    Ok((
+                        replace_cols_by_name(expr.clone(), &remap)?,
+                        alias.clone(),
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            per_input_columns[idx] = columns_needed
+                .iter()
+                .filter_map(|col| {
+                    let rewritten =
+                        replace_cols_by_name(Expr::Column(col.clone()), &remap)
+                            .ok()?;
+                    if let Expr::Column(c) = rewritten {
+                        Some(c)
+                    } else {
+                        Some(col.clone())
+                    }
+                })
+                .collect();
         }
     } else {
         for (expr, alias) in pairs {
