@@ -142,24 +142,20 @@ fn extract_from_plan(
         routing_extract(expr, &mut extractors, &input_column_sets)
     })?;
 
-    // Check if any extractor has extractions
-    let any_extracted = extractors.iter().any(|e| e.has_extractions());
-    if !any_extracted {
-        assert!(!transformed.transformed);
+    // If no expressions were rewritten, nothing was extracted
+    if !transformed.transformed {
         return Ok(transformed);
     }
 
-    // Build per-input extraction projections
+    // Build per-input extraction projections (None means no extractions for that input)
     let new_inputs: Vec<LogicalPlan> = owned_inputs
         .iter()
         .zip(extractors.iter())
         .map(|(input, extractor)| {
-            if extractor.has_extractions() {
-                let input_arc = Arc::new(input.clone());
-                extractor.build_extraction_projection(&input_arc)
-            } else {
-                Ok(input.clone())
-            }
+            let input_arc = Arc::new(input.clone());
+            Ok(extractor
+                .build_extraction_projection(&input_arc)?
+                .unwrap_or_else(|| input.clone()))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -360,18 +356,18 @@ impl<'a> LeafExpressionExtractor<'a> {
         Ok(Expr::Column(Column::new_unqualified(&alias)))
     }
 
-    fn has_extractions(&self) -> bool {
-        !self.extracted.is_empty()
-    }
-
     /// Builds a fresh extraction projection above the given input.
     ///
-    /// Creates a new projection that includes extracted expressions (aliased)
-    /// plus all input schema columns for pass-through.
+    /// Returns `None` if there are no extractions. Otherwise creates a new
+    /// projection that includes extracted expressions (aliased) plus all
+    /// input schema columns for pass-through.
     fn build_extraction_projection(
         &self,
         input: &Arc<LogicalPlan>,
-    ) -> Result<LogicalPlan> {
+    ) -> Result<Option<LogicalPlan>> {
+        if self.extracted.is_empty() {
+            return Ok(None);
+        }
         let mut proj_exprs = Vec::new();
         for (expr, alias) in self.extracted.iter() {
             proj_exprs.push(expr.clone().alias(alias));
@@ -379,10 +375,10 @@ impl<'a> LeafExpressionExtractor<'a> {
         for (qualifier, field) in self.input_schema.iter() {
             proj_exprs.push(Expr::from((qualifier, field)));
         }
-        Ok(LogicalPlan::Projection(Projection::try_new(
+        Ok(Some(LogicalPlan::Projection(Projection::try_new(
             proj_exprs,
             Arc::clone(input),
-        )?))
+        )?)))
     }
 }
 
@@ -684,7 +680,7 @@ fn split_and_push_projection(
             // Build the extraction projection in-place (not pushed) using
             // ALL pairs (manual + extractor) so the recovery can resolve
             // both __extracted aliases and newly extracted expressions.
-            if !extractor.has_extractions() {
+            if extractor.extracted.is_empty() {
                 // Only manual pairs (all __extracted + columns) but push failed.
                 // The original projection is already an extraction projection,
                 // and we couldn't push it further. Return None.
