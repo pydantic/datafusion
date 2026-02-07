@@ -658,11 +658,13 @@ fn split_and_push_projection(
     // For each projection expression, collect extraction pairs and build
     // recovery expressions.
 
-    // Manual pairs/columns from __extracted aliases (pre-handled before routing_extract)
-    let mut manual_pairs: Vec<(Expr, String)> = Vec::new();
-    let mut manual_columns: IndexSet<Column> = IndexSet::new();
+    // Pre-existing __extracted alias pairs. Kept in a Vec (not the extractor's
+    // IndexMap) because the same inner expression may appear under multiple
+    // alias names (e.g. after CSE rewrites), and the IndexMap would deduplicate them.
+    let mut preexisting_pairs: Vec<(Expr, String)> = Vec::new();
 
-    // Extractor for everything else (via routing_extract)
+    // Extractor for new extractions via routing_extract.
+    // Also tracks columns_needed for both pre-existing and new entries.
     let mut extractors = vec![LeafExpressionExtractor::new(
         input_schema.as_ref(),
         alias_generator,
@@ -672,31 +674,34 @@ fn split_and_push_projection(
     let original_schema = proj.schema.as_ref();
     let mut recovery_exprs: Vec<Expr> = Vec::with_capacity(proj.expr.len());
     let mut needs_recovery = false;
+    let mut has_new_extractions = false;
 
     for (expr, (qualifier, field)) in proj.expr.iter().zip(original_schema.iter()) {
         if let Expr::Alias(alias) = expr
             && alias.name.starts_with(EXTRACTED_EXPR_PREFIX)
         {
-            // Pre-handle __extracted aliases: add inner expr to manual pairs,
-            // recovery just references the extracted alias as a column.
+            // Pre-existing __extracted aliases: track columns in the extractor
+            // but keep the pair in a separate Vec to avoid dedup.
             let inner = *alias.expr.clone();
             let alias_name = alias.name.clone();
 
-            // Track columns referenced by the inner expression
             for col_ref in inner.column_refs() {
-                manual_columns.insert(col_ref.clone());
+                extractors[0].columns_needed.insert(col_ref.clone());
             }
 
-            manual_pairs.push((inner, alias_name.clone()));
+            preexisting_pairs.push((inner, alias_name.clone()));
             recovery_exprs.push(Expr::Column(Column::new_unqualified(&alias_name)));
         } else if let Expr::Column(col) = expr {
-            // Plain column pass-through — track it and use as-is for recovery
-            manual_columns.insert(col.clone());
+            // Plain column pass-through — track it in the extractor
+            extractors[0].columns_needed.insert(col.clone());
             recovery_exprs.push(expr.clone());
         } else {
             // Everything else: run through routing_extract
             let transformed =
                 routing_extract(expr.clone(), &mut extractors, &input_column_sets)?;
+            if transformed.transformed {
+                has_new_extractions = true;
+            }
             let transformed_expr = transformed.data;
 
             // Build recovery expression, aliasing back to original name if needed
@@ -728,17 +733,13 @@ fn split_and_push_projection(
         }
     }
 
-    // Merge manual pairs/columns with extractor's pairs/columns
+    // Combine pre-existing pairs with newly extracted pairs.
     let extractor = &extractors[0];
-    let mut extraction_pairs: Vec<(Expr, String)> = manual_pairs;
-    let mut columns_needed: IndexSet<Column> = manual_columns;
-
-    for (expr, alias) in extractor.extracted.iter() {
-        extraction_pairs.push((expr.clone(), alias.clone()));
+    let mut extraction_pairs: Vec<(Expr, String)> = preexisting_pairs;
+    for (e, a) in extractor.extracted.iter() {
+        extraction_pairs.push((e.clone(), a.clone()));
     }
-    for col in &extractor.columns_needed {
-        columns_needed.insert(col.clone());
-    }
+    let columns_needed = &extractor.columns_needed;
 
     // If no extractions found, nothing to do
     if extraction_pairs.is_empty() {
@@ -749,7 +750,7 @@ fn split_and_push_projection(
     let proj_input = Arc::clone(&proj.input);
     let pushed = push_extraction_pairs(
         &extraction_pairs,
-        &columns_needed,
+        columns_needed,
         proj,
         &proj_input,
         alias_generator,
@@ -771,19 +772,19 @@ fn split_and_push_projection(
         }
         (None, true) => {
             // Push returned None but we still have extractions to apply.
-            // Build the extraction projection in-place (not pushed) using
-            // ALL extraction_pairs (manual + extractor) so the recovery can
-            // resolve both __extracted aliases and newly extracted expressions.
-            if extractor.extracted.is_empty() {
-                // Only manual pairs (all __extracted + columns) but push failed.
-                // The original projection is already an extraction projection,
-                // and we couldn't push it further. Return None.
+            // Build the extraction projection in-place (not pushed) so the
+            // recovery can resolve extracted expressions.
+            if !has_new_extractions {
+                // Only pre-existing __extracted aliases and columns, no new
+                // extractions from routing_extract. The original projection is
+                // already an extraction projection that couldn't be pushed
+                // further. Return None.
                 return Ok(None);
             }
             let input_arc = Arc::clone(input);
             let extraction = build_extraction_projection_impl(
                 &extraction_pairs,
-                &columns_needed,
+                columns_needed,
                 &input_arc,
                 input_schema.as_ref(),
             )?;
@@ -2589,6 +2590,206 @@ mod tests {
             Filter: __datafusion_extracted_1 = Utf8("a") AND __datafusion_extracted_2 = Utf8("b")
               Projection: mock_leaf(test.user, Utf8("field")) AS __datafusion_extracted_1, mock_leaf(test.user, Utf8("field")) AS __datafusion_extracted_2, test.id, test.user
                 TableScan: test projection=[id, user]
+        "#)
+    }
+
+    // =========================================================================
+    // Filter pushdown interaction tests
+    // =========================================================================
+
+    /// Extraction pushdown through a filter that already had its own
+    /// `mock_leaf` extracted.
+    ///
+    /// The projection above the filter has a `mock_leaf` extraction and a
+    /// plain column.  The filter's predicate was already extracted by
+    /// `extract_from_plan` in a previous pass, producing its own
+    /// `__extracted` alias for the same expression.  The push-down must
+    /// merge both extractions into the same leaf projection.
+    ///
+    /// Reproduces the scenario:
+    ///   Projection: mock_leaf(user, "name") [pushed extraction]
+    ///     Filter: mock_leaf(user, "status") = 'active' [already extracted]
+    ///       TableScan
+    #[test]
+    fn test_extraction_pushdown_through_filter_with_extracted_predicate() -> Result<()> {
+        let table_scan = test_table_scan_with_struct()?;
+        // Filter uses mock_leaf(user, "status"), projection uses mock_leaf(user, "name")
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .filter(mock_leaf(col("user"), "status").eq(lit("active")))?
+            .project(vec![col("id"), mock_leaf(col("user"), "name")])?
+            .build()?;
+
+        assert_original_plan!(plan, @r#"
+        Projection: test.id, mock_leaf(test.user, Utf8("name"))
+          Filter: mock_leaf(test.user, Utf8("status")) = Utf8("active")
+            TableScan: test projection=[id, user]
+        "#)?;
+
+        assert_after_extract!(plan, @r#"
+        Projection: test.id, mock_leaf(test.user, Utf8("name"))
+          Projection: test.id, test.user
+            Filter: __datafusion_extracted_1 = Utf8("active")
+              Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, test.id, test.user
+                TableScan: test projection=[id, user]
+        "#)?;
+
+        // Projection extraction for mock_leaf(user, "name") must push
+        // through the filter and merge with the existing extraction
+        // projection that has __extracted_1.
+        assert_optimized!(plan, @r#"
+        Projection: test.id, __datafusion_extracted_2 AS mock_leaf(test.user,Utf8("name"))
+          Filter: __datafusion_extracted_1 = Utf8("active")
+            Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, test.id, mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_2
+              TableScan: test projection=[id, user]
+        "#)
+    }
+
+    /// Same expression in filter predicate and projection output.
+    ///
+    /// Both the filter and the projection reference the exact same
+    /// `mock_leaf(user, "status")`.  After filter extraction creates
+    /// `__extracted_1`, the projection pushdown must handle the duplicate
+    /// correctly—either reusing the alias or creating a second one.
+    #[test]
+    fn test_extraction_pushdown_same_expr_in_filter_and_projection() -> Result<()> {
+        let table_scan = test_table_scan_with_struct()?;
+        let field_expr = mock_leaf(col("user"), "status");
+        // Filter and projection use the SAME expression
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .filter(field_expr.clone().gt(lit(5)))?
+            .project(vec![col("id"), field_expr])?
+            .build()?;
+
+        assert_original_plan!(plan, @r#"
+        Projection: test.id, mock_leaf(test.user, Utf8("status"))
+          Filter: mock_leaf(test.user, Utf8("status")) > Int32(5)
+            TableScan: test projection=[id, user]
+        "#)?;
+
+        assert_after_extract!(plan, @r#"
+        Projection: test.id, mock_leaf(test.user, Utf8("status"))
+          Projection: test.id, test.user
+            Filter: __datafusion_extracted_1 > Int32(5)
+              Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, test.id, test.user
+                TableScan: test projection=[id, user]
+        "#)?;
+
+        // The projection extraction should merge with the filter's
+        // extraction. Since it's the same expression, it may reuse the
+        // existing alias or create a second one—but the plan must be valid.
+        assert_optimized!(plan, @r#"
+        Projection: test.id, __datafusion_extracted_2 AS mock_leaf(test.user,Utf8("status"))
+          Filter: __datafusion_extracted_1 > Int32(5)
+            Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, test.id, mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_2
+              TableScan: test projection=[id, user]
+        "#)
+    }
+
+    /// Left join with a `mock_leaf` filter on the right side AND
+    /// the projection also selects `mock_leaf` from the right side.
+    ///
+    /// The join filter's mock_leaf is extracted by extract_from_plan,
+    /// then the projection's mock_leaf is pushed through the join into
+    /// the right-side extraction projection.
+    #[test]
+    fn test_left_join_with_filter_and_projection_extraction() -> Result<()> {
+        use datafusion_expr::JoinType;
+
+        let left = test_table_scan_with_struct()?;
+        let right = test_table_scan_with_struct_named("right")?;
+
+        // Left join: left.id = right.id AND mock_leaf(right.user, "status") > 5
+        // Projection: left.id, mock_leaf(left.user, "name"), mock_leaf(right.user, "status")
+        let plan = LogicalPlanBuilder::from(left)
+            .join_on(
+                right,
+                JoinType::Left,
+                vec![
+                    col("test.id").eq(col("right.id")),
+                    mock_leaf(col("right.user"), "status").gt(lit(5)),
+                ],
+            )?
+            .project(vec![
+                col("test.id"),
+                mock_leaf(col("test.user"), "name"),
+                mock_leaf(col("right.user"), "status"),
+            ])?
+            .build()?;
+
+        assert_original_plan!(plan, @r#"
+        Projection: test.id, mock_leaf(test.user, Utf8("name")), mock_leaf(right.user, Utf8("status"))
+          Left Join:  Filter: test.id = right.id AND mock_leaf(right.user, Utf8("status")) > Int32(5)
+            TableScan: test projection=[id, user]
+            TableScan: right projection=[id, user]
+        "#)?;
+
+        // After extraction, the join filter's mock_leaf is extracted.
+        // The projection still has bare mock_leaf expressions.
+        assert_after_extract!(plan, @r#"
+        Projection: test.id, mock_leaf(test.user, Utf8("name")), mock_leaf(right.user, Utf8("status"))
+          Projection: test.id, test.user, right.id, right.user
+            Left Join:  Filter: test.id = right.id AND __datafusion_extracted_1 > Int32(5)
+              TableScan: test projection=[id, user]
+              Projection: mock_leaf(right.user, Utf8("status")) AS __datafusion_extracted_1, right.id, right.user
+                TableScan: right projection=[id, user]
+        "#)?;
+
+        // Full pipeline: the join filter extraction and the projection
+        // extraction both end up on the right side's extraction projection.
+        // (Note: the filter condition stays in the join ON clause—there is
+        // no separate Filter node because FilterPushdown is not included
+        // in this test pipeline.)
+        assert_optimized!(plan, @r#"
+        Projection: test.id, __datafusion_extracted_2 AS mock_leaf(test.user,Utf8("name")), __datafusion_extracted_3 AS mock_leaf(right.user,Utf8("status"))
+          Left Join:  Filter: test.id = right.id AND __datafusion_extracted_1 > Int32(5)
+            Projection: mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_2, test.id
+              TableScan: test projection=[id, user]
+            Projection: mock_leaf(right.user, Utf8("status")) AS __datafusion_extracted_1, right.id, mock_leaf(right.user, Utf8("status")) AS __datafusion_extracted_3
+              TableScan: right projection=[id, user]
+        "#)
+    }
+
+    /// Extraction projection (all `__extracted` + columns) pushed through
+    /// a filter whose predicate references a different extracted expression.
+    ///
+    /// Simulates the result after extract_from_plan processes a filter,
+    /// and then split_and_push_projection encounters a pure extraction
+    /// projection above that filter.
+    #[test]
+    fn test_pure_extraction_proj_push_through_filter() -> Result<()> {
+        let table_scan = test_table_scan_with_struct()?;
+        // Build: Filter on mock_leaf(user, "status"), then project
+        // mock_leaf(user, "name") which will create an extraction projection.
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .filter(mock_leaf(col("user"), "status").gt(lit(5)))?
+            .project(vec![
+                col("id"),
+                mock_leaf(col("user"), "name"),
+                mock_leaf(col("user"), "status"),
+            ])?
+            .build()?;
+
+        assert_original_plan!(plan, @r#"
+        Projection: test.id, mock_leaf(test.user, Utf8("name")), mock_leaf(test.user, Utf8("status"))
+          Filter: mock_leaf(test.user, Utf8("status")) > Int32(5)
+            TableScan: test projection=[id, user]
+        "#)?;
+
+        assert_after_extract!(plan, @r#"
+        Projection: test.id, mock_leaf(test.user, Utf8("name")), mock_leaf(test.user, Utf8("status"))
+          Projection: test.id, test.user
+            Filter: __datafusion_extracted_1 > Int32(5)
+              Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, test.id, test.user
+                TableScan: test projection=[id, user]
+        "#)?;
+
+        // The projection must push through the filter and merge with
+        // the existing extraction projection.
+        assert_optimized!(plan, @r#"
+        Projection: test.id, __datafusion_extracted_2 AS mock_leaf(test.user,Utf8("name")), __datafusion_extracted_3 AS mock_leaf(test.user,Utf8("status"))
+          Filter: __datafusion_extracted_1 > Int32(5)
+            Projection: mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_1, test.id, mock_leaf(test.user, Utf8("name")) AS __datafusion_extracted_2, mock_leaf(test.user, Utf8("status")) AS __datafusion_extracted_3
+              TableScan: test projection=[id, user]
         "#)
     }
 }
