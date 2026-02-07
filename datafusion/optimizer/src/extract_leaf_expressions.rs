@@ -321,8 +321,8 @@ fn build_recovery_projection(
 
 /// Extracts `MoveTowardsLeafNodes` sub-expressions from larger expressions.
 struct LeafExpressionExtractor<'a> {
-    /// Extracted expressions: maps schema_name -> (original_expr, alias)
-    extracted: IndexMap<String, (Expr, String)>,
+    /// Extracted expressions: maps expression -> alias
+    extracted: IndexMap<Expr, String>,
     /// Columns needed for pass-through
     columns_needed: IndexSet<Column>,
     /// Input schema
@@ -343,10 +343,8 @@ impl<'a> LeafExpressionExtractor<'a> {
 
     /// Adds an expression to extracted set, returns column reference.
     fn add_extracted(&mut self, expr: Expr) -> Result<Expr> {
-        let schema_name = expr.schema_name().to_string();
-
         // Deduplication: reuse existing alias if same expression
-        if let Some((_, alias)) = self.extracted.get(&schema_name) {
+        if let Some(alias) = self.extracted.get(&expr) {
             return Ok(Expr::Column(Column::new_unqualified(alias)));
         }
 
@@ -357,7 +355,7 @@ impl<'a> LeafExpressionExtractor<'a> {
 
         // Generate unique alias
         let alias = self.alias_generator.next(EXTRACTED_EXPR_PREFIX);
-        self.extracted.insert(schema_name, (expr, alias.clone()));
+        self.extracted.insert(expr, alias.clone());
 
         Ok(Expr::Column(Column::new_unqualified(&alias)))
     }
@@ -375,7 +373,7 @@ impl<'a> LeafExpressionExtractor<'a> {
         input: &Arc<LogicalPlan>,
     ) -> Result<LogicalPlan> {
         let mut proj_exprs = Vec::new();
-        for (expr, alias) in self.extracted.values() {
+        for (expr, alias) in self.extracted.iter() {
             proj_exprs.push(expr.clone().alias(alias));
         }
         for (qualifier, field) in self.input_schema.iter() {
@@ -391,7 +389,7 @@ impl<'a> LeafExpressionExtractor<'a> {
 /// Build an extraction projection above the target node.
 ///
 /// If the target is an existing projection, merges into it (dedup by resolved
-/// schema_name, resolve columns through rename mapping, add pass-through
+/// expression equality, resolve columns through rename mapping, add pass-through
 /// columns_needed). Otherwise builds a fresh projection with extracted
 /// expressions + ALL input schema columns.
 fn build_extraction_projection_impl(
@@ -404,16 +402,15 @@ fn build_extraction_projection_impl(
         // Merge into existing projection
         let mut proj_exprs = existing.expr.clone();
 
-        // Build a map of existing expressions (by schema_name) to their aliases
-        let existing_extractions: IndexMap<String, String> = existing
+        // Build a map of existing expressions (by Expr equality) to their aliases
+        let existing_extractions: IndexMap<Expr, String> = existing
             .expr
             .iter()
             .filter_map(|e| {
                 if let Expr::Alias(alias) = e
                     && alias.name.starts_with(EXTRACTED_EXPR_PREFIX)
                 {
-                    let schema_name = alias.expr.schema_name().to_string();
-                    return Some((schema_name, alias.name.clone()));
+                    return Some((*alias.expr.clone(), alias.name.clone()));
                 }
                 None
             })
@@ -425,13 +422,12 @@ fn build_extraction_projection_impl(
         // Add new extracted expressions, resolving column refs through the projection
         for (expr, alias) in extracted_exprs {
             let resolved = replace_cols_by_name(expr.clone().alias(alias), &replace_map)?;
-            let resolved_schema_name = if let Expr::Alias(a) = &resolved {
-                a.expr.schema_name().to_string()
+            let resolved_inner = if let Expr::Alias(a) = &resolved {
+                a.expr.as_ref()
             } else {
-                resolved.schema_name().to_string()
+                &resolved
             };
-            if let Some(existing_alias) = existing_extractions.get(&resolved_schema_name)
-            {
+            if let Some(existing_alias) = existing_extractions.get(resolved_inner) {
                 // Same expression already extracted under a different alias —
                 // add the expression with the new alias so both names are
                 // available in the output. We can't reference the existing alias
@@ -647,7 +643,7 @@ fn split_and_push_projection(
     let mut pairs: Vec<(Expr, String)> = manual_pairs;
     let mut columns_needed: IndexSet<Column> = manual_columns;
 
-    for (expr, alias) in extractor.extracted.values() {
+    for (expr, alias) in extractor.extracted.iter() {
         pairs.push((expr.clone(), alias.clone()));
     }
     for col in &extractor.columns_needed {
@@ -890,18 +886,14 @@ fn try_push_into_inputs(
             per_input_pairs[idx] = pairs
                 .iter()
                 .map(|(expr, alias)| {
-                    Ok((
-                        replace_cols_by_name(expr.clone(), &remap)?,
-                        alias.clone(),
-                    ))
+                    Ok((replace_cols_by_name(expr.clone(), &remap)?, alias.clone()))
                 })
                 .collect::<Result<_>>()?;
             per_input_columns[idx] = columns_needed
                 .iter()
                 .filter_map(|col| {
                     let rewritten =
-                        replace_cols_by_name(Expr::Column(col.clone()), &remap)
-                            .ok()?;
+                        replace_cols_by_name(Expr::Column(col.clone()), &remap).ok()?;
                     if let Expr::Column(c) = rewritten {
                         Some(c)
                     } else {
@@ -2389,5 +2381,109 @@ mod tests {
         SubqueryAlias: sub
           TableScan: test projection=[a, b]
         ")
+    }
+
+    /// A variant of MockLeafFunc with the same `name()` but a different concrete type.
+    /// Used to verify that deduplication uses `Expr` equality, not `schema_name`.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct MockLeafFuncVariant {
+        signature: Signature,
+    }
+
+    impl MockLeafFuncVariant {
+        fn new() -> Self {
+            Self {
+                signature: Signature::new(
+                    TypeSignature::Any(2),
+                    datafusion_expr::Volatility::Immutable,
+                ),
+            }
+        }
+    }
+
+    impl ScalarUDFImpl for MockLeafFuncVariant {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn name(&self) -> &str {
+            "mock_leaf"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _args: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Utf8)
+        }
+
+        fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            unimplemented!("This is only used for testing optimization")
+        }
+
+        fn placement(&self, args: &[ExpressionPlacement]) -> ExpressionPlacement {
+            match args.first() {
+                Some(ExpressionPlacement::Column)
+                | Some(ExpressionPlacement::MoveTowardsLeafNodes) => {
+                    ExpressionPlacement::MoveTowardsLeafNodes
+                }
+                _ => ExpressionPlacement::KeepInPlace,
+            }
+        }
+    }
+
+    /// Two UDFs with the same `name()` but different concrete types should NOT be
+    /// deduplicated — they are semantically different expressions that happen to
+    /// collide on `schema_name()`. Before the fix (schema_name-based dedup), both
+    /// would collapse into one alias; with Expr-equality dedup they get two aliases.
+    #[test]
+    fn test_different_udfs_same_schema_name_not_deduplicated() -> Result<()> {
+        let udf_a = Arc::new(ScalarUDF::new_from_impl(MockLeafFunc::new()));
+        let udf_b = Arc::new(ScalarUDF::new_from_impl(MockLeafFuncVariant::new()));
+
+        let expr_a = Expr::ScalarFunction(ScalarFunction::new_udf(
+            udf_a,
+            vec![col("user"), lit("field")],
+        ));
+        let expr_b = Expr::ScalarFunction(ScalarFunction::new_udf(
+            udf_b,
+            vec![col("user"), lit("field")],
+        ));
+
+        // Verify preconditions: same schema_name but different Expr
+        assert_eq!(
+            expr_a.schema_name().to_string(),
+            expr_b.schema_name().to_string(),
+            "Both expressions should have the same schema_name"
+        );
+        assert_ne!(
+            expr_a, expr_b,
+            "Expressions should NOT be equal (different UDF instances)"
+        );
+
+        // Use both expressions in a filter so they get extracted.
+        // With schema_name dedup, both would collapse into one alias since
+        // they have the same schema_name. With Expr-equality, each gets
+        // its own extraction alias.
+        let table_scan = test_table_scan_with_struct()?;
+        let plan = LogicalPlanBuilder::from(table_scan.clone())
+            .filter(expr_a.clone().eq(lit("a")).and(expr_b.clone().eq(lit("b"))))?
+            .select(vec![
+                table_scan
+                    .schema()
+                    .index_of_column_by_name(None, "id")
+                    .unwrap(),
+            ])?
+            .build()?;
+
+        // After extraction, both expressions should get separate aliases
+        assert_after_extract!(plan, @r#"
+        Projection: test.id
+          Projection: test.id, test.user
+            Filter: __datafusion_extracted_1 = Utf8("a") AND __datafusion_extracted_2 = Utf8("b")
+              Projection: mock_leaf(test.user, Utf8("field")) AS __datafusion_extracted_1, mock_leaf(test.user, Utf8("field")) AS __datafusion_extracted_2, test.id, test.user
+                TableScan: test projection=[id, user]
+        "#)
     }
 }
