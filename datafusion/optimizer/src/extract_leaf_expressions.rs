@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Two-pass optimizer pipeline that pushes cheap expressions (like struct field
+//! access `user['status']`) closer to data sources, enabling early data reduction
+//! and source-level optimizations (e.g., Parquet column pruning). See
+//! [`ExtractLeafExpressions`] (pass 1) and [`PushDownLeafProjections`] (pass 2).
+
 use indexmap::{IndexMap, IndexSet};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,10 +35,24 @@ use crate::push_down_filter::replace_cols_by_name;
 use crate::utils::{EXTRACTED_EXPR_PREFIX, has_all_column_refs};
 use crate::{OptimizerConfig, OptimizerRule};
 
-/// Extracts `MoveTowardsLeafNodes` sub-expressions from non-projection nodes into projections.
+/// Extracts `MoveTowardsLeafNodes` sub-expressions from non-projection nodes
+/// into **extraction projections** (pass 1 of 2).
 ///
-/// This handles Filter, Sort, Limit, Aggregate, and Join nodes. For Projection nodes,
-/// extraction and pushdown are handled by [`PushDownLeafProjections`].
+/// This handles Filter, Sort, Limit, Aggregate, and Join nodes. For Projection
+/// nodes, extraction and pushdown are handled by [`PushDownLeafProjections`].
+///
+/// # Key Concepts
+///
+/// **Extraction projection**: a projection inserted *below* a node that
+/// pre-computes a cheap expression and exposes it under an alias
+/// (`__datafusion_extracted_N`). The parent node then references the alias
+/// instead of the original expression.
+///
+/// **Recovery projection**: a projection inserted *above* a node to restore
+/// the original output schema when extraction changes it.
+/// Schema-preserving nodes (Filter, Sort, Limit) gain extra columns from
+/// the extraction projection that bubble up; the recovery projection selects
+/// only the original columns to hide the extras.
 ///
 /// # Example
 ///
@@ -41,15 +60,18 @@ use crate::{OptimizerConfig, OptimizerRule};
 ///
 /// ```text
 /// Filter: user['status'] = 'active'
-///   TableScan: t [user]
+///   TableScan: t [id, user]
 /// ```
 ///
-/// This rule extracts the field access into a projection:
+/// This rule:
+/// 1. Inserts an **extraction projection** below the filter:
+/// 2. Adds a **recovery projection** above to hide the extra column:
 ///
 /// ```text
-/// Filter: __datafusion_extracted_1 = 'active'
-///   Projection: user['status'] AS __datafusion_extracted_1, user
-///     TableScan: t [user]
+/// Projection: id, user                                                        <-- recovery projection
+///   Filter: __datafusion_extracted_1 = 'active'
+///     Projection: user['status'] AS __datafusion_extracted_1, id, user         <-- extraction projection
+///       TableScan: t [id, user]
 /// ```
 ///
 /// **Important:** The `PushDownFilter` rule is aware of projections created by this rule
@@ -218,6 +240,11 @@ fn routing_extract(
                 }
             }
             ExpressionPlacement::Column => {
+                // Track columns that the parent node references so the
+                // extraction projection includes them as pass-through.
+                // Without this, the extraction projection would only
+                // contain __extracted_N aliases, and the parent couldn't
+                // resolve its other column references.
                 if let Expr::Column(col) = &e
                     && let Some(idx) = find_owning_input(&e, input_column_sets)
                 {
@@ -265,11 +292,26 @@ fn build_projection_replace_map(projection: &Projection) -> HashMap<String, Expr
 
 /// Build a recovery projection to restore the original output schema.
 ///
-/// Handles two cases:
-/// - **Schema-preserving nodes** (Filter/Sort/Limit): new schema has extra extraction
-///   columns. Original columns still exist by name → select them to hide extras.
-/// - **Schema-defining nodes** (Projection/Aggregate): same number of columns but
-///   names may differ. Map positionally, aliasing where names changed.
+/// After extraction, a node's output schema may differ from the original:
+///
+/// - **Schema-preserving nodes** (Filter/Sort/Limit): the extraction projection
+///   below adds extra `__extracted_N` columns that bubble up through the node.
+///   Recovery selects only the original columns to hide the extras.
+///   ```text
+///   Original schema: [id, user]
+///   After extraction: [__extracted_1, id, user]   ← extra column leaked through
+///   Recovery: SELECT id, user FROM ...            ← hides __extracted_1
+///   ```
+///
+/// - **Schema-defining nodes** (Aggregate): same number of columns but names
+///   may differ because extracted aliases replaced the original expressions.
+///   Recovery maps positionally, aliasing where names changed.
+///   ```text
+///   Original: [SUM(user['balance'])]
+///   After:    [SUM(__extracted_1)]                ← name changed
+///   Recovery: SUM(__extracted_1) AS "SUM(user['balance'])"
+///   ```
+///
 /// - **Schemas identical** → no recovery projection needed.
 fn build_recovery_projection(
     original_schema: &DFSchema,
@@ -315,11 +357,21 @@ fn build_recovery_projection(
     }
 }
 
-/// Extracts `MoveTowardsLeafNodes` sub-expressions from larger expressions.
+/// Collects `MoveTowardsLeafNodes` sub-expressions found during expression
+/// tree traversal and can build an extraction projection from them.
+///
+/// # Example
+///
+/// Given `Filter: user['status'] = 'active' AND user['name'] IS NOT NULL`:
+/// - `add_extracted(user['status'])` → stores it, returns `col("__extracted_1")`
+/// - `add_extracted(user['name'])`   → stores it, returns `col("__extracted_2")`
+/// - `build_extraction_projection()` produces:
+///   `Projection: user['status'] AS __extracted_1, user['name'] AS __extracted_2, <all input columns>`
 struct LeafExpressionExtractor<'a> {
     /// Extracted expressions: maps expression -> alias
     extracted: IndexMap<Expr, String>,
-    /// Columns needed for pass-through
+    /// Columns referenced by extracted expressions or the parent node,
+    /// included as pass-through in the extraction projection.
     columns_needed: IndexSet<Column>,
     /// Input schema
     input_schema: &'a DFSchema,
@@ -384,9 +436,14 @@ impl<'a> LeafExpressionExtractor<'a> {
 
 /// Build an extraction projection above the target node.
 ///
-/// If the target is an existing projection, merges into it (dedup by resolved
-/// expression equality, resolve columns through rename mapping, add pass-through
-/// columns_needed). Otherwise builds a fresh projection with extracted
+/// If the target is an existing projection, merges into it. This requires
+/// resolving column references through the projection's rename mapping:
+/// if the projection has `user AS u`, and an extracted expression references
+/// `u['name']`, we must rewrite it to `user['name']` since the merged
+/// projection reads from the same input as the original.
+///
+/// Deduplicates by resolved expression equality and adds pass-through
+/// columns as needed. Otherwise builds a fresh projection with extracted
 /// expressions + ALL input schema columns.
 fn build_extraction_projection_impl(
     extracted_exprs: &[(Expr, String)],
@@ -485,20 +542,35 @@ fn build_extraction_projection_impl(
 // Pass 2: PushDownLeafProjections
 // =============================================================================
 
-/// Pushes extraction projections down through schema-preserving nodes towards leaf nodes.
+/// Pushes extraction projections down through schema-preserving nodes towards
+/// leaf nodes (pass 2 of 2, after [`ExtractLeafExpressions`]).
 ///
 /// Handles two types of projections:
 /// - **Pure extraction projections** (all `__datafusion_extracted` aliases + columns):
 ///   pushes through Filter/Sort/Limit, merges into existing projections, or routes
 ///   into multi-input node inputs (Join, SubqueryAlias, etc.)
-/// - **Mixed projections** (containing `MoveTowardsLeafNodes` sub-expressions):
-///   splits into a recovery projection + pure extraction projection, then recursively
-///   pushes the extraction projection down.
+/// - **Mixed projections** (user projections containing `MoveTowardsLeafNodes`
+///   sub-expressions): splits into a recovery projection + extraction projection,
+///   then pushes the extraction projection down.
 ///
-/// This is the second pass of a two-pass extraction pipeline:
-/// 1. [`ExtractLeafExpressions`] extracts sub-expressions from non-projection nodes
-/// 2. [`PushDownLeafProjections`] handles projection splitting/pushing and pushes
-///    extraction projections down through schema-preserving nodes
+/// # Example: Pushing through a Filter
+///
+/// After pass 1, the extraction projection sits directly below the filter:
+/// ```text
+/// Projection: id, user                                                       <-- recovery
+///   Filter: __extracted_1 = 'active'
+///     Projection: user['status'] AS __extracted_1, id, user                   <-- extraction
+///       TableScan: t [id, user]
+/// ```
+///
+/// Pass 2 pushes the extraction projection through the recovery and filter,
+/// and a subsequent `OptimizeProjections` pass removes the (now-redundant)
+/// recovery projection:
+/// ```text
+/// Filter: __extracted_1 = 'active'
+///   Projection: user['status'] AS __extracted_1, id, user                     <-- extraction (pushed down)
+///     TableScan: t [id, user]
+/// ```
 #[derive(Default, Debug)]
 pub struct PushDownLeafProjections {}
 
@@ -544,8 +616,8 @@ fn try_push_input(
     split_and_push_projection(proj, alias_generator)
 }
 
-/// Unified function that splits a projection into extractable pieces, pushes
-/// them towards leaf nodes, and adds a recovery projection if needed.
+/// Splits a projection into extractable pieces, pushes them towards leaf
+/// nodes, and adds a recovery projection if needed.
 ///
 /// Handles both:
 /// - **Pure extraction projections** (all `__extracted` aliases + columns)
@@ -553,6 +625,28 @@ fn try_push_input(
 ///
 /// Returns `Some(new_subtree)` if extractions were pushed down,
 /// `None` if there is nothing to extract or push.
+///
+/// # Example: Mixed Projection
+///
+/// ```text
+/// Input plan:
+///   Projection: user['name'] IS NOT NULL AS has_name, id
+///     Filter: ...
+///       TableScan
+///
+/// Phase 1 (Split):
+///   extraction_pairs: [(user['name'], "__extracted_1")]
+///   recovery_exprs:   [__extracted_1 IS NOT NULL AS has_name, id]
+///
+/// Phase 2 (Push):
+///   Push extraction projection through Filter toward TableScan
+///
+/// Phase 3 (Recovery):
+///   Projection: __extracted_1 IS NOT NULL AS has_name, id       <-- recovery
+///     Filter: ...
+///       Projection: user['name'] AS __extracted_1, id           <-- extraction (pushed)
+///         TableScan
+/// ```
 fn split_and_push_projection(
     proj: &Projection,
     alias_generator: &Arc<AliasGenerator>,
@@ -636,25 +730,25 @@ fn split_and_push_projection(
 
     // Merge manual pairs/columns with extractor's pairs/columns
     let extractor = &extractors[0];
-    let mut pairs: Vec<(Expr, String)> = manual_pairs;
+    let mut extraction_pairs: Vec<(Expr, String)> = manual_pairs;
     let mut columns_needed: IndexSet<Column> = manual_columns;
 
     for (expr, alias) in extractor.extracted.iter() {
-        pairs.push((expr.clone(), alias.clone()));
+        extraction_pairs.push((expr.clone(), alias.clone()));
     }
     for col in &extractor.columns_needed {
         columns_needed.insert(col.clone());
     }
 
     // If no extractions found, nothing to do
-    if pairs.is_empty() {
+    if extraction_pairs.is_empty() {
         return Ok(None);
     }
 
     // ── Phase 2: Push down ──────────────────────────────────────────────
     let proj_input = Arc::clone(&proj.input);
     let pushed = push_extraction_pairs(
-        &pairs,
+        &extraction_pairs,
         &columns_needed,
         proj,
         &proj_input,
@@ -678,8 +772,8 @@ fn split_and_push_projection(
         (None, true) => {
             // Push returned None but we still have extractions to apply.
             // Build the extraction projection in-place (not pushed) using
-            // ALL pairs (manual + extractor) so the recovery can resolve
-            // both __extracted aliases and newly extracted expressions.
+            // ALL extraction_pairs (manual + extractor) so the recovery can
+            // resolve both __extracted aliases and newly extracted expressions.
             if extractor.extracted.is_empty() {
                 // Only manual pairs (all __extracted + columns) but push failed.
                 // The original projection is already an extraction projection,
@@ -688,7 +782,7 @@ fn split_and_push_projection(
             }
             let input_arc = Arc::clone(input);
             let extraction = build_extraction_projection_impl(
-                &pairs,
+                &extraction_pairs,
                 &columns_needed,
                 &input_arc,
                 input_schema.as_ref(),
@@ -727,9 +821,7 @@ fn is_pure_extraction_projection(plan: &LogicalPlan) -> bool {
     has_extraction
 }
 
-/// Pushes extraction pairs down through the projection's input node.
-///
-/// This contains the match arms from the former `try_push_pure_extraction`,
+/// Pushes extraction pairs down through the projection's input node,
 /// dispatching to the appropriate handler based on the input node type.
 fn push_extraction_pairs(
     pairs: &[(Expr, String)],
@@ -796,6 +888,23 @@ fn push_extraction_pairs(
 /// rebuilt node's output schema contains all extracted aliases.
 /// Returns `None` if any expression references columns from multiple inputs
 /// or the node doesn't pass through the extracted columns.
+///
+/// # Example: Join with expressions from both sides
+///
+/// ```text
+/// Extraction projection above a Join:
+///   Projection: left.user['name'] AS __extracted_1, right.order['total'] AS __extracted_2, ...
+///     Join: left.id = right.user_id
+///       TableScan: left [id, user]
+///       TableScan: right [user_id, order]
+///
+/// After routing each expression to its owning input:
+///   Join: left.id = right.user_id
+///     Projection: user['name'] AS __extracted_1, id, user              <-- left-side extraction
+///       TableScan: left [id, user]
+///     Projection: order['total'] AS __extracted_2, user_id, order      <-- right-side extraction
+///       TableScan: right [user_id, order]
+/// ```
 fn try_push_into_inputs(
     pairs: &[(Expr, String)],
     columns_needed: &IndexSet<Column>,
