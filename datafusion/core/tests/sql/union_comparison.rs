@@ -433,8 +433,7 @@ async fn test_union_cast_compatible_variant() -> Result<()> {
     Ok(())
 }
 
-// todo: this should also be fixed since arrow-ord now has support for union arrays...
-// test this with arrow pointed to main...
+/// Tests union-to-union equality comparison (supported via arrow-ord).
 #[tokio::test]
 async fn test_union_eq_same_union() -> Result<()> {
     let union_fields = UnionFields::new(
@@ -481,15 +480,14 @@ async fn test_union_eq_same_union() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_batch("test", batch)?;
 
+    // Row 1: Int(10) = Int(10) -> true; Row 2: Str("hello") = Str("world") -> false
     let df = ctx
         .sql("SELECT id FROM test WHERE val1 = val2")
-        .await
-        .unwrap();
+        .await?;
+    let results = df.collect().await?;
 
-    let exec_result = df.collect().await;
-    assert!(exec_result.is_err());
-    let err = exec_result.unwrap_err();
-    assert!(err.to_string().contains("no natural order"),);
+    let expected = ["+----+", "| id |", "+----+", "| 1  |", "+----+"];
+    assert_batches_eq!(expected, &results);
 
     Ok(())
 }
