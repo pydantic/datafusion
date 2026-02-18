@@ -571,6 +571,7 @@ async fn setup_context(
 
     let runtime = Arc::new(RuntimeEnv {
         memory_pool: runtime.memory_pool.clone(),
+        memory_coordinator: runtime.memory_coordinator.clone(),
         disk_manager: Arc::new(disk_manager),
         cache_manager: runtime.cache_manager.clone(),
         object_store_registry: runtime.object_store_registry.clone(),

@@ -30,11 +30,11 @@ use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::human_readable_size;
 use datafusion_common::{Result, assert_or_internal_err, internal_err};
 use datafusion_execution::disk_manager::RefCountedTempFile;
-use datafusion_execution::memory_pool::{
-    MemoryConsumer, MemoryPool, MemoryReservation, UnboundedMemoryPool,
+use datafusion_execution::memory_pool::coordinated::{
+    AllocationType, MemoryAllocation, MemoryCoordinator,
 };
+
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
-use std::sync::Arc;
 
 macro_rules! primitive_merge_helper {
     ($t:ty, $($v:ident),+) => {
@@ -86,7 +86,7 @@ pub struct StreamingMergeBuilder<'a> {
     metrics: Option<BaselineMetrics>,
     batch_size: Option<usize>,
     fetch: Option<usize>,
-    reservation: Option<MemoryReservation>,
+    allocation: Option<MemoryAllocation>,
     enable_round_robin_tie_breaker: bool,
 }
 
@@ -141,8 +141,8 @@ impl<'a> StreamingMergeBuilder<'a> {
         self
     }
 
-    pub fn with_reservation(mut self, reservation: MemoryReservation) -> Self {
-        self.reservation = Some(reservation);
+    pub fn with_allocation(mut self, allocation: MemoryAllocation) -> Self {
+        self.allocation = Some(allocation);
         self
     }
 
@@ -162,10 +162,12 @@ impl<'a> StreamingMergeBuilder<'a> {
     ///
     /// This is not marked as `pub` because it is not recommended to use this method
     pub(super) fn with_bypass_mempool(self) -> Self {
-        let mem_pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let coordinator = MemoryCoordinator::new_unbounded();
 
-        self.with_reservation(
-            MemoryConsumer::new("merge stream mock memory").register(&mem_pool),
+        self.with_allocation(
+            coordinator
+                .register("MockPool")
+                .new_empty(AllocationType::Required),
         )
     }
 
@@ -177,7 +179,7 @@ impl<'a> StreamingMergeBuilder<'a> {
             schema,
             metrics,
             batch_size,
-            reservation,
+            allocation,
             fetch,
             expressions,
             enable_round_robin_tie_breaker,
@@ -194,8 +196,10 @@ impl<'a> StreamingMergeBuilder<'a> {
             let metrics = metrics.expect("Metrics cannot be empty for streaming merge");
             let batch_size =
                 batch_size.expect("Batch size cannot be empty for streaming merge");
-            let reservation =
-                reservation.expect("Reservation cannot be empty for streaming merge");
+            let allocation =
+                allocation.expect("Reservation cannot be empty for streaming merge");
+
+            let consumer_name = format!("{}:MultiLevelMergeBuilder", allocation.consumer_name());
 
             return Ok(MultiLevelMergeBuilder::new(
                 spill_manager.expect("spill_manager should exist"),
@@ -205,7 +209,7 @@ impl<'a> StreamingMergeBuilder<'a> {
                 expressions.clone(),
                 metrics,
                 batch_size,
-                reservation,
+                allocation.change_consumer(&consumer_name),
                 fetch,
                 enable_round_robin_tie_breaker,
             )
@@ -223,20 +227,21 @@ impl<'a> StreamingMergeBuilder<'a> {
         let metrics = metrics.expect("Metrics cannot be empty for streaming merge");
         let batch_size =
             batch_size.expect("Batch size cannot be empty for streaming merge");
-        let reservation =
-            reservation.expect("Reservation cannot be empty for streaming merge");
+
+        let mut allocation =
+            allocation.expect("Allocation cannot be empty for streaming merge");
 
         // Special case single column comparisons with optimized cursor implementations
         if expressions.len() == 1 {
             let sort = expressions[0].clone();
             let data_type = sort.expr.data_type(schema.as_ref())?;
             downcast_primitive! {
-                data_type => (primitive_merge_helper, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker),
-                DataType::Utf8 => merge_helper!(StringArray, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker)
-                DataType::Utf8View => merge_helper!(StringViewArray, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker)
-                DataType::LargeUtf8 => merge_helper!(LargeStringArray, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker)
-                DataType::Binary => merge_helper!(BinaryArray, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker)
-                DataType::LargeBinary => merge_helper!(LargeBinaryArray, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker)
+                data_type => (primitive_merge_helper, sort, streams, schema, metrics, batch_size, fetch, allocation, enable_round_robin_tie_breaker),
+                DataType::Utf8 => merge_helper!(StringArray, sort, streams, schema, metrics, batch_size, fetch, allocation, enable_round_robin_tie_breaker)
+                DataType::Utf8View => merge_helper!(StringViewArray, sort, streams, schema, metrics, batch_size, fetch, allocation, enable_round_robin_tie_breaker)
+                DataType::LargeUtf8 => merge_helper!(LargeStringArray, sort, streams, schema, metrics, batch_size, fetch, allocation, enable_round_robin_tie_breaker)
+                DataType::Binary => merge_helper!(BinaryArray, sort, streams, schema, metrics, batch_size, fetch, allocation, enable_round_robin_tie_breaker)
+                DataType::LargeBinary => merge_helper!(LargeBinaryArray, sort, streams, schema, metrics, batch_size, fetch, allocation, enable_round_robin_tie_breaker)
                 _ => {}
             }
         }
@@ -245,7 +250,7 @@ impl<'a> StreamingMergeBuilder<'a> {
             schema.as_ref(),
             expressions,
             streams,
-            reservation.new_empty(),
+            allocation.new_empty().change_consumer(&format!("{}:RowCursorStream", allocation.consumer_name())),
         )?;
         Ok(Box::pin(SortPreservingMergeStream::new(
             Box::new(streams),
@@ -253,7 +258,7 @@ impl<'a> StreamingMergeBuilder<'a> {
             metrics,
             batch_size,
             fetch,
-            reservation,
+            allocation.new_empty().change_consumer(&format!("{}:SortPreservingMergeStream", allocation.consumer_name())),
             enable_round_robin_tie_breaker,
         )))
     }

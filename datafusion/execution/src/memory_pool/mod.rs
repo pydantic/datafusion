@@ -22,6 +22,7 @@ use datafusion_common::{Result, internal_datafusion_err};
 use std::hash::{Hash, Hasher};
 use std::{cmp::Ordering, sync::Arc, sync::atomic};
 
+pub mod coordinated;
 mod pool;
 pub mod proxy {
     pub use datafusion_common::utils::proxy::{HashTableAllocExt, VecAllocExt};
@@ -363,6 +364,11 @@ impl MemoryReservation {
     /// Returns [MemoryConsumer] for this [MemoryReservation]
     pub fn consumer(&self) -> &MemoryConsumer {
         &self.registration.consumer
+    }
+
+    /// Returns [Pool] for this [MemoryReservation]
+    pub fn pool(&self) -> &Arc<dyn MemoryPool> {
+        &self.registration.pool
     }
 
     /// Frees all bytes from this reservation back to the underlying

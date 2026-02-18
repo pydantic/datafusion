@@ -20,6 +20,7 @@
 use crate::metrics::BaselineMetrics;
 use crate::{EmptyRecordBatchStream, SpillManager};
 use arrow::array::RecordBatch;
+use datafusion_execution::memory_pool::coordinated::MemoryAllocation;
 use std::fmt::{Debug, Formatter};
 use std::mem;
 use std::pin::Pin;
@@ -28,7 +29,6 @@ use std::task::{Context, Poll};
 
 use arrow::datatypes::SchemaRef;
 use datafusion_common::Result;
-use datafusion_execution::memory_pool::MemoryReservation;
 
 use crate::sorts::sort::get_reserved_bytes_for_record_batch_size;
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
@@ -133,7 +133,7 @@ pub(crate) struct MultiLevelMergeBuilder {
     expr: LexOrdering,
     metrics: BaselineMetrics,
     batch_size: usize,
-    reservation: MemoryReservation,
+    allocation: MemoryAllocation,
     fetch: Option<usize>,
     enable_round_robin_tie_breaker: bool,
 }
@@ -154,7 +154,7 @@ impl MultiLevelMergeBuilder {
         expr: LexOrdering,
         metrics: BaselineMetrics,
         batch_size: usize,
-        reservation: MemoryReservation,
+        reservation: MemoryAllocation,
         fetch: Option<usize>,
         enable_round_robin_tie_breaker: bool,
     ) -> Self {
@@ -166,7 +166,7 @@ impl MultiLevelMergeBuilder {
             expr,
             metrics,
             batch_size,
-            reservation,
+            allocation: reservation,
             enable_round_robin_tie_breaker,
             fetch,
         }
@@ -253,7 +253,7 @@ impl MultiLevelMergeBuilder {
 
             // Need to merge multiple streams
             (_, _) => {
-                let mut memory_reservation = self.reservation.new_empty();
+                let mut memory_reservation = self.allocation.take();
 
                 // Don't account for existing streams memory
                 // as we are not holding the memory for them
@@ -338,7 +338,7 @@ impl MultiLevelMergeBuilder {
         } else {
             // If we are only merging in-memory streams, we need to use the memory reservation
             // because we don't know the maximum size of the batches in the streams
-            builder = builder.with_reservation(self.reservation.new_empty());
+            builder = builder.with_allocation(self.allocation.new_empty());
         }
 
         builder.build()
@@ -352,7 +352,7 @@ impl MultiLevelMergeBuilder {
         &mut self,
         buffer_len: usize,
         minimum_number_of_required_streams: usize,
-        reservation: &mut MemoryReservation,
+        reservation: &mut MemoryAllocation,
     ) -> Result<(Vec<SortedSpillFile>, usize)> {
         assert_ne!(buffer_len, 0, "Buffer length must be greater than 0");
         let mut number_of_spills_to_read_for_current_phase = 0;
@@ -369,6 +369,10 @@ impl MultiLevelMergeBuilder {
             ) {
                 Ok(_) => {
                     number_of_spills_to_read_for_current_phase += 1;
+
+                    if number_of_spills_to_read_for_current_phase >= 16 {
+                        break;
+                    }
                 }
                 // If we can't grow the reservation, we need to stop
                 Err(err) => {
@@ -388,7 +392,7 @@ impl MultiLevelMergeBuilder {
                             );
                         }
 
-                        return Err(err);
+                        return Err(err.context(format!("Could not allocate with max_record_batch_memory: {}", spill.max_record_batch_memory)));
                     }
 
                     // We reached the maximum amount of memory we can use
@@ -409,11 +413,11 @@ impl MultiLevelMergeBuilder {
 
 struct StreamAttachedReservation {
     stream: SendableRecordBatchStream,
-    reservation: MemoryReservation,
+    reservation: MemoryAllocation,
 }
 
 impl StreamAttachedReservation {
-    fn new(stream: SendableRecordBatchStream, reservation: MemoryReservation) -> Self {
+    fn new(stream: SendableRecordBatchStream, reservation: MemoryAllocation) -> Self {
         Self {
             stream,
             reservation,

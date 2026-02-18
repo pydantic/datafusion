@@ -24,6 +24,7 @@ use crate::{
     disk_manager::{DiskManager, DiskManagerBuilder, DiskManagerMode},
     memory_pool::{
         GreedyMemoryPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool,
+        coordinated::MemoryCoordinator,
     },
     object_store::{DefaultObjectStoreRegistry, ObjectStoreRegistry},
 };
@@ -74,6 +75,8 @@ use url::Url;
 pub struct RuntimeEnv {
     /// Runtime memory management
     pub memory_pool: Arc<dyn MemoryPool>,
+    /// Coordinated memory pool for cooperative spilling (used by the sort pipeline)
+    pub memory_coordinator: MemoryCoordinator,
     /// Manage temporary files during query execution
     pub disk_manager: Arc<DiskManager>,
     /// Manage temporary cache during query execution
@@ -327,6 +330,10 @@ pub struct RuntimeEnvBuilder {
     ///
     /// Defaults to using an [`UnboundedMemoryPool`] if `None`
     pub memory_pool: Option<Arc<dyn MemoryPool>>,
+    /// [`MemoryCoordinator`] for cooperative spilling in the sort pipeline.
+    ///
+    /// Defaults to an unbounded coordinator if `None`.
+    pub memory_coordinator: Option<MemoryCoordinator>,
     /// CacheManager to manage cache data
     pub cache_manager: CacheManagerConfig,
     /// ObjectStoreRegistry to get object store based on url
@@ -349,6 +356,7 @@ impl RuntimeEnvBuilder {
             disk_manager: Default::default(),
             disk_manager_builder: Default::default(),
             memory_pool: Default::default(),
+            memory_coordinator: Default::default(),
             cache_manager: Default::default(),
             object_store_registry: Arc::new(DefaultObjectStoreRegistry::default()),
             #[cfg(feature = "parquet_encryption")]
@@ -376,6 +384,12 @@ impl RuntimeEnvBuilder {
         self
     }
 
+    /// Customize the coordinated memory pool for cooperative spilling
+    pub fn with_memory_coordinator(mut self, coordinator: MemoryCoordinator) -> Self {
+        self.memory_coordinator = Some(coordinator);
+        self
+    }
+
     /// Customize cache policy
     pub fn with_cache_manager(mut self, cache_manager: CacheManagerConfig) -> Self {
         self.cache_manager = cache_manager;
@@ -396,14 +410,22 @@ impl RuntimeEnvBuilder {
     ///
     /// This defaults to using [`GreedyMemoryPool`] wrapped in the
     /// [`TrackConsumersPool`] with a maximum of 5 consumers.
+    /// Also configures the [`MemoryCoordinator`] with the same limit
+    /// (unless one has already been explicitly set).
     ///
     /// Note DataFusion does not yet respect this limit in all cases.
     pub fn with_memory_limit(self, max_memory: usize, memory_fraction: f64) -> Self {
         let pool_size = (max_memory as f64 * memory_fraction) as usize;
-        self.with_memory_pool(Arc::new(TrackConsumersPool::new(
+        let builder = self.with_memory_pool(Arc::new(TrackConsumersPool::new(
             GreedyMemoryPool::new(pool_size),
             NonZeroUsize::new(5).unwrap(),
-        )))
+        )));
+        // Also set the coordinator to the same limit if not explicitly set
+        if builder.memory_coordinator.is_none() {
+            builder.with_memory_coordinator(MemoryCoordinator::new_bounded(pool_size))
+        } else {
+            builder
+        }
     }
 
     /// Use the specified path to create any needed temporary files
@@ -444,6 +466,7 @@ impl RuntimeEnvBuilder {
             disk_manager,
             disk_manager_builder,
             memory_pool,
+            memory_coordinator,
             cache_manager,
             object_store_registry,
             #[cfg(feature = "parquet_encryption")]
@@ -451,9 +474,12 @@ impl RuntimeEnvBuilder {
         } = self;
         let memory_pool =
             memory_pool.unwrap_or_else(|| Arc::new(UnboundedMemoryPool::default()));
+        let memory_coordinator =
+            memory_coordinator.unwrap_or_else(MemoryCoordinator::new_unbounded);
 
         Ok(RuntimeEnv {
             memory_pool,
+            memory_coordinator,
             disk_manager: if let Some(builder) = disk_manager_builder {
                 Arc::new(builder.build()?)
             } else {
@@ -496,6 +522,7 @@ impl RuntimeEnvBuilder {
             )),
             disk_manager_builder: None,
             memory_pool: Some(Arc::clone(&runtime_env.memory_pool)),
+            memory_coordinator: Some(runtime_env.memory_coordinator.clone()),
             cache_manager: cache_config,
             object_store_registry: Arc::clone(&runtime_env.object_store_registry),
             #[cfg(feature = "parquet_encryption")]

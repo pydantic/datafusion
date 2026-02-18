@@ -20,7 +20,7 @@ use arrow::compute::interleave;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::Result;
-use datafusion_execution::memory_pool::MemoryReservation;
+use datafusion_execution::memory_pool::coordinated::MemoryAllocation;
 use std::sync::Arc;
 
 #[derive(Debug, Copy, Clone, Default)]
@@ -41,7 +41,7 @@ pub struct BatchBuilder {
     batches: Vec<(usize, RecordBatch)>,
 
     /// Accounts for memory used by buffered batches
-    reservation: MemoryReservation,
+    allocation: MemoryAllocation,
 
     /// The current [`BatchCursor`] for each stream
     cursors: Vec<BatchCursor>,
@@ -57,21 +57,19 @@ impl BatchBuilder {
         schema: SchemaRef,
         stream_count: usize,
         batch_size: usize,
-        reservation: MemoryReservation,
+        allocation: MemoryAllocation,
     ) -> Self {
         Self {
             schema,
             batches: Vec::with_capacity(stream_count * 2),
             cursors: vec![BatchCursor::default(); stream_count],
             indices: Vec::with_capacity(batch_size),
-            reservation,
+            allocation,
         }
     }
 
     /// Append a new batch in `stream_idx`
     pub fn push_batch(&mut self, stream_idx: usize, batch: RecordBatch) -> Result<()> {
-        self.reservation
-            .try_grow(get_record_batch_memory_size(&batch))?;
         let batch_idx = self.batches.len();
         self.batches.push((stream_idx, batch));
         self.cursors[stream_idx] = BatchCursor {
@@ -134,7 +132,7 @@ impl BatchBuilder {
         // We can therefore drop all but the last batch for each stream
         let mut batch_idx = 0;
         let mut retained = 0;
-        self.batches.retain(|(stream_idx, batch)| {
+        self.batches.retain(|(stream_idx, _)| {
             let stream_cursor = &mut self.cursors[*stream_idx];
             let retain = stream_cursor.batch_idx == batch_idx;
             batch_idx += 1;
@@ -142,8 +140,6 @@ impl BatchBuilder {
             if retain {
                 stream_cursor.batch_idx = retained;
                 retained += 1;
-            } else {
-                self.reservation.shrink(get_record_batch_memory_size(batch));
             }
             retain
         });

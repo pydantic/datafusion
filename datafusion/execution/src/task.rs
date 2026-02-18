@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::{
-    config::SessionConfig, memory_pool::MemoryPool, registry::FunctionRegistry,
+    config::SessionConfig, memory_pool::MemoryPool,
+    memory_pool::coordinated::MemoryCoordinator, registry::FunctionRegistry,
     runtime_env::RuntimeEnv,
 };
 use datafusion_common::{Result, internal_datafusion_err, plan_datafusion_err};
@@ -111,6 +112,11 @@ impl TaskContext {
     /// Return the [`MemoryPool`] associated with this [TaskContext]
     pub fn memory_pool(&self) -> &Arc<dyn MemoryPool> {
         &self.runtime.memory_pool
+    }
+
+    /// Return the [`MemoryCoordinator`] associated with this [TaskContext]
+    pub fn memory_coordinator(&self) -> &MemoryCoordinator {
+        &self.runtime.memory_coordinator
     }
 
     /// Return the [RuntimeEnv] associated with this [TaskContext]

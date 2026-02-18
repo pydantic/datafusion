@@ -35,6 +35,7 @@ use datafusion_common_runtime::JoinSet;
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryReservation;
 
+use datafusion_execution::memory_pool::coordinated::MemoryAllocation;
 use futures::ready;
 use futures::stream::BoxStream;
 use futures::{Future, Stream, StreamExt};
@@ -705,12 +706,14 @@ impl RecordBatchStream for BatchSplitStream {
 /// shrinking the reservation as batches are consumed.
 /// The original reservation must have its batch sizes calculated using [`get_record_batch_memory_size`]
 /// On error, the reservation is *NOT* freed, until the stream is dropped.
+#[allow(unused)]
 pub(crate) struct ReservationStream {
     schema: SchemaRef,
     inner: SendableRecordBatchStream,
     reservation: MemoryReservation,
 }
 
+#[allow(unused)]
 impl ReservationStream {
     pub(crate) fn new(
         schema: SchemaRef,
@@ -764,6 +767,72 @@ impl RecordBatchStream for ReservationStream {
         Arc::clone(&self.schema)
     }
 }
+
+
+/// A stream that holds a memory allocation for its lifetime,
+/// shrinking the reservation as batches are consumed.
+/// The original reservation must have its batch sizes calculated using [`get_record_batch_memory_size`]
+/// On error, the reservation is *NOT* freed, until the stream is dropped.
+pub(crate) struct AllocationStream {
+    schema: SchemaRef,
+    inner: SendableRecordBatchStream,
+    reservation: MemoryAllocation,
+}
+
+impl AllocationStream {
+    pub(crate) fn new(
+        schema: SchemaRef,
+        inner: SendableRecordBatchStream,
+        reservation: MemoryAllocation,
+    ) -> Self {
+        Self {
+            schema,
+            inner,
+            reservation,
+        }
+    }
+}
+
+impl Stream for AllocationStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let res = self.inner.poll_next_unpin(cx);
+
+        match res {
+            Poll::Ready(res) => {
+                match res {
+                    Some(Ok(batch)) => {
+                        self.reservation
+                            .shrink(get_record_batch_memory_size(&batch));
+                        Poll::Ready(Some(Ok(batch)))
+                    }
+                    Some(Err(err)) => Poll::Ready(Some(Err(err))),
+                    None => {
+                        // Stream is done so free the reservation completely
+                        self.reservation.free();
+                        Poll::Ready(None)
+                    }
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl RecordBatchStream for AllocationStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
 
 #[cfg(test)]
 mod test {

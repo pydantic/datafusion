@@ -24,6 +24,7 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use datafusion_execution::memory_pool::coordinated::{AllocationType, CoordinatedConsumer, MemoryAllocation};
 use parking_lot::RwLock;
 
 use crate::common::spawn_buffered;
@@ -38,11 +39,10 @@ use crate::metrics::{
 };
 use crate::projection::{ProjectionExec, make_with_child, update_ordering};
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
-use crate::spill::get_record_batch_memory_size;
+use crate::spill::{gc_view_arrays, get_record_batch_memory_size};
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::{GetSlicedSize, SpillManager};
-use crate::stream::RecordBatchStreamAdapter;
-use crate::stream::ReservationStream;
+use crate::stream::{AllocationStream, RecordBatchStreamAdapter};
 use crate::topk::TopK;
 use crate::topk::TopKDynamicFilters;
 use crate::{
@@ -60,7 +60,6 @@ use datafusion_common::{
     unwrap_or_internal_err,
 };
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr::PhysicalExpr;
@@ -246,14 +245,17 @@ struct ExternalSorter {
     metrics: ExternalSorterMetrics,
     /// A handle to the runtime to get spill files
     runtime: Arc<RuntimeEnv>,
+
+    memory_consumer: CoordinatedConsumer,
+
     /// Reservation for in_mem_batches
-    reservation: MemoryReservation,
+    reservation: MemoryAllocation,
     spill_manager: SpillManager,
 
     /// Reservation for the merging of in-memory batches. If the sort
     /// might spill, `sort_spill_reservation_bytes` will be
     /// pre-reserved to ensure there is some space for this sort/merge.
-    merge_reservation: MemoryReservation,
+    merge_reservation: MemoryAllocation,
     /// How much memory to reserve for performing in-memory sort/merges
     /// prior to spilling.
     sort_spill_reservation_bytes: usize,
@@ -276,13 +278,9 @@ impl ExternalSorter {
         runtime: Arc<RuntimeEnv>,
     ) -> Result<Self> {
         let metrics = ExternalSorterMetrics::new(metrics, partition_id);
-        let reservation = MemoryConsumer::new(format!("ExternalSorter[{partition_id}]"))
-            .with_can_spill(true)
-            .register(&runtime.memory_pool);
 
-        let merge_reservation =
-            MemoryConsumer::new(format!("ExternalSorterMerge[{partition_id}]"))
-                .register(&runtime.memory_pool);
+
+        let memory_consumer = runtime.memory_coordinator.register(format!("ExternalSorter[{partition_id}]"));
 
         let spill_manager = SpillManager::new(
             Arc::clone(&runtime),
@@ -298,9 +296,10 @@ impl ExternalSorter {
             finished_spill_files: vec![],
             expr,
             metrics,
-            reservation,
+            reservation: memory_consumer.try_allocate(0, AllocationType::Spillable)?,
             spill_manager,
-            merge_reservation,
+            merge_reservation: memory_consumer.try_allocate(0, AllocationType::Required)?,
+            memory_consumer,
             runtime,
             batch_size,
             sort_spill_reservation_bytes,
@@ -312,11 +311,17 @@ impl ExternalSorter {
     ///
     /// Updates memory usage metrics, and possibly triggers spilling to disk
     async fn insert_batch(&mut self, input: RecordBatch) -> Result<()> {
+
+        if self.memory_consumer.should_spill() {
+            self.sort_and_spill_in_mem_batches().await?;
+        }
+
+
         if input.num_rows() == 0 {
             return Ok(());
         }
 
-        self.reserve_memory_for_merge()?;
+        self.reserve_memory_for_merge().await?;
         self.reserve_memory_for_batch_and_maybe_spill(&input)
             .await?;
 
@@ -338,11 +343,6 @@ impl ExternalSorter {
     /// 2. A combined streaming merge incorporating both in-memory
     ///    batches and data from spill files on disk.
     async fn sort(&mut self) -> Result<SendableRecordBatchStream> {
-        // Release the memory reserved for merge back to the pool so
-        // there is some left when `in_mem_sort_stream` requests an
-        // allocation.
-        self.merge_reservation.free();
-
         if self.spilled_before() {
             // Sort `in_mem_batches` and spill it first. If there are many
             // `in_mem_batches` and the memory limit is almost reached, merging
@@ -359,7 +359,7 @@ impl ExternalSorter {
                 .with_metrics(self.metrics.baseline.clone())
                 .with_batch_size(self.batch_size)
                 .with_fetch(None)
-                .with_reservation(self.merge_reservation.new_empty())
+                .with_allocation(self.merge_reservation.take())
                 .build()
         } else {
             self.in_mem_sort_stream(self.metrics.baseline.clone())
@@ -402,7 +402,6 @@ impl ExternalSorter {
                 Some((self.spill_manager.create_in_progress_file("Sorting")?, 0));
         }
 
-        Self::organize_stringview_arrays(globally_sorted_batches)?;
 
         debug!("Spilling sort data of ExternalSorter to disk whilst inserting");
 
@@ -415,6 +414,8 @@ impl ExternalSorter {
             })?;
 
         for batch in batches_to_spill {
+            let batch = gc_view_arrays(&batch)?;
+
             in_progress_file.append_batch(&batch)?;
 
             *max_record_batch_size =
@@ -520,11 +521,6 @@ impl ExternalSorter {
             "in_mem_batches must not be empty when attempting to sort and spill"
         );
 
-        // Release the memory reserved for merge back to the pool so
-        // there is some left when `in_mem_sort_stream` requests an
-        // allocation. At the end of this function, memory will be
-        // reserved again for the next spill.
-        self.merge_reservation.free();
 
         let mut sorted_stream =
             self.in_mem_sort_stream(self.metrics.baseline.intermediate())?;
@@ -569,9 +565,6 @@ impl ExternalSorter {
             buffers_cleared_property,
             "in_mem_batches and globally_sorted_batches should be cleared before"
         );
-
-        // Reserve headroom for next sort/merge
-        self.reserve_memory_for_merge()?;
 
         Ok(())
     }
@@ -668,7 +661,7 @@ impl ExternalSorter {
             self.in_mem_batches.clear();
             self.reservation
                 .try_resize(get_reserved_bytes_for_record_batch(&batch)?)
-                .map_err(Self::err_with_oom_context)?;
+                .map_err(|err| Self::err_with_oom_context(err, "below reservation size"))?;
             let reservation = self.reservation.take();
             return self.sort_batch_stream(batch, &metrics, reservation);
         }
@@ -692,7 +685,7 @@ impl ExternalSorter {
             .with_metrics(metrics)
             .with_batch_size(self.batch_size)
             .with_fetch(None)
-            .with_reservation(self.merge_reservation.new_empty())
+            .with_allocation(self.merge_reservation.take().change_consumer(&format!("{}:InMemSortStream", self.merge_reservation.consumer_name())))
             .build()
     }
 
@@ -709,7 +702,7 @@ impl ExternalSorter {
         &self,
         batch: RecordBatch,
         metrics: &BaselineMetrics,
-        reservation: MemoryReservation,
+        reservation: MemoryAllocation,
     ) -> Result<SendableRecordBatchStream> {
         assert_eq!(
             get_reserved_bytes_for_record_batch(&batch)?,
@@ -728,26 +721,14 @@ impl ExternalSorter {
             let sorted_batches = sort_batch_chunked(&batch, &expressions, batch_size)?;
             drop(batch);
 
-            // Free the old reservation and grow it to match the actual sorted output size
-            reservation.free();
-
             Result::<_, DataFusionError>::Ok((schema, sorted_batches, reservation))
         })
         .then({
             move |batches| async move {
                 match batches {
                     Ok((schema, sorted_batches, reservation)) => {
-                        // Calculate the total size of sorted batches
-                        let total_sorted_size: usize = sorted_batches
-                            .iter()
-                            .map(get_record_batch_memory_size)
-                            .sum();
-                        reservation
-                            .try_grow(total_sorted_size)
-                            .map_err(Self::err_with_oom_context)?;
-
                         // Wrap in ReservationStream to hold the reservation
-                        Ok(Box::pin(ReservationStream::new(
+                        Ok(Box::pin(AllocationStream::new(
                             Arc::clone(&schema),
                             Box::pin(RecordBatchStreamAdapter::new(
                                 schema,
@@ -775,14 +756,15 @@ impl ExternalSorter {
     /// If this sort may spill, pre-allocates
     /// `sort_spill_reservation_bytes` of memory to guarantee memory
     /// left for the in memory sort/merge.
-    fn reserve_memory_for_merge(&mut self) -> Result<()> {
+    async fn reserve_memory_for_merge(&mut self) -> Result<()> {
         // Reserve headroom for next merge sort
         if self.runtime.disk_manager.tmp_files_enabled() {
             let size = self.sort_spill_reservation_bytes;
             if self.merge_reservation.size() != size {
-                self.merge_reservation
-                    .try_resize(size)
-                    .map_err(Self::err_with_oom_context)?;
+                self.merge_reservation.free();
+
+                self.merge_reservation = self.memory_consumer.allocate(size, AllocationType::Required).await
+                    .map_err(|err| Self::err_with_oom_context(err, "reserve_memory_for_merge"))?;
             }
         }
 
@@ -799,28 +781,28 @@ impl ExternalSorter {
 
         match self.reservation.try_grow(size) {
             Ok(_) => Ok(()),
-            Err(e) => {
-                if self.in_mem_batches.is_empty() {
-                    return Err(Self::err_with_oom_context(e));
+            Err(_) => {
+                if !self.in_mem_batches.is_empty() {
+                    // Spill and try again.
+                    self.sort_and_spill_in_mem_batches().await?;
                 }
 
-                // Spill and try again.
-                self.sort_and_spill_in_mem_batches().await?;
-                self.reservation
-                    .try_grow(size)
-                    .map_err(Self::err_with_oom_context)
+
+                self.reservation.grow(size).await
+                    .map_err(|err| Self::err_with_oom_context(err, "waiting grow"))
             }
         }
     }
 
     /// Wraps the error with a context message suggesting settings to tweak.
     /// This is meant to be used with DataFusionError::ResourcesExhausted only.
-    fn err_with_oom_context(e: DataFusionError) -> DataFusionError {
+    fn err_with_oom_context(e: DataFusionError, location: &str) -> DataFusionError {
         match e {
             DataFusionError::ResourcesExhausted(_) => e.context(
-                "Not enough memory to continue external sort. \
+                format!(
+                "Not enough memory to continue external sort in {location}. \
                     Consider increasing the memory limit config: 'datafusion.runtime.memory_limit', \
-                    or decreasing the config: 'datafusion.execution.sort_spill_reservation_bytes'."
+                    or decreasing the config: 'datafusion.execution.sort_spill_reservation_bytes'.")
             ),
             // This is not an OOM error, so just return it as is.
             _ => e,

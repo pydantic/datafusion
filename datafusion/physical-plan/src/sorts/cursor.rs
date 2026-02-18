@@ -26,7 +26,7 @@ use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::compute::SortOptions;
 use arrow::datatypes::ArrowNativeTypeOp;
 use arrow::row::Rows;
-use datafusion_execution::memory_pool::MemoryReservation;
+use datafusion_execution::memory_pool::coordinated::MemoryAllocation;
 
 /// A comparable collection of values for use with [`Cursor`]
 ///
@@ -153,10 +153,6 @@ impl<T: CursorValues> Ord for Cursor<T> {
 #[derive(Debug)]
 pub struct RowValues {
     rows: Arc<Rows>,
-
-    /// Tracks for the memory used by in the `Rows` of this
-    /// cursor. Freed on drop
-    _reservation: MemoryReservation,
 }
 
 impl RowValues {
@@ -165,16 +161,10 @@ impl RowValues {
     ///
     /// Panics if the reservation is not for exactly `rows.size()`
     /// bytes or if `rows` is empty.
-    pub fn new(rows: Arc<Rows>, reservation: MemoryReservation) -> Self {
-        assert_eq!(
-            rows.size(),
-            reservation.size(),
-            "memory reservation mismatch"
-        );
+    pub fn new(rows: Arc<Rows>) -> Self {
         assert!(rows.num_rows() > 0);
         Self {
             rows,
-            _reservation: reservation,
         }
     }
 }
@@ -367,7 +357,7 @@ pub struct ArrayValues<T: CursorValues> {
 
     /// Tracks the memory used by the values array,
     /// freed on drop.
-    _reservation: MemoryReservation,
+    _allocation: MemoryAllocation,
 }
 
 impl<T: CursorValues> ArrayValues<T> {
@@ -378,7 +368,7 @@ impl<T: CursorValues> ArrayValues<T> {
     pub fn new<A: CursorArray<Values = T>>(
         options: SortOptions,
         array: &A,
-        reservation: MemoryReservation,
+        allocation: MemoryAllocation,
     ) -> Self {
         assert!(array.len() > 0, "Empty array passed to FieldCursor");
         let null_threshold = match options.nulls_first {
@@ -390,7 +380,7 @@ impl<T: CursorValues> ArrayValues<T> {
             values: array.values(),
             null_threshold,
             options,
-            _reservation: reservation,
+            _allocation: allocation,
         }
     }
 
@@ -443,9 +433,8 @@ impl<T: CursorValues> CursorValues for ArrayValues<T> {
 #[cfg(test)]
 mod tests {
     use datafusion_execution::memory_pool::{
-        GreedyMemoryPool, MemoryConsumer, MemoryPool,
+        coordinated::{AllocationType, MemoryCoordinator},
     };
-    use std::sync::Arc;
 
     use super::*;
 
@@ -459,15 +448,16 @@ mod tests {
             false => values.len() - null_count,
         };
 
-        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(10000));
-        let consumer = MemoryConsumer::new("test");
-        let reservation = consumer.register(&memory_pool);
+
+        let coordinator = MemoryCoordinator::new_bounded(10000);
+        let _allocation = coordinator.register("New").new_empty(AllocationType::Required);
+
 
         let values = ArrayValues {
             values: PrimitiveValues(values),
             null_threshold,
             options,
-            _reservation: reservation,
+            _allocation
         };
 
         Cursor::new(values)

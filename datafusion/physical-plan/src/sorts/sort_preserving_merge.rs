@@ -32,7 +32,7 @@ use crate::{
 
 use datafusion_common::{Result, assert_eq_or_internal_err, internal_err};
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::MemoryConsumer;
+use datafusion_execution::memory_pool::coordinated::AllocationType;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, OrderingRequirements};
 
 use crate::execution_plan::{EvaluationType, SchedulingType};
@@ -306,9 +306,7 @@ impl ExecutionPlan for SortPreservingMergeExec {
         );
         let schema = self.schema();
 
-        let reservation =
-            MemoryConsumer::new(format!("SortPreservingMergeExec[{partition}]"))
-                .register(&context.runtime_env().memory_pool);
+        let allocation = context.memory_coordinator().register(format!("SortPreservingMergeExec[{partition}]")).new_empty(AllocationType::Required);
 
         match input_partitions {
             0 => internal_err!(
@@ -355,7 +353,7 @@ impl ExecutionPlan for SortPreservingMergeExec {
                     .with_metrics(BaselineMetrics::new(&self.metrics, partition))
                     .with_batch_size(context.session_config().batch_size())
                     .with_fetch(self.fetch)
-                    .with_reservation(reservation)
+                    .with_allocation(allocation)
                     .with_round_robin_tie_breaker(self.enable_round_robin_repartition)
                     .build()?;
 
@@ -440,6 +438,7 @@ mod tests {
     use datafusion_common_runtime::SpawnedTask;
     use datafusion_execution::RecordBatchStream;
     use datafusion_execution::config::SessionConfig;
+    use datafusion_execution::memory_pool::coordinated::MemoryCoordinator;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_physical_expr::EquivalenceProperties;
     use datafusion_physical_expr::expressions::Column;
@@ -1115,8 +1114,10 @@ mod tests {
         }
 
         let metrics = ExecutionPlanMetricsSet::new();
-        let reservation =
-            MemoryConsumer::new("test").register(&task_ctx.runtime_env().memory_pool);
+
+        let coordinator = MemoryCoordinator::new_unbounded();
+        let allocation = coordinator.register("test").new_empty(AllocationType::Required);
+
 
         let fetch = None;
         let merge_stream = StreamingMergeBuilder::new()
@@ -1126,7 +1127,7 @@ mod tests {
             .with_metrics(BaselineMetrics::new(&metrics, 0))
             .with_batch_size(task_ctx.session_config().batch_size())
             .with_fetch(fetch)
-            .with_reservation(reservation)
+            .with_allocation(allocation)
             .build()?;
 
         let mut merged = common::collect(merge_stream).await.unwrap();

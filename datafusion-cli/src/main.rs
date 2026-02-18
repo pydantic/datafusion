@@ -24,6 +24,7 @@ use std::sync::{Arc, LazyLock};
 
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionConfig;
+use datafusion::execution::memory_pool::coordinated::MemoryCoordinator;
 use datafusion::execution::memory_pool::{
     FairSpillPool, GreedyMemoryPool, MemoryPool, TrackConsumersPool,
 };
@@ -121,7 +122,7 @@ struct Args {
     #[clap(
         long,
         help = "Specify the memory pool type 'greedy' or 'fair'",
-        default_value_t = PoolType::Greedy
+        default_value_t = PoolType::Fair
     )]
     mem_pool_type: PoolType,
 
@@ -206,7 +207,9 @@ async fn main_inner() -> Result<()> {
             )),
         };
 
-        rt_builder = rt_builder.with_memory_pool(pool)
+        rt_builder = rt_builder
+            .with_memory_pool(pool)
+            .with_memory_coordinator(MemoryCoordinator::new_bounded(memory_limit));
     }
 
     // set disk limit

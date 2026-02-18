@@ -23,7 +23,7 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use arrow::row::{RowConverter, Rows, SortField};
 use datafusion_common::{Result, internal_datafusion_err};
-use datafusion_execution::memory_pool::MemoryReservation;
+use datafusion_execution::memory_pool::coordinated::MemoryAllocation;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::stream::{Fuse, StreamExt};
@@ -120,7 +120,7 @@ pub struct RowCursorStream {
     /// Input streams
     streams: FusedStreams,
     /// Tracks the memory used by `converter`
-    reservation: MemoryReservation,
+    allocation: MemoryAllocation,
     /// Allocated rows for each partition, we keep two to allow for buffering one
     /// in the consumer of the stream
     rows: ReusableRows,
@@ -131,7 +131,7 @@ impl RowCursorStream {
         schema: &Schema,
         expressions: &LexOrdering,
         streams: Vec<SendableRecordBatchStream>,
-        reservation: MemoryReservation,
+        allocation: MemoryAllocation,
     ) -> Result<Self> {
         let sort_fields = expressions
             .iter()
@@ -153,7 +153,7 @@ impl RowCursorStream {
         }
         Ok(Self {
             converter,
-            reservation,
+            allocation,
             column_expressions: expressions.iter().map(|x| Arc::clone(&x.expr)).collect(),
             streams: FusedStreams(streams),
             rows: ReusableRows { inner: rows },
@@ -173,16 +173,13 @@ impl RowCursorStream {
         rows.clear();
 
         self.converter.append(&mut rows, &cols)?;
-        self.reservation.try_resize(self.converter.size())?;
+        self.allocation.try_resize(self.converter.size())?;
 
         let rows = Arc::new(rows);
 
         self.rows.save(stream_idx, &rows);
 
-        // track the memory in the newly created Rows.
-        let rows_reservation = self.reservation.new_empty();
-        rows_reservation.try_grow(rows.size())?;
-        Ok(RowValues::new(rows, rows_reservation))
+        Ok(RowValues::new(rows))
     }
 }
 
@@ -214,7 +211,7 @@ pub struct FieldCursorStream<T: CursorArray> {
     /// Input streams
     streams: FusedStreams,
     /// Create new reservations for each array
-    reservation: MemoryReservation,
+    allocation: MemoryAllocation,
     phantom: PhantomData<fn(T) -> T>,
 }
 
@@ -230,13 +227,13 @@ impl<T: CursorArray> FieldCursorStream<T> {
     pub fn new(
         sort: PhysicalSortExpr,
         streams: Vec<SendableRecordBatchStream>,
-        reservation: MemoryReservation,
+        allocation: MemoryAllocation,
     ) -> Self {
         let streams = streams.into_iter().map(|s| s.fuse()).collect();
         Self {
             sort,
             streams: FusedStreams(streams),
-            reservation,
+            allocation,
             phantom: Default::default(),
         }
     }
@@ -246,7 +243,7 @@ impl<T: CursorArray> FieldCursorStream<T> {
         let array = value.into_array(batch.num_rows())?;
         let size_in_mem = array.get_buffer_memory_size();
         let array = array.as_any().downcast_ref::<T>().expect("field values");
-        let array_reservation = self.reservation.new_empty();
+        let mut array_reservation = self.allocation.new_empty().change_consumer(&format!("{}:FieldCursorStream", self.allocation.consumer_name()));
         array_reservation.try_grow(size_in_mem)?;
         Ok(ArrayValues::new(
             self.sort.options,

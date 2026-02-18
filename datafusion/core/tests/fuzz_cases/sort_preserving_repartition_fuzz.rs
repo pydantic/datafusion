@@ -35,7 +35,7 @@ mod sp_repartition_fuzz_tests {
     };
     use datafusion::prelude::SessionContext;
     use datafusion_common::Result;
-    use datafusion_execution::{config::SessionConfig, memory_pool::MemoryConsumer};
+    use datafusion_execution::config::SessionConfig;
     use datafusion_physical_expr::ConstExpr;
     use datafusion_physical_expr::equivalence::{
         EquivalenceClass, EquivalenceProperties,
@@ -242,8 +242,10 @@ mod sp_repartition_fuzz_tests {
             };
 
             let context = SessionContext::new().task_ctx();
-            let mem_reservation =
-                MemoryConsumer::new("test".to_string()).register(context.memory_pool());
+            let merge_consumer = context
+                .runtime_env()
+                .memory_coordinator
+                .register("test");
 
             // Internally SortPreservingMergeExec uses this function for merging.
             let res = StreamingMergeBuilder::new()
@@ -252,7 +254,7 @@ mod sp_repartition_fuzz_tests {
                 .with_expressions(&exprs)
                 .with_metrics(BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0))
                 .with_batch_size(1)
-                .with_reservation(mem_reservation)
+                .with_consumer(merge_consumer)
                 .build()?;
             let res = collect(res).await?;
             // Contains the merged result.

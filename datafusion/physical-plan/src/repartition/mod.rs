@@ -55,6 +55,7 @@ use datafusion_common::{Result, not_impl_err};
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryConsumer;
+use datafusion_execution::memory_pool::coordinated::AllocationType;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
@@ -1027,9 +1028,8 @@ impl ExecutionPlan for RepartitionExec {
                 // Merge streams (while preserving ordering) coming from
                 // input partitions to this partition:
                 let fetch = None;
-                let merge_reservation =
-                    MemoryConsumer::new(format!("{name}[Merge {partition}]"))
-                        .register(context.memory_pool());
+
+                let allocation = context.memory_coordinator().register(format!("{name}[Merge {partition}]")).try_allocate(0, AllocationType::Required)?;
                 StreamingMergeBuilder::new()
                     .with_streams(input_streams)
                     .with_schema(schema_captured)
@@ -1037,8 +1037,8 @@ impl ExecutionPlan for RepartitionExec {
                     .with_metrics(BaselineMetrics::new(&metrics, partition))
                     .with_batch_size(context.session_config().batch_size())
                     .with_fetch(fetch)
-                    .with_reservation(merge_reservation)
                     .with_spill_manager(spill_manager)
+                    .with_allocation(allocation)
                     .build()
             } else {
                 // Non-preserve-order case: single input stream, so use the first spill reader

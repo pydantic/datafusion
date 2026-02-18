@@ -31,8 +31,8 @@ use crate::sorts::stream::PartitionedStream;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::Result;
-use datafusion_execution::memory_pool::MemoryReservation;
 
+use datafusion_execution::memory_pool::coordinated::MemoryAllocation;
 use futures::Stream;
 
 /// A fallible [`PartitionedStream`] of [`Cursor`] and [`RecordBatch`]
@@ -154,13 +154,15 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         metrics: BaselineMetrics,
         batch_size: usize,
         fetch: Option<usize>,
-        reservation: MemoryReservation,
+        reservation: MemoryAllocation,
         enable_round_robin_tie_breaker: bool,
     ) -> Self {
         let stream_count = streams.partitions();
 
+        let consumer_name = format!("{}:SortPreservingMergeStream", reservation.consumer_name());
+
         Self {
-            in_progress: BatchBuilder::new(schema, stream_count, batch_size, reservation),
+            in_progress: BatchBuilder::new(schema, stream_count, batch_size, reservation.change_consumer(&consumer_name)),
             streams,
             metrics,
             done: false,
