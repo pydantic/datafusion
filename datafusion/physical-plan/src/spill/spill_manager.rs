@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use super::{SpillReaderStream, in_progress_spill_file::InProgressSpillFile};
 use crate::coop::cooperative;
+use crate::spill::gc_view_arrays;
 use crate::{common::spawn_buffered, metrics::SpillMetrics};
 
 /// The `SpillManager` is responsible for the following tasks:
@@ -162,6 +163,8 @@ impl SpillManager {
 
         while let Some(batch) = stream.next().await {
             let batch = batch?;
+            let batch = gc_view_arrays(&batch)?;
+
             in_progress_file.append_batch(&batch)?;
 
             max_record_batch_size = max_record_batch_size.max(batch.get_sliced_size()?);

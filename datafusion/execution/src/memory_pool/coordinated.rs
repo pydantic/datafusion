@@ -53,6 +53,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use super::human_readable_size;
@@ -154,6 +155,7 @@ impl CoordinatorState {
 
 struct CoordinatorInner {
     capacity: Option<usize>, // None = unbounded
+    active_consumers: AtomicUsize,
     state: Mutex<CoordinatorState>,
 }
 
@@ -188,6 +190,7 @@ impl MemoryCoordinator {
         Self {
             inner: Arc::new(CoordinatorInner {
                 capacity: Some(capacity),
+                active_consumers: AtomicUsize::new(0),
                 state: Mutex::new(CoordinatorState {
                     used_required: 0,
                     used_spillable: 0,
@@ -203,6 +206,7 @@ impl MemoryCoordinator {
         Self {
             inner: Arc::new(CoordinatorInner {
                 capacity: None,
+                active_consumers: AtomicUsize::new(0),
                 state: Mutex::new(CoordinatorState {
                     used_required: 0,
                     used_spillable: 0,
@@ -215,6 +219,7 @@ impl MemoryCoordinator {
 
     /// Registers a new consumer with this coordinator.
     pub fn register(&self, name: impl Into<String>) -> CoordinatedConsumer {
+        self.inner.active_consumers.fetch_add(1, Ordering::Relaxed);
         CoordinatedConsumer {
             name: name.into(),
             coordinator: Arc::clone(&self.inner),
@@ -246,6 +251,11 @@ impl MemoryCoordinator {
     pub fn num_waiters(&self) -> usize {
         self.inner.state.lock().waiter_queue.len()
     }
+
+    /// Returns the number of active consumers registered with this coordinator.
+    pub fn num_consumers(&self) -> usize {
+        self.inner.active_consumers.load(Ordering::Relaxed)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -259,10 +269,25 @@ impl MemoryCoordinator {
 ///
 /// Use [`CoordinatedConsumer::should_spill`] in processing loops to cooperatively
 /// free memory when other consumers are waiting.
-#[derive(Clone)]
 pub struct CoordinatedConsumer {
     name: String,
     coordinator: Arc<CoordinatorInner>,
+}
+
+impl Clone for CoordinatedConsumer {
+    fn clone(&self) -> Self {
+        self.coordinator.active_consumers.fetch_add(1, Ordering::Relaxed);
+        Self {
+            name: self.name.clone(),
+            coordinator: Arc::clone(&self.coordinator),
+        }
+    }
+}
+
+impl Drop for CoordinatedConsumer {
+    fn drop(&mut self) {
+        self.coordinator.active_consumers.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl fmt::Debug for CoordinatedConsumer {
@@ -381,6 +406,16 @@ impl MemoryAllocation {
     /// Returns the name of the consumer of this allocation.
     pub fn consumer_name(&self) -> &str {
         &self.consumer_name
+    }
+
+    /// Returns the number of active consumers sharing this coordinator.
+    pub fn num_consumers(&self) -> usize {
+        self.coordinator.active_consumers.load(Ordering::Relaxed)
+    }
+
+    /// Returns the capacity of the coordinator, or `None` if unbounded.
+    pub fn capacity(&self) -> Option<usize> {
+        self.coordinator.capacity
     }
 
     pub fn change_consumer(mut self, name: &str) -> Self {

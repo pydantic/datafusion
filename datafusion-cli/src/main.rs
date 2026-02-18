@@ -49,10 +49,9 @@ use clap::Parser;
 use datafusion::common::config_err;
 use datafusion::config::ConfigOptions;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
-use mimalloc::MiMalloc;
-
+use tokio::signal::ctrl_c;
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static ALLOC: dhat::Alloc = dhat::Alloc;
 
 #[derive(Debug, Parser, PartialEq)]
 #[clap(author, version, about, long_about= None)]
@@ -162,10 +161,21 @@ struct Args {
 #[tokio::main]
 /// Calls [`main_inner`], then handles printing errors and returning the correct exit code
 pub async fn main() -> ExitCode {
-    if let Err(e) = main_inner().await {
-        println!("Error: {e}");
-        return ExitCode::FAILURE;
+    let _profiler = dhat::Profiler::new_heap();
+
+
+    tokio::select! {
+        result = main_inner() => {
+            if let Err(e) = result {
+                println!("Error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ = ctrl_c() => {
+            println!("Exiting due to ctrl+c")
+        }
     }
+
 
     ExitCode::SUCCESS
 }
@@ -800,7 +810,7 @@ mod tests {
         ctx.sql("COPY (SELECT * FROM src_table) TO 'mem://test_table/1.parquet' STORED AS PARQUET").await?.collect().await?;
 
         ctx.sql(
-            "CREATE EXTERNAL TABLE test_table 
+            "CREATE EXTERNAL TABLE test_table
             STORED AS PARQUET
             LOCATION 'mem://test_table/'
         ",

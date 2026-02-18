@@ -181,7 +181,7 @@ impl MultiLevelMergeBuilder {
 
     async fn create_stream(mut self) -> Result<SendableRecordBatchStream> {
         loop {
-            let mut stream = self.merge_sorted_runs_within_mem_limit()?;
+            let mut stream = self.merge_sorted_runs_within_mem_limit().await?;
 
             // TODO - add a threshold for number of files to disk even if empty and reading from disk so
             //        we can avoid the memory reservation
@@ -219,7 +219,7 @@ impl MultiLevelMergeBuilder {
 
     /// This tries to create a stream that merges the most sorted streams and sorted spill files
     /// as possible within the memory limit.
-    fn merge_sorted_runs_within_mem_limit(
+    async fn merge_sorted_runs_within_mem_limit(
         &mut self,
     ) -> Result<SendableRecordBatchStream> {
         match (self.sorted_spill_files.len(), self.sorted_streams.len()) {
@@ -265,7 +265,10 @@ impl MultiLevelMergeBuilder {
                         // we must have at least 2 streams to merge
                         2_usize.saturating_sub(sorted_streams.len()),
                         &mut memory_reservation,
-                    )?;
+                    )
+                    .await?;
+
+                eprintln!("Allocation size: {}", memory_reservation.size());
 
                 let is_only_merging_memory_streams = sorted_spill_files.is_empty();
 
@@ -344,67 +347,72 @@ impl MultiLevelMergeBuilder {
         builder.build()
     }
 
-    /// Return the sorted spill files to use for the next phase, and the buffer size
-    /// This will try to get as many spill files as possible to merge, and if we don't have enough streams
-    /// it will try to reduce the buffer size until we have enough streams to merge
-    /// otherwise it will return an error
-    fn get_sorted_spill_files_to_merge(
+    /// Return the sorted spill files to use for the next phase, and the buffer size.
+    ///
+    /// Phase 1: Compute the memory needed for the minimum required streams and
+    /// cooperatively wait (`grow().await`) until that memory is available. This
+    /// prevents immediate failure when the pool is temporarily full.
+    ///
+    /// Phase 2: Greedily `try_grow` for additional spill files (up to a 16-file
+    /// hard cap and a fair-share cap derived from pool capacity / active consumers).
+    async fn get_sorted_spill_files_to_merge(
         &mut self,
         buffer_len: usize,
         minimum_number_of_required_streams: usize,
         reservation: &mut MemoryAllocation,
     ) -> Result<(Vec<SortedSpillFile>, usize)> {
         assert_ne!(buffer_len, 0, "Buffer length must be greater than 0");
-        let mut number_of_spills_to_read_for_current_phase = 0;
 
-        for spill in &self.sorted_spill_files {
-            // For memory pools that are not shared this is good, for other this is not
-            // and there should be some upper limit to memory reservation so we won't starve the system
+        // Memory is bounded by fair_share to prevent starving other
+        // concurrent consumers sharing the coordinator
+        let fair_share = match reservation.capacity() {
+            Some(cap) => cap / reservation.num_consumers().max(1),
+            None => usize::MAX,
+        };
+
+        // --- Phase 1: await the minimum required memory ---
+        let min_streams = minimum_number_of_required_streams
+            .min(self.sorted_spill_files.len());
+
+        let mut minimum_memory = 0;
+        for spill in self.sorted_spill_files.iter().take(min_streams) {
+            minimum_memory += get_reserved_bytes_for_record_batch_size(
+                spill.max_record_batch_memory,
+                spill.max_record_batch_memory,
+            ) * buffer_len;
+        }
+
+        // Cooperatively wait for the minimum memory to become available
+        if minimum_memory > 0 {
+            reservation.grow(minimum_memory).await?;
+        }
+
+        let mut number_of_spills_to_read = min_streams;
+
+        // --- Phase 2: try to grow beyond the minimum up to fair share ---
+        for spill in self.sorted_spill_files.iter().skip(min_streams) {
+            if number_of_spills_to_read >= 16 {
+                break;
+            }
+            if reservation.size() >= fair_share {
+                break;
+            }
             match reservation.try_grow(
                 get_reserved_bytes_for_record_batch_size(
                     spill.max_record_batch_memory,
-                    // Size will be the same as the sliced size, bc it is a spilled batch.
                     spill.max_record_batch_memory,
                 ) * buffer_len,
             ) {
                 Ok(_) => {
-                    number_of_spills_to_read_for_current_phase += 1;
-
-                    if number_of_spills_to_read_for_current_phase >= 16 {
-                        break;
-                    }
+                    number_of_spills_to_read += 1;
                 }
-                // If we can't grow the reservation, we need to stop
-                Err(err) => {
-                    // We must have at least 2 streams to merge, so if we don't have enough memory
-                    // fail
-                    if minimum_number_of_required_streams
-                        > number_of_spills_to_read_for_current_phase
-                    {
-                        // Free the memory we reserved for this merge as we either try again or fail
-                        reservation.free();
-                        if buffer_len > 1 {
-                            // Try again with smaller buffer size, it will be slower but at least we can merge
-                            return self.get_sorted_spill_files_to_merge(
-                                buffer_len - 1,
-                                minimum_number_of_required_streams,
-                                reservation,
-                            );
-                        }
-
-                        return Err(err.context(format!("Could not allocate with max_record_batch_memory: {}", spill.max_record_batch_memory)));
-                    }
-
-                    // We reached the maximum amount of memory we can use
-                    // for this merge
-                    break;
-                }
+                Err(_) => break,
             }
         }
 
         let spills = self
             .sorted_spill_files
-            .drain(..number_of_spills_to_read_for_current_phase)
+            .drain(..number_of_spills_to_read)
             .collect::<Vec<_>>();
 
         Ok((spills, buffer_len))

@@ -418,8 +418,18 @@ impl ExternalSorter {
 
             in_progress_file.append_batch(&batch)?;
 
-            *max_record_batch_size =
-                (*max_record_batch_size).max(batch.get_sliced_size()?);
+            let sliced_size = batch.get_sliced_size()?;
+            *max_record_batch_size = (*max_record_batch_size).max(sliced_size);
+
+            if sliced_size > 20 * 1024 * 1024 {
+                eprintln!(
+                    "[DEBUG] consume_and_spill_append: max_record_batch_size={}, sliced_size={}, num_rows={}, num_columns={}",
+                    *max_record_batch_size,
+                    sliced_size,
+                    batch.num_rows(),
+                    batch.num_columns(),
+                );
+            }
         }
 
         assert_or_internal_err!(
