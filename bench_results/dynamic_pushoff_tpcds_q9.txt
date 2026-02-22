@@ -1,0 +1,4 @@
+=== dynamic_pushoff_tpcds_q9 ===
+  Run 1: 0.62s
+  Run 2: 0.61s
+  Run 3: 0.62s

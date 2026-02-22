@@ -1,0 +1,4 @@
+=== main_pushon_tpcds_q9 ===
+  Run 1: 1.55s
+  Run 2: 1.53s
+  Run 3: 1.52s

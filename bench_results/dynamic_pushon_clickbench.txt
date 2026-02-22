@@ -1,0 +1,4 @@
+=== dynamic_pushon_clickbench ===
+  Run 1: 1.94s
+  Run 2: 1.01s
+  Run 3: 1.07s

@@ -1,0 +1,252 @@
+================================================================================
+BRANCH ANALYSIS: filter-pushdown-dynamic-bytes
+================================================================================
+
+1. SUMMARY
+----------
+
+This branch implements adaptive filter pushdown for Parquet scanning in
+Apache DataFusion. Instead of unconditionally pushing all filter predicates
+into row-level Parquet filters (which incurs late-materialization overhead),
+the system now:
+
+  a) Runs a "collection phase" where all filters execute post-scan to gather
+     unbiased per-filter selectivity, timing, and pairwise correlation stats.
+
+  b) After collection, promotes only filters whose throughput (bytes_saved /
+     eval_time) exceeds a configurable threshold (default 100 MB/s) to row
+     filters; the rest remain post-scan.
+
+  c) Groups positively correlated filters into compound ArrowPredicates
+     (via union-find on correlation ratios) so they share column decoding.
+
+  d) Introduces "optional" filters (e.g., hash-join dynamic filters) that
+     can be dropped entirely when ineffective, rather than demoted to
+     post-scan.
+
+  e) Caches promotion/demotion decisions and re-evaluates periodically.
+
+Benchmark results (included in benchmarks/results.txt) show mixed results:
+TPC-H is ~2% faster overall (13 faster, 6 slower), TPC-DS is ~44% faster
+overall (largely due to Q64 going from 17s to 0.7s), and ClickBench
+partitioned is ~6% slower overall (18 faster, 12 slower).
+
+
+2. FILES CHANGED (33 files, +3857/-218 lines)
+----------------------------------------------
+
+NEW FILES:
+  - datafusion/datasource-parquet/src/selectivity.rs (1816 lines)
+  - benchmarks/results.txt (217 lines)
+
+MAJOR MODIFICATIONS:
+  - datafusion/datasource-parquet/src/opener.rs (+425 lines)
+  - datafusion/datasource-parquet/src/row_filter.rs (+466 lines)
+  - datafusion/physical-expr-common/src/physical_expr.rs (+257 lines)
+  - datafusion/datasource-parquet/src/source.rs (+76 lines)
+
+CONFIGURATION / PROTO:
+  - datafusion/common/src/config.rs (+90 lines)
+  - datafusion/proto-common/proto/datafusion_common.proto (+20 lines)
+  - datafusion/proto-common/src/generated/prost.rs (+54 lines)
+  - datafusion/proto-common/src/generated/pbjson.rs (+114 lines)
+  - datafusion/proto-common/src/from_proto/mod.rs (+15 lines)
+  - datafusion/proto-common/src/to_proto/mod.rs (+5 lines)
+  - datafusion/proto/src/generated/datafusion_proto_common.rs (+54 lines)
+  - datafusion/proto/src/logical_plan/file_formats.rs (+20 lines)
+  - datafusion/proto/src/physical_plan/mod.rs (+8 lines)
+
+TEST / SLT UPDATES:
+  - datafusion/core/tests/physical_optimizer/filter_pushdown.rs
+  - datafusion/core/tests/sql/explain_analyze.rs
+  - datafusion/core/src/dataframe/parquet.rs
+  - datafusion/core/src/datasource/physical_plan/parquet.rs
+  - datafusion/datasource-parquet/benches/parquet_nested_filter_pushdown.rs
+  - datafusion/common/src/file_options/parquet_writer.rs
+  - Multiple .slt files (information_schema, push_down_filter, etc.)
+
+OTHER:
+  - datafusion/datasource-parquet/src/file_format.rs
+  - datafusion/datasource-parquet/src/metrics.rs
+  - datafusion/datasource-parquet/src/mod.rs
+  - datafusion/physical-plan/src/joins/hash_join/exec.rs
+  - docs/source/user-guide/configs.md
+
+
+3. KEY CHANGES PER FILE
+------------------------
+
+### selectivity.rs (NEW - 1816 lines)
+Core of the feature. Contains:
+- `SelectivityTracker`: cross-file tracker maintaining per-filter stats
+  (rows_matched, rows_total, eval_nanos) and pairwise correlation stats.
+- `SelectivityStats`: per-filter stats with effectiveness() and
+  bytes_per_sec() computations.
+- `PartitionedFilters` / `PartitionedFiltersGrouped`: result types for
+  filter partitioning decisions.
+- `ExprKey`: structural hash/eq wrapper for Arc<dyn PhysicalExpr> using
+  snapshot() for dynamic expression stability.
+- `PairKey`: canonical (A,B)==(B,A) pair key for correlation tracking.
+- `CachedDecision`: caches promotion decisions, replayed until enough new
+  rows arrive.
+- `PromotionStrategy` enum: Disabled / AllPromoted / Threshold(f64).
+- Union-find algorithm for grouping correlated filters.
+- `partition_filters_grouped()`: main entry point implementing the two-phase
+  (collection then optimized) strategy with correlation grouping.
+- ~600 lines of unit tests covering all edge cases.
+
+### opener.rs
+Major restructuring of the file opening pipeline:
+- Removed the old simple "if pushdown_filters, build row filter" path.
+- Added `selectivity_tracker` field to `ParquetOpener`.
+- New flow: split filters via `tracker.partition_filters_grouped()`, build
+  row filter from groups via `build_row_filter_from_groups()`, remaining
+  filters become post-scan.
+- Post-scan filters are applied in the stream mapping closure via
+  `apply_post_scan_filters()` BEFORE projection.
+- Limit is only applied to the reader when no post-scan filters exist.
+- Projection mask is expanded to include columns needed by post-scan filters.
+- `compute_bytes_per_row()`: computes avg compressed bytes/row from metadata.
+- `apply_post_scan_filters()`: during collection phase, evaluates each filter
+  individually with timing and pairwise AND for correlation tracking. After
+  collection, evaluates all together without overhead.
+- `SelectivityUpdatingStream`: wraps the output stream to feed row filter
+  metrics (matched/pruned/timing deltas) back into the tracker for demotion.
+- `and_boolean_arrays()`: utility to AND multiple BooleanArrays.
+
+### row_filter.rs
+- New `FilterMetrics` struct: per-filter rows_matched/pruned/eval_time
+  counters paired with the original expression.
+- New `RowFilterWithMetrics` struct: bundles RowFilter + FilterMetrics +
+  unbuildable_filters.
+- New `build_row_filter_with_metrics()`: like build_row_filter but returns
+  per-expression metrics for selectivity tracking.
+- New `build_row_filter_from_groups()`: builds compound ArrowPredicates from
+  groups of correlated filters. Falls back to individual predicates when
+  compound build fails. Returns unbuildable filters for post-scan.
+- New `DatafusionArrowPredicateWithMetrics`: variant that tracks both
+  per-predicate (local) and global metrics simultaneously.
+- Modified `build_row_filter()`: now accepts `&SelectivityTracker` and uses
+  effectiveness-based sorting when reorder_predicates is true.
+
+### physical_expr.rs
+- New `OptionalFilterPhysicalExpr`: transparent wrapper marking a filter as
+  droppable without affecting correctness. Delegates all PhysicalExpr methods
+  to inner. Display shows "Optional(...)". snapshot() unwraps the wrapper.
+  snapshot_generation() returns 0.
+- ~110 lines of unit tests.
+
+### source.rs (ParquetSource)
+- Added `selectivity_tracker` field (Arc<RwLock<SelectivityTracker>>).
+- `with_table_parquet_options()` now initializes the tracker from config.
+- New `with_filter_pushdown_min_bytes_per_sec()` builder method.
+- New `with_filter_pushdown_min_bytes_per_sec_opt()` builder method.
+- `create_opener()` now passes the tracker to ParquetOpener.
+- `create_opener()` calls `notify_dataset_rows()` when statistics are known.
+
+### config.rs
+Five new ParquetOptions configuration parameters:
+- `filter_pushdown_min_bytes_per_sec` (f64, default 104_857_600.0 = 100 MB/s)
+- `filter_correlation_threshold` (f64, default 1.5)
+- `filter_statistics_collection_min_rows` (u64, default 50_000)
+- `filter_statistics_collection_fraction` (f64, default 0.05)
+- `filter_statistics_collection_max_rows` (u64, default 750_000)
+Each has detailed doc comments explaining interaction with pushdown_filters
+and reorder_filters.
+
+### hash_join/exec.rs
+- Dynamic join filters are now wrapped in `OptionalFilterPhysicalExpr`.
+- `with_pushed_down_filters_exact()` unwraps the Optional wrapper before
+  downcasting to `DynamicFilterPhysicalExpr`.
+- Display output changes from "DynamicFilter [...]" to
+  "Optional(DynamicFilter [...])".
+
+### metrics.rs
+- Added `filter_apply_time: Time` metric to `ParquetFileMetrics` for
+  tracking post-scan filter evaluation time.
+
+### file_format.rs
+- Reads `filter_pushdown_min_bytes_per_sec` from session config and applies
+  it to the ParquetSource.
+
+### Proto files (proto, prost, pbjson, from_proto, to_proto)
+- Added protobuf fields 35-39 for the five new ParquetOptions.
+- Serialization/deserialization for all new fields.
+
+### Test updates
+- filter_pushdown.rs: All dynamic filter predicates now show "Optional(...)"
+  wrapper in plan output.
+- explain_analyze.rs: output_rows changed from 8 to 5 (adaptive pushdown
+  filters more rows during scan).
+- parquet.rs tests: added `with_filter_pushdown_min_bytes_per_sec(0.0)` to
+  force all filters as row filters.
+- parquet_nested_filter_pushdown bench: passes SelectivityTracker::default().
+- dataframe/parquet.rs: changed test assertion from checking for FilterExec
+  to checking for predicate= in DataSourceExec (filter pushed into scan).
+- Various .slt files updated for new config options in information_schema
+  and changed plan output.
+
+
+4. NOTABLE PATTERNS AND CONCERNS
+---------------------------------
+
+### Architecture Patterns
+- Two-phase adaptive strategy: collection then optimization. Clean separation.
+- Union-find for correlation grouping is a good algorithmic choice.
+- Decision caching with periodic re-evaluation avoids per-file overhead.
+- ExprKey using snapshot() for dynamic expression stability is important for
+  HashMap correctness.
+
+### Concurrency
+- SelectivityTracker is behind `Arc<parking_lot::RwLock<...>>` shared across
+  all openers/streams for a single scan.
+- Write locks are held briefly (stats updates); read locks for decisions.
+- `apply_post_scan_filters()` does compute-heavy work (filter evaluation,
+  pairwise AND) outside the lock, only acquiring write lock for brief updates.
+- `partition_filters_grouped()` requires `&mut self` (write lock at call site).
+
+### Potential Concerns
+
+1. **Lock contention**: The shared RwLock could become a bottleneck with many
+   concurrent partitions/files. The write lock in `apply_post_scan_filters`
+   is called on every batch during collection phase. parking_lot mitigates
+   this somewhat.
+
+2. **O(n^2) pairwise correlation**: Bounded to <= 10 filters, but could still
+   be significant per batch during collection.
+
+3. **Default threshold (100 MB/s)**: Changes behavior for all users with
+   pushdown_filters=true. The default effectively enables adaptive pushdown
+   for everyone. Users relying on unconditional pushdown would need to set
+   `filter_pushdown_min_bytes_per_sec = 0.0`.
+
+4. **Post-scan filter correctness**: Limit is now only applied when no
+   post-scan filters exist, which is correct but changes behavior. The
+   projection mask expansion for post-scan filter columns is also a
+   correctness-critical path.
+
+5. **Mixed benchmark results**: Some queries are significantly slower
+   (ClickBench Q23: 5.65x slower, TPC-DS Q24: 5.31x slower). These
+   regressions should be investigated before merging.
+
+6. **Test changes**: Several tests had to change expected output_rows or
+   plan shapes, suggesting the adaptive behavior changes query results in
+   some cases (e.g., explain_analyze output_rows 8->5). This needs
+   verification that results are still correct.
+
+7. **OptionalFilterPhysicalExpr Display**: Shows "Optional(...)" in EXPLAIN
+   output which changes many test expectations. This is a visible user-facing
+   change.
+
+8. **and_boolean_arrays panics on empty input**: The function expects at
+   least one array and panics otherwise. Callers should ensure non-empty
+   input.
+
+9. **Proto field numbers**: Uses fields 35-39 (skipping 34), which is fine
+   for protobuf but worth noting for future additions.
+
+10. **from_proto defaults mismatch**: The from_proto defaults for
+    `filter_statistics_collection_min_rows` (10,000) and
+    `filter_statistics_collection_max_rows` (1,000,000) differ from the
+    config.rs defaults (50,000 and 750,000 respectively). This could cause
+    inconsistencies when deserializing proto messages.
