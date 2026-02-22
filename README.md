@@ -28,6 +28,7 @@
 [![Discord chat][discord-badge]][discord-url]
 [![Linkedin][linkedin-badge]][linkedin-url]
 ![Crates.io MSRV][msrv-badge]
+[![CodSpeed][codspeed-badge]][codspeed-url]
 
 [crates-badge]: https://img.shields.io/crates/v/datafusion.svg
 [crates-url]: https://crates.io/crates/datafusion
@@ -45,6 +46,8 @@
 [linkedin-badge]: https://img.shields.io/badge/Follow-Linkedin-blue
 [linkedin-url]: https://www.linkedin.com/company/apache-datafusion/
 [msrv-badge]: https://img.shields.io/crates/msrv/datafusion?label=Min%20Rust%20Version
+[codspeed-badge]: https://img.shields.io/endpoint?url=https://codspeed.io/badge.json
+[codspeed-url]: https://codspeed.io/pydantic/datafusion?utm_source=badge
 
 [Website](https://datafusion.apache.org/) |
 [API Docs](https://docs.rs/datafusion/latest/datafusion/) |
