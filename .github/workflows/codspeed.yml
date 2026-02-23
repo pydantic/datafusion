@@ -1,0 +1,126 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: CodSpeed
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+  # `workflow_dispatch` allows CodSpeed to trigger backtest
+  # performance analysis in order to generate initial data.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  codspeed:
+    name: Criterion CPU Simulation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      - name: Setup Rust toolchain
+        run: rustup toolchain install stable
+
+      - name: Install protobuf compiler
+        run: sudo apt-get install -y protobuf-compiler
+
+      - name: Install cargo-codspeed
+        run: cargo install cargo-codspeed --version 4.3.0
+
+      - name: Build the benchmark target(s)
+        run: cargo codspeed build -m simulation
+
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@4deb3275dd364fb96fb074c953133d29ec96f80f # v4.10.6
+        with:
+          mode: simulation
+          run: cargo codspeed run
+
+  codspeed-memory:
+    name: Criterion Memory Profiling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      - name: Setup Rust toolchain
+        run: rustup toolchain install stable
+
+      - name: Install protobuf compiler
+        run: sudo apt-get install -y protobuf-compiler
+
+      - name: Install cargo-codspeed
+        run: cargo install cargo-codspeed --version 4.3.0
+
+      - name: Build benchmarks (memory mode)
+        run: cargo codspeed build -m memory
+
+      - name: Run memory benchmarks
+        uses: CodSpeedHQ/action@4deb3275dd364fb96fb074c953133d29ec96f80f # v4.10.6
+        with:
+          mode: memory
+          run: cargo codspeed run
+
+  codspeed-macro:
+    name: Macro Benchmarks (Simulation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      - name: Setup Rust toolchain
+        run: rustup toolchain install stable
+
+      - name: Install protobuf compiler
+        run: sudo apt-get install -y protobuf-compiler
+
+      - name: Install CodSpeed CLI
+        run: curl -fsSL https://codspeed.io/install.sh | bash
+
+      - name: Install tpchgen-cli
+        run: cargo install tpchgen-cli --locked
+
+      - name: Build dfbench binary
+        run: cargo build --release --bin dfbench
+
+      - name: Generate TPC-H SF1 data
+        run: |
+          mkdir -p benchmarks/data/tpch_sf1
+          tpchgen-cli --scale-factor 1 --format parquet --parquet-compression='ZSTD(1)' --parts=1 --output-dir benchmarks/data/tpch_sf1
+
+      - name: Download ClickBench partitioned data
+        run: |
+          mkdir -p benchmarks/data/hits_partitioned
+          seq 0 99 | xargs -P10 -I{} bash -c 'wget -q --continue https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_{}.parquet -O benchmarks/data/hits_partitioned/hits_{}.parquet'
+
+      - name: Run macro benchmarks
+        uses: CodSpeedHQ/action@4deb3275dd364fb96fb074c953133d29ec96f80f # v4.10.6
+        with:
+          mode: simulation
+          run: benchmarks/codspeed_macro.sh
