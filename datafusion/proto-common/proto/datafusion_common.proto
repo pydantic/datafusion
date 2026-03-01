@@ -606,7 +606,7 @@ message ParquetOptions {
   }
 
   oneof filter_pushdown_min_bytes_per_sec_opt {
-    double filter_pushdown_min_bytes_per_sec = 35;
+    double filter_pushdown_min_bytes_per_sec = 42;
   }
 
   // field 36 removed (filter_correlation_threshold)

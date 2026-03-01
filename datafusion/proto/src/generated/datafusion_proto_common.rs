@@ -872,7 +872,7 @@ pub struct ParquetOptions {
     pub max_predicate_cache_size_opt: ::core::option::Option<
         parquet_options::MaxPredicateCacheSizeOpt,
     >,
-    #[prost(oneof = "parquet_options::FilterPushdownMinBytesPerSecOpt", tags = "35")]
+    #[prost(oneof = "parquet_options::FilterPushdownMinBytesPerSecOpt", tags = "42")]
     pub filter_pushdown_min_bytes_per_sec_opt: ::core::option::Option<
         parquet_options::FilterPushdownMinBytesPerSecOpt,
     >,
@@ -947,7 +947,7 @@ pub mod parquet_options {
     }
     #[derive(Clone, Copy, PartialEq, ::prost::Oneof)]
     pub enum FilterPushdownMinBytesPerSecOpt {
-        #[prost(double, tag = "35")]
+        #[prost(double, tag = "42")]
         FilterPushdownMinBytesPerSec(f64),
     }
     #[derive(Clone, Copy, PartialEq, ::prost::Oneof)]

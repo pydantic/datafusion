@@ -289,7 +289,10 @@ impl FileOpener for ParquetOpener {
 
         let expr_adapter_factory = Arc::clone(&self.expr_adapter_factory);
         let table_schema = self.table_schema.clone();
-        let predicate = self.predicate.clone();
+        let predicate: Option<Arc<dyn PhysicalExpr>> = self
+            .predicate_conjuncts
+            .as_ref()
+            .map(|c| conjunction(c.iter().map(|(_, e)| Arc::clone(e))));
         let metrics = self.metrics.clone();
         let enable_row_group_stats_pruning = self.enable_row_group_stats_pruning;
         let enable_bloom_filter = self.enable_bloom_filter;
@@ -843,7 +846,8 @@ impl FileOpener for ParquetOpener {
                 rg_metadata.len(),
                 rg_metadata,
                 file_range.as_ref(),
-                predicate
+                pruning_predicate
+                    .as_deref()
                     .filter(|_| enable_row_group_stats_pruning && !is_morsel)
                     .map(|predicate| RowGroupStatisticsPruningContext {
                         physical_file_schema: &physical_file_schema,
@@ -854,7 +858,7 @@ impl FileOpener for ParquetOpener {
             )?;
 
             // If there is a predicate that can be evaluated against the metadata
-            if let Some(predicate) = predicate.as_ref() {
+            if let Some(predicate) = pruning_predicate.as_deref() {
                 if !enable_row_group_stats_pruning {
                     // Update metrics: statistics unavailable, so all row groups are
                     // matched (not pruned)
