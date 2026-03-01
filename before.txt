@@ -1,0 +1,49 @@
+=== PhysicalExprAdapter Serialization Example ===
+
+Step 1: Creating sample Parquet data...
+Step 2: Setting up session with custom adapter...
+Step 3: Creating physical plan with filter...
+    [Verify] original plan adapter check: true
+  Original plan has adapter: true
+
+Step 4: Serializing plan with AdapterPreservingCodec...
+    [Serialize] Found DataSourceExec with adapter tag: v1
+  Serialized 1049 bytes
+  (DataSourceExec with adapter was wrapped as PhysicalExtensionNode)
+
+Step 5: Deserializing plan with AdapterPreservingCodec...
+    [Deserialize] Found adapter extension with tag: v1
+    [Verify] restored plan adapter check: true
+  Restored plan has adapter: true
+
+Step 6: Executing plans and comparing results...
+
+  Original plan results:
++----+
+| id |
++----+
+| 6  |
+| 7  |
+| 8  |
+| 9  |
+| 10 |
++----+
+
+  Restored plan results:
++----+
+| id |
++----+
+| 6  |
+| 7  |
+| 8  |
+| 9  |
+| 10 |
++----+
+
+=== Example Complete! ===
+Key takeaways:
+  1. PhysicalExtensionCodec provides serialize_physical_plan/deserialize_physical_plan hooks
+  2. Custom metadata can be wrapped as PhysicalExtensionNode
+  3. Nested serialization (protobuf + JSON) works seamlessly
+  4. Both plans produce identical results despite serialization round-trip
+  5. Adapters are fully preserved through the serialization round-trip
