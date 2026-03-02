@@ -38,7 +38,7 @@ use datafusion_physical_plan::{
 use itertools::Itertools;
 
 use crate::file_scan_config::FileScanConfig;
-use crate::shared_pipeline::SharedPipeline;
+use crate::file_stream::WorkQueue;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::config::ConfigOptions;
@@ -313,49 +313,26 @@ impl ExecutionPlan for DataSourceExec {
             .downcast_ref::<FileScanConfig>()
             .filter(|c| c.morsel_driven);
 
-        if let Some(config) = morsel_config {
+        let (stream, queue) = if let Some(config) = morsel_config {
             let key = Arc::as_ptr(&self.data_source) as *const () as usize;
-            let pipeline = context.get_or_insert_shared_state(key, || {
-                let all_files: Vec<_> = config
+            let queue = context.get_or_insert_shared_state(key, || {
+                let all_files = config
                     .file_groups
                     .iter()
                     .flat_map(|g| g.files().iter().cloned())
                     .collect();
-                let object_store = context
-                    .runtime_env()
-                    .object_store(&config.object_store_url)
-                    .unwrap();
-                let batch_size = config
-                    .batch_size
-                    .unwrap_or_else(|| context.session_config().batch_size());
-                let source = config.file_source.with_batch_size(batch_size);
-                let opener = source.create_file_opener(object_store, config, 0).unwrap();
-                let schema = config.projected_schema().unwrap();
-                let parquet_opts = &context.session_config().options().execution.parquet;
-                let m = match parquet_opts.morsel_morselize_concurrency {
-                    0 => std::thread::available_parallelism()
-                        .map(|n| n.get() * 2)
-                        .unwrap_or(4),
-                    v => v,
-                };
-                let n = parquet_opts.morsel_open_concurrency;
-                SharedPipeline::spawn(opener, all_files, schema, config.limit, m, n)
+                WorkQueue::new(all_files)
             });
-            let metrics = self.data_source.metrics();
-            let stream = pipeline.partition_stream(partition, &metrics);
-            let batch_size = context.session_config().batch_size();
-            let split_metrics = SplitMetrics::new(&metrics, partition);
-            return Ok(Box::pin(DataSourceExecStream {
-                inner: Box::pin(BatchSplitStream::new(
-                    Box::pin(stream),
-                    batch_size,
-                    split_metrics,
-                )),
-                _shared_pipeline: Some(pipeline),
-            }));
-        }
+            let stream =
+                config.open_with_queue(partition, &context, Some(Arc::clone(&queue)))?;
+            (stream, Some(queue))
+        } else {
+            (
+                self.data_source.open(partition, Arc::clone(&context))?,
+                None,
+            )
+        };
 
-        let stream = self.data_source.open(partition, Arc::clone(&context))?;
         let batch_size = context.session_config().batch_size();
         log::debug!(
             "Batch splitting enabled for partition {partition}: batch_size={batch_size}"
@@ -364,7 +341,7 @@ impl ExecutionPlan for DataSourceExec {
         let split_metrics = SplitMetrics::new(&metrics, partition);
         Ok(Box::pin(DataSourceExecStream {
             inner: Box::pin(BatchSplitStream::new(stream, batch_size, split_metrics)),
-            _shared_pipeline: None,
+            _shared_queue: queue,
         }))
     }
 
@@ -465,9 +442,9 @@ impl ExecutionPlan for DataSourceExec {
 
 struct DataSourceExecStream {
     inner: SendableRecordBatchStream,
-    /// Holds a strong reference to the shared pipeline so it stays alive
+    /// Holds a strong reference to the morsel queue so it stays alive
     /// as long as any partition stream exists.
-    _shared_pipeline: Option<Arc<SharedPipeline>>,
+    _shared_queue: Option<Arc<WorkQueue>>,
 }
 
 impl Stream for DataSourceExecStream {

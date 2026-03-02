@@ -427,8 +427,6 @@ mod parquet {
                     parquet_options::MaxPredicateCacheSizeOpt::MaxPredicateCacheSize(size as u64)
                 }),
                 allow_morsel_driven: global_options.global.allow_morsel_driven,
-                morsel_morselize_concurrency: global_options.global.morsel_morselize_concurrency as u64,
-                morsel_open_concurrency: global_options.global.morsel_open_concurrency as u64,
                 filter_pushdown_min_bytes_per_sec_opt: Some(parquet_options::FilterPushdownMinBytesPerSecOpt::FilterPushdownMinBytesPerSec(global_options.global.filter_pushdown_min_bytes_per_sec)),
                 filter_collecting_byte_ratio_threshold_opt: Some(parquet_options::FilterCollectingByteRatioThresholdOpt::FilterCollectingByteRatioThreshold(global_options.global.filter_collecting_byte_ratio_threshold)),
                 filter_confidence_z_opt: Some(parquet_options::FilterConfidenceZOpt::FilterConfidenceZ(global_options.global.filter_confidence_z)),
@@ -532,8 +530,6 @@ mod parquet {
                 parquet_options::MaxPredicateCacheSizeOpt::MaxPredicateCacheSize(size) => *size as usize,
             }),
             allow_morsel_driven: proto.allow_morsel_driven,
-            morsel_morselize_concurrency: proto.morsel_morselize_concurrency as usize,
-            morsel_open_concurrency: proto.morsel_open_concurrency as usize,
             filter_pushdown_min_bytes_per_sec: proto.filter_pushdown_min_bytes_per_sec_opt.as_ref().map(|opt| match opt {
                 parquet_options::FilterPushdownMinBytesPerSecOpt::FilterPushdownMinBytesPerSec(v) => *v,
             }).unwrap_or(f64::INFINITY),
