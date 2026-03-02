@@ -1,0 +1,7 @@
+DataFusion CLI v52.1.0
+0 row(s) fetched. 
+Elapsed 0.000 seconds.
+
+0 row(s) fetched. 
+Elapsed 0.034 seconds.
+

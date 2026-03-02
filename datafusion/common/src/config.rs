@@ -709,11 +709,6 @@ config_namespace! {
         /// reduce the number of rows decoded. This optimization is sometimes called "late materialization".
         pub pushdown_filters: bool, default = false
 
-        /// (reading) If true, filter expressions evaluated during the parquet decoding operation
-        /// will be reordered heuristically to minimize the cost of evaluation. If false,
-        /// the filters are applied in the same order as written in the query
-        pub reorder_filters: bool, default = false
-
         /// (reading) Force the use of RowSelections for filter results, when
         /// pushdown_filters is enabled. If false, the reader will automatically
         /// choose between a RowSelection and a Bitmap based on the number and
@@ -743,6 +738,10 @@ config_namespace! {
         /// (reading) Use any available bloom filters when reading parquet files
         pub bloom_filter_on_read: bool, default = true
 
+        /// (reading) If true, the parquet reader will share work between partitions
+        /// using morsel-driven execution. This can help mitigate data skew.
+        pub allow_morsel_driven: bool, default = true
+
         /// (reading) The maximum predicate cache size, in bytes. When
         /// `pushdown_filters` is enabled, sets the maximum memory used to cache
         /// the results of predicate evaluation between filter evaluation and
@@ -750,6 +749,49 @@ config_namespace! {
         /// but may increase IO and CPU usage. None means use the default
         /// parquet reader setting. 0 means no caching.
         pub max_predicate_cache_size: Option<usize>, default = None
+
+        /// (reading) Minimum bytes/sec throughput for adaptive filter pushdown.
+        /// Filters that achieve at least this throughput (bytes_saved / eval_time)
+        /// are promoted to row filters.
+        /// f64::INFINITY = no filters promoted (feature disabled).
+        /// 0.0 = all filters pushed as row filters (no adaptive logic).
+        /// Default: 104,857,600 bytes/sec (100 MiB/sec), empirically chosen based on
+        /// TPC-H, TPC-DS, and ClickBench benchmarks on an m4 MacBook Pro.
+        /// The optimal value for this setting likely depends on the relative
+        /// cost of CPU vs. IO in your environment, and to some extent the shape
+        /// of your query.
+        ///
+        /// **Interaction with `pushdown_filters`:**
+        /// This option only takes effect when `pushdown_filters = true`.
+        /// When pushdown is disabled, all filters run post-scan and this
+        /// threshold is ignored.
+        pub filter_pushdown_min_bytes_per_sec: f64, default = 104_857_600.0
+
+        /// (reading) Byte-ratio threshold for applying filters one at a time
+        /// (iterative pruning; aka row-level) vs. all at once (post-scan).
+        /// The ratio is computed as: (extra filter bytes not in projection) / (projected bytes).
+        /// Filters whose extra columns consume a smaller fraction than this threshold are placed as row filters.
+        /// Filters whose extra columns consume a larger fraction are placed as post-scan filters.
+        /// Note: filter columns that are already in the query projection have zero extra cost,
+        /// so such filters always start as row filters regardless of this threshold.
+        /// Default: 0.05 meaning filters that require less than 5% additional bytes beyond the projection
+        /// are placed as row filters.
+        /// Set to INF to place all filters as row filters (skip byte-ratio check).
+        /// Set to 0 to place all filters as post-scan filters (no filter passes the ratio check).
+        ///
+        /// **Interaction with `pushdown_filters`:**
+        /// Only takes effect when `pushdown_filters = true`.
+        pub filter_collecting_byte_ratio_threshold: f64, default = 0.05
+
+        /// (reading) Z-score for confidence intervals on filter effectiveness.
+        /// Controls how much statistical evidence is required before promoting
+        /// or demoting a filter. Lower values = faster decisions with less
+        /// confidence. Higher values = more conservative, requiring more data.
+        /// Default: 2.0 (~95% confidence).
+        ///
+        /// **Interaction with `pushdown_filters`:**
+        /// Only takes effect when `pushdown_filters = true`.
+        pub filter_confidence_z: f64, default = 2.0
 
         // The following options affect writing to parquet files
         // and map to parquet::file::properties::WriterProperties
