@@ -905,6 +905,8 @@ impl TryFrom<&ParquetOptions> for protobuf::ParquetOptions {
             coerce_int96_opt: value.coerce_int96.clone().map(protobuf::parquet_options::CoerceInt96Opt::CoerceInt96),
             max_predicate_cache_size_opt: value.max_predicate_cache_size.map(|v| protobuf::parquet_options::MaxPredicateCacheSizeOpt::MaxPredicateCacheSize(v as u64)),
             allow_morsel_driven: value.allow_morsel_driven,
+            morsel_morselize_concurrency: value.morsel_morselize_concurrency as u64,
+            morsel_open_concurrency: value.morsel_open_concurrency as u64,
             filter_pushdown_min_bytes_per_sec_opt: Some(protobuf::parquet_options::FilterPushdownMinBytesPerSecOpt::FilterPushdownMinBytesPerSec(value.filter_pushdown_min_bytes_per_sec)),
             filter_collecting_byte_ratio_threshold_opt: Some(protobuf::parquet_options::FilterCollectingByteRatioThresholdOpt::FilterCollectingByteRatioThreshold(value.filter_collecting_byte_ratio_threshold)),
             filter_confidence_z_opt: Some(protobuf::parquet_options::FilterConfidenceZOpt::FilterConfidenceZ(value.filter_confidence_z)),

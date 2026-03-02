@@ -742,6 +742,18 @@ config_namespace! {
         /// using morsel-driven execution. This can help mitigate data skew.
         pub allow_morsel_driven: bool, default = true
 
+        /// (reading) Maximum number of concurrent file metadata fetches
+        /// (morselization) in the morsel-driven pipeline. Metadata fetches are
+        /// I/O-bound and cheap after completion (shared via Arc), so this can
+        /// be large. Default: 0 = auto (2 × number of CPU cores).
+        pub morsel_morselize_concurrency: usize, transform = ParquetOptions::normalized_double_parallelism, default = 0
+
+        /// (reading) Maximum number of concurrent row group opens in the
+        /// morsel-driven pipeline. Each open reader holds column chunk buffers
+        /// in memory, but try_flatten drains only one at a time, so the rest
+        /// are prefetch. Keep this small. Default: 2.
+        pub morsel_open_concurrency: usize, default = 2
+
         /// (reading) The maximum predicate cache size, in bytes. When
         /// `pushdown_filters` is enabled, sets the maximum memory used to cache
         /// the results of predicate evaluation between filter evaluation and
@@ -1238,6 +1250,19 @@ impl ExecutionOptions {
     fn normalized_parallelism(value: &str) -> String {
         if value.parse::<usize>() == Ok(0) {
             get_available_parallelism().to_string()
+        } else {
+            value.to_owned()
+        }
+    }
+}
+
+impl ParquetOptions {
+    /// Returns double the available parallelism when `value` is `"0"`.
+    /// Useful for I/O-bound concurrency where we want more in-flight
+    /// operations than CPU cores.
+    fn normalized_double_parallelism(value: &str) -> String {
+        if value.parse::<usize>() == Ok(0) {
+            (get_available_parallelism() * 2).to_string()
         } else {
             value.to_owned()
         }

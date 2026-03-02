@@ -5684,6 +5684,12 @@ impl serde::Serialize for ParquetOptions {
         if self.allow_morsel_driven {
             len += 1;
         }
+        if self.morsel_morselize_concurrency != 0 {
+            len += 1;
+        }
+        if self.morsel_open_concurrency != 0 {
+            len += 1;
+        }
         if self.dictionary_page_size_limit != 0 {
             len += 1;
         }
@@ -5798,6 +5804,16 @@ impl serde::Serialize for ParquetOptions {
         }
         if self.allow_morsel_driven {
             struct_ser.serialize_field("allowMorselDriven", &self.allow_morsel_driven)?;
+        }
+        if self.morsel_morselize_concurrency != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("morselMorselizeConcurrency", ToString::to_string(&self.morsel_morselize_concurrency).as_str())?;
+        }
+        if self.morsel_open_concurrency != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("morselOpenConcurrency", ToString::to_string(&self.morsel_open_concurrency).as_str())?;
         }
         if self.dictionary_page_size_limit != 0 {
             #[allow(clippy::needless_borrow)]
@@ -5969,6 +5985,10 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             "skipArrowMetadata",
             "allow_morsel_driven",
             "allowMorselDriven",
+            "morsel_morselize_concurrency",
+            "morselMorselizeConcurrency",
+            "morsel_open_concurrency",
+            "morselOpenConcurrency",
             "dictionary_page_size_limit",
             "dictionaryPageSizeLimit",
             "data_page_row_count_limit",
@@ -6025,6 +6045,8 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             BinaryAsString,
             SkipArrowMetadata,
             AllowMorselDriven,
+            MorselMorselizeConcurrency,
+            MorselOpenConcurrency,
             DictionaryPageSizeLimit,
             DataPageRowCountLimit,
             MaxRowGroupSize,
@@ -6082,6 +6104,8 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             "binaryAsString" | "binary_as_string" => Ok(GeneratedField::BinaryAsString),
                             "skipArrowMetadata" | "skip_arrow_metadata" => Ok(GeneratedField::SkipArrowMetadata),
                             "allowMorselDriven" | "allow_morsel_driven" => Ok(GeneratedField::AllowMorselDriven),
+                            "morselMorselizeConcurrency" | "morsel_morselize_concurrency" => Ok(GeneratedField::MorselMorselizeConcurrency),
+                            "morselOpenConcurrency" | "morsel_open_concurrency" => Ok(GeneratedField::MorselOpenConcurrency),
                             "dictionaryPageSizeLimit" | "dictionary_page_size_limit" => Ok(GeneratedField::DictionaryPageSizeLimit),
                             "dataPageRowCountLimit" | "data_page_row_count_limit" => Ok(GeneratedField::DataPageRowCountLimit),
                             "maxRowGroupSize" | "max_row_group_size" => Ok(GeneratedField::MaxRowGroupSize),
@@ -6137,6 +6161,8 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                 let mut binary_as_string__ = None;
                 let mut skip_arrow_metadata__ = None;
                 let mut allow_morsel_driven__ = None;
+                let mut morsel_morselize_concurrency__ = None;
+                let mut morsel_open_concurrency__ = None;
                 let mut dictionary_page_size_limit__ = None;
                 let mut data_page_row_count_limit__ = None;
                 let mut max_row_group_size__ = None;
@@ -6267,6 +6293,22 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                                 return Err(serde::de::Error::duplicate_field("allowMorselDriven"));
                             }
                             allow_morsel_driven__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::MorselMorselizeConcurrency => {
+                            if morsel_morselize_concurrency__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("morselMorselizeConcurrency"));
+                            }
+                            morsel_morselize_concurrency__ =
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::MorselOpenConcurrency => {
+                            if morsel_open_concurrency__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("morselOpenConcurrency"));
+                            }
+                            morsel_open_concurrency__ =
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
                         }
                         GeneratedField::DictionaryPageSizeLimit => {
                             if dictionary_page_size_limit__.is_some() {
@@ -6403,6 +6445,8 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                     binary_as_string: binary_as_string__.unwrap_or_default(),
                     skip_arrow_metadata: skip_arrow_metadata__.unwrap_or_default(),
                     allow_morsel_driven: allow_morsel_driven__.unwrap_or_default(),
+                    morsel_morselize_concurrency: morsel_morselize_concurrency__.unwrap_or_default(),
+                    morsel_open_concurrency: morsel_open_concurrency__.unwrap_or_default(),
                     dictionary_page_size_limit: dictionary_page_size_limit__.unwrap_or_default(),
                     data_page_row_count_limit: data_page_row_count_limit__.unwrap_or_default(),
                     max_row_group_size: max_row_group_size__.unwrap_or_default(),

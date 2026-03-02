@@ -830,6 +830,12 @@ pub struct ParquetOptions {
     /// default = true
     #[prost(bool, tag = "35")]
     pub allow_morsel_driven: bool,
+    /// default = 0 (auto)
+    #[prost(uint64, tag = "43")]
+    pub morsel_morselize_concurrency: u64,
+    /// default = 2
+    #[prost(uint64, tag = "44")]
+    pub morsel_open_concurrency: u64,
     #[prost(uint64, tag = "12")]
     pub dictionary_page_size_limit: u64,
     #[prost(uint64, tag = "18")]

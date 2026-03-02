@@ -209,6 +209,8 @@ impl ParquetOptions {
             coerce_int96: _,     // not used for writer props
             skip_arrow_metadata: _,
             allow_morsel_driven: _,
+            morsel_morselize_concurrency: _, // not used for writer props
+            morsel_open_concurrency: _,      // not used for writer props
             max_predicate_cache_size: _,
             filter_pushdown_min_bytes_per_sec: _, // not used for writer props
             filter_collecting_byte_ratio_threshold: _, // not used for writer props
@@ -465,6 +467,8 @@ mod tests {
             coerce_int96: None,
             max_predicate_cache_size: defaults.max_predicate_cache_size,
             allow_morsel_driven: defaults.allow_morsel_driven,
+            morsel_morselize_concurrency: defaults.morsel_morselize_concurrency,
+            morsel_open_concurrency: defaults.morsel_open_concurrency,
             filter_pushdown_min_bytes_per_sec: defaults.filter_pushdown_min_bytes_per_sec,
             filter_collecting_byte_ratio_threshold: defaults
                 .filter_collecting_byte_ratio_threshold,
@@ -585,6 +589,9 @@ mod tests {
                 binary_as_string: global_options_defaults.binary_as_string,
                 skip_arrow_metadata: global_options_defaults.skip_arrow_metadata,
                 allow_morsel_driven: global_options_defaults.allow_morsel_driven,
+                morsel_morselize_concurrency: global_options_defaults
+                    .morsel_morselize_concurrency,
+                morsel_open_concurrency: global_options_defaults.morsel_open_concurrency,
                 coerce_int96: None,
                 filter_pushdown_min_bytes_per_sec: global_options_defaults
                     .filter_pushdown_min_bytes_per_sec,

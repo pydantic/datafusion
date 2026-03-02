@@ -1091,6 +1091,8 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
                 protobuf::parquet_options::MaxPredicateCacheSizeOpt::MaxPredicateCacheSize(v) => Some(v as usize),
             }).unwrap_or(None),
             allow_morsel_driven: value.allow_morsel_driven,
+            morsel_morselize_concurrency: value.morsel_morselize_concurrency as usize,
+            morsel_open_concurrency: value.morsel_open_concurrency as usize,
             filter_pushdown_min_bytes_per_sec: value.filter_pushdown_min_bytes_per_sec_opt.map(|opt| match opt {
                 protobuf::parquet_options::FilterPushdownMinBytesPerSecOpt::FilterPushdownMinBytesPerSec(v) => v,
             }).unwrap_or(f64::INFINITY),
