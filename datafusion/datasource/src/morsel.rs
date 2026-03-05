@@ -59,11 +59,23 @@ use log::debug;
 use tokio::sync::mpsc;
 
 /// Configuration for morsel-driven scanning.
+///
+/// Controls the 3-stage pipeline:
+/// - **Stage 1 (File Opening)**: Opens files and splits them into morsels.
+///   Controlled by `max_concurrent_opens` and `open_prefetch_depth`.
+/// - **Stage 2 (Morsel Execution)**: Executes morsels to produce RecordBatches.
+///   Controlled by `max_concurrent_executions`.
+/// - **Stage 3 (Output Buffering)**: Buffers ready RecordBatches for consumers.
+///   Controlled by `morsel_buffer_size`.
 #[derive(Debug, Clone)]
 pub struct MorselConfig {
     /// Maximum number of files to open concurrently (Stage 1).
     pub max_concurrent_opens: usize,
-    /// How many opened-but-not-yet-dispatched morsels to buffer.
+    /// How many opened-but-not-yet-executing files to buffer between Stage 1 and Stage 2.
+    pub open_prefetch_depth: usize,
+    /// Maximum number of morsels to execute concurrently per partition (Stage 2).
+    pub max_concurrent_executions: usize,
+    /// How many ready RecordBatches to buffer per partition (Stage 3).
     pub morsel_buffer_size: usize,
 }
 
@@ -71,7 +83,23 @@ impl Default for MorselConfig {
     fn default() -> Self {
         Self {
             max_concurrent_opens: 4,
-            morsel_buffer_size: 16,
+            open_prefetch_depth: 4,
+            max_concurrent_executions: 1,
+            morsel_buffer_size: 2,
+        }
+    }
+}
+
+impl MorselConfig {
+    /// Create a `MorselConfig` from DataFusion's `ExecutionOptions`.
+    pub fn from_execution_options(
+        options: &datafusion_common::config::ExecutionOptions,
+    ) -> Self {
+        Self {
+            max_concurrent_opens: options.morsel_max_concurrent_opens,
+            open_prefetch_depth: options.morsel_open_prefetch_depth,
+            max_concurrent_executions: options.morsel_max_concurrent_executions,
+            morsel_buffer_size: options.morsel_buffer_size,
         }
     }
 }

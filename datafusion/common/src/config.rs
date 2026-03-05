@@ -647,6 +647,30 @@ config_namespace! {
         /// the remote end point.
         pub objectstore_writer_buffer_size: usize, default = 10 * 1024 * 1024
 
+        /// Maximum number of files to open concurrently during file scanning (Stage 1).
+        /// Opening a file loads metadata and splits it into morsels, but does not read data.
+        /// Higher values improve throughput for high-latency storage (e.g., object stores)
+        /// at the cost of more concurrent IO and higher memroy usage.
+        /// Lower values may be better for local SSDs where IO is fast and CPU is the bottleneck.
+        pub morsel_max_concurrent_opens: usize, default = 4
+
+        /// Maximum number of opened-but-not-yet-executing files to buffer.
+        /// This controls how far ahead the file opening pipeline runs relative
+        /// to morsel execution.
+        /// Higher values hide open latency for object storage.
+        pub morsel_open_prefetch_depth: usize, default = 1
+
+        /// Maximum number of morsels to execute concurrently per partition (Stage 2).
+        /// Each morsel represents a chunk of a file (e.g., one or more Parquet row groups).
+        /// Higher values increase IO/decode parallelism within a partition.
+        pub morsel_max_concurrent_executions: usize, default = 2
+
+        /// Number of ready RecordBatches to buffer per partition (Stage 3).
+        /// This is the output buffer depth. Higher values provide more prefetching,
+        /// hiding IO latency, but use more memory.
+        /// For object storage, consider increasing this to 8 or higher.
+        pub morsel_buffer_size: usize, default = 2
+
         /// Whether to enable ANSI SQL mode.
         ///
         /// The flag is experimental and relevant only for DataFusion Spark built-in functions

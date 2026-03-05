@@ -743,6 +743,8 @@ impl FileOpener for ParquetOpener {
         let preserve_order = self.preserve_order;
         let reverse_row_groups = self.reverse_row_groups;
         let max_predicate_cache_size = self.max_predicate_cache_size;
+        let pushdown_filters = self.pushdown_filters;
+        let reorder_filters = self.reorder_filters;
 
         let predicate_creation_errors = MetricBuilder::new(&self.metrics)
             .global_counter("num_predicate_creation_errors");
@@ -975,6 +977,10 @@ impl FileOpener for ParquetOpener {
                         force_filter_selections,
                         limit,
                         max_predicate_cache_size,
+                        predicate.clone(),
+                        Arc::clone(&physical_file_schema),
+                        pushdown_filters,
+                        reorder_filters,
                         Some(est_rows),
                         Some(est_bytes),
                     )) as Box<dyn FileMorsel>

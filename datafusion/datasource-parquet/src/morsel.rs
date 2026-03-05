@@ -29,8 +29,10 @@ use datafusion_datasource::PartitionedFile;
 use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::reassign_expr_columns;
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, Gauge};
 use futures::{Stream, StreamExt, TryStreamExt};
+use log::debug;
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, RowSelection, RowSelectionPolicy,
@@ -38,7 +40,7 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 
-use crate::{ParquetFileMetrics, ParquetFileReaderFactory};
+use crate::{ParquetFileMetrics, ParquetFileReaderFactory, row_filter};
 
 /// Minimum number of rows for a morsel to be created independently.
 /// Row groups smaller than this will be packed together.
@@ -79,6 +81,14 @@ pub struct ParquetMorsel {
     limit: Option<usize>,
     /// Maximum predicate cache size
     max_predicate_cache_size: Option<usize>,
+    /// Predicate for row-level filter pushdown
+    predicate: Option<Arc<dyn PhysicalExpr>>,
+    /// Physical file schema (needed for building row filters)
+    physical_file_schema: SchemaRef,
+    /// Whether filter pushdown is enabled
+    pushdown_filters: bool,
+    /// Whether to reorder filter predicates for efficiency
+    reorder_filters: bool,
     /// Estimated total rows in this morsel
     est_rows: Option<usize>,
     /// Estimated total bytes in this morsel
@@ -102,6 +112,10 @@ impl ParquetMorsel {
         force_filter_selections: bool,
         limit: Option<usize>,
         max_predicate_cache_size: Option<usize>,
+        predicate: Option<Arc<dyn PhysicalExpr>>,
+        physical_file_schema: SchemaRef,
+        pushdown_filters: bool,
+        reorder_filters: bool,
         est_rows: Option<usize>,
         est_bytes: Option<usize>,
     ) -> Self {
@@ -120,6 +134,10 @@ impl ParquetMorsel {
             force_filter_selections,
             limit,
             max_predicate_cache_size,
+            predicate,
+            physical_file_schema,
+            pushdown_filters,
+            reorder_filters,
             est_rows,
             est_bytes,
         }
@@ -161,6 +179,28 @@ impl FileMorsel for ParquetMorsel {
         builder = builder.with_row_groups(self.row_group_indexes.clone());
         if let Some(ref row_selection) = self.row_selection {
             builder = builder.with_row_selection(row_selection.clone());
+        }
+
+        // Apply row filter (predicate pushdown into parquet scan)
+        if let Some(predicate) = self.pushdown_filters.then_some(&self.predicate).and_then(|p| p.as_ref()) {
+            let row_filter = row_filter::build_row_filter(
+                predicate,
+                &self.physical_file_schema,
+                builder.metadata(),
+                self.reorder_filters,
+                &file_metrics,
+            );
+            match row_filter {
+                Ok(Some(filter)) => {
+                    builder = builder.with_row_filter(filter);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    debug!(
+                        "Ignoring error building row filter for '{predicate:?}': {e}"
+                    );
+                }
+            }
         }
 
         if let Some(limit) = self.limit {
