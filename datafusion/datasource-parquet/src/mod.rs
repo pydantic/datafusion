@@ -24,6 +24,7 @@ pub mod access_plan;
 pub mod file_format;
 pub mod metadata;
 mod metrics;
+pub mod morsel;
 mod opener;
 mod page_filter;
 mod reader;

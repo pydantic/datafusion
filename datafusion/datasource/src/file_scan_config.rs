@@ -208,6 +208,13 @@ pub struct FileScanConfig {
     /// If the number of file partitions > target_partitions, the file partitions will be grouped
     /// in a round-robin fashion such that number of file partitions = target_partitions.
     pub partitioned_by_file_group: bool,
+    /// Whether to use morsel-driven scanning instead of the traditional FileStream.
+    /// When enabled, files are split into morsels that can be processed in parallel
+    /// with work stealing across partitions.
+    pub use_morsel_scanning: bool,
+    /// Lazily-initialized shared morsel pool for morsel-driven scanning.
+    /// Created on first call to `open()` and shared across all partitions.
+    morsel_pool: Arc<std::sync::OnceLock<Arc<crate::morsel::MorselPool>>>,
 }
 
 /// A builder for [`FileScanConfig`]'s.
@@ -550,6 +557,8 @@ impl FileScanConfigBuilder {
             expr_adapter_factory: expr_adapter,
             statistics,
             partitioned_by_file_group,
+            use_morsel_scanning: false,
+            morsel_pool: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -587,6 +596,30 @@ impl DataSource for FileScanConfig {
         let source = self.file_source.with_batch_size(batch_size);
 
         let opener = source.create_file_opener(object_store, self, partition)?;
+
+        if self.use_morsel_scanning {
+            let pool = self
+                .morsel_pool
+                .get_or_init(|| {
+                    let morsel_config = crate::morsel::MorselConfig::default();
+                    Arc::new(
+                        crate::morsel::MorselPool::new(
+                            self,
+                            opener,
+                            source.metrics(),
+                            morsel_config,
+                        )
+                        .expect("Failed to create MorselPool"),
+                    )
+                });
+            let stream = crate::morsel::MorselStream::new(
+                Arc::clone(pool),
+                partition,
+                self.limit,
+                source.metrics(),
+            );
+            return Ok(Box::pin(cooperative(stream)));
+        }
 
         let stream = FileStream::new(self, partition, opener, source.metrics())?;
         Ok(Box::pin(cooperative(stream)))

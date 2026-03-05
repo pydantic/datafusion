@@ -31,7 +31,7 @@ use crate::PartitionedFile;
 use crate::file_scan_config::FileScanConfig;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::error::Result;
-use datafusion_execution::RecordBatchStream;
+use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, Time,
 };
@@ -313,6 +313,136 @@ pub trait FileOpener: Unpin + Send + Sync {
     /// Asynchronously open the specified file and return a stream
     /// of [`RecordBatch`]
     fn open(&self, partitioned_file: PartitionedFile) -> Result<FileOpenFuture>;
+
+    /// Open a file and return a list of [`FileMorsel`]s for parallel execution.
+    ///
+    /// This method performs metadata loading, schema resolution, and pruning,
+    /// but does NOT read the actual data. Each returned morsel represents a
+    /// unit of work (e.g., one or more row groups for Parquet) that can be
+    /// independently executed.
+    ///
+    /// The default implementation wraps the existing [`Self::open`] result as a
+    /// single [`StreamMorsel`], providing backwards compatibility for formats
+    /// like CSV, JSON, Arrow, and Avro that don't have sub-file structure.
+    fn open_morsels(
+        &self,
+        partitioned_file: PartitionedFile,
+    ) -> Result<FileOpenMorselFuture> {
+        let future = self.open(partitioned_file)?;
+        Ok(Box::pin(async move {
+            let stream = future.await?;
+            let morsel: Box<dyn FileMorsel> = Box::new(StreamMorsel::new(stream));
+            Ok(vec![morsel])
+        }))
+    }
+}
+
+/// A future that resolves to a list of [`FileMorsel`]s
+pub type FileOpenMorselFuture =
+    BoxFuture<'static, Result<Vec<Box<dyn FileMorsel>>>>;
+
+/// A unit of work within a file that can be independently executed.
+///
+/// For Parquet files, a morsel typically represents one or more row groups.
+/// For CSV/JSON/Arrow, the entire file is wrapped as a single morsel via
+/// [`StreamMorsel`].
+///
+/// Morsels enable sub-file parallelism and work stealing across partitions.
+/// A [`MorselPool`] distributes morsels to partition streams on demand,
+/// allowing fast partitions to process more morsels than slow ones.
+///
+/// [`MorselPool`]: crate::morsel::MorselPool
+pub trait FileMorsel: Send + Sync {
+    /// Execute this morsel, producing a stream of [`RecordBatch`]es.
+    ///
+    /// This is where the actual IO and decoding happens.
+    fn execute(&self) -> Result<SendableRecordBatchStream>;
+
+    /// Estimated number of rows in this morsel (for scheduling decisions).
+    fn estimated_rows(&self) -> Option<usize> {
+        None
+    }
+
+    /// Estimated byte size of this morsel (for scheduling decisions).
+    fn estimated_bytes(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// Wraps an existing [`BoxStream`] of [`RecordBatch`] as a single [`FileMorsel`].
+///
+/// This provides backwards compatibility for file formats (CSV, JSON, Arrow, Avro)
+/// that produce a stream from [`FileOpener::open`] without sub-file structure.
+pub struct StreamMorsel {
+    stream: std::sync::Mutex<Option<BoxStream<'static, Result<RecordBatch>>>>,
+    schema: SchemaRef,
+}
+
+impl StreamMorsel {
+    /// Create a new `StreamMorsel` wrapping a `SendableRecordBatchStream`.
+    pub fn new(stream: BoxStream<'static, Result<RecordBatch>>) -> Self {
+        // We can't know the schema without polling, so use an empty schema as placeholder.
+        // In practice the MorselStream will use the projected schema from FileScanConfig.
+        Self {
+            stream: std::sync::Mutex::new(Some(stream)),
+            schema: Arc::new(arrow::datatypes::Schema::empty()),
+        }
+    }
+
+    /// Create a new `StreamMorsel` with a known schema.
+    pub fn with_schema(
+        stream: BoxStream<'static, Result<RecordBatch>>,
+        schema: SchemaRef,
+    ) -> Self {
+        Self {
+            stream: std::sync::Mutex::new(Some(stream)),
+            schema,
+        }
+    }
+}
+
+impl FileMorsel for StreamMorsel {
+    fn execute(&self) -> Result<SendableRecordBatchStream> {
+        let stream = self
+            .stream
+            .lock()
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Internal(format!(
+                    "Failed to lock StreamMorsel: {e}"
+                ))
+            })?
+            .take()
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "StreamMorsel already consumed".to_string(),
+                )
+            })?;
+        let schema = Arc::clone(&self.schema);
+        Ok(Box::pin(StreamMorselStream { stream, schema }))
+    }
+}
+
+/// Adapter that wraps a `BoxStream<Result<RecordBatch>>` into a `SendableRecordBatchStream`.
+struct StreamMorselStream {
+    stream: BoxStream<'static, Result<RecordBatch>>,
+    schema: SchemaRef,
+}
+
+impl Stream for StreamMorselStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.stream.poll_next_unpin(cx)
+    }
+}
+
+impl RecordBatchStream for StreamMorselStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
 }
 
 /// Represents the state of the next `FileOpenFuture`. Since we need to poll
