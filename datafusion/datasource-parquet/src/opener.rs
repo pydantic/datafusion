@@ -863,7 +863,7 @@ impl FileOpener for ParquetOpener {
             metadata_timer.stop();
 
             // Use a temporary builder just for pruning (need parquet_schema etc.)
-            let temp_builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
+            let mut temp_builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
                 async_file_reader,
                 reader_metadata.clone(),
             );
@@ -896,13 +896,20 @@ impl FileOpener for ParquetOpener {
                 }
 
                 if enable_bloom_filter && !row_groups.is_empty() {
-                    // Note: bloom filter pruning requires a mutable builder reference
-                    // but we can't do that with the temp builder. For morsel mode,
-                    // we skip bloom filter pruning for now. This is a known limitation
-                    // that can be addressed in a follow-up.
-                    file_metrics
-                        .row_groups_pruned_bloom_filter
-                        .add_matched(row_groups.remaining_row_group_count());
+                    if let Some(ref predicate) = pruning_predicate {
+                        row_groups
+                            .prune_by_bloom_filters(
+                                &physical_file_schema,
+                                &mut temp_builder,
+                                predicate,
+                                &file_metrics,
+                            )
+                            .await;
+                    } else {
+                        file_metrics
+                            .row_groups_pruned_bloom_filter
+                            .add_matched(row_groups.remaining_row_group_count());
+                    }
                 } else {
                     file_metrics
                         .row_groups_pruned_bloom_filter
