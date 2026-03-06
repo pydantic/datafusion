@@ -621,8 +621,14 @@ impl DataSource for FileScanConfig {
         );
         let projected_schema = self.projected_schema()?;
 
-        let (morsel_source, morsel_partition) = if self.preserve_order {
-            // Ordered: each partition gets its own MorselSource
+        // When partitioned_by_file_group is true, the optimizer reports Hash
+        // partitioning and may skip RepartitionExec. Each partition MUST read
+        // only its own file group to preserve the partitioning contract.
+        // Similarly, preserve_order requires per-partition file ordering.
+        let per_partition = self.preserve_order || self.partitioned_by_file_group;
+
+        let (morsel_source, morsel_partition) = if per_partition {
+            // Per-partition: each partition gets its own MorselSource
             let files: Vec<PartitionedFile> =
                 self.file_groups[partition].iter().cloned().collect();
             let ms = Arc::new(crate::morsel::MorselSource::new(

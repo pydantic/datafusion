@@ -176,7 +176,7 @@ impl MorselSource {
         &self,
         partition: usize,
     ) -> Option<Result<Box<dyn FileMorsel>>> {
-        // 1. Check own local queue
+        // 1. Check own local queue (cache-hot, same-file morsels)
         if let Steal::Success(morsel) = self.local_queues[partition].steal() {
             return Some(Ok(morsel));
         }
@@ -199,17 +199,24 @@ impl MorselSource {
             return Some(Ok(morsel));
         }
 
-        match feeder.next().await? {
-            Ok(mut morsels) => {
-                let first = morsels.remove(0);
-                // Push surplus to own local queue
-                // (locality: same-file morsels stay together)
-                for morsel in morsels {
-                    self.local_queues[partition].push(morsel);
+        loop {
+            match feeder.next().await? {
+                Ok(mut morsels) => {
+                    if morsels.is_empty() {
+                        // File produced no morsels (e.g., all row groups pruned),
+                        // keep pulling from feeder
+                        continue;
+                    }
+                    let first = morsels.remove(0);
+                    // Push surplus to own local queue
+                    // (locality: same-file morsels stay together)
+                    for morsel in morsels {
+                        self.local_queues[partition].push(morsel);
+                    }
+                    return Some(Ok(first));
                 }
-                Some(Ok(first))
+                Err(e) => return Some(Err(e)),
             }
-            Err(e) => Some(Err(e)),
         }
     }
 
