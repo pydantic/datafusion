@@ -207,11 +207,11 @@ pub struct FileScanConfig {
     /// If the number of file partitions > target_partitions, the file partitions will be grouped
     /// in a round-robin fashion such that number of file partitions = target_partitions.
     pub partitioned_by_file_group: bool,
-    /// Shared morsel pool for morsel-driven scanning.
-    /// Uses `Weak` so the pool is automatically recreated when all partition
+    /// Shared morsel source for morsel-driven scanning (unordered mode only).
+    /// Uses `Weak` so the source is automatically recreated when all partition
     /// streams from a previous execution round are dropped (e.g., recursive CTEs
     /// re-execute the same plan multiple times).
-    morsel_pool: std::sync::Mutex<std::sync::Weak<crate::morsel::MorselPool>>,
+    morsel_source: std::sync::Mutex<std::sync::Weak<crate::morsel::MorselSource>>,
 }
 
 impl Clone for FileScanConfig {
@@ -229,9 +229,9 @@ impl Clone for FileScanConfig {
             expr_adapter_factory: self.expr_adapter_factory.clone(),
             statistics: self.statistics.clone(),
             partitioned_by_file_group: self.partitioned_by_file_group,
-            // New clone gets a fresh (empty) morsel pool — each clone
+            // New clone gets a fresh (empty) morsel source — each clone
             // starts its own execution lifecycle.
-            morsel_pool: std::sync::Mutex::new(std::sync::Weak::new()),
+            morsel_source: std::sync::Mutex::new(std::sync::Weak::new()),
         }
     }
 }
@@ -576,7 +576,7 @@ impl FileScanConfigBuilder {
             expr_adapter_factory: expr_adapter,
             statistics,
             partitioned_by_file_group,
-            morsel_pool: std::sync::Mutex::new(std::sync::Weak::new()),
+            morsel_source: std::sync::Mutex::new(std::sync::Weak::new()),
         }
     }
 }
@@ -616,30 +616,50 @@ impl DataSource for FileScanConfig {
         let opener = source.create_file_opener(object_store, self, partition)?;
 
         let execution_options = &context.session_config().options().execution;
-        let pool = {
-            let mut guard = self.morsel_pool.lock().unwrap();
-            if let Some(existing) = guard.upgrade() {
+        let morsel_config = crate::morsel::MorselConfig::from_execution_options(
+            execution_options,
+        );
+        let projected_schema = self.projected_schema()?;
+
+        let (morsel_source, morsel_partition) = if self.preserve_order {
+            // Ordered: each partition gets its own MorselSource
+            let files: Vec<PartitionedFile> =
+                self.file_groups[partition].iter().cloned().collect();
+            let ms = Arc::new(crate::morsel::MorselSource::new(
+                files,
+                opener,
+                &morsel_config,
+                1, // single local queue
+                projected_schema,
+            ));
+            (ms, 0) // partition=0 within its own source
+        } else {
+            // Unordered: shared MorselSource, created once via Weak cache
+            let mut guard = self.morsel_source.lock().unwrap();
+            let ms = if let Some(existing) = guard.upgrade() {
                 existing
             } else {
-                let morsel_config = crate::morsel::MorselConfig::from_execution_options(
-                    execution_options,
-                );
-                let new_pool = Arc::new(
-                    crate::morsel::MorselPool::new(
-                        self,
-                        opener,
-                        source.metrics(),
-                        morsel_config,
-                    )
-                    .expect("Failed to create MorselPool"),
-                );
-                *guard = Arc::downgrade(&new_pool);
-                new_pool
-            }
+                let all_files: Vec<PartitionedFile> = self
+                    .file_groups
+                    .iter()
+                    .flat_map(|group| group.iter().cloned())
+                    .collect();
+                let new_source = Arc::new(crate::morsel::MorselSource::new(
+                    all_files,
+                    opener,
+                    &morsel_config,
+                    self.file_groups.len(),
+                    projected_schema,
+                ));
+                *guard = Arc::downgrade(&new_source);
+                new_source
+            };
+            (ms, partition)
         };
+
         let stream = crate::morsel::MorselStream::new(
-            Arc::clone(&pool),
-            partition,
+            morsel_source,
+            morsel_partition,
             self.limit,
             source.metrics(),
         );

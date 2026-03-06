@@ -347,10 +347,10 @@ pub type FileOpenMorselFuture = BoxFuture<'static, Result<Vec<Box<dyn FileMorsel
 /// [`StreamMorsel`].
 ///
 /// Morsels enable sub-file parallelism and work stealing across partitions.
-/// A [`MorselPool`] distributes morsels to partition streams on demand,
+/// A [`MorselSource`] distributes morsels to partition streams on demand,
 /// allowing fast partitions to process more morsels than slow ones.
 ///
-/// [`MorselPool`]: crate::morsel::MorselPool
+/// [`MorselSource`]: crate::morsel::MorselSource
 pub trait FileMorsel: Send + Sync {
     /// Execute this morsel, producing a stream of [`RecordBatch`]es.
     ///

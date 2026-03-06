@@ -15,28 +15,41 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! [`MorselPool`] and [`MorselStream`] for morsel-driven file scanning.
+//! [`MorselSource`] and [`MorselStream`] for morsel-driven file scanning.
 //!
-//! This module implements the core morsel execution engine that replaces
-//! static file-to-partition assignment with dynamic work stealing.
+//! This module implements the core morsel execution engine using Stream
+//! composition with work-stealing deques for cache locality.
 //!
 //! # Architecture
 //!
 //! ```text
-//! Stage 1: File Opening     Stage 2: Morsel Distribution    Stage 3: Execution
-//! (IO-heavy)                (shared pool)                    (per-partition)
-//!
-//! [File1] ──open──► [M1a, M1b] ──► MorselPool ──► Partition 0: MorselStream
-//! [File2] ──open──► [M2a]      ──►            ──► Partition 1: MorselStream
-//! [File3] ──open──► [M3a, M3b] ──►            ──► Partition 2: MorselStream
+//!                    ┌─────────────────────────────┐
+//!                    │  Feeder Stream (shared)      │
+//!                    │  files.map(open_morsels)     │
+//!                    │      .buffered(N)            │
+//!                    │  produces Vec<FileMorsel>    │
+//!                    └──────────┬──────────────────┘
+//!                               │
+//!         partition K pulls a batch, pushes surplus to own queue
+//!                               │
+//!    ┌──────────────┬───────────┼───────────────┐
+//!    │              │           │               │
+//!  Queue[0]      Queue[1]   Queue[2]        Queue[3]
+//!    │              │           │               │
+//!  MorselStream  MorselStream MorselStream  MorselStream
+//!  1. pop local  1. pop local 1. pop local  1. pop local
+//!  2. steal      2. steal     2. steal      2. steal
+//!  3. pull feeder 3. pull     3. pull       3. pull
 //! ```
 //!
-//! In **unordered mode** (default for analytics), all partitions share a
-//! single morsel queue — fast partitions naturally "steal" work from slow
-//! ones by grabbing morsels first.
+//! In **unordered mode** (default), all partitions share a single
+//! `MorselSource`. Each partition preferentially pops from its own
+//! local queue, then steals from others, then pulls from the feeder.
+//! This provides both work stealing and cache locality.
 //!
-//! In **ordered mode** (`preserve_order == true`), each partition gets its
-//! own dedicated morsel queue to maintain file ordering guarantees.
+//! In **ordered mode** (`preserve_order == true`), each partition gets
+//! its own `MorselSource` with a dedicated feeder stream over its own
+//! file group.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -44,10 +57,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::PartitionedFile;
-use crate::file_scan_config::FileScanConfig;
 use crate::file_stream::{FileMorsel, FileOpener};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use crossbeam_deque::{Injector, Steal};
 use datafusion_common::error::Result;
 use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_physical_plan::metrics::{
@@ -55,27 +68,27 @@ use datafusion_physical_plan::metrics::{
 };
 
 use futures::{Stream, StreamExt as _, ready};
-use log::debug;
-use tokio::sync::mpsc;
 
 /// Configuration for morsel-driven scanning.
 ///
-/// Controls the 3-stage pipeline:
-/// - **Stage 1 (File Opening)**: Opens files and splits them into morsels.
-///   Controlled by `max_concurrent_opens` and `open_prefetch_depth`.
-/// - **Stage 2 (Morsel Execution)**: Executes morsels to produce RecordBatches.
-///   Controlled by `max_concurrent_executions`.
-/// - **Stage 3 (Output Buffering)**: Buffers ready RecordBatches for consumers.
-///   Controlled by `morsel_buffer_size`.
+/// Controls the pipeline:
+/// - **File Opening**: Opens files and splits them into morsels.
+///   Controlled by `max_concurrent_opens`.
+/// - **Morsel Execution**: Executes morsels to produce RecordBatches.
+///   `max_concurrent_executions` reserved for future use.
+/// - **Output Buffering**: `morsel_buffer_size` reserved for future use
+///   (demand-driven model provides natural backpressure).
 #[derive(Debug, Clone)]
 pub struct MorselConfig {
-    /// Maximum number of files to open concurrently (Stage 1).
+    /// Maximum number of files to open concurrently.
     pub max_concurrent_opens: usize,
-    /// How many opened-but-not-yet-executing files to buffer between Stage 1 and Stage 2.
+    /// How many opened-but-not-yet-executing files to buffer.
+    /// Currently merged with `max_concurrent_opens`.
     pub open_prefetch_depth: usize,
-    /// Maximum number of morsels to execute concurrently per partition (Stage 2).
+    /// Maximum number of morsels to execute concurrently per partition.
+    /// Reserved for future use.
     pub max_concurrent_executions: usize,
-    /// How many ready RecordBatches to buffer per partition (Stage 3).
+    /// Reserved for future use (demand-driven model provides backpressure).
     pub morsel_buffer_size: usize,
 }
 
@@ -104,261 +117,137 @@ impl MorselConfig {
     }
 }
 
-/// Shared morsel pool that distributes work across partition streams.
+/// Shared morsel source with work-stealing deques for cache locality.
 ///
-/// The pool manages file opening and morsel distribution. In unordered mode,
-/// all partitions share a single channel. In ordered mode, each partition
-/// gets its own channel to preserve file ordering.
-pub struct MorselPool {
-    /// Receivers for each partition. In unordered mode, all partitions share
-    /// the same underlying sender (but each has its own receiver from a
-    /// broadcast-like fanout). In ordered mode, each partition has a dedicated
-    /// channel.
-    receivers: Vec<tokio::sync::Mutex<mpsc::Receiver<Box<dyn FileMorsel>>>>,
+/// Each partition has a local queue (crossbeam `Injector`). When a partition
+/// needs work it: (1) pops from its own queue, (2) steals from other
+/// partitions' queues, (3) pulls from the shared feeder stream.
+///
+/// When pulling from the feeder, the partition takes the first morsel and
+/// pushes surplus morsels (from the same file) to its own queue. This keeps
+/// same-file morsels together on one partition for cache locality.
+pub struct MorselSource {
+    /// Per-partition lock-free work-stealing queues.
+    local_queues: Vec<Injector<Box<dyn FileMorsel>>>,
+
+    /// Shared feeder stream producing `Vec<FileMorsel>` per file.
+    /// Protected by a Mutex so only one partition pulls at a time.
+    feeder: tokio::sync::Mutex<
+        Pin<Box<dyn Stream<Item = Result<Vec<Box<dyn FileMorsel>>>> + Send>>,
+    >,
 
     /// Schema of the output stream.
     projected_schema: SchemaRef,
 }
 
-impl MorselPool {
-    /// Create a new morsel pool and start the background file opening task.
+impl MorselSource {
+    /// Create a new `MorselSource`.
     ///
     /// # Arguments
-    /// * `config` - The file scan configuration
-    /// * `file_opener` - The opener used to create morsels from files
-    /// * `metrics` - Metrics for tracking pool operations
-    /// * `morsel_config` - Configuration for concurrency and buffering
+    /// * `files` - Files to open and split into morsels
+    /// * `opener` - The opener used to create morsels from files
+    /// * `morsel_config` - Configuration for concurrency
+    /// * `num_partitions` - Number of local queues to create
+    /// * `projected_schema` - Schema of the output stream
     pub fn new(
-        config: &FileScanConfig,
-        file_opener: Arc<dyn FileOpener>,
-        metrics: &ExecutionPlanMetricsSet,
-        morsel_config: MorselConfig,
-    ) -> Result<Self> {
-        let projected_schema = config.projected_schema()?;
-        let num_partitions = config.file_groups.len();
-        let ordered = config.preserve_order;
-
-        if ordered {
-            Self::new_ordered(
-                config,
-                file_opener,
-                metrics,
-                morsel_config,
-                projected_schema,
-            )
-        } else {
-            Self::new_unordered(
-                config,
-                file_opener,
-                metrics,
-                morsel_config,
-                projected_schema,
-                num_partitions,
-            )
-        }
-    }
-
-    /// Create unordered pool — all partitions pull from the same morsel source.
-    fn new_unordered(
-        config: &FileScanConfig,
-        file_opener: Arc<dyn FileOpener>,
-        _metrics: &ExecutionPlanMetricsSet,
-        morsel_config: MorselConfig,
-        projected_schema: SchemaRef,
+        files: Vec<PartitionedFile>,
+        opener: Arc<dyn FileOpener>,
+        morsel_config: &MorselConfig,
         num_partitions: usize,
-    ) -> Result<Self> {
-        // Collect all files from all partitions into a single list
-        let all_files: Vec<PartitionedFile> = config
-            .file_groups
-            .iter()
-            .flat_map(|group| group.iter().cloned())
-            .collect();
-
-        // Create per-partition channels
-        let mut receivers = Vec::with_capacity(num_partitions);
-        let mut senders = Vec::with_capacity(num_partitions);
-
-        for _ in 0..num_partitions {
-            let (tx, rx) = mpsc::channel(morsel_config.morsel_buffer_size);
-            senders.push(tx);
-            receivers.push(tokio::sync::Mutex::new(rx));
-        }
-
-        // Spawn background task that opens files and round-robin distributes morsels
-        let max_concurrent = morsel_config.max_concurrent_opens;
-        let limit = config.limit;
-        tokio::spawn(async move {
-            Self::open_and_distribute_unordered(
-                all_files,
-                file_opener,
-                senders,
-                max_concurrent,
-                limit,
-            )
-            .await;
-        });
-
-        Ok(Self {
-            receivers,
-            projected_schema,
-        })
-    }
-
-    /// Background task for unordered mode: opens files, splits into morsels,
-    /// and round-robin distributes to partition channels.
-    async fn open_and_distribute_unordered(
-        files: Vec<PartitionedFile>,
-        opener: Arc<dyn FileOpener>,
-        senders: Vec<mpsc::Sender<Box<dyn FileMorsel>>>,
-        max_concurrent: usize,
-        _limit: Option<usize>,
-    ) {
-        use futures::stream::FuturesOrdered;
-
-        let mut file_iter = files.into_iter();
-        let mut pending_opens = FuturesOrdered::new();
-        let mut sender_idx = 0;
-        let num_senders = senders.len();
-
-        // Seed the initial batch of concurrent opens
-        for _ in 0..max_concurrent {
-            if let Some(file) = file_iter.next() {
-                match opener.open_morsels(file) {
-                    Ok(future) => pending_opens.push_back(future),
-                    Err(e) => {
-                        debug!("Error starting morsel open: {e}");
-                        continue;
-                    }
-                }
-            }
-        }
-
-        loop {
-            let morsels = match pending_opens.next().await {
-                Some(Ok(morsels)) => morsels,
-                Some(Err(e)) => {
-                    debug!("Error opening file for morsels: {e}");
-                    // Start next file to replace the failed one
-                    if let Some(file) = file_iter.next() {
-                        match opener.open_morsels(file) {
-                            Ok(future) => pending_opens.push_back(future),
-                            Err(e) => debug!("Error starting morsel open: {e}"),
-                        }
-                    }
-                    continue;
-                }
-                None => break, // All files processed
-            };
-
-            // Start opening next file to maintain concurrency
-            if let Some(file) = file_iter.next() {
-                match opener.open_morsels(file) {
-                    Ok(future) => pending_opens.push_back(future),
-                    Err(e) => debug!("Error starting morsel open: {e}"),
-                }
-            }
-
-            // Distribute morsels round-robin across partitions
-            for morsel in morsels {
-                let idx = sender_idx % num_senders;
-                sender_idx += 1;
-                if senders[idx].send(morsel).await.is_err() {
-                    // Receiver dropped — check if all are gone
-                    let all_closed = senders.iter().all(|s| s.is_closed());
-                    if all_closed {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Create ordered pool — each partition gets morsels only from its own file group.
-    fn new_ordered(
-        config: &FileScanConfig,
-        file_opener: Arc<dyn FileOpener>,
-        _metrics: &ExecutionPlanMetricsSet,
-        morsel_config: MorselConfig,
         projected_schema: SchemaRef,
-    ) -> Result<Self> {
-        let mut receivers = Vec::with_capacity(config.file_groups.len());
+    ) -> Self {
+        let local_queues = (0..num_partitions).map(|_| Injector::new()).collect();
+        let feeder = build_morsel_stream(files, opener, morsel_config.max_concurrent_opens);
 
-        for group in &config.file_groups {
-            let (tx, rx) = mpsc::channel(morsel_config.morsel_buffer_size);
-            receivers.push(tokio::sync::Mutex::new(rx));
-
-            let files: Vec<PartitionedFile> = group.iter().cloned().collect();
-            let opener = Arc::clone(&file_opener);
-            let max_concurrent = morsel_config.max_concurrent_opens;
-
-            // For ordered mode, each partition has its own background task
-            tokio::spawn(async move {
-                Self::open_and_distribute_ordered(files, opener, tx, max_concurrent)
-                    .await;
-            });
-        }
-
-        Ok(Self {
-            receivers,
+        Self {
+            local_queues,
+            feeder: tokio::sync::Mutex::new(feeder),
             projected_schema,
-        })
-    }
-
-    /// Background task for ordered mode: opens files sequentially within a
-    /// partition and sends morsels in order.
-    async fn open_and_distribute_ordered(
-        files: Vec<PartitionedFile>,
-        opener: Arc<dyn FileOpener>,
-        sender: mpsc::Sender<Box<dyn FileMorsel>>,
-        _max_concurrent: usize,
-    ) {
-        // In ordered mode, files must be processed sequentially to maintain order
-        for file in files {
-            let morsels = match opener.open_morsels(file) {
-                Ok(future) => match future.await {
-                    Ok(morsels) => morsels,
-                    Err(e) => {
-                        debug!("Error opening file for ordered morsels: {e}");
-                        continue;
-                    }
-                },
-                Err(e) => {
-                    debug!("Error starting ordered morsel open: {e}");
-                    continue;
-                }
-            };
-
-            // Send morsels in order
-            for morsel in morsels {
-                if sender.send(morsel).await.is_err() {
-                    return; // Receiver dropped
-                }
-            }
         }
     }
 
     /// Get the next morsel for the given partition.
     ///
-    /// Returns `None` when all morsels have been consumed (no more work).
-    pub async fn next_morsel(&self, partition: usize) -> Option<Box<dyn FileMorsel>> {
-        self.receivers[partition].lock().await.recv().await
+    /// Three-tier lookup:
+    /// 1. Own local queue (cache-hot, same-file morsels)
+    /// 2. Steal from other partitions' queues
+    /// 3. Pull from feeder stream (may need to wait for IO)
+    pub async fn next_morsel(
+        &self,
+        partition: usize,
+    ) -> Option<Result<Box<dyn FileMorsel>>> {
+        // 1. Check own local queue
+        if let Steal::Success(morsel) = self.local_queues[partition].steal() {
+            return Some(Ok(morsel));
+        }
+
+        // 2. Steal from other partitions' queues
+        let n = self.local_queues.len();
+        for i in 1..n {
+            let other = (partition + i) % n;
+            if let Steal::Success(morsel) = self.local_queues[other].steal() {
+                return Some(Ok(morsel));
+            }
+        }
+
+        // 3. Pull from feeder stream (may need to wait for IO)
+        let mut feeder = self.feeder.lock().await;
+
+        // Double-check local queue after acquiring lock
+        // (another partition may have fed us while we waited)
+        if let Steal::Success(morsel) = self.local_queues[partition].steal() {
+            return Some(Ok(morsel));
+        }
+
+        match feeder.next().await? {
+            Ok(mut morsels) => {
+                let first = morsels.remove(0);
+                // Push surplus to own local queue
+                // (locality: same-file morsels stay together)
+                for morsel in morsels {
+                    self.local_queues[partition].push(morsel);
+                }
+                Some(Ok(first))
+            }
+            Err(e) => Some(Err(e)),
+        }
     }
 
-    /// Get the projected schema for streams produced by this pool.
+    /// Get the projected schema for streams produced by this source.
     pub fn projected_schema(&self) -> &SchemaRef {
         &self.projected_schema
     }
 }
 
-/// Per-partition stream backed by a shared [`MorselPool`].
+/// Build the feeder stream that produces `Vec<FileMorsel>` per file.
 ///
-/// Each `MorselStream` pulls morsels from the pool on demand and streams
+/// Files are opened concurrently (up to `max_concurrent_opens`) but each
+/// file produces a `Vec` of morsels that is NOT flattened — this allows
+/// the consumer to keep same-file morsels together for locality.
+fn build_morsel_stream(
+    files: Vec<PartitionedFile>,
+    opener: Arc<dyn FileOpener>,
+    max_concurrent_opens: usize,
+) -> Pin<Box<dyn Stream<Item = Result<Vec<Box<dyn FileMorsel>>>> + Send>> {
+    Box::pin(
+        futures::stream::iter(files)
+            .map(move |file| {
+                let opener = Arc::clone(&opener);
+                async move { opener.open_morsels(file)?.await }
+            })
+            .buffered(max_concurrent_opens),
+    )
+}
+
+/// Per-partition stream backed by a shared [`MorselSource`].
+///
+/// Each `MorselStream` pulls morsels from the source on demand and streams
 /// their `RecordBatch`es to the consumer. When one morsel is exhausted,
-/// the next is automatically fetched from the pool.
+/// the next is automatically fetched from the source.
 pub struct MorselStream {
-    /// The shared morsel pool
-    pool: Arc<MorselPool>,
-    /// This stream's partition ID
+    /// The shared morsel source
+    source: Arc<MorselSource>,
+    /// This stream's partition ID within the source
     partition: usize,
     /// Current state of the stream
     state: MorselStreamState,
@@ -371,13 +260,14 @@ pub struct MorselStream {
 }
 
 enum MorselStreamState {
-    /// Need to fetch the next morsel from the pool
+    /// Need to fetch the next morsel from the source
     FetchMorsel,
     /// Currently executing a morsel's stream
     Executing { stream: SendableRecordBatchStream },
-    /// Waiting for a morsel from the pool
+    /// Waiting for a morsel from the source
     WaitingForMorsel {
-        future: Pin<Box<dyn Future<Output = Option<Box<dyn FileMorsel>>> + Send>>,
+        future:
+            Pin<Box<dyn Future<Output = Option<Result<Box<dyn FileMorsel>>>> + Send>>,
     },
     /// Stream is done
     Done,
@@ -386,13 +276,13 @@ enum MorselStreamState {
 impl MorselStream {
     /// Create a new `MorselStream` for the given partition.
     pub fn new(
-        pool: Arc<MorselPool>,
+        source: Arc<MorselSource>,
         partition: usize,
         limit: Option<usize>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> Self {
         Self {
-            pool,
+            source,
             partition,
             state: MorselStreamState::FetchMorsel,
             remain: limit,
@@ -406,25 +296,30 @@ impl MorselStream {
         loop {
             match &mut self.state {
                 MorselStreamState::FetchMorsel => {
-                    let pool = Arc::clone(&self.pool);
+                    let source = Arc::clone(&self.source);
                     let partition = self.partition;
                     let future =
-                        Box::pin(async move { pool.next_morsel(partition).await });
+                        Box::pin(async move { source.next_morsel(partition).await });
                     self.state = MorselStreamState::WaitingForMorsel { future };
                 }
                 MorselStreamState::WaitingForMorsel { future } => {
                     match ready!(future.as_mut().poll(cx)) {
-                        Some(morsel) => {
+                        Some(Ok(morsel)) => {
                             self.morsels_executed.add(1);
                             match morsel.execute() {
                                 Ok(stream) => {
-                                    self.state = MorselStreamState::Executing { stream };
+                                    self.state =
+                                        MorselStreamState::Executing { stream };
                                 }
                                 Err(e) => {
                                     self.state = MorselStreamState::Done;
                                     return Poll::Ready(Some(Err(e)));
                                 }
                             }
+                        }
+                        Some(Err(e)) => {
+                            self.state = MorselStreamState::Done;
+                            return Poll::Ready(Some(Err(e)));
                         }
                         None => {
                             self.state = MorselStreamState::Done;
@@ -483,14 +378,14 @@ impl Stream for MorselStream {
 
 impl RecordBatchStream for MorselStream {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(self.pool.projected_schema())
+        Arc::clone(self.source.projected_schema())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_scan_config::FileScanConfigBuilder;
+    use crate::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
     use crate::file_stream::FileOpenFuture;
     use crate::test_util::MockSource;
     use arrow::array::Int32Array;
@@ -555,6 +450,29 @@ mod tests {
         builder.build()
     }
 
+    fn make_source(
+        config: &FileScanConfig,
+        opener: Arc<dyn FileOpener>,
+        morsel_config: &MorselConfig,
+    ) -> Arc<MorselSource> {
+        let projected_schema = config.projected_schema().unwrap();
+        let num_partitions = config.file_groups.len();
+
+        let all_files: Vec<PartitionedFile> = config
+            .file_groups
+            .iter()
+            .flat_map(|group: &crate::file_groups::FileGroup| group.iter().cloned())
+            .collect();
+
+        Arc::new(MorselSource::new(
+            all_files,
+            opener,
+            morsel_config,
+            num_partitions,
+            projected_schema,
+        ))
+    }
+
     #[tokio::test]
     async fn test_morsel_stream_basic() {
         let batch = make_batch(0, 3);
@@ -563,12 +481,10 @@ mod tests {
         let config = make_test_config(schema, 1, 2, false);
         let opener = Arc::new(TestMorselOpener::new(vec![batch.clone()]));
         let metrics = ExecutionPlanMetricsSet::new();
+        let morsel_config = MorselConfig::default();
 
-        let pool = Arc::new(
-            MorselPool::new(&config, opener, &metrics, MorselConfig::default()).unwrap(),
-        );
-
-        let stream = MorselStream::new(Arc::clone(&pool), 0, None, &metrics);
+        let source = make_source(&config, opener, &morsel_config);
+        let stream = MorselStream::new(Arc::clone(&source), 0, None, &metrics);
         let batches: Vec<RecordBatch> = stream
             .collect::<Vec<_>>()
             .await
@@ -599,12 +515,10 @@ mod tests {
         let config = make_test_config(schema, 1, 2, false);
         let opener = Arc::new(TestMorselOpener::new(vec![batch.clone()]));
         let metrics = ExecutionPlanMetricsSet::new();
+        let morsel_config = MorselConfig::default();
 
-        let pool = Arc::new(
-            MorselPool::new(&config, opener, &metrics, MorselConfig::default()).unwrap(),
-        );
-
-        let stream = MorselStream::new(Arc::clone(&pool), 0, Some(4), &metrics);
+        let source = make_source(&config, opener, &morsel_config);
+        let stream = MorselStream::new(Arc::clone(&source), 0, Some(4), &metrics);
         let batches: Vec<RecordBatch> = stream
             .collect::<Vec<_>>()
             .await
@@ -626,7 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_morsel_pool_ordered() {
+    async fn test_morsel_source_ordered() {
         let batch = make_batch(0, 2);
         let schema = batch.schema();
 
@@ -634,13 +548,27 @@ mod tests {
         let config = make_test_config(schema, 2, 1, true);
         let opener = Arc::new(TestMorselOpener::new(vec![batch.clone()]));
         let metrics = ExecutionPlanMetricsSet::new();
+        let morsel_config = MorselConfig::default();
+        let projected_schema = config.projected_schema().unwrap();
 
-        let pool = Arc::new(
-            MorselPool::new(&config, opener, &metrics, MorselConfig::default()).unwrap(),
-        );
+        // Ordered: each partition gets its own MorselSource
+        let source0 = Arc::new(MorselSource::new(
+            config.file_groups[0].iter().cloned().collect(),
+            Arc::clone(&opener) as Arc<dyn FileOpener>,
+            &morsel_config,
+            1,
+            Arc::clone(&projected_schema),
+        ));
+        let source1 = Arc::new(MorselSource::new(
+            config.file_groups[1].iter().cloned().collect(),
+            opener,
+            &morsel_config,
+            1,
+            projected_schema,
+        ));
 
         // Each partition should get exactly its own file's morsels
-        let stream0 = MorselStream::new(Arc::clone(&pool), 0, None, &metrics);
+        let stream0 = MorselStream::new(Arc::clone(&source0), 0, None, &metrics);
         let batches0: Vec<RecordBatch> = stream0
             .collect::<Vec<_>>()
             .await
@@ -651,7 +579,7 @@ mod tests {
         assert_eq!(batches0.len(), 1);
         assert_eq!(batches0[0].num_rows(), 2);
 
-        let stream1 = MorselStream::new(Arc::clone(&pool), 1, None, &metrics);
+        let stream1 = MorselStream::new(Arc::clone(&source1), 0, None, &metrics);
         let batches1: Vec<RecordBatch> = stream1
             .collect::<Vec<_>>()
             .await
@@ -661,5 +589,146 @@ mod tests {
 
         assert_eq!(batches1.len(), 1);
         assert_eq!(batches1[0].num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_work_stealing() {
+        // Create a source with 2 partitions and 4 files
+        let batch = make_batch(0, 2);
+        let schema = batch.schema();
+
+        let config = make_test_config(schema, 2, 2, false);
+        let opener = Arc::new(TestMorselOpener::new(vec![batch.clone()]));
+        let morsel_config = MorselConfig::default();
+
+        let source = make_source(&config, opener, &morsel_config);
+
+        // Drain all morsels from partition 0 only — it should steal
+        // from partition 1's queue if needed, or pull from feeder
+        let mut count = 0;
+        while source.next_morsel(0).await.is_some() {
+            count += 1;
+        }
+        // 2 partitions × 2 files = 4 files total, each producing 1 morsel
+        assert_eq!(count, 4);
+
+        // Partition 1 should have nothing left
+        assert!(source.next_morsel(1).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_error_propagation() {
+        use datafusion_common::internal_err;
+
+        struct ErrorOpener;
+        impl FileOpener for ErrorOpener {
+            fn open(
+                &self,
+                _partitioned_file: PartitionedFile,
+            ) -> Result<FileOpenFuture> {
+                Ok(futures::future::ready(internal_err!("test error")).boxed())
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let config = make_test_config(schema, 1, 1, false);
+        let opener = Arc::new(ErrorOpener);
+        let morsel_config = MorselConfig::default();
+
+        let source = make_source(&config, opener, &morsel_config);
+        let result = source.next_morsel(0).await;
+        assert!(result.is_some());
+        assert!(result.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_locality() {
+        use crate::file_stream::FileOpenMorselFuture;
+
+        // Opener that returns multiple morsels per file
+        struct MultiMorselOpener {
+            records: Vec<RecordBatch>,
+        }
+
+        impl FileOpener for MultiMorselOpener {
+            fn open(
+                &self,
+                _partitioned_file: PartitionedFile,
+            ) -> Result<FileOpenFuture> {
+                let iterator = self.records.clone().into_iter().map(Ok);
+                let stream = futures::stream::iter(iterator).boxed();
+                Ok(futures::future::ready(Ok(stream)).boxed())
+            }
+
+            fn open_morsels(
+                &self,
+                _partitioned_file: PartitionedFile,
+            ) -> Result<FileOpenMorselFuture> {
+                let records = self.records.clone();
+                Ok(Box::pin(async move {
+                    // Return 3 morsels per file
+                    let mut morsels: Vec<Box<dyn FileMorsel>> = Vec::new();
+                    for record in records {
+                        let stream =
+                            futures::stream::iter(vec![Ok(record)]).boxed();
+                        morsels.push(Box::new(
+                            crate::file_stream::StreamMorsel::new(stream),
+                        ));
+                    }
+                    Ok(morsels)
+                }))
+            }
+        }
+
+        let batch1 = make_batch(1, 1);
+        let batch2 = make_batch(2, 1);
+        let batch3 = make_batch(3, 1);
+
+        let opener = Arc::new(MultiMorselOpener {
+            records: vec![batch1, batch2, batch3],
+        });
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let projected_schema = schema;
+
+        // 2 partitions, 1 file
+        let files = vec![PartitionedFile::new("file0", 100)];
+        let morsel_config = MorselConfig::default();
+        let source = Arc::new(MorselSource::new(
+            files,
+            opener,
+            &morsel_config,
+            2,
+            projected_schema,
+        ));
+
+        // Partition 0 pulls from feeder: gets first morsel, pushes 2 to its queue
+        let m0 = source.next_morsel(0).await.unwrap().unwrap();
+        // Next call should come from partition 0's local queue (locality)
+        let m1 = source.next_morsel(0).await.unwrap().unwrap();
+        // And the third
+        let m2 = source.next_morsel(0).await.unwrap().unwrap();
+
+        // Execute all three and verify we got all the data
+        let b0 = m0.execute().unwrap();
+        let b1 = m1.execute().unwrap();
+        let b2 = m2.execute().unwrap();
+
+        let batches: Vec<RecordBatch> = futures::stream::select_all(vec![b0, b1, b2])
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(batches.len(), 3);
     }
 }

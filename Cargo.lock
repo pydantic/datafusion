@@ -1936,6 +1936,7 @@ dependencies = [
  "bzip2",
  "chrono",
  "criterion",
+ "crossbeam-deque",
  "datafusion-common",
  "datafusion-common-runtime",
  "datafusion-execution",
