@@ -684,7 +684,9 @@ impl FileOpener for ParquetOpener {
         &self,
         partitioned_file: PartitionedFile,
     ) -> Result<FileOpenMorselFuture> {
-        use crate::morsel::{split_row_groups_into_morsels, ParquetMorsel, DEFAULT_MIN_MORSEL_ROWS};
+        use crate::morsel::{
+            DEFAULT_MIN_MORSEL_ROWS, ParquetMorsel, split_row_groups_into_morsels,
+        };
 
         let file_range = partitioned_file.range.clone();
         let extensions = partitioned_file.extensions.clone();
@@ -947,8 +949,11 @@ impl FileOpener for ParquetOpener {
             }
 
             // --- Split into morsels ---
-            let morsel_groups =
-                split_row_groups_into_morsels(&row_group_indexes, rg_metadata, DEFAULT_MIN_MORSEL_ROWS);
+            let morsel_groups = split_row_groups_into_morsels(
+                &row_group_indexes,
+                rg_metadata,
+                DEFAULT_MIN_MORSEL_ROWS,
+            );
 
             let morsels: Vec<Box<dyn FileMorsel>> = morsel_groups
                 .into_iter()

@@ -21,8 +21,8 @@
 use crate::file_groups::FileGroup;
 use crate::{
     PartitionedFile, display::FileGroupsDisplay, file::FileSource,
-    file_compression_type::FileCompressionType,
-    source::DataSource, statistics::MinMaxStatistics,
+    file_compression_type::FileCompressionType, source::DataSource,
+    statistics::MinMaxStatistics,
 };
 use arrow::datatypes::FieldRef;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
@@ -621,10 +621,9 @@ impl DataSource for FileScanConfig {
             if let Some(existing) = guard.upgrade() {
                 existing
             } else {
-                let morsel_config =
-                    crate::morsel::MorselConfig::from_execution_options(
-                        execution_options,
-                    );
+                let morsel_config = crate::morsel::MorselConfig::from_execution_options(
+                    execution_options,
+                );
                 let new_pool = Arc::new(
                     crate::morsel::MorselPool::new(
                         self,

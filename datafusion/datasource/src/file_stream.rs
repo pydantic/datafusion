@@ -338,8 +338,7 @@ pub trait FileOpener: Unpin + Send + Sync {
 }
 
 /// A future that resolves to a list of [`FileMorsel`]s
-pub type FileOpenMorselFuture =
-    BoxFuture<'static, Result<Vec<Box<dyn FileMorsel>>>>;
+pub type FileOpenMorselFuture = BoxFuture<'static, Result<Vec<Box<dyn FileMorsel>>>>;
 
 /// A unit of work within a file that can be independently executed.
 ///
@@ -356,7 +355,7 @@ pub trait FileMorsel: Send + Sync {
     /// Execute this morsel, producing a stream of [`RecordBatch`]es.
     ///
     /// This is where the actual IO and decoding happens.
-    fn execute(&self) -> Result<SendableRecordBatchStream>;
+    fn execute(self: Box<Self>) -> Result<SendableRecordBatchStream>;
 
     /// Estimated number of rows in this morsel (for scheduling decisions).
     fn estimated_rows(&self) -> Option<usize> {
@@ -402,7 +401,7 @@ impl StreamMorsel {
 }
 
 impl FileMorsel for StreamMorsel {
-    fn execute(&self) -> Result<SendableRecordBatchStream> {
+    fn execute(self: Box<Self>) -> Result<SendableRecordBatchStream> {
         let stream = self
             .stream
             .lock()

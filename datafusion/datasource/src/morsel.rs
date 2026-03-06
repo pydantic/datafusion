@@ -43,9 +43,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::PartitionedFile;
 use crate::file_scan_config::FileScanConfig;
 use crate::file_stream::{FileMorsel, FileOpener};
-use crate::PartitionedFile;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::error::Result;
@@ -340,10 +340,7 @@ impl MorselPool {
     /// Get the next morsel for the given partition.
     ///
     /// Returns `None` when all morsels have been consumed (no more work).
-    pub async fn next_morsel(
-        &self,
-        partition: usize,
-    ) -> Option<Box<dyn FileMorsel>> {
+    pub async fn next_morsel(&self, partition: usize) -> Option<Box<dyn FileMorsel>> {
         self.receivers[partition].lock().await.recv().await
     }
 
@@ -377,9 +374,7 @@ enum MorselStreamState {
     /// Need to fetch the next morsel from the pool
     FetchMorsel,
     /// Currently executing a morsel's stream
-    Executing {
-        stream: SendableRecordBatchStream,
-    },
+    Executing { stream: SendableRecordBatchStream },
     /// Waiting for a morsel from the pool
     WaitingForMorsel {
         future: Pin<Box<dyn Future<Output = Option<Box<dyn FileMorsel>>> + Send>>,
@@ -413,9 +408,8 @@ impl MorselStream {
                 MorselStreamState::FetchMorsel => {
                     let pool = Arc::clone(&self.pool);
                     let partition = self.partition;
-                    let future = Box::pin(async move {
-                        pool.next_morsel(partition).await
-                    });
+                    let future =
+                        Box::pin(async move { pool.next_morsel(partition).await });
                     self.state = MorselStreamState::WaitingForMorsel { future };
                 }
                 MorselStreamState::WaitingForMorsel { future } => {
@@ -424,8 +418,7 @@ impl MorselStream {
                             self.morsels_executed.add(1);
                             match morsel.execute() {
                                 Ok(stream) => {
-                                    self.state =
-                                        MorselStreamState::Executing { stream };
+                                    self.state = MorselStreamState::Executing { stream };
                                 }
                                 Err(e) => {
                                     self.state = MorselStreamState::Done;
@@ -546,18 +539,15 @@ mod tests {
             crate::table_schema::TableSchema::new(Arc::clone(&schema), vec![]);
         let file_source = Arc::new(MockSource::new(table_schema));
 
-        let mut builder =
-            FileScanConfigBuilder::new(ObjectStoreUrl::parse("test:///").unwrap(), file_source)
-                .with_preserve_order(preserve_order);
+        let mut builder = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test:///").unwrap(),
+            file_source,
+        )
+        .with_preserve_order(preserve_order);
 
         for partition in 0..num_partitions {
             let files: Vec<PartitionedFile> = (0..files_per_partition)
-                .map(|f| {
-                    PartitionedFile::new(
-                        format!("file_p{partition}_f{f}"),
-                        100,
-                    )
-                })
+                .map(|f| PartitionedFile::new(format!("file_p{partition}_f{f}"), 100))
                 .collect();
             builder = builder.with_file_group(crate::file_groups::FileGroup::new(files));
         }

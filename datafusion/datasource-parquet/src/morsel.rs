@@ -24,8 +24,8 @@ use std::task::{Context, Poll};
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::datatypes::SchemaRef;
 use datafusion_common::{DataFusionError, Result};
-use datafusion_datasource::file_stream::FileMorsel;
 use datafusion_datasource::PartitionedFile;
+use datafusion_datasource::file_stream::FileMorsel;
 use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::reassign_expr_columns;
@@ -145,7 +145,7 @@ impl ParquetMorsel {
 }
 
 impl FileMorsel for ParquetMorsel {
-    fn execute(&self) -> Result<SendableRecordBatchStream> {
+    fn execute(self: Box<Self>) -> Result<SendableRecordBatchStream> {
         let file_name = self.partitioned_file.object_meta.location.to_string();
         let file_metrics =
             ParquetFileMetrics::new(self.partition_index, &file_name, &self.metrics);
@@ -155,11 +155,10 @@ impl FileMorsel for ParquetMorsel {
             .partitioned_file
             .metadata_size_hint
             .or(self.metadata_size_hint);
-        let async_file_reader: Box<dyn AsyncFileReader> = self
-            .reader_factory
-            .create_reader(
+        let async_file_reader: Box<dyn AsyncFileReader> =
+            self.reader_factory.create_reader(
                 self.partition_index,
-                self.partitioned_file.clone(),
+                self.partitioned_file,
                 metadata_size_hint,
                 &self.metrics,
             )?;
@@ -167,22 +166,25 @@ impl FileMorsel for ParquetMorsel {
         // Build the stream from the shared metadata
         let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
             async_file_reader,
-            self.metadata.clone(),
+            self.metadata,
         );
 
         if self.force_filter_selections {
-            builder =
-                builder.with_row_selection_policy(RowSelectionPolicy::Selectors);
+            builder = builder.with_row_selection_policy(RowSelectionPolicy::Selectors);
         }
 
         // Apply row groups and row selection
-        builder = builder.with_row_groups(self.row_group_indexes.clone());
-        if let Some(ref row_selection) = self.row_selection {
-            builder = builder.with_row_selection(row_selection.clone());
+        builder = builder.with_row_groups(self.row_group_indexes);
+        if let Some(row_selection) = self.row_selection {
+            builder = builder.with_row_selection(row_selection);
         }
 
         // Apply row filter (predicate pushdown into parquet scan)
-        if let Some(predicate) = self.pushdown_filters.then_some(&self.predicate).and_then(|p| p.as_ref()) {
+        if let Some(predicate) = self
+            .pushdown_filters
+            .then_some(&self.predicate)
+            .and_then(|p| p.as_ref())
+        {
             let row_filter = row_filter::build_row_filter(
                 predicate,
                 &self.physical_file_schema,
@@ -196,9 +198,7 @@ impl FileMorsel for ParquetMorsel {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    debug!(
-                        "Ignoring error building row filter for '{predicate:?}': {e}"
-                    );
+                    debug!("Ignoring error building row filter for '{predicate:?}': {e}");
                 }
             }
         }
@@ -233,13 +233,11 @@ impl FileMorsel for ParquetMorsel {
         // Rebase column indices to match the narrowed stream schema
         let projection = self
             .projection
-            .clone()
             .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
         let projector = projection.make_projector(&stream_schema)?;
 
-        let adapted = stream
-            .map_err(|e| DataFusionError::from(e))
-            .map(move |batch_result: Result<RecordBatch>| {
+        let adapted = stream.map_err(|e| DataFusionError::from(e)).map(
+            move |batch_result: Result<RecordBatch>| {
                 batch_result.and_then(|b| {
                     copy_arrow_reader_metrics(
                         &arrow_reader_metrics,
@@ -261,7 +259,8 @@ impl FileMorsel for ParquetMorsel {
                         Ok(projected)
                     }
                 })
-            });
+            },
+        );
 
         Ok(Box::pin(ParquetMorselStream {
             stream: Box::pin(adapted),
