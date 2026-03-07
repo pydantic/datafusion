@@ -22,8 +22,20 @@ use crate::{
 use datafusion_common::{Result, internal_datafusion_err, plan_datafusion_err};
 use datafusion_expr::planner::ExprPlanner;
 use datafusion_expr::{AggregateUDF, ScalarUDF, WindowUDF};
+use std::any::Any;
 use std::collections::HashSet;
+use std::sync::Mutex;
 use std::{collections::HashMap, sync::Arc};
+
+/// Type-erased shared state map for caching execution-scoped data (e.g., morsel sources).
+struct SharedState(Mutex<HashMap<usize, Arc<dyn Any + Send + Sync>>>);
+
+impl std::fmt::Debug for SharedState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self.0.lock().map(|m| m.len()).unwrap_or(0);
+        write!(f, "SharedState({len} entries)")
+    }
+}
 
 /// Task Execution Context
 ///
@@ -48,6 +60,8 @@ pub struct TaskContext {
     window_functions: HashMap<String, Arc<WindowUDF>>,
     /// Runtime environment associated with this task context
     runtime: Arc<RuntimeEnv>,
+    /// Type-erased shared state for caching execution-scoped data across partitions.
+    shared_state: SharedState,
 }
 
 impl Default for TaskContext {
@@ -63,6 +77,7 @@ impl Default for TaskContext {
             aggregate_functions: HashMap::new(),
             window_functions: HashMap::new(),
             runtime,
+            shared_state: SharedState(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -90,6 +105,7 @@ impl TaskContext {
             aggregate_functions,
             window_functions,
             runtime,
+            shared_state: SharedState(Mutex::new(HashMap::new())),
         }
     }
 
@@ -140,6 +156,26 @@ impl TaskContext {
     pub fn with_runtime(mut self, runtime: Arc<RuntimeEnv>) -> Self {
         self.runtime = runtime;
         self
+    }
+
+    /// Get or insert a shared state entry keyed by a `usize` (typically a pointer).
+    ///
+    /// This is used to cache execution-scoped data (e.g., morsel sources) that
+    /// is shared across partitions within a single query execution.
+    pub fn get_or_insert_shared_state<T: Any + Send + Sync>(
+        &self,
+        key: usize,
+        create: impl FnOnce() -> T,
+    ) -> Arc<T> {
+        let mut map = self.shared_state.0.lock().unwrap();
+        if let Some(existing) = map.get(&key)
+            && let Ok(typed) = Arc::clone(existing).downcast::<T>()
+        {
+            return typed;
+        }
+        let value = Arc::new(create());
+        map.insert(key, Arc::clone(&value) as Arc<dyn Any + Send + Sync>);
+        value
     }
 }
 

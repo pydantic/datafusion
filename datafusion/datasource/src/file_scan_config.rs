@@ -54,7 +54,11 @@ use datafusion_physical_plan::{
     metrics::ExecutionPlanMetricsSet,
 };
 use log::{debug, warn};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{any::Any, fmt::Debug, fmt::Formatter, fmt::Result as FmtResult, sync::Arc};
+
+/// Global counter for unique FileScanConfig instance IDs.
+static NEXT_INSTANCE_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// [`FileScanConfig`] represents scanning data from a group of files
 ///
@@ -207,11 +211,10 @@ pub struct FileScanConfig {
     /// If the number of file partitions > target_partitions, the file partitions will be grouped
     /// in a round-robin fashion such that number of file partitions = target_partitions.
     pub partitioned_by_file_group: bool,
-    /// Shared morsel source for morsel-driven scanning (unordered mode only).
-    /// Uses `Weak` so the source is automatically recreated when all partition
-    /// streams from a previous execution round are dropped (e.g., recursive CTEs
-    /// re-execute the same plan multiple times).
-    morsel_source: std::sync::Mutex<std::sync::Weak<crate::morsel::MorselSource>>,
+    /// Unique instance ID for TaskContext shared state keying.
+    /// Each FileScanConfig gets a fresh ID to avoid stale cache hits
+    /// from address reuse after reset_state()/clone().
+    instance_id: usize,
 }
 
 impl Clone for FileScanConfig {
@@ -229,9 +232,7 @@ impl Clone for FileScanConfig {
             expr_adapter_factory: self.expr_adapter_factory.clone(),
             statistics: self.statistics.clone(),
             partitioned_by_file_group: self.partitioned_by_file_group,
-            // New clone gets a fresh (empty) morsel source — each clone
-            // starts its own execution lifecycle.
-            morsel_source: std::sync::Mutex::new(std::sync::Weak::new()),
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 }
@@ -576,7 +577,7 @@ impl FileScanConfigBuilder {
             expr_adapter_factory: expr_adapter,
             statistics,
             partitioned_by_file_group,
-            morsel_source: std::sync::Mutex::new(std::sync::Weak::new()),
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 }
@@ -616,9 +617,8 @@ impl DataSource for FileScanConfig {
         let opener = source.create_file_opener(object_store, self, partition)?;
 
         let execution_options = &context.session_config().options().execution;
-        let morsel_config = crate::morsel::MorselConfig::from_execution_options(
-            execution_options,
-        );
+        let morsel_config =
+            crate::morsel::MorselConfig::from_execution_options(execution_options);
         let projected_schema = self.projected_schema()?;
 
         // When partitioned_by_file_group is true, the optimizer reports Hash
@@ -640,26 +640,25 @@ impl DataSource for FileScanConfig {
             ));
             (ms, 0) // partition=0 within its own source
         } else {
-            // Unordered: shared MorselSource, created once via Weak cache
-            let mut guard = self.morsel_source.lock().unwrap();
-            let ms = if let Some(existing) = guard.upgrade() {
-                existing
-            } else {
+            // Unordered: shared MorselSource via TaskContext.
+            // Same `self` pointer → same key → reuse across partitions.
+            // CTE re-execution calls reset_state() which clones FileScanConfig
+            // into a new Arc → different pointer → fresh source.
+            let num_partitions = self.file_groups.len();
+            let ms = context.get_or_insert_shared_state(self.instance_id, || {
                 let all_files: Vec<PartitionedFile> = self
                     .file_groups
                     .iter()
                     .flat_map(|group| group.iter().cloned())
                     .collect();
-                let new_source = Arc::new(crate::morsel::MorselSource::new(
+                crate::morsel::MorselSource::new(
                     all_files,
                     opener,
                     &morsel_config,
-                    self.file_groups.len(),
+                    num_partitions,
                     projected_schema,
-                ));
-                *guard = Arc::downgrade(&new_source);
-                new_source
-            };
+                )
+            });
             (ms, partition)
         };
 
@@ -994,6 +993,10 @@ impl DataSource for FileScanConfig {
                 Ok(SortOrderPushdownResult::Unsupported)
             }
         }
+    }
+
+    fn reset_state(&self) -> Result<Option<Arc<dyn DataSource>>> {
+        Ok(Some(Arc::new(self.clone())))
     }
 
     fn with_preserve_order(&self, preserve_order: bool) -> Option<Arc<dyn DataSource>> {

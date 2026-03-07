@@ -213,6 +213,12 @@ pub trait DataSource: Send + Sync + Debug {
         None
     }
 
+    /// Create a fresh copy for re-execution (e.g. recursive CTEs).
+    /// Returns `None` if no reset is needed (default).
+    fn reset_state(&self) -> Result<Option<Arc<dyn DataSource>>> {
+        Ok(None)
+    }
+
     /// Apply a closure to each expression used by this data source.
     ///
     /// This includes filter predicates (which may contain dynamic filters) and any
@@ -308,6 +314,13 @@ impl ExecutionPlan for DataSourceExec {
         _: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        match self.data_source.reset_state()? {
+            Some(new_source) => Ok(Arc::new(DataSourceExec::new(new_source))),
+            None => Ok(self),
+        }
     }
 
     /// Implementation of [`ExecutionPlan::repartitioned`] which relies upon the inner [`DataSource::repartitioned`].

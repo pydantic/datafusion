@@ -157,7 +157,8 @@ impl MorselSource {
         projected_schema: SchemaRef,
     ) -> Self {
         let local_queues = (0..num_partitions).map(|_| Injector::new()).collect();
-        let feeder = build_morsel_stream(files, opener, morsel_config.max_concurrent_opens);
+        let feeder =
+            build_morsel_stream(files, opener, morsel_config.max_concurrent_opens);
 
         Self {
             local_queues,
@@ -200,8 +201,8 @@ impl MorselSource {
         }
 
         loop {
-            match feeder.next().await? {
-                Ok(mut morsels) => {
+            match feeder.next().await {
+                Some(Ok(mut morsels)) => {
                     if morsels.is_empty() {
                         // File produced no morsels (e.g., all row groups pruned),
                         // keep pulling from feeder
@@ -215,7 +216,10 @@ impl MorselSource {
                     }
                     return Some(Ok(first));
                 }
-                Err(e) => return Some(Err(e)),
+                Some(Err(e)) => return Some(Err(e)),
+                None => {
+                    return None;
+                }
             }
         }
     }
@@ -273,8 +277,7 @@ enum MorselStreamState {
     Executing { stream: SendableRecordBatchStream },
     /// Waiting for a morsel from the source
     WaitingForMorsel {
-        future:
-            Pin<Box<dyn Future<Output = Option<Result<Box<dyn FileMorsel>>>> + Send>>,
+        future: Pin<Box<dyn Future<Output = Option<Result<Box<dyn FileMorsel>>>> + Send>>,
     },
     /// Stream is done
     Done,
@@ -315,8 +318,7 @@ impl MorselStream {
                             self.morsels_executed.add(1);
                             match morsel.execute() {
                                 Ok(stream) => {
-                                    self.state =
-                                        MorselStreamState::Executing { stream };
+                                    self.state = MorselStreamState::Executing { stream };
                                 }
                                 Err(e) => {
                                     self.state = MorselStreamState::Done;
@@ -629,19 +631,12 @@ mod tests {
 
         struct ErrorOpener;
         impl FileOpener for ErrorOpener {
-            fn open(
-                &self,
-                _partitioned_file: PartitionedFile,
-            ) -> Result<FileOpenFuture> {
+            fn open(&self, _partitioned_file: PartitionedFile) -> Result<FileOpenFuture> {
                 Ok(futures::future::ready(internal_err!("test error")).boxed())
             }
         }
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "i",
-            DataType::Int32,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
         let config = make_test_config(schema, 1, 1, false);
         let opener = Arc::new(ErrorOpener);
         let morsel_config = MorselConfig::default();
@@ -662,10 +657,7 @@ mod tests {
         }
 
         impl FileOpener for MultiMorselOpener {
-            fn open(
-                &self,
-                _partitioned_file: PartitionedFile,
-            ) -> Result<FileOpenFuture> {
+            fn open(&self, _partitioned_file: PartitionedFile) -> Result<FileOpenFuture> {
                 let iterator = self.records.clone().into_iter().map(Ok);
                 let stream = futures::stream::iter(iterator).boxed();
                 Ok(futures::future::ready(Ok(stream)).boxed())
@@ -680,11 +672,10 @@ mod tests {
                     // Return 3 morsels per file
                     let mut morsels: Vec<Box<dyn FileMorsel>> = Vec::new();
                     for record in records {
-                        let stream =
-                            futures::stream::iter(vec![Ok(record)]).boxed();
-                        morsels.push(Box::new(
-                            crate::file_stream::StreamMorsel::new(stream),
-                        ));
+                        let stream = futures::stream::iter(vec![Ok(record)]).boxed();
+                        morsels.push(Box::new(crate::file_stream::StreamMorsel::new(
+                            stream,
+                        )));
                     }
                     Ok(morsels)
                 }))
@@ -699,11 +690,7 @@ mod tests {
             records: vec![batch1, batch2, batch3],
         });
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "i",
-            DataType::Int32,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
         let projected_schema = schema;
 
         // 2 partitions, 1 file
