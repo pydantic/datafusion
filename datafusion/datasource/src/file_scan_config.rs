@@ -632,30 +632,27 @@ impl DataSource for FileScanConfig {
             let files: Vec<PartitionedFile> =
                 self.file_groups[partition].iter().cloned().collect();
             let ms = Arc::new(crate::morsel::MorselSource::new(
-                files,
+                vec![files], // single group
                 opener,
                 &morsel_config,
-                1, // single local queue
                 projected_schema,
             ));
             (ms, 0) // partition=0 within its own source
         } else {
-            // Unordered: shared MorselSource via TaskContext.
-            // Same `self` pointer → same key → reuse across partitions.
-            // CTE re-execution calls reset_state() which clones FileScanConfig
-            // into a new Arc → different pointer → fresh source.
-            let num_partitions = self.file_groups.len();
+            // Shared MorselSource with partition-aware distribution.
+            // Files are tagged with their assigned partition so morsels
+            // go to the correct queue, preserving data locality.
+            // Work-stealing only kicks in when a partition finishes early.
             let ms = context.get_or_insert_shared_state(self.instance_id, || {
-                let all_files: Vec<PartitionedFile> = self
+                let file_groups: Vec<Vec<PartitionedFile>> = self
                     .file_groups
                     .iter()
-                    .flat_map(|group| group.iter().cloned())
+                    .map(|group| group.iter().cloned().collect())
                     .collect();
                 crate::morsel::MorselSource::new(
-                    all_files,
+                    file_groups,
                     opener,
                     &morsel_config,
-                    num_partitions,
                     projected_schema,
                 )
             });
