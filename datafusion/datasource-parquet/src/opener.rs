@@ -984,7 +984,6 @@ impl FileOpener for ParquetOpener {
                         reader_metadata.clone(),
                         partition_index,
                         metrics.clone(),
-                        metadata_size_hint,
                         force_filter_selections,
                         limit,
                         max_predicate_cache_size,

@@ -77,8 +77,6 @@ pub struct ParquetMorsel {
     partition_index: usize,
     /// Metrics for reporting
     metrics: ExecutionPlanMetricsSet,
-    /// Metadata size hint for the reader
-    metadata_size_hint: Option<usize>,
     /// Force row selection policy
     force_filter_selections: bool,
     /// Optional limit on rows to read
@@ -112,7 +110,6 @@ impl ParquetMorsel {
         metadata: ArrowReaderMetadata,
         partition_index: usize,
         metrics: ExecutionPlanMetricsSet,
-        metadata_size_hint: Option<usize>,
         force_filter_selections: bool,
         limit: Option<usize>,
         max_predicate_cache_size: Option<usize>,
@@ -134,7 +131,6 @@ impl ParquetMorsel {
             metadata,
             partition_index,
             metrics,
-            metadata_size_hint,
             force_filter_selections,
             limit,
             max_predicate_cache_size,
