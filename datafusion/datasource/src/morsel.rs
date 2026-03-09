@@ -197,7 +197,7 @@ impl MorselSource {
         }
 
         // 2. Pull from own feeder (no contention with other partitions)
-        if let Some(result) = self.pull_own_feeder(partition).await {
+        if let Some(result) = self.pull_feeder(partition, partition).await {
             return Some(result);
         }
 
@@ -212,9 +212,12 @@ impl MorselSource {
 
         // 4. All queues empty — try pulling from other partitions' feeders
         //    (last resort: the other partition may have finished early)
+        //    Surplus morsels go to the stealer's queue for locality — the
+        //    stolen file's remaining morsels stay with the partition that
+        //    opened the file.
         for i in 1..n {
             let other = (partition + i) % n;
-            if let Some(result) = self.pull_own_feeder(other).await {
+            if let Some(result) = self.pull_feeder(other, partition).await {
                 return Some(result);
             }
         }
@@ -222,13 +225,22 @@ impl MorselSource {
         None
     }
 
-    /// Pull from this partition's own feeder stream.
+    /// Pull from the given partition's feeder stream.
+    ///
+    /// - `feeder_partition`: which partition's feeder to pull from.
+    /// - `push_surplus_to`: which partition's local queue receives the
+    ///   surplus (same-file) morsels. When a partition pulls its own
+    ///   feeder this equals `feeder_partition`; when stealing, this is
+    ///   the stealer's partition so the stolen file's morsels stay local
+    ///   to the partition that opened the file.
+    ///
     /// Returns `Some` if a morsel was found, `None` if feeder is exhausted.
-    async fn pull_own_feeder(
+    async fn pull_feeder(
         &self,
-        partition: usize,
+        feeder_partition: usize,
+        push_surplus_to: usize,
     ) -> Option<Result<Box<dyn FileMorsel>>> {
-        let mut feeder = self.feeders[partition].lock().await;
+        let mut feeder = self.feeders[feeder_partition].lock().await;
         loop {
             match feeder.next().await {
                 Some(Ok(mut morsels)) => {
@@ -236,9 +248,9 @@ impl MorselSource {
                         continue; // pruned file, try next
                     }
                     let first = morsels.remove(0);
-                    // Push surplus to own local queue (same-file locality)
+                    // Push surplus to designated local queue (same-file locality)
                     for morsel in morsels {
-                        self.local_queues[partition].push(morsel);
+                        self.local_queues[push_surplus_to].push(morsel);
                     }
                     return Some(Ok(first));
                 }
