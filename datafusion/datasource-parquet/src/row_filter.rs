@@ -401,7 +401,7 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
     fn f_down(&mut self, node: &Self::Node) -> Result<TreeNodeRecursion> {
         // check for get_field(Column("foo"), "bar", ...) accessing a struct field
         // the resolved return type tells us the leaf type
-        // if it's non0nested, we can pushdown by recording the root column index and skip children
+        // if it's non-nested, we can push down by recording the root column index and skip children
         // this way, the visitor never sees the raw struct Column and rejects it
         if let Some(func) =
             ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(node.as_ref())
