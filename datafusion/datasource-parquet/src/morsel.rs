@@ -44,9 +44,9 @@ use crate::{ParquetFileMetrics, ParquetFileReaderFactory, row_filter};
 
 /// Default target projected bytes per morsel (1 MB).
 ///
-/// Row groups whose projected compressed size exceeds 2× this value are split
-/// into sub-morsels via RowSelection. Row groups smaller than this value are
-/// packed together until the target is reached.
+/// Small row groups are packed together until their cumulative projected
+/// compressed size reaches this target. Each row group is the minimum
+/// unit — row groups are never split into sub-morsels.
 pub(crate) const DEFAULT_TARGET_MORSEL_BYTES: usize = 1_000_000;
 
 /// A unit of work representing one or more Parquet row groups that can be
@@ -345,15 +345,12 @@ fn projected_rg_bytes(
         .sum()
 }
 
-/// Split row group indices into morsel groups, packing small row groups together
-/// and splitting large row groups into multiple morsels using RowSelection.
+/// Group row group indices into morsels by packing small row groups together.
 ///
-/// Uses projected compressed byte sizes from Parquet column metadata to decide
-/// both packing and splitting against a single `target_bytes` threshold:
-/// - Row groups whose projected bytes exceed `2 * target_bytes` are split
-///   into `ceil(bytes / target_bytes)` sub-morsels with evenly distributed rows.
-/// - Smaller row groups are packed together until their cumulative projected
-///   bytes reach `target_bytes`.
+/// Uses projected compressed byte sizes from Parquet column metadata.
+/// Row groups are packed together until their cumulative projected bytes
+/// reach `target_bytes`. Each row group is the minimum unit — row groups
+/// are never split into sub-morsels.
 pub(crate) fn split_row_groups_into_morsels(
     row_group_indexes: &[usize],
     row_group_metadata: &[parquet::file::metadata::RowGroupMetaData],
@@ -370,102 +367,24 @@ pub(crate) fn split_row_groups_into_morsels(
     let mut current_rows: usize = 0;
     let mut current_bytes: usize = 0;
 
-    // Build per-row-group selections from the overall row_selection if present.
-    // The overall RowSelection covers all selected row groups sequentially.
-    let per_rg_selections: Option<Vec<(usize, RowSelection)>> =
-        row_selection.map(|sel| {
-            split_row_selection_by_row_groups(sel, row_group_indexes, row_group_metadata)
-        });
-
-    for (i, &rg_idx) in row_group_indexes.iter().enumerate() {
+    for &rg_idx in row_group_indexes {
         let rg_meta = &row_group_metadata[rg_idx];
         let rg_rows = rg_meta.num_rows() as usize;
         let rg_proj_bytes = projected_rg_bytes(rg_meta, projected_columns);
 
-        if rg_proj_bytes >= 2 * target_bytes {
-            // Flush any accumulated small RGs first
-            if !current_rg_indexes.is_empty() {
-                morsels.push(MorselPlan {
-                    row_group_indexes: std::mem::take(&mut current_rg_indexes),
-                    row_selection: row_selection.cloned(),
-                    est_rows: current_rows,
-                    est_bytes: current_bytes,
-                });
-                current_rows = 0;
-                current_bytes = 0;
-            }
+        current_rg_indexes.push(rg_idx);
+        current_rows += rg_rows;
+        current_bytes += rg_proj_bytes;
 
-            // Split large RG into sub-morsels based on byte budget
-            let n = rg_proj_bytes.div_ceil(target_bytes);
-            let chunk_rows = rg_rows / n;
-            let remainder = rg_rows % n;
-            let bytes_per_row = if rg_rows > 0 {
-                rg_proj_bytes as f64 / rg_rows as f64
-            } else {
-                0.0
-            };
-
-            let rg_selection = per_rg_selections.as_ref().map(|sels| &sels[i].1);
-
-            let mut offset = 0;
-            for chunk_idx in 0..n {
-                let rows = if chunk_idx < remainder {
-                    chunk_rows + 1
-                } else {
-                    chunk_rows
-                };
-
-                let selection = match rg_selection {
-                    Some(sel) => Some(sub_select_from_row_selection(sel, offset, rows)),
-                    None => {
-                        // Create a simple Skip/Select RowSelection
-                        let mut selectors = Vec::new();
-                        if offset > 0 {
-                            selectors.push(
-                                parquet::arrow::arrow_reader::RowSelector::skip(offset),
-                            );
-                        }
-                        selectors.push(
-                            parquet::arrow::arrow_reader::RowSelector::select(rows),
-                        );
-                        let remaining = rg_rows - offset - rows;
-                        if remaining > 0 {
-                            selectors.push(
-                                parquet::arrow::arrow_reader::RowSelector::skip(
-                                    remaining,
-                                ),
-                            );
-                        }
-                        Some(RowSelection::from(selectors))
-                    }
-                };
-
-                let est_bytes = (rows as f64 * bytes_per_row) as usize;
-                morsels.push(MorselPlan {
-                    row_group_indexes: vec![rg_idx],
-                    row_selection: selection,
-                    est_rows: rows,
-                    est_bytes,
-                });
-
-                offset += rows;
-            }
-        } else {
-            // Small RG: pack into current morsel
-            current_rg_indexes.push(rg_idx);
-            current_rows += rg_rows;
-            current_bytes += rg_proj_bytes;
-
-            if current_bytes >= target_bytes {
-                morsels.push(MorselPlan {
-                    row_group_indexes: std::mem::take(&mut current_rg_indexes),
-                    row_selection: row_selection.cloned(),
-                    est_rows: current_rows,
-                    est_bytes: current_bytes,
-                });
-                current_rows = 0;
-                current_bytes = 0;
-            }
+        if current_bytes >= target_bytes {
+            morsels.push(MorselPlan {
+                row_group_indexes: std::mem::take(&mut current_rg_indexes),
+                row_selection: row_selection.cloned(),
+                est_rows: current_rows,
+                est_bytes: current_bytes,
+            });
+            current_rows = 0;
+            current_bytes = 0;
         }
     }
 
@@ -481,144 +400,15 @@ pub(crate) fn split_row_groups_into_morsels(
     morsels
 }
 
-/// Split an overall RowSelection into per-row-group RowSelections.
-///
-/// The overall RowSelection covers all selected row groups sequentially.
-/// This function walks the selectors, consuming rows for each row group
-/// based on its total row count, producing a RowSelection scoped to each RG.
-fn split_row_selection_by_row_groups(
-    row_selection: &RowSelection,
-    row_group_indexes: &[usize],
-    row_group_metadata: &[parquet::file::metadata::RowGroupMetaData],
-) -> Vec<(usize, RowSelection)> {
-    use parquet::arrow::arrow_reader::RowSelector;
-
-    let selectors: Vec<RowSelector> = row_selection.iter().cloned().collect();
-    let mut sel_idx = 0;
-    let mut sel_offset = 0; // how many rows consumed in current selector
-    let mut result = Vec::with_capacity(row_group_indexes.len());
-
-    for &rg_idx in row_group_indexes {
-        let rg_rows = row_group_metadata[rg_idx].num_rows() as usize;
-        let mut remaining = rg_rows;
-        let mut rg_selectors = Vec::new();
-
-        while remaining > 0 && sel_idx < selectors.len() {
-            let sel = &selectors[sel_idx];
-            let available = sel.row_count - sel_offset;
-            let take = remaining.min(available);
-
-            if sel.skip {
-                rg_selectors.push(RowSelector::skip(take));
-            } else {
-                rg_selectors.push(RowSelector::select(take));
-            }
-
-            sel_offset += take;
-            remaining -= take;
-
-            if sel_offset >= sel.row_count {
-                sel_idx += 1;
-                sel_offset = 0;
-            }
-        }
-
-        result.push((rg_idx, RowSelection::from(rg_selectors)));
-    }
-
-    result
-}
-
-/// Extract a sub-selection from a per-RG RowSelection targeting `target_selected` rows
-/// starting at the `skip_selected`-th selected row.
-///
-/// This walks the selectors, preserving skip/select structure, but only including
-/// the portion that covers the target range of *selected* rows.
-fn sub_select_from_row_selection(
-    rg_selection: &RowSelection,
-    skip_selected: usize,
-    target_selected: usize,
-) -> RowSelection {
-    use parquet::arrow::arrow_reader::RowSelector;
-
-    let selectors: Vec<RowSelector> = rg_selection.iter().cloned().collect();
-    let mut result = Vec::new();
-    let mut selected_seen = 0usize;
-    let mut selected_taken = 0usize;
-    let mut physical_skip_prefix = 0usize;
-    let mut in_range = false;
-
-    for sel in &selectors {
-        if selected_taken >= target_selected {
-            // We have enough selected rows; remaining rows become trailing skip
-            break;
-        }
-
-        if sel.skip {
-            if !in_range {
-                physical_skip_prefix += sel.row_count;
-            } else {
-                result.push(RowSelector::skip(sel.row_count));
-            }
-        } else {
-            // This is a select range
-            let sel_end = selected_seen + sel.row_count;
-
-            if sel_end <= skip_selected {
-                // Entirely before our range — skip all these physical rows
-                physical_skip_prefix += sel.row_count;
-                selected_seen = sel_end;
-                continue;
-            }
-
-            // Some or all of this selector is in our range
-            let start_in_sel = skip_selected.saturating_sub(selected_seen);
-            let available = sel.row_count - start_in_sel;
-            let take = available.min(target_selected - selected_taken);
-
-            if !in_range {
-                // Add accumulated skip prefix + partial skip within this selector
-                let total_skip = physical_skip_prefix + start_in_sel;
-                if total_skip > 0 {
-                    result.push(RowSelector::skip(total_skip));
-                }
-                in_range = true;
-            } else if start_in_sel > 0 {
-                result.push(RowSelector::skip(start_in_sel));
-            }
-
-            result.push(RowSelector::select(take));
-            selected_taken += take;
-            selected_seen = sel_end;
-            continue;
-        }
-
-        selected_seen += if sel.skip { 0 } else { sel.row_count };
-    }
-
-    // Add trailing skip for remaining physical rows in the RG
-    // (arrow-rs needs the selection to cover exactly the RG's row count)
-    let total_physical: usize = selectors.iter().map(|s| s.row_count).sum();
-    let used_physical: usize = result.iter().map(|s| s.row_count).sum();
-    let trailing = total_physical - used_physical;
-    if trailing > 0 {
-        result.push(RowSelector::skip(trailing));
-    }
-
-    RowSelection::from(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parquet::arrow::arrow_reader::RowSelector;
     use parquet::basic::Type as PhysicalType;
     use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
     use parquet::schema::types::{SchemaDescriptor, Type};
     use std::sync::Arc;
 
     /// Create test RG metadata with a single INT32 column.
-    /// `compressed_bytes` sets the column's compressed size.
     fn make_rg_metadata_with_bytes(
         num_rows: i64,
         compressed_bytes: i64,
@@ -696,7 +486,6 @@ mod tests {
 
     #[test]
     fn test_small_rgs_pack_together() {
-        // Each RG is 5MB — well below 2*15MB split threshold
         // target_bytes=15MB, so RGs pack until cumulative bytes >= 15MB
         let metadata = vec![
             make_rg_metadata_with_bytes(30_000, 5 * MB as i64),
@@ -721,72 +510,9 @@ mod tests {
     }
 
     #[test]
-    fn test_large_rg_split_by_bytes() {
-        // 1M rows, 150MB compressed → 150MB / 15MB = 10 morsels
+    fn test_large_rg_becomes_single_morsel() {
+        // 1M rows, 150MB compressed — large RG should NOT be split
         let metadata = vec![make_rg_metadata_with_bytes(1_000_000, 150 * MB as i64)];
-        let indexes = vec![0];
-
-        let morsels =
-            split_row_groups_into_morsels(&indexes, &metadata, None, &[0], 15 * MB);
-
-        assert_eq!(morsels.len(), 10);
-        for morsel in &morsels {
-            assert_eq!(morsel.row_group_indexes, vec![0]);
-            assert_eq!(morsel.est_rows, 100_000);
-            assert!(morsel.row_selection.is_some());
-        }
-    }
-
-    #[test]
-    fn test_large_rg_uneven_split() {
-        // 100K rows, 40MB → n=ceil(40/15)=3, rows split: 33334+33333+33333
-        let metadata = vec![make_rg_metadata_with_bytes(100_000, 40 * MB as i64)];
-        let indexes = vec![0];
-
-        let morsels =
-            split_row_groups_into_morsels(&indexes, &metadata, None, &[0], 15 * MB);
-
-        assert_eq!(morsels.len(), 3);
-        assert_eq!(morsels[0].est_rows, 33334);
-        assert_eq!(morsels[1].est_rows, 33333);
-        assert_eq!(morsels[2].est_rows, 33333);
-
-        for morsel in &morsels {
-            assert_eq!(morsel.row_group_indexes, vec![0]);
-            assert!(morsel.row_selection.is_some());
-        }
-    }
-
-    #[test]
-    fn test_mixed_small_and_large() {
-        let metadata = vec![
-            make_rg_metadata_with_bytes(50_000, 5 * MB as i64), // small
-            make_rg_metadata_with_bytes(500_000, 75 * MB as i64), // large (75MB >= 30MB)
-            make_rg_metadata_with_bytes(30_000, 3 * MB as i64), // small
-        ];
-        let indexes = vec![0, 1, 2];
-
-        let morsels =
-            split_row_groups_into_morsels(&indexes, &metadata, None, &[0], 15 * MB);
-
-        // RG 0: 5MB < 15MB target → accumulate
-        // RG 1: 75MB >= 30MB → flush RG 0, split RG 1 into ceil(75/15)=5
-        // RG 2: 3MB → remainder morsel
-        assert_eq!(morsels.len(), 7);
-        assert_eq!(morsels[0].row_group_indexes, vec![0]);
-        assert_eq!(morsels[0].est_rows, 50_000);
-        for morsel in &morsels[1..6] {
-            assert_eq!(morsel.row_group_indexes, vec![1]);
-            assert_eq!(morsel.est_rows, 100_000);
-        }
-        assert_eq!(morsels[6].row_group_indexes, vec![2]);
-        assert_eq!(morsels[6].est_rows, 30_000);
-    }
-
-    #[test]
-    fn test_borderline_not_split() {
-        // 29MB < 2*15MB = 30MB → should NOT be split
-        let metadata = vec![make_rg_metadata_with_bytes(200_000, 29 * MB as i64)];
         let indexes = vec![0];
 
         let morsels =
@@ -794,21 +520,62 @@ mod tests {
 
         assert_eq!(morsels.len(), 1);
         assert_eq!(morsels[0].row_group_indexes, vec![0]);
-        assert_eq!(morsels[0].est_rows, 200_000);
+        assert_eq!(morsels[0].est_rows, 1_000_000);
         assert!(morsels[0].row_selection.is_none());
     }
 
     #[test]
-    fn test_split_with_existing_row_selection() {
-        // 300K rows, 45MB → split into 3
-        let metadata = vec![make_rg_metadata_with_bytes(300_000, 45 * MB as i64)];
-        let indexes = vec![0];
+    fn test_each_rg_own_morsel_when_above_target() {
+        // Each RG is 20MB > 15MB target → each becomes its own morsel
+        let metadata = vec![
+            make_rg_metadata_with_bytes(100_000, 20 * MB as i64),
+            make_rg_metadata_with_bytes(100_000, 20 * MB as i64),
+            make_rg_metadata_with_bytes(100_000, 20 * MB as i64),
+        ];
+        let indexes = vec![0, 1, 2];
 
-        // Selection: skip 50K, select 200K, skip 50K
+        let morsels =
+            split_row_groups_into_morsels(&indexes, &metadata, None, &[0], 15 * MB);
+
+        assert_eq!(morsels.len(), 3);
+        assert_eq!(morsels[0].row_group_indexes, vec![0]);
+        assert_eq!(morsels[1].row_group_indexes, vec![1]);
+        assert_eq!(morsels[2].row_group_indexes, vec![2]);
+    }
+
+    #[test]
+    fn test_mixed_small_and_large() {
+        let metadata = vec![
+            make_rg_metadata_with_bytes(50_000, 5 * MB as i64), // small
+            make_rg_metadata_with_bytes(500_000, 75 * MB as i64), // large
+            make_rg_metadata_with_bytes(30_000, 3 * MB as i64), // small
+        ];
+        let indexes = vec![0, 1, 2];
+
+        let morsels =
+            split_row_groups_into_morsels(&indexes, &metadata, None, &[0], 15 * MB);
+
+        // RG 0 (5MB) + RG 1 (75MB) = 80MB >= 15MB → first morsel
+        // RG 2 (3MB) → remainder morsel
+        assert_eq!(morsels.len(), 2);
+        assert_eq!(morsels[0].row_group_indexes, vec![0, 1]);
+        assert_eq!(morsels[0].est_rows, 550_000);
+        assert_eq!(morsels[1].row_group_indexes, vec![2]);
+        assert_eq!(morsels[1].est_rows, 30_000);
+    }
+
+    #[test]
+    fn test_row_selection_passed_through() {
+        // Row selection from page pruning should be passed through to morsels
+        let metadata = vec![
+            make_rg_metadata_with_bytes(100_000, 10 * MB as i64),
+            make_rg_metadata_with_bytes(100_000, 10 * MB as i64),
+        ];
+        let indexes = vec![0, 1];
+
         let selection = RowSelection::from(vec![
-            RowSelector::skip(50_000),
-            RowSelector::select(200_000),
-            RowSelector::skip(50_000),
+            parquet::arrow::arrow_reader::RowSelector::skip(50_000),
+            parquet::arrow::arrow_reader::RowSelector::select(150_000),
         ]);
 
         let morsels = split_row_groups_into_morsels(
@@ -819,11 +586,9 @@ mod tests {
             15 * MB,
         );
 
-        assert_eq!(morsels.len(), 3);
-        for morsel in &morsels {
-            assert_eq!(morsel.row_group_indexes, vec![0]);
-            assert!(morsel.row_selection.is_some());
-        }
+        // 10MB + 10MB = 20MB >= 15MB → single morsel with both RGs
+        assert_eq!(morsels.len(), 1);
+        assert!(morsels[0].row_selection.is_some());
     }
 
     #[test]
@@ -834,67 +599,28 @@ mod tests {
     }
 
     #[test]
-    fn test_row_selection_for_simple_split() {
-        // 200K rows, 30MB = exactly 2*15MB → split into 2
-        let metadata = vec![make_rg_metadata_with_bytes(200_000, 30 * MB as i64)];
-        let indexes = vec![0];
+    fn test_projection_affects_packing() {
+        // 2-column RG: col0=5MB, col1=20MB.
+        // Projecting col0 only: 5MB < 15MB → packs with next
+        // Projecting col1 only: 20MB >= 15MB → own morsel
+        let metadata = vec![
+            make_rg_metadata_2col(100_000, 5 * MB as i64, 20 * MB as i64),
+            make_rg_metadata_2col(100_000, 5 * MB as i64, 20 * MB as i64),
+        ];
+        let indexes = vec![0, 1];
 
-        let morsels =
-            split_row_groups_into_morsels(&indexes, &metadata, None, &[0], 15 * MB);
-
-        assert_eq!(morsels.len(), 2);
-
-        // First morsel: select first 100K, skip last 100K
-        let sel0 = morsels[0].row_selection.as_ref().unwrap();
-        let sels0: Vec<_> = sel0.iter().collect();
-        assert_eq!(sels0.len(), 2);
-        assert!(!sels0[0].skip);
-        assert_eq!(sels0[0].row_count, 100_000);
-        assert!(sels0[1].skip);
-        assert_eq!(sels0[1].row_count, 100_000);
-
-        // Second morsel: skip first 100K, select last 100K
-        let sel1 = morsels[1].row_selection.as_ref().unwrap();
-        let sels1: Vec<_> = sel1.iter().collect();
-        assert_eq!(sels1.len(), 2);
-        assert!(sels1[0].skip);
-        assert_eq!(sels1[0].row_count, 100_000);
-        assert!(!sels1[1].skip);
-        assert_eq!(sels1[1].row_count, 100_000);
-    }
-
-    #[test]
-    fn test_projection_affects_split() {
-        // 2-column RG: col0=10MB, col1=50MB. Total=60MB.
-        // Projecting col0 only: 10MB < 30MB → no split
-        // Projecting col1 only: 50MB >= 30MB → split into ceil(50/15)=4
-        // Projecting both: 60MB >= 30MB → split into ceil(60/15)=4
-        let metadata = vec![make_rg_metadata_2col(
-            100_000,
-            10 * MB as i64,
-            50 * MB as i64,
-        )];
-        let indexes = vec![0];
-
-        // Project col0 only (small column) → no split
+        // Project col0 only (5MB each) → packed into 1 morsel
         let morsels =
             split_row_groups_into_morsels(&indexes, &metadata, None, &[0], 15 * MB);
         assert_eq!(morsels.len(), 1);
-        assert!(morsels[0].row_selection.is_none());
+        assert_eq!(morsels[0].row_group_indexes, vec![0, 1]);
 
-        // Project col1 only (large column) → split
+        // Project col1 only (20MB each) → each RG is its own morsel
         let morsels =
             split_row_groups_into_morsels(&indexes, &metadata, None, &[1], 15 * MB);
-        assert_eq!(morsels.len(), 4);
-        for morsel in &morsels {
-            assert_eq!(morsel.row_group_indexes, vec![0]);
-            assert!(morsel.row_selection.is_some());
-        }
-
-        // Project both columns → split based on total projected bytes
-        let morsels =
-            split_row_groups_into_morsels(&indexes, &metadata, None, &[0, 1], 15 * MB);
-        assert_eq!(morsels.len(), 4);
+        assert_eq!(morsels.len(), 2);
+        assert_eq!(morsels[0].row_group_indexes, vec![0]);
+        assert_eq!(morsels[1].row_group_indexes, vec![1]);
     }
 
     #[test]
@@ -906,7 +632,8 @@ mod tests {
         let morsels =
             split_row_groups_into_morsels(&indexes, &metadata, None, &[], 15 * MB);
 
-        // 30MB >= 2*15MB → should split
-        assert_eq!(morsels.len(), 2);
+        // 30MB >= 15MB → single morsel (no splitting, just one RG)
+        assert_eq!(morsels.len(), 1);
+        assert_eq!(morsels[0].row_group_indexes, vec![0]);
     }
 }
