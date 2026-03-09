@@ -569,6 +569,7 @@ impl FileSource for ParquetSource {
             encryption_factory: self.get_encryption_factory_with_config(),
             max_predicate_cache_size: self.max_predicate_cache_size(),
             reverse_row_groups: self.reverse_row_groups,
+            max_morsel_bytes: crate::morsel::DEFAULT_MAX_MORSEL_BYTES,
         });
         Ok(opener)
     }

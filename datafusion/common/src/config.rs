@@ -671,6 +671,13 @@ config_namespace! {
         /// For object storage, consider increasing this to 8 or higher.
         pub morsel_buffer_size: usize, default = 2
 
+        /// Maximum projected bytes per morsel. Large row groups exceeding
+        /// 2× this value will be split into multiple morsels using RowSelection,
+        /// enabling better parallelism for files with few large row groups.
+        /// Uses projected column sizes from Parquet metadata to adapt to
+        /// narrow vs wide projections.
+        pub morsel_max_bytes: usize, default = 15_000_000
+
         /// Whether to enable ANSI SQL mode.
         ///
         /// The flag is experimental and relevant only for DataFusion Spark built-in functions

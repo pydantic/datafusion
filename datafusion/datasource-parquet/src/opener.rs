@@ -122,6 +122,8 @@ pub(super) struct ParquetOpener {
     pub max_predicate_cache_size: Option<usize>,
     /// Whether to read row groups in reverse order
     pub reverse_row_groups: bool,
+    /// Maximum projected bytes per morsel. Large row groups will be split.
+    pub max_morsel_bytes: usize,
 }
 
 /// Represents a prepared access plan with optional row selection
@@ -685,7 +687,8 @@ impl FileOpener for ParquetOpener {
         partitioned_file: PartitionedFile,
     ) -> Result<FileOpenMorselFuture> {
         use crate::morsel::{
-            DEFAULT_MIN_MORSEL_ROWS, ParquetMorsel, split_row_groups_into_morsels,
+            DEFAULT_MIN_MORSEL_ROWS, MorselPlan, ParquetMorsel,
+            split_row_groups_into_morsels,
         };
 
         let file_range = partitioned_file.range.clone();
@@ -744,6 +747,7 @@ impl FileOpener for ParquetOpener {
         let force_filter_selections = self.force_filter_selections;
         let preserve_order = self.preserve_order;
         let reverse_row_groups = self.reverse_row_groups;
+        let max_morsel_bytes = self.max_morsel_bytes;
         let max_predicate_cache_size = self.max_predicate_cache_size;
         let pushdown_filters = self.pushdown_filters;
         let reorder_filters = self.reorder_filters;
@@ -956,29 +960,24 @@ impl FileOpener for ParquetOpener {
             }
 
             // --- Split into morsels ---
-            let morsel_groups = split_row_groups_into_morsels(
+            let projected_columns = projection.column_indices();
+            let morsel_plans = split_row_groups_into_morsels(
                 &row_group_indexes,
                 rg_metadata,
+                row_selection.as_ref(),
+                &projected_columns,
                 DEFAULT_MIN_MORSEL_ROWS,
+                max_morsel_bytes,
             );
 
-            let morsels: Vec<Box<dyn FileMorsel>> = morsel_groups
+            let morsels: Vec<Box<dyn FileMorsel>> = morsel_plans
                 .into_iter()
-                .map(|rg_indices| {
-                    let est_rows: usize = rg_indices
-                        .iter()
-                        .map(|&idx| rg_metadata[idx].num_rows() as usize)
-                        .sum();
-                    let est_bytes: usize = rg_indices
-                        .iter()
-                        .map(|&idx| rg_metadata[idx].compressed_size() as usize)
-                        .sum();
-
+                .map(|plan: MorselPlan| {
                     Box::new(ParquetMorsel::new(
                         Arc::clone(&reader_factory),
                         partitioned_file.clone(),
-                        rg_indices,
-                        row_selection.clone(), // TODO: split row selection per-morsel
+                        plan.row_group_indexes,
+                        plan.row_selection,
                         projection.clone(),
                         batch_size,
                         Arc::clone(&output_schema),
@@ -993,8 +992,8 @@ impl FileOpener for ParquetOpener {
                         Arc::clone(&physical_file_schema),
                         pushdown_filters,
                         reorder_filters,
-                        Some(est_rows),
-                        Some(est_bytes),
+                        Some(plan.est_rows),
+                        Some(plan.est_bytes),
                     )) as Box<dyn FileMorsel>
                 })
                 .collect();
@@ -1524,6 +1523,7 @@ mod test {
                 max_predicate_cache_size: self.max_predicate_cache_size,
                 reverse_row_groups: self.reverse_row_groups,
                 preserve_order: self.preserve_order,
+                max_morsel_bytes: crate::morsel::DEFAULT_MAX_MORSEL_BYTES,
             }
         }
     }

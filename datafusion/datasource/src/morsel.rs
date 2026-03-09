@@ -98,6 +98,8 @@ pub struct MorselConfig {
     pub max_concurrent_executions: usize,
     /// Reserved for future use (demand-driven model provides backpressure).
     pub morsel_buffer_size: usize,
+    /// Maximum projected bytes per morsel. Large row groups will be split.
+    pub max_morsel_bytes: usize,
 }
 
 impl Default for MorselConfig {
@@ -107,6 +109,7 @@ impl Default for MorselConfig {
             open_prefetch_depth: 4,
             max_concurrent_executions: 1,
             morsel_buffer_size: 2,
+            max_morsel_bytes: 15_000_000,
         }
     }
 }
@@ -121,6 +124,7 @@ impl MorselConfig {
             open_prefetch_depth: options.morsel_open_prefetch_depth,
             max_concurrent_executions: options.morsel_max_concurrent_executions,
             morsel_buffer_size: options.morsel_buffer_size,
+            max_morsel_bytes: options.morsel_max_bytes,
         }
     }
 }
@@ -597,7 +601,7 @@ mod tests {
         ));
         let source1 = Arc::new(MorselSource::new(
             vec![config.file_groups[1].iter().cloned().collect()],
-            &opener,
+            &(opener as Arc<dyn FileOpener>),
             &morsel_config,
             projected_schema,
         ));
@@ -726,7 +730,7 @@ mod tests {
                 vec![PartitionedFile::new("file0", 100)],
                 vec![], // partition 1 has no files
             ],
-            &opener,
+            &(opener as Arc<dyn FileOpener>),
             &morsel_config,
             projected_schema,
         ));
