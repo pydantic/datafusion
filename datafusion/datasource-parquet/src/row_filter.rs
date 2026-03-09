@@ -61,10 +61,14 @@
 //!
 //! List-aware predicates (for example, `array_has`, `array_has_all`, and
 //! `array_has_any`) can be evaluated directly during Parquet decoding.
-//! Struct field access via `get_field` (e.g. `WHERE s['value'] > 5`) is also
-//! supported when the accessed leaf is a primitive type. Direct references to
-//! whole struct columns and other unsupported nested projections will continue
-//! to be evaluated after the batches are materialized.
+//! Struct field access via `get_field` is also supported when the accessed
+//! leaf is a primitive type. Filters that reference entire struct columns
+//! rather than individual fields cannot be pushed down and are instead
+//! evaluated after the full batches are materialized.
+//!
+//! For example, given a struct column `s {name: Utf8, value: Int32}`:
+//! - `WHERE s['value'] > 5` — pushed down (accesses a primitive leaf)
+//! - `WHERE s IS NOT NULL`  — not pushed down (references the whole struct)
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
