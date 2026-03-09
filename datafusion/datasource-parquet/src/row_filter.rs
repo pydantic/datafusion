@@ -308,6 +308,25 @@ impl<'schema> PushdownChecker<'schema> {
         }
     }
 
+    /// Checks whether a struct's root column exists in the file schema and, if so,
+    /// records its index so the entire struct is decoded for filter evaluation.
+    ///
+    /// This is called when we see a `get_field` expression that resolves to a
+    /// primitive leaf type. We only need the *root* column index because the
+    /// Parquet reader decodes all leaves of a struct together.
+    ///
+    /// # Example
+    ///
+    /// Given file schema `{a: Int32, s: Struct(foo: Utf8, bar: Int64)}` and the
+    /// expression `get_field(s, 'foo') = 'hello'`:
+    ///
+    /// - `column_name` = `"s"` (the root struct column)
+    /// - `file_schema.index_of("s")` returns `1`
+    /// - We push `1` into `required_columns`
+    /// - Return `None` (no issue — traversal continues in the caller)
+    ///
+    /// If `"s"` is not in the file schema (e.g. a projected-away column), we set
+    /// `projected_columns = true` and return `Jump` to skip the subtree.
     fn check_struct_field_column(
         &mut self,
         column_name: &str,
@@ -399,10 +418,26 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
     type Node = Arc<dyn PhysicalExpr>;
 
     fn f_down(&mut self, node: &Self::Node) -> Result<TreeNodeRecursion> {
-        // check for get_field(Column("foo"), "bar", ...) accessing a struct field
-        // the resolved return type tells us the leaf type
-        // if it's non-nested, we can push down by recording the root column index and skip children
-        // this way, the visitor never sees the raw struct Column and rejects it
+        // Handle struct field access like `s['foo']['bar'] > 10`.
+        //
+        // DataFusion represents nested field access as `get_field(Column("s"), "foo")`
+        // (or chained: `get_field(get_field(Column("s"), "foo"), "bar")`).
+        //
+        // We intercept the outermost `get_field` on the way *down* the tree so
+        // the visitor never reaches the raw `Column("s")` node. Without this,
+        // `check_single_column` would see that `s` is a Struct and reject it.
+        //
+        // The strategy:
+        //   1. Match `get_field` whose first arg is a `Column` (the struct root).
+        //   2. Check that the *resolved* return type is primitive — meaning we've
+        //      drilled all the way to a leaf (e.g. `s['foo']` → Utf8).
+        //   3. Record the root column index via `check_struct_field_column` and
+        //      return `Jump` to skip visiting the children (the Column and the
+        //      literal field-name args), since we've already handled them.
+        //
+        // If the return type is still nested (e.g. `s['nested_struct']` → Struct),
+        // we fall through and let normal traversal continue, which will
+        // eventually reject the expression when it hits the struct Column.
         if let Some(func) =
             ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(node.as_ref())
         {
