@@ -155,10 +155,9 @@ impl FileMorsel for ParquetMorsel {
             ParquetFileMetrics::new(self.partition_index, &file_name, &self.metrics);
 
         // Create a new reader for this morsel
-        let metadata_size_hint = self
-            .partitioned_file
-            .metadata_size_hint
-            .or(self.metadata_size_hint);
+        // Pass None for metadata_size_hint since metadata is already loaded
+        // and passed via new_with_metadata — the hint is irrelevant here.
+        let metadata_size_hint = None;
         let async_file_reader: Box<dyn AsyncFileReader> =
             self.reader_factory.create_reader(
                 self.partition_index,
