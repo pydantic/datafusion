@@ -43,7 +43,6 @@ mod tests {
     use datafusion_common::{Result, assert_batches_eq};
     use datafusion_execution::config::SessionConfig;
     use datafusion_physical_plan::ExecutionPlan;
-    use datafusion_physical_plan::metrics::MetricsSet;
 
     #[cfg(feature = "compression")]
     use datafusion_datasource::file_compression_type::FileCompressionType;
@@ -807,17 +806,6 @@ mod tests {
         assert_eq!(allparts_count, 80);
 
         Ok(())
-    }
-
-    fn get_value(metrics: &MetricsSet, metric_name: &str) -> usize {
-        match metrics.sum_by_name(metric_name) {
-            Some(v) => v.as_usize(),
-            _ => {
-                panic!(
-                    "Expected metric not found. Looking for '{metric_name}' in\n\n{metrics:#?}"
-                );
-            }
-        }
     }
 
     /// Get the schema for the aggregate_test_* csv files with an additional filed not present in the files.
