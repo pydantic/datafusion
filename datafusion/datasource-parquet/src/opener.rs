@@ -686,10 +686,7 @@ impl FileOpener for ParquetOpener {
         &self,
         partitioned_file: PartitionedFile,
     ) -> Result<FileOpenMorselFuture> {
-        use crate::morsel::{
-            DEFAULT_MIN_MORSEL_ROWS, MorselPlan, ParquetMorsel,
-            split_row_groups_into_morsels,
-        };
+        use crate::morsel::{MorselPlan, ParquetMorsel, split_row_groups_into_morsels};
 
         let file_range = partitioned_file.range.clone();
         let extensions = partitioned_file.extensions.clone();
@@ -966,7 +963,6 @@ impl FileOpener for ParquetOpener {
                 rg_metadata,
                 row_selection.as_ref(),
                 &projected_columns,
-                DEFAULT_MIN_MORSEL_ROWS,
                 max_morsel_bytes,
             );
 
@@ -1522,7 +1518,7 @@ mod test {
                 max_predicate_cache_size: self.max_predicate_cache_size,
                 reverse_row_groups: self.reverse_row_groups,
                 preserve_order: self.preserve_order,
-                max_morsel_bytes: crate::morsel::DEFAULT_MAX_MORSEL_BYTES,
+                max_morsel_bytes: crate::morsel::DEFAULT_TARGET_MORSEL_BYTES,
             }
         }
     }

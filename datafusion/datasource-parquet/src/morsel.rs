@@ -42,13 +42,12 @@ use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 
 use crate::{ParquetFileMetrics, ParquetFileReaderFactory, row_filter};
 
-/// Minimum number of rows for a morsel to be created independently.
-/// Row groups smaller than this will be packed together.
-pub(crate) const DEFAULT_MIN_MORSEL_ROWS: usize = 100_000;
-
-/// Default maximum projected bytes per morsel (15 MB).
-/// Large row groups exceeding 2× this will be split into multiple morsels.
-pub(crate) const DEFAULT_MAX_MORSEL_BYTES: usize = 15_000_000;
+/// Default target projected bytes per morsel (1 MB).
+///
+/// Row groups whose projected compressed size exceeds 2× this value are split
+/// into sub-morsels via RowSelection. Row groups smaller than this value are
+/// packed together until the target is reached.
+pub(crate) const DEFAULT_TARGET_MORSEL_BYTES: usize = 1_000_000;
 
 /// A unit of work representing one or more Parquet row groups that can be
 /// independently read and decoded.
@@ -350,16 +349,17 @@ fn projected_rg_bytes(
 /// and splitting large row groups into multiple morsels using RowSelection.
 ///
 /// Uses projected compressed byte sizes from Parquet column metadata to decide
-/// splitting. Row groups whose projected bytes exceed `2 * max_bytes` are split
-/// into `ceil(bytes / max_bytes)` sub-morsels with evenly distributed rows.
-/// Smaller row groups are packed together using `min_rows` as the packing threshold.
+/// both packing and splitting against a single `target_bytes` threshold:
+/// - Row groups whose projected bytes exceed `2 * target_bytes` are split
+///   into `ceil(bytes / target_bytes)` sub-morsels with evenly distributed rows.
+/// - Smaller row groups are packed together until their cumulative projected
+///   bytes reach `target_bytes`.
 pub(crate) fn split_row_groups_into_morsels(
     row_group_indexes: &[usize],
     row_group_metadata: &[parquet::file::metadata::RowGroupMetaData],
     row_selection: Option<&RowSelection>,
     projected_columns: &[usize],
-    min_rows: usize,
-    max_bytes: usize,
+    target_bytes: usize,
 ) -> Vec<MorselPlan> {
     if row_group_indexes.is_empty() {
         return vec![];
@@ -382,7 +382,7 @@ pub(crate) fn split_row_groups_into_morsels(
         let rg_rows = rg_meta.num_rows() as usize;
         let rg_proj_bytes = projected_rg_bytes(rg_meta, projected_columns);
 
-        if rg_proj_bytes >= 2 * max_bytes {
+        if rg_proj_bytes >= 2 * target_bytes {
             // Flush any accumulated small RGs first
             if !current_rg_indexes.is_empty() {
                 morsels.push(MorselPlan {
@@ -396,7 +396,7 @@ pub(crate) fn split_row_groups_into_morsels(
             }
 
             // Split large RG into sub-morsels based on byte budget
-            let n = rg_proj_bytes.div_ceil(max_bytes);
+            let n = rg_proj_bytes.div_ceil(target_bytes);
             let chunk_rows = rg_rows / n;
             let remainder = rg_rows % n;
             let bytes_per_row = if rg_rows > 0 {
@@ -456,7 +456,7 @@ pub(crate) fn split_row_groups_into_morsels(
             current_rows += rg_rows;
             current_bytes += rg_proj_bytes;
 
-            if current_rows >= min_rows {
+            if current_bytes >= target_bytes {
                 morsels.push(MorselPlan {
                     row_group_indexes: std::mem::take(&mut current_rg_indexes),
                     row_selection: row_selection.cloned(),
@@ -696,7 +696,8 @@ mod tests {
 
     #[test]
     fn test_small_rgs_pack_together() {
-        // Each RG is 5MB — well below 2*15MB threshold
+        // Each RG is 5MB — well below 2*15MB split threshold
+        // target_bytes=15MB, so RGs pack until cumulative bytes >= 15MB
         let metadata = vec![
             make_rg_metadata_with_bytes(30_000, 5 * MB as i64),
             make_rg_metadata_with_bytes(40_000, 5 * MB as i64),
@@ -705,17 +706,11 @@ mod tests {
         ];
         let indexes: Vec<usize> = (0..4).collect();
 
-        let morsels = split_row_groups_into_morsels(
-            &indexes,
-            &metadata,
-            None,
-            &[0],
-            100_000,
-            15 * MB,
-        );
+        let morsels =
+            split_row_groups_into_morsels(&indexes, &metadata, None, &[0], 15 * MB);
 
-        // 30k + 40k + 50k = 120k >= 100k min_rows → first morsel
-        // 20k → second morsel (remainder)
+        // 5MB + 5MB + 5MB = 15MB >= 15MB target → first morsel
+        // 5MB → second morsel (remainder)
         assert_eq!(morsels.len(), 2);
         assert_eq!(morsels[0].row_group_indexes, vec![0, 1, 2]);
         assert_eq!(morsels[0].est_rows, 120_000);
@@ -731,14 +726,8 @@ mod tests {
         let metadata = vec![make_rg_metadata_with_bytes(1_000_000, 150 * MB as i64)];
         let indexes = vec![0];
 
-        let morsels = split_row_groups_into_morsels(
-            &indexes,
-            &metadata,
-            None,
-            &[0],
-            100_000,
-            15 * MB,
-        );
+        let morsels =
+            split_row_groups_into_morsels(&indexes, &metadata, None, &[0], 15 * MB);
 
         assert_eq!(morsels.len(), 10);
         for morsel in &morsels {
@@ -754,14 +743,8 @@ mod tests {
         let metadata = vec![make_rg_metadata_with_bytes(100_000, 40 * MB as i64)];
         let indexes = vec![0];
 
-        let morsels = split_row_groups_into_morsels(
-            &indexes,
-            &metadata,
-            None,
-            &[0],
-            100_000,
-            15 * MB,
-        );
+        let morsels =
+            split_row_groups_into_morsels(&indexes, &metadata, None, &[0], 15 * MB);
 
         assert_eq!(morsels.len(), 3);
         assert_eq!(morsels[0].est_rows, 33334);
@@ -783,16 +766,10 @@ mod tests {
         ];
         let indexes = vec![0, 1, 2];
 
-        let morsels = split_row_groups_into_morsels(
-            &indexes,
-            &metadata,
-            None,
-            &[0],
-            100_000,
-            15 * MB,
-        );
+        let morsels =
+            split_row_groups_into_morsels(&indexes, &metadata, None, &[0], 15 * MB);
 
-        // RG 0: 5MB → accumulate
+        // RG 0: 5MB < 15MB target → accumulate
         // RG 1: 75MB >= 30MB → flush RG 0, split RG 1 into ceil(75/15)=5
         // RG 2: 3MB → remainder morsel
         assert_eq!(morsels.len(), 7);
@@ -812,14 +789,8 @@ mod tests {
         let metadata = vec![make_rg_metadata_with_bytes(200_000, 29 * MB as i64)];
         let indexes = vec![0];
 
-        let morsels = split_row_groups_into_morsels(
-            &indexes,
-            &metadata,
-            None,
-            &[0],
-            100_000,
-            15 * MB,
-        );
+        let morsels =
+            split_row_groups_into_morsels(&indexes, &metadata, None, &[0], 15 * MB);
 
         assert_eq!(morsels.len(), 1);
         assert_eq!(morsels[0].row_group_indexes, vec![0]);
@@ -845,7 +816,6 @@ mod tests {
             &metadata,
             Some(&selection),
             &[0],
-            100_000,
             15 * MB,
         );
 
@@ -859,8 +829,7 @@ mod tests {
     #[test]
     fn test_empty_input() {
         let metadata = vec![];
-        let morsels =
-            split_row_groups_into_morsels(&[], &metadata, None, &[], 100_000, 15 * MB);
+        let morsels = split_row_groups_into_morsels(&[], &metadata, None, &[], 15 * MB);
         assert!(morsels.is_empty());
     }
 
@@ -870,14 +839,8 @@ mod tests {
         let metadata = vec![make_rg_metadata_with_bytes(200_000, 30 * MB as i64)];
         let indexes = vec![0];
 
-        let morsels = split_row_groups_into_morsels(
-            &indexes,
-            &metadata,
-            None,
-            &[0],
-            100_000,
-            15 * MB,
-        );
+        let morsels =
+            split_row_groups_into_morsels(&indexes, &metadata, None, &[0], 15 * MB);
 
         assert_eq!(morsels.len(), 2);
 
@@ -914,26 +877,14 @@ mod tests {
         let indexes = vec![0];
 
         // Project col0 only (small column) → no split
-        let morsels = split_row_groups_into_morsels(
-            &indexes,
-            &metadata,
-            None,
-            &[0],
-            100_000,
-            15 * MB,
-        );
+        let morsels =
+            split_row_groups_into_morsels(&indexes, &metadata, None, &[0], 15 * MB);
         assert_eq!(morsels.len(), 1);
         assert!(morsels[0].row_selection.is_none());
 
         // Project col1 only (large column) → split
-        let morsels = split_row_groups_into_morsels(
-            &indexes,
-            &metadata,
-            None,
-            &[1],
-            100_000,
-            15 * MB,
-        );
+        let morsels =
+            split_row_groups_into_morsels(&indexes, &metadata, None, &[1], 15 * MB);
         assert_eq!(morsels.len(), 4);
         for morsel in &morsels {
             assert_eq!(morsel.row_group_indexes, vec![0]);
@@ -941,14 +892,8 @@ mod tests {
         }
 
         // Project both columns → split based on total projected bytes
-        let morsels = split_row_groups_into_morsels(
-            &indexes,
-            &metadata,
-            None,
-            &[0, 1],
-            100_000,
-            15 * MB,
-        );
+        let morsels =
+            split_row_groups_into_morsels(&indexes, &metadata, None, &[0, 1], 15 * MB);
         assert_eq!(morsels.len(), 4);
     }
 
@@ -958,14 +903,8 @@ mod tests {
         let metadata = vec![make_rg_metadata_with_bytes(200_000, 30 * MB as i64)];
         let indexes = vec![0];
 
-        let morsels = split_row_groups_into_morsels(
-            &indexes,
-            &metadata,
-            None,
-            &[],
-            100_000,
-            15 * MB,
-        );
+        let morsels =
+            split_row_groups_into_morsels(&indexes, &metadata, None, &[], 15 * MB);
 
         // 30MB >= 2*15MB → should split
         assert_eq!(morsels.len(), 2);

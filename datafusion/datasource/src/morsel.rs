@@ -98,7 +98,8 @@ pub struct MorselConfig {
     pub max_concurrent_executions: usize,
     /// Reserved for future use (demand-driven model provides backpressure).
     pub morsel_buffer_size: usize,
-    /// Maximum projected bytes per morsel. Large row groups will be split.
+    /// Target projected bytes per morsel. Row groups exceeding 2× this are
+    /// split; smaller ones are packed together until this target is reached.
     pub max_morsel_bytes: usize,
 }
 
@@ -109,7 +110,7 @@ impl Default for MorselConfig {
             open_prefetch_depth: 4,
             max_concurrent_executions: 1,
             morsel_buffer_size: 2,
-            max_morsel_bytes: 15_000_000,
+            max_morsel_bytes: 1_000_000,
         }
     }
 }
@@ -124,7 +125,7 @@ impl MorselConfig {
             open_prefetch_depth: options.morsel_open_prefetch_depth,
             max_concurrent_executions: options.morsel_max_concurrent_executions,
             morsel_buffer_size: options.morsel_buffer_size,
-            max_morsel_bytes: options.morsel_max_bytes,
+            max_morsel_bytes: options.morsel_target_bytes,
         }
     }
 }

@@ -671,12 +671,11 @@ config_namespace! {
         /// For object storage, consider increasing this to 8 or higher.
         pub morsel_buffer_size: usize, default = 2
 
-        /// Maximum projected bytes per morsel. Large row groups exceeding
-        /// 2× this value will be split into multiple morsels using RowSelection,
-        /// enabling better parallelism for files with few large row groups.
-        /// Uses projected column sizes from Parquet metadata to adapt to
-        /// narrow vs wide projections.
-        pub morsel_max_bytes: usize, default = 1_000_000
+        /// Target projected bytes per morsel. Row groups exceeding 2× this
+        /// value are split into sub-morsels; smaller row groups are packed
+        /// together until this target is reached. Uses projected column sizes
+        /// from Parquet metadata to adapt to narrow vs wide projections.
+        pub morsel_target_bytes: usize, default = 1_000_000
 
         /// Whether to enable ANSI SQL mode.
         ///
