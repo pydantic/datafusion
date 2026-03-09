@@ -439,7 +439,9 @@ mod tests {
         ");}
 
         let metrics = csv.metrics().expect("doesn't found metrics");
-        let elapsed_compute = get_value(&metrics, "elapsed_compute");
+        let elapsed_compute = metrics
+            .elapsed_compute()
+            .expect("Expected elapsed_compute metric");
         assert!(
             elapsed_compute > 0,
             "Expected elapsed_compute greater than 0",

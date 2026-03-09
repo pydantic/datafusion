@@ -2456,7 +2456,7 @@ mod tests {
         assert_eq!(res.len(), 2);
 
         let calls = size_hint_calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls, vec![Some(123), Some(456)]);
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls, vec![Some(123), None, Some(456), None]);
     }
 }
