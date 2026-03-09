@@ -229,7 +229,7 @@ datafusion.execution.max_spill_file_size_bytes 134217728
 datafusion.execution.meta_fetch_concurrency 32
 datafusion.execution.minimum_parallel_output_files 4
 datafusion.execution.morsel_buffer_size 2
-datafusion.execution.morsel_max_bytes 15000000
+datafusion.execution.morsel_max_bytes 1000000
 datafusion.execution.morsel_max_concurrent_executions 2
 datafusion.execution.morsel_max_concurrent_opens 4
 datafusion.execution.morsel_open_prefetch_depth 1
@@ -374,7 +374,7 @@ datafusion.execution.max_spill_file_size_bytes 134217728 Maximum size in bytes f
 datafusion.execution.meta_fetch_concurrency 32 Number of files to read in parallel when inferring schema and statistics
 datafusion.execution.minimum_parallel_output_files 4 Guarantees a minimum level of output files running in parallel. RecordBatches will be distributed in round robin fashion to each parallel writer. Each writer is closed and a new file opened once soft_max_rows_per_output_file is reached.
 datafusion.execution.morsel_buffer_size 2 Number of ready RecordBatches to buffer per partition (Stage 3). This is the output buffer depth. Higher values provide more prefetching, hiding IO latency, but use more memory. For object storage, consider increasing this to 8 or higher.
-datafusion.execution.morsel_max_bytes 15000000 Maximum projected bytes per morsel. Large row groups exceeding 2× this value will be split into multiple morsels using RowSelection, enabling better parallelism for files with few large row groups. Uses projected column sizes from Parquet metadata to adapt to narrow vs wide projections.
+datafusion.execution.morsel_max_bytes 1000000 Maximum projected bytes per morsel. Large row groups exceeding 2× this value will be split into multiple morsels using RowSelection, enabling better parallelism for files with few large row groups. Uses projected column sizes from Parquet metadata to adapt to narrow vs wide projections.
 datafusion.execution.morsel_max_concurrent_executions 2 Maximum number of morsels to execute concurrently per partition (Stage 2). Each morsel represents a chunk of a file (e.g., one or more Parquet row groups). Higher values increase IO/decode parallelism within a partition.
 datafusion.execution.morsel_max_concurrent_opens 4 Maximum number of files to open concurrently during file scanning (Stage 1). Opening a file loads metadata and splits it into morsels, but does not read data. Higher values improve throughput for high-latency storage (e.g., object stores) at the cost of more concurrent IO and higher memory usage. Lower values may be better for local SSDs where IO is fast and CPU is the bottleneck.
 datafusion.execution.morsel_open_prefetch_depth 1 Maximum number of opened-but-not-yet-executing files to buffer. This controls how far ahead the file opening pipeline runs relative to morsel execution. Higher values hide open latency for object storage.

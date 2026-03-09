@@ -676,7 +676,7 @@ config_namespace! {
         /// enabling better parallelism for files with few large row groups.
         /// Uses projected column sizes from Parquet metadata to adapt to
         /// narrow vs wide projections.
-        pub morsel_max_bytes: usize, default = 15_000_000
+        pub morsel_max_bytes: usize, default = 1_000_000
 
         /// Whether to enable ANSI SQL mode.
         ///
