@@ -74,6 +74,7 @@ use arrow::array::BooleanArray;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
+use datafusion_functions::core::getfield::GetFieldFunc;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowPredicate, RowFilter};
 use parquet::file::metadata::ParquetMetaData;
@@ -398,8 +399,8 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
         // the resolved return type tells us the leaf type
         // if it's non0nested, we can pushdown by recording the root column index and skip children
         // this way, the visitor never sees the raw struct Column and rejects it
-        if let Some(func) = node.as_any().downcast_ref::<ScalarFunctionExpr>()
-            && func.name() == "get_field"
+        if let Some(func) =
+            ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(node.as_ref())
         {
             let args = func.args();
 
