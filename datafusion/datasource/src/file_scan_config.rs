@@ -226,7 +226,7 @@ impl Clone for FileScanConfig {
             limit: self.limit,
             preserve_order: self.preserve_order,
             output_ordering: self.output_ordering.clone(),
-            file_compression_type: self.file_compression_type.clone(),
+            file_compression_type: self.file_compression_type,
             file_source: Arc::clone(&self.file_source),
             batch_size: self.batch_size,
             expr_adapter_factory: self.expr_adapter_factory.clone(),
@@ -633,7 +633,7 @@ impl DataSource for FileScanConfig {
                 self.file_groups[partition].iter().cloned().collect();
             let ms = Arc::new(crate::morsel::MorselSource::new(
                 vec![files], // single group
-                opener,
+                &opener,
                 &morsel_config,
                 projected_schema,
             ));
@@ -651,7 +651,7 @@ impl DataSource for FileScanConfig {
                     .collect();
                 crate::morsel::MorselSource::new(
                     file_groups,
-                    opener,
+                    &opener,
                     &morsel_config,
                     projected_schema,
                 )

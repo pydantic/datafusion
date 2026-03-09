@@ -69,6 +69,14 @@ use datafusion_physical_plan::metrics::{
 
 use futures::{Stream, StreamExt as _, ready};
 
+/// A boxed, pinned stream of morsel batches (used in feeder streams and return types).
+type MorselFeederStream =
+    Pin<Box<dyn Stream<Item = Result<Vec<Box<dyn FileMorsel>>>> + Send>>;
+
+/// A boxed, pinned future that resolves to an optional morsel result.
+type MorselFuture =
+    Pin<Box<dyn Future<Output = Option<Result<Box<dyn FileMorsel>>>> + Send>>;
+
 /// Configuration for morsel-driven scanning.
 ///
 /// Controls the pipeline:
@@ -130,11 +138,7 @@ pub struct MorselSource {
     /// Per-partition feeder streams. Each partition has its own feeder
     /// that opens only its assigned files. Protected by individual mutexes
     /// so partitions don't block each other.
-    feeders: Vec<
-        tokio::sync::Mutex<
-            Pin<Box<dyn Stream<Item = Result<Vec<Box<dyn FileMorsel>>>> + Send>>,
-        >,
-    >,
+    feeders: Vec<tokio::sync::Mutex<MorselFeederStream>>,
 
     /// Schema of the output stream.
     projected_schema: SchemaRef,
@@ -151,7 +155,7 @@ impl MorselSource {
     /// * `projected_schema` - Schema of the output stream
     pub fn new(
         file_groups: Vec<Vec<PartitionedFile>>,
-        opener: Arc<dyn FileOpener>,
+        opener: &Arc<dyn FileOpener>,
         morsel_config: &MorselConfig,
         projected_schema: SchemaRef,
     ) -> Self {
@@ -163,7 +167,7 @@ impl MorselSource {
             .map(|files| {
                 let feeder = build_partition_feeder(
                     files,
-                    Arc::clone(&opener),
+                    Arc::clone(opener),
                     morsel_config.max_concurrent_opens,
                 );
                 tokio::sync::Mutex::new(feeder)
@@ -255,7 +259,7 @@ fn build_partition_feeder(
     files: Vec<PartitionedFile>,
     opener: Arc<dyn FileOpener>,
     max_concurrent_opens: usize,
-) -> Pin<Box<dyn Stream<Item = Result<Vec<Box<dyn FileMorsel>>>> + Send>> {
+) -> MorselFeederStream {
     Box::pin(
         futures::stream::iter(files)
             .map(move |file| {
@@ -292,9 +296,7 @@ enum MorselStreamState {
     /// Currently executing a morsel's stream
     Executing { stream: SendableRecordBatchStream },
     /// Waiting for a morsel from the source
-    WaitingForMorsel {
-        future: Pin<Box<dyn Future<Output = Option<Result<Box<dyn FileMorsel>>>> + Send>>,
-    },
+    WaitingForMorsel { future: MorselFuture },
     /// Stream is done
     Done,
 }
@@ -490,7 +492,7 @@ mod tests {
 
         Arc::new(MorselSource::new(
             file_groups,
-            opener,
+            &opener,
             morsel_config,
             projected_schema,
         ))
@@ -577,13 +579,13 @@ mod tests {
         // Ordered: each partition gets its own MorselSource
         let source0 = Arc::new(MorselSource::new(
             vec![config.file_groups[0].iter().cloned().collect()],
-            Arc::clone(&opener) as Arc<dyn FileOpener>,
+            &(Arc::clone(&opener) as Arc<dyn FileOpener>),
             &morsel_config,
             Arc::clone(&projected_schema),
         ));
         let source1 = Arc::new(MorselSource::new(
             vec![config.file_groups[1].iter().cloned().collect()],
-            opener,
+            &opener,
             &morsel_config,
             projected_schema,
         ));
@@ -712,7 +714,7 @@ mod tests {
                 vec![PartitionedFile::new("file0", 100)],
                 vec![], // partition 1 has no files
             ],
-            opener,
+            &opener,
             &morsel_config,
             projected_schema,
         ));
