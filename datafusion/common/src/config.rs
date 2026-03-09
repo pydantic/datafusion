@@ -650,7 +650,7 @@ config_namespace! {
         /// Maximum number of files to open concurrently during file scanning (Stage 1).
         /// Opening a file loads metadata and splits it into morsels, but does not read data.
         /// Higher values improve throughput for high-latency storage (e.g., object stores)
-        /// at the cost of more concurrent IO and higher memroy usage.
+        /// at the cost of more concurrent IO and higher memory usage.
         /// Lower values may be better for local SSDs where IO is fast and CPU is the bottleneck.
         pub morsel_max_concurrent_opens: usize, default = 4
 
