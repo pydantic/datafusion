@@ -27,6 +27,7 @@ use crate::{
 use arrow::datatypes::FieldRef;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     Constraints, Result, ScalarValue, Statistics, internal_datafusion_err, internal_err,
 };
@@ -78,7 +79,9 @@ use std::{any::Any, fmt::Debug, fmt::Formatter, fmt::Result as FmtResult, sync::
 /// # use arrow::datatypes::{Field, Fields, DataType, Schema, SchemaRef};
 /// # use object_store::ObjectStore;
 /// # use datafusion_common::Result;
+/// # use datafusion_common::tree_node::TreeNodeRecursion;
 /// # use datafusion_datasource::file::FileSource;
+/// # use datafusion_physical_plan::PhysicalExpr;
 /// # use datafusion_datasource::file_groups::FileGroup;
 /// # use datafusion_datasource::PartitionedFile;
 /// # use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
@@ -109,6 +112,7 @@ use std::{any::Any, fmt::Debug, fmt::Formatter, fmt::Result as FmtResult, sync::
 /// #  fn file_type(&self) -> &str { "parquet" }
 /// #  // Note that this implementation drops the projection on the floor, it is not complete!
 /// #  fn try_pushdown_projection(&self, projection: &ProjectionExprs) -> Result<Option<Arc<dyn FileSource>>> { Ok(Some(Arc::new(self.clone()) as Arc<dyn FileSource>)) }
+/// #  fn apply_expressions(&self, _f: &mut dyn FnMut(&dyn PhysicalExpr) -> Result<TreeNodeRecursion>) -> Result<TreeNodeRecursion> { Ok(TreeNodeRecursion::Continue) }
 /// #  }
 /// # impl ParquetSource {
 /// #  fn new(table_schema: impl Into<TableSchema>) -> Self { Self {table_schema: table_schema.into()} }
@@ -736,7 +740,7 @@ impl DataSource for FileScanConfig {
         let schema = self.file_source.table_schema().table_schema();
         let mut eq_properties = EquivalenceProperties::new_with_orderings(
             Arc::clone(schema),
-            self.output_ordering.clone(),
+            self.validated_output_ordering(),
         )
         .with_constraints(self.constraints.clone());
 
@@ -777,7 +781,7 @@ impl DataSource for FileScanConfig {
         SchedulingType::Cooperative
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         if let Some(partition) = partition {
             // Get statistics for a specific partition
             // Note: FileGroup statistics include partition columns (computed from partition_values)
@@ -787,22 +791,28 @@ impl DataSource for FileScanConfig {
                 // Project the statistics based on the projection
                 let output_schema = self.projected_schema()?;
                 return if let Some(projection) = self.file_source.projection() {
-                    projection.project_statistics(stat.clone(), &output_schema)
+                    Ok(Arc::new(
+                        projection.project_statistics(stat.clone(), &output_schema)?,
+                    ))
                 } else {
-                    Ok(stat.clone())
+                    Ok(Arc::new(stat.clone()))
                 };
             }
             // If no statistics available for this partition, return unknown
-            Ok(Statistics::new_unknown(self.projected_schema()?.as_ref()))
+            Ok(Arc::new(Statistics::new_unknown(
+                self.projected_schema()?.as_ref(),
+            )))
         } else {
             // Return aggregate statistics across all partitions
             let statistics = self.statistics();
             let projection = self.file_source.projection();
             let output_schema = self.projected_schema()?;
             if let Some(projection) = &projection {
-                projection.project_statistics(statistics.clone(), &output_schema)
+                Ok(Arc::new(
+                    projection.project_statistics(statistics.clone(), &output_schema)?,
+                ))
             } else {
-                Ok(statistics)
+                Ok(Arc::new(statistics))
             }
         }
     }
@@ -923,9 +933,51 @@ impl DataSource for FileScanConfig {
         };
         Some(Arc::new(new_config))
     }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&dyn PhysicalExpr) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        // Delegate to the file source
+        self.file_source.apply_expressions(f)
+    }
 }
 
 impl FileScanConfig {
+    /// Returns only the output orderings that are validated against actual
+    /// file group statistics.
+    ///
+    /// For example, individual files may be ordered by `col1 ASC`,
+    /// but if we have files with these min/max statistics in a single partition / file group:
+    ///
+    /// - file1: min(col1) = 10, max(col1) = 20
+    /// - file2: min(col1) = 5, max(col1) = 15
+    ///
+    /// Because reading file1 followed by file2 would produce out-of-order output (there is overlap
+    /// in the ranges), we cannot retain `col1 ASC` as a valid output ordering.
+    ///
+    /// Similarly this would not be a valid order (non-overlapping ranges but not ordered):
+    ///
+    /// - file1: min(col1) = 20, max(col1) = 30
+    /// - file2: min(col1) = 10, max(col1) = 15
+    ///
+    /// On the other hand if we had:
+    ///
+    /// - file1: min(col1) = 5, max(col1) = 15
+    /// - file2: min(col1) = 16, max(col1) = 25
+    ///
+    /// Then we know that reading file1 followed by file2 will produce ordered output,
+    /// so `col1 ASC` would be retained.
+    ///
+    /// Note that we are checking for ordering *within* *each* file group / partition,
+    /// files in different partitions are read independently and do not affect each other's ordering.
+    /// Merging of the multiple partition streams into a single ordered stream is handled
+    /// upstream e.g. by `SortPreservingMergeExec`.
+    fn validated_output_ordering(&self) -> Vec<LexOrdering> {
+        let schema = self.file_source.table_schema().table_schema();
+        validate_orderings(&self.output_ordering, schema, &self.file_groups, None)
+    }
+
     /// Get the file schema (schema of the files without partition columns)
     pub fn file_schema(&self) -> &SchemaRef {
         self.file_source.table_schema().file_schema()
@@ -1300,6 +1352,51 @@ fn ordered_column_indices_from_projection(
         .collect::<Option<Vec<usize>>>()
 }
 
+/// Check whether a given ordering is valid for all file groups by verifying
+/// that files within each group are sorted according to their min/max statistics.
+///
+/// For single-file (or empty) groups, the ordering is trivially valid.
+/// For multi-file groups, we check that the min/max statistics for the sort
+/// columns are in order and non-overlapping (or touching at boundaries).
+///
+/// `projection` maps projected column indices back to table-schema indices
+/// when validating after projection; pass `None` when validating at
+/// table-schema level.
+fn is_ordering_valid_for_file_groups(
+    file_groups: &[FileGroup],
+    ordering: &LexOrdering,
+    schema: &SchemaRef,
+    projection: Option<&[usize]>,
+) -> bool {
+    file_groups.iter().all(|group| {
+        if group.len() <= 1 {
+            return true; // single-file groups are trivially sorted
+        }
+        match MinMaxStatistics::new_from_files(ordering, schema, projection, group.iter())
+        {
+            Ok(stats) => stats.is_sorted(),
+            Err(_) => false, // can't prove sorted → reject
+        }
+    })
+}
+
+/// Filters orderings to retain only those valid for all file groups,
+/// verified via min/max statistics.
+fn validate_orderings(
+    orderings: &[LexOrdering],
+    schema: &SchemaRef,
+    file_groups: &[FileGroup],
+    projection: Option<&[usize]>,
+) -> Vec<LexOrdering> {
+    orderings
+        .iter()
+        .filter(|ordering| {
+            is_ordering_valid_for_file_groups(file_groups, ordering, schema, projection)
+        })
+        .cloned()
+        .collect()
+}
+
 /// The various listing tables does not attempt to read all files
 /// concurrently, instead they will read files in sequence within a
 /// partition.  This is an important property as it allows plans to
@@ -1366,52 +1463,47 @@ fn get_projected_output_ordering(
     let projected_orderings =
         project_orderings(&base_config.output_ordering, projected_schema);
 
-    let mut all_orderings = vec![];
-    for new_ordering in projected_orderings {
-        // Check if any file groups are not sorted
-        if base_config.file_groups.iter().any(|group| {
-            if group.len() <= 1 {
-                // File groups with <= 1 files are always sorted
-                return false;
-            }
+    let indices = base_config
+        .file_source
+        .projection()
+        .as_ref()
+        .map(|p| ordered_column_indices_from_projection(p));
 
-            let Some(indices) = base_config
-                .file_source
-                .projection()
-                .as_ref()
-                .map(|p| ordered_column_indices_from_projection(p))
-            else {
-                // Can't determine if ordered without a simple projection
-                return true;
-            };
-
-            let statistics = match MinMaxStatistics::new_from_files(
-                &new_ordering,
+    match indices {
+        Some(Some(indices)) => {
+            // Simple column projection — validate with statistics
+            validate_orderings(
+                &projected_orderings,
                 projected_schema,
-                indices.as_deref(),
-                group.iter(),
-            ) {
-                Ok(statistics) => statistics,
-                Err(e) => {
-                    log::trace!("Error fetching statistics for file group: {e}");
-                    // we can't prove that it's ordered, so we have to reject it
-                    return true;
-                }
-            };
-
-            !statistics.is_sorted()
-        }) {
-            debug!(
-                "Skipping specified output ordering {:?}. \
-                Some file groups couldn't be determined to be sorted: {:?}",
-                base_config.output_ordering[0], base_config.file_groups
-            );
-            continue;
+                &base_config.file_groups,
+                Some(indices.as_slice()),
+            )
         }
-
-        all_orderings.push(new_ordering);
+        None => {
+            // No projection — validate with statistics (no remapping needed)
+            validate_orderings(
+                &projected_orderings,
+                projected_schema,
+                &base_config.file_groups,
+                None,
+            )
+        }
+        Some(None) => {
+            // Complex projection (expressions, not simple columns) — can't
+            // determine column indices for statistics. Still valid if all
+            // file groups have at most one file.
+            if base_config.file_groups.iter().all(|g| g.len() <= 1) {
+                projected_orderings
+            } else {
+                debug!(
+                    "Skipping specified output orderings. \
+                     Some file groups couldn't be determined to be sorted: {:?}",
+                    base_config.file_groups
+                );
+                vec![]
+            }
+        }
     }
-    all_orderings
 }
 
 /// Convert type to a type suitable for use as a `ListingTable`
@@ -1509,6 +1601,13 @@ mod tests {
             Ok(SortOrderPushdownResult::Inexact {
                 inner: Arc::new(self.clone()) as Arc<dyn FileSource>,
             })
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&dyn PhysicalExpr) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
         }
     }
 
