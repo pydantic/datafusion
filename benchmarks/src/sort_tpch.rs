@@ -99,7 +99,7 @@ impl RunOpt {
     /// Payload Columns:
     /// - Thin variant: `l_partkey` column with `BIGINT` type (1 column)
     /// - Wide variant: all columns except for possible key columns (12 columns)
-    const SORT_QUERIES: [&'static str; 11] = [
+    pub const SORT_QUERIES: [&'static str; 11] = [
         // Q1: 1 sort key (type: INTEGER, cardinality: 7) + 1 payload column
         r#"
         SELECT l_linenumber, l_partkey

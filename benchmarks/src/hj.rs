@@ -53,16 +53,16 @@ pub struct RunOpt {
     output_path: Option<PathBuf>,
 }
 
-struct HashJoinQuery {
-    sql: &'static str,
-    density: f64,
-    prob_hit: f64,
-    build_size: &'static str,
-    probe_size: &'static str,
+pub struct HashJoinQuery {
+    pub sql: &'static str,
+    pub density: f64,
+    pub prob_hit: f64,
+    pub build_size: &'static str,
+    pub probe_size: &'static str,
 }
 
 /// Inline SQL queries for Hash Join benchmarks
-const HASH_QUERIES: &[HashJoinQuery] = &[
+pub const HASH_QUERIES: &[HashJoinQuery] = &[
     // Q1: Very Small Build Side (Dense)
     // Build Side: nation (25 rows) | Probe Side: customer (1.5M rows)
     HashJoinQuery {

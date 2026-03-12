@@ -1816,6 +1816,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "criterion",
  "datafusion",
  "datafusion-common",
  "datafusion-proto",

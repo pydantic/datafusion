@@ -98,7 +98,7 @@ pub struct RunOpt {
     hash_join_buffering_capacity: usize,
 }
 
-fn map_query_id_to_str(query_id: usize) -> &'static str {
+pub fn map_query_id_to_str(query_id: usize) -> &'static str {
     match query_id {
         // 1
         1 => "1a",

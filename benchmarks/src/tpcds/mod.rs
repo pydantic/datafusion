@@ -16,4 +16,6 @@
 // under the License.
 
 mod run;
-pub use run::RunOpt;
+pub use run::{
+    RunOpt, TPCDS_QUERY_END_ID, TPCDS_QUERY_START_ID, TPCDS_TABLES, get_query_sql,
+};

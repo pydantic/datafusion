@@ -59,7 +59,7 @@ pub struct RunOpt {
 ///   - Left row count × Right row count
 ///   - Key cardinality (rows per key)
 ///   - Filter selectivity (if applicable)
-const SMJ_QUERIES: &[&str] = &[
+pub const SMJ_QUERIES: &[&str] = &[
     // Q1: INNER 100K x 100K | 1:1
     r#"
         WITH t1_sorted AS (
