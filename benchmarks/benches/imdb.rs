@@ -25,7 +25,7 @@ use datafusion_benchmarks::imdb::{
 use tokio::runtime::Runtime;
 
 fn data_path() -> String {
-    std::env::var("IMDB_DATA").expect("IMDB_DATA env var must be set")
+    std::env::var("IMDB_DATA").unwrap_or_else(|_| "benchmarks/data/imdb".to_string())
 }
 
 fn make_runtime() -> Runtime {
