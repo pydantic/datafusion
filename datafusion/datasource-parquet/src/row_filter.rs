@@ -935,6 +935,7 @@ mod test {
     };
     use arrow::datatypes::{Field, TimeUnit::Nanosecond};
     use datafusion_expr::{Expr, col};
+    use datafusion_functions::core::get_field;
     use datafusion_functions_nested::array_has::{
         array_has_all_udf, array_has_any_udf, array_has_udf,
     };
@@ -1458,7 +1459,7 @@ mod test {
         )]));
 
         // get_field(struct_col, 'a') > 5
-        let get_field_expr = datafusion_functions::core::get_field().call(vec![
+        let get_field_expr = get_field().call(vec![
             col("struct_col"),
             Expr::Literal(ScalarValue::Utf8(Some("a".to_string())), None),
         ]);
@@ -1483,7 +1484,7 @@ mod test {
         )]));
 
         // get_field(struct_col, 'nested') IS NOT NULL — the leaf is still a struct
-        let get_field_expr = datafusion_functions::core::get_field().call(vec![
+        let get_field_expr = get_field().call(vec![
             col("struct_col"),
             Expr::Literal(ScalarValue::Utf8(Some("nested".to_string())), None),
         ]);
@@ -1491,6 +1492,41 @@ mod test {
         let expr = logical2physical(&expr, &table_schema);
 
         assert!(!can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
+    }
+
+    /// get_field returning a list inside a struct should allow pushdown when
+    /// wrapped in a supported list predicate like `array_has_any`.
+    /// e.g. `array_has_any(get_field(s, 'items'), make_array('x'))`
+    #[test]
+    fn get_field_list_leaf_with_array_predicate_allows_pushdown() {
+        let item_field = Arc::new(Field::new("item", DataType::Utf8, true));
+        let table_schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("id", DataType::Int32, true)),
+                    Arc::new(Field::new("items", DataType::List(item_field), true)),
+                ]
+                .into(),
+            ),
+            true,
+        )]));
+
+        // array_has_any(get_field(s, 'items'), make_array('x'))
+        let get_field_expr = get_field().call(vec![
+            col("s"),
+            Expr::Literal(ScalarValue::Utf8(Some("items".to_string())), None),
+        ]);
+        let expr = array_has_any(
+            get_field_expr,
+            make_array(vec![Expr::Literal(
+                ScalarValue::Utf8(Some("x".to_string())),
+                None,
+            )]),
+        );
+        let expr = logical2physical(&expr, &table_schema);
+
+        assert!(can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
     }
 
     /// get_field on a struct produces correct Parquet leaf indices.
@@ -1540,7 +1576,7 @@ mod test {
         let file_schema = builder.schema().clone();
 
         // get_field(s, 'value') > 5
-        let get_field_expr = datafusion_functions::core::get_field().call(vec![
+        let get_field_expr = get_field().call(vec![
             col("s"),
             Expr::Literal(ScalarValue::Utf8(Some("value".to_string())), None),
         ]);
@@ -1582,7 +1618,7 @@ mod test {
         )]));
 
         // s['outer']['inner'] > 5
-        let get_field_expr = datafusion_functions::core::get_field().call(vec![
+        let get_field_expr = get_field().call(vec![
             col("s"),
             Expr::Literal(ScalarValue::Utf8(Some("outer".to_string())), None),
             Expr::Literal(ScalarValue::Utf8(Some("inner".to_string())), None),
@@ -1663,7 +1699,7 @@ mod test {
 
         // get_field(s, 'outer', 'inner') > 15
         // Should only need leaf 2 (s.outer.inner), not leaf 1 (s.outer.extra) or leaf 3 (s.tag).
-        let get_field_expr = datafusion_functions::core::get_field().call(vec![
+        let get_field_expr = get_field().call(vec![
             col("s"),
             Expr::Literal(ScalarValue::Utf8(Some("outer".to_string())), None),
             Expr::Literal(ScalarValue::Utf8(Some("inner".to_string())), None),
@@ -1739,7 +1775,7 @@ mod test {
         let file_schema = parquet_reader_builder.schema().clone();
 
         // get_field(s, 'value') > 15  — should match rows with value=20 and value=30
-        let get_field_expr = datafusion_functions::core::get_field().call(vec![
+        let get_field_expr = get_field().call(vec![
             col("s"),
             Expr::Literal(ScalarValue::Utf8(Some("value".to_string())), None),
         ]);
