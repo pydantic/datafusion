@@ -465,20 +465,39 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
                 .and_then(|a| a.as_any().downcast_ref::<Column>())
             {
                 let return_type = func.return_type();
-                if !DataType::is_nested(return_type) {
+
+                if !DataType::is_nested(return_type)
+                    || self.is_nested_type_supported(return_type)
+                {
+                    // try to resolve all field name arguments to strinrg literals
+                    // if any argument is not a string literal, we can not determine the exact
+                    // leaf path so we fall back to reading the entire struct root column
                     let field_path = args[1..]
                         .iter()
-                        .filter_map(|arg| {
+                        .map(|arg| {
                             arg.as_any().downcast_ref::<Literal>().and_then(|lit| {
                                 lit.value().try_as_str().flatten().map(|s| s.to_string())
                             })
                         })
                         .collect();
 
-                    if let Some(recursion) =
-                        self.check_struct_field_column(column.name(), field_path)
-                    {
-                        return Ok(recursion);
+                    match field_path {
+                        Some(path) => {
+                            if let Some(recursion) =
+                                self.check_struct_field_column(column.name(), path)
+                            {
+                                return Ok(recursion);
+                            }
+                        }
+                        None => {
+                            // Could not resolve field path — fall back to
+                            // reading the entire struct root column.
+                            if let Some(recursion) =
+                                self.check_single_column(column.name())
+                            {
+                                return Ok(recursion);
+                            }
+                        }
                     }
 
                     return Ok(TreeNodeRecursion::Jump);
