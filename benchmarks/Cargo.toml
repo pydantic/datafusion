@@ -41,6 +41,7 @@ mimalloc_extended = ["libmimalloc-sys/extended"]
 [dependencies]
 arrow = { workspace = true }
 clap = { version = "4.5.60", features = ["derive"] }
+criterion = { workspace = true, features = ["async_tokio"] }
 datafusion = { workspace = true, default-features = true }
 datafusion-common = { workspace = true, default-features = true }
 env_logger = { workspace = true }
@@ -59,4 +60,41 @@ tokio = { workspace = true, features = ["rt-multi-thread", "parking_lot"] }
 tokio-util = { version = "0.7.17" }
 
 [dev-dependencies]
+criterion = { workspace = true, features = ["async_tokio"] }
 datafusion-proto = { workspace = true }
+
+[[bench]]
+harness = false
+name = "tpch"
+
+[[bench]]
+harness = false
+name = "clickbench"
+
+[[bench]]
+harness = false
+name = "tpcds"
+
+[[bench]]
+harness = false
+name = "h2o"
+
+[[bench]]
+harness = false
+name = "imdb"
+
+[[bench]]
+harness = false
+name = "sort_tpch"
+
+[[bench]]
+harness = false
+name = "hj"
+
+[[bench]]
+harness = false
+name = "nlj"
+
+[[bench]]
+harness = false
+name = "smj"

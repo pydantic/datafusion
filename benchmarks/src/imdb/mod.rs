@@ -27,7 +27,7 @@ pub use convert::ConvertOpt;
 
 use std::fs;
 mod run;
-pub use run::RunOpt;
+pub use run::{RunOpt, map_query_id_to_str};
 
 // we have 21 tables in the IMDB dataset
 pub const IMDB_TABLES: &[&str] = &[

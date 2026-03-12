@@ -61,7 +61,7 @@ pub struct RunOpt {
 /// Each query's comment includes:
 ///   - Left (build) side row count × Right (probe) side row count
 ///   - Join predicate selectivity (1% means the output size is 1% * input size)
-const NLJ_QUERIES: &[&str] = &[
+pub const NLJ_QUERIES: &[&str] = &[
     // Q1: INNER 10K x 10K | LOW 0.1%
     r#"
         SELECT *
