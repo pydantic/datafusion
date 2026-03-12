@@ -24,7 +24,8 @@ use datafusion_benchmarks::tpcds::{
 use tokio::runtime::Runtime;
 
 fn data_path() -> String {
-    std::env::var("TPCDS_DATA").expect("TPCDS_DATA env var must be set")
+    std::env::var("TPCDS_DATA")
+        .unwrap_or_else(|_| "benchmarks/data/tpcds_sf1".to_string())
 }
 
 fn query_path() -> String {
