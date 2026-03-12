@@ -18,6 +18,7 @@
 //! [`ParquetOpener`] for opening Parquet files
 
 use crate::page_filter::PagePruningAccessPlanFilter;
+use crate::row_filter::build_projection_read_plan;
 use crate::row_group_filter::RowGroupAccessPlanFilter;
 use crate::{
     ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
@@ -621,9 +622,16 @@ impl FileOpener for ParquetOpener {
             // metrics from the arrow reader itself
             let arrow_reader_metrics = ArrowReaderMetrics::enabled();
 
-            let indices = projection.column_indices();
-            let mask =
-                ProjectionMask::roots(reader_metadata.parquet_schema(), indices.clone());
+            let read_plan = build_projection_read_plan(
+                projection.expr_iter(),
+                &physical_file_schema,
+                reader_metadata.parquet_schema(),
+            );
+
+            let mask = ProjectionMask::leaves(
+                reader_metadata.parquet_schema(),
+                read_plan.leaf_indices.iter().copied(),
+            );
 
             let decoder = builder
                 .with_projection(mask)
@@ -639,7 +647,7 @@ impl FileOpener for ParquetOpener {
             // Rebase column indices to match the narrowed stream schema.
             // The projection expressions have indices based on physical_file_schema,
             // but the stream only contains the columns selected by the ProjectionMask.
-            let stream_schema = Arc::new(physical_file_schema.project(&indices)?);
+            let stream_schema = read_plan.projected_schema;
             let replace_schema = stream_schema != output_schema;
             let projection = projection
                 .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
