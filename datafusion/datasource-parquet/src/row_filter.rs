@@ -125,7 +125,6 @@ impl DatafusionArrowPredicate {
     /// Create a new `DatafusionArrowPredicate` from a `FilterCandidate`
     pub fn try_new(
         candidate: FilterCandidate,
-        metadata: &ParquetMetaData,
         rows_pruned: metrics::Count,
         rows_matched: metrics::Count,
         time: metrics::Time,
@@ -135,13 +134,7 @@ impl DatafusionArrowPredicate {
 
         Ok(Self {
             physical_expr,
-            // Use leaf indices: when nested columns are involved, we must specify
-            // leaf (primitive) column indices in the Parquet schema so the decoder
-            // can properly project and filter nested structures.
-            projection_mask: ProjectionMask::leaves(
-                metadata.file_metadata().schema_descr(),
-                candidate.read_plan.leaf_indices.iter().copied(),
-            ),
+            projection_mask: candidate.read_plan.projection_mask,
             rows_pruned,
             rows_matched,
             time,
@@ -202,8 +195,10 @@ pub(crate) struct FilterCandidate {
 /// the row filter to build `ArrowPredicate`s and the opener to build `ProjectionMask`s
 #[derive(Debug, Clone)]
 pub(crate) struct ParquetReadPlan {
-    /// Leaf column indices in the Parquet schema descriptor to decode
-    pub leaf_indices: Vec<usize>,
+    /// Projection mask built from leaf column indices in the Parquet schema.
+    /// Using a `ProjectionMask` directly (rather than raw indices) prevents
+    /// bugs from accidentally mixing up root vs leaf indices.
+    pub projection_mask: ProjectionMask,
     /// The projected Arrow schema containing only the columns/fields required
     /// Struct types are pruned to include only the accessed sub-fields
     pub projected_schema: SchemaRef,
@@ -238,18 +233,15 @@ impl FilterCandidateBuilder {
     /// * `Ok(None)` if the expression cannot be used as an ArrowFilter
     /// * `Err(e)` if an error occurs while building the candidate
     pub fn build(self, metadata: &ParquetMetaData) -> Result<Option<FilterCandidate>> {
-        let schema_descr = metadata.file_metadata().schema_descr();
-        let read_plan =
-            match build_parquet_read_plan(&self.expr, &self.file_schema, schema_descr)? {
-                Some(plan) => plan,
-                None => return Ok(None),
-            };
-
-        Ok(Some(FilterCandidate {
-            expr: self.expr,
-            required_bytes: size_of_columns(&read_plan.leaf_indices, metadata)?,
-            read_plan,
-        }))
+        Ok(
+            build_parquet_read_plan(&self.expr, &self.file_schema, metadata)?.map(
+                |(read_plan, required_bytes)| FilterCandidate {
+                    expr: self.expr,
+                    required_bytes,
+                    read_plan,
+                },
+            ),
+        )
     }
 }
 
@@ -533,17 +525,22 @@ fn pushdown_columns(
 /// Resolves which Parquet leaf columns and Arrow schema fields are needed
 /// to evaluate `expr` against a Parquet file
 ///
-/// Returns `Ok(Some(plan))` when the expression can be evaluated using only
-/// pushdown-compatible columns. `Ok(None)` when it can not (it references
-/// whole struct columns or columns missing from disk)
+/// Returns `Ok(Some((plan, required_bytes)))` when the expression can be
+/// evaluated using only pushdown-compatible columns. `Ok(None)` when it
+/// cannot (it references whole struct columns or columns missing from disk).
+///
+/// The `required_bytes` is the total compressed size of all referenced columns
+/// across all row groups, used to estimate filter evaluation cost.
 ///
 /// Note: this is a shared entry point used by both row filter construction and
 /// the opener's projection logic
 pub(crate) fn build_parquet_read_plan(
     expr: &Arc<dyn PhysicalExpr>,
     file_schema: &Schema,
-    schema_descr: &SchemaDescriptor,
-) -> Result<Option<ParquetReadPlan>> {
+    metadata: &ParquetMetaData,
+) -> Result<Option<(ParquetReadPlan, usize)>> {
+    let schema_descr = metadata.file_metadata().schema_descr();
+
     let Some(required_columns) = pushdown_columns(expr, file_schema)? else {
         return Ok(None);
     };
@@ -562,16 +559,24 @@ pub(crate) fn build_parquet_read_plan(
     leaf_indices.sort_unstable();
     leaf_indices.dedup();
 
+    let required_bytes = size_of_columns(&leaf_indices, metadata)?;
+
+    let projection_mask =
+        ProjectionMask::leaves(schema_descr, leaf_indices.iter().copied());
+
     let projected_schema = build_filter_schema(
         file_schema,
         root_indices,
         &required_columns.struct_field_accesses,
     );
 
-    Ok(Some(ParquetReadPlan {
-        leaf_indices,
-        projected_schema,
-    }))
+    Ok(Some((
+        ParquetReadPlan {
+            projection_mask,
+            projected_schema,
+        },
+        required_bytes,
+    )))
 }
 
 fn leaf_indices_for_roots<I>(
@@ -913,7 +918,6 @@ pub fn build_row_filter(
 
             DatafusionArrowPredicate::try_new(
                 candidate,
-                metadata,
                 predicate_rows_pruned,
                 predicate_rows_matched,
                 time.clone(),
@@ -983,7 +987,9 @@ mod test {
             .expect("building candidate")
             .expect("list pushdown should be supported");
 
-        assert_eq!(candidate.read_plan.leaf_indices, vec![list_index]);
+        let expected_mask =
+            ProjectionMask::leaves(metadata.file_metadata().schema_descr(), [list_index]);
+        assert_eq!(candidate.read_plan.projection_mask, expected_mask);
     }
 
     #[test]
@@ -1023,7 +1029,6 @@ mod test {
 
         let mut row_filter = DatafusionArrowPredicate::try_new(
             candidate,
-            &metadata,
             Count::new(),
             Count::new(),
             Time::new(),
@@ -1063,7 +1068,6 @@ mod test {
 
         let mut row_filter = DatafusionArrowPredicate::try_new(
             candidate,
-            &metadata,
             Count::new(),
             Count::new(),
             Time::new(),
@@ -1440,10 +1444,11 @@ mod test {
             .expect("filter on primitive col_b should be pushable");
 
         // col_b is Parquet leaf 3 (shifted by struct_col's two children).
+        let expected_mask =
+            ProjectionMask::leaves(metadata.file_metadata().schema_descr(), [3]);
         assert_eq!(
-            candidate.read_plan.leaf_indices,
-            vec![3],
-            "leaf_indices should be [3] for col_b"
+            candidate.read_plan.projection_mask, expected_mask,
+            "projection_mask should select only leaf 3 for col_b"
         );
     }
 
@@ -1590,10 +1595,11 @@ mod test {
 
         // The filter accesses only s.value, so only Parquet leaf 1 is needed.
         // Leaf 2 (s.label) is not read, reducing unnecessary I/O.
+        let expected_mask =
+            ProjectionMask::leaves(metadata.file_metadata().schema_descr(), [1]);
         assert_eq!(
-            candidate.read_plan.leaf_indices,
-            vec![1],
-            "leaf_indices should contain only the accessed struct field leaf"
+            candidate.read_plan.projection_mask, expected_mask,
+            "projection_mask should select only the accessed struct field leaf"
         );
     }
 
@@ -1713,10 +1719,11 @@ mod test {
             .expect("deeply nested get_field filter should be pushable");
 
         // Only s.outer.inner (leaf 2) should be projected,
+        let expected_mask =
+            ProjectionMask::leaves(metadata.file_metadata().schema_descr(), [2]);
         assert_eq!(
-            candidate.read_plan.leaf_indices,
-            vec![2],
-            "leaf_indices should be [2] for s.outer.inner, skipping sibling and cousin leaves"
+            candidate.read_plan.projection_mask, expected_mask,
+            "projection_mask should select only leaf 2 for s.outer.inner, skipping sibling and cousin leaves"
         );
     }
 
