@@ -1,0 +1,1 @@
+../../../queries/clickbench/queries/q23.sql

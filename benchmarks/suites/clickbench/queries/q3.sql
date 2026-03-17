@@ -1,0 +1,1 @@
+../../../queries/clickbench/queries/q3.sql

@@ -1,0 +1,1 @@
+CREATE EXTERNAL TABLE large STORED AS CSV LOCATION '${H2O_DATA:-${WORKSPACE}/benchmarks/data/h2o}/J1_1e7_1e7_NA.csv';

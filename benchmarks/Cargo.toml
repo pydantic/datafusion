@@ -75,11 +75,23 @@ name = "clickbench"
 
 [[bench]]
 harness = false
+name = "clickbench_partitioned"
+
+[[bench]]
+harness = false
 name = "tpcds"
 
 [[bench]]
 harness = false
-name = "h2o"
+name = "h2o_groupby"
+
+[[bench]]
+harness = false
+name = "h2o_join"
+
+[[bench]]
+harness = false
+name = "h2o_window"
 
 [[bench]]
 harness = false

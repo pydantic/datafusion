@@ -1,0 +1,1 @@
+../../../../datafusion/core/tests/tpc-ds/72.sql

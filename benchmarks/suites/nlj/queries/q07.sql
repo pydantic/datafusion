@@ -1,0 +1,4 @@
+SELECT *
+FROM range(10000) AS t1
+RIGHT JOIN range(200000) AS t2
+ON (t1.value + t2.value) % 1000 = 0

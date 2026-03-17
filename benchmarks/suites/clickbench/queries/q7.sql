@@ -1,0 +1,1 @@
+../../../queries/clickbench/queries/q7.sql

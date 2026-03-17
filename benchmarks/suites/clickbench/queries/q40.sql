@@ -1,0 +1,1 @@
+../../../queries/clickbench/queries/q40.sql

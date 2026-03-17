@@ -1,0 +1,8 @@
+SELECT *
+FROM range(30000) AS t2(k2)
+WHERE k2 > 0
+OR EXISTS (
+    SELECT 1
+    FROM range(30000) AS t1(k1)
+    WHERE t2.k2 > t1.k1
+)

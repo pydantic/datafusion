@@ -1,0 +1,1 @@
+../../../queries/imdb/22c.sql

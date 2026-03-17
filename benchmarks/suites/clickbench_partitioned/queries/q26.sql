@@ -1,0 +1,1 @@
+../../../queries/clickbench/queries/q26.sql
