@@ -25,7 +25,7 @@ use arrow::datatypes::{Int32Type, SchemaRef};
 use arrow::util::pretty::pretty_format_batches;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::pruning::PruningStatistics;
+use datafusion::common::pruning::{PruningColumn, PruningStatistics};
 use datafusion::common::{
     DFSchema, DataFusionError, Result, ScalarValue, internal_datafusion_err,
 };
@@ -432,21 +432,19 @@ impl ParquetMetadataIndex {
 /// the required statistics via the [`PruningStatistics`] trait
 impl PruningStatistics for ParquetMetadataIndex {
     /// return the minimum values for the value column
-    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
-        if column.name.eq("value") {
-            Some(self.value_column_mins().clone())
-        } else {
-            None
-        }
+    fn min_values(&self, column: &PruningColumn) -> Option<ArrayRef> {
+        column
+            .name()
+            .eq("value")
+            .then_some(self.value_column_mins().clone())
     }
 
     /// return the maximum values for the value column
-    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
-        if column.name.eq("value") {
-            Some(self.value_column_maxes().clone())
-        } else {
-            None
-        }
+    fn max_values(&self, column: &PruningColumn) -> Option<ArrayRef> {
+        column
+            .name()
+            .eq("value")
+            .then_some(self.value_column_maxes().clone())
     }
 
     /// return the number of "containers". In this example, each "container" is
@@ -457,12 +455,12 @@ impl PruningStatistics for ParquetMetadataIndex {
 
     /// Return `None` to signal we don't have any information about null
     /// counts in the index,
-    fn null_counts(&self, _column: &Column) -> Option<ArrayRef> {
+    fn null_counts(&self, _column: &PruningColumn) -> Option<ArrayRef> {
         None
     }
 
     /// return the row counts for each file
-    fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
+    fn row_counts(&self, _column: &PruningColumn) -> Option<ArrayRef> {
         Some(self.row_counts_ref().clone())
     }
 
@@ -470,7 +468,7 @@ impl PruningStatistics for ParquetMetadataIndex {
     /// but is not used in this example, so return `None`
     fn contained(
         &self,
-        _column: &Column,
+        _column: &PruningColumn,
         _values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray> {
         None

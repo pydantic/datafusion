@@ -26,6 +26,50 @@ use crate::stats::Precision;
 use crate::{Column, Statistics};
 use crate::{ColumnStatistics, ScalarValue};
 
+/// Identifies a column for statistics lookup in [`PruningStatistics`].
+///
+/// Can represent either a top-level column or a nested field within a struct.
+/// For top-level columns, `field_path` is empty. For nested struct fields
+/// (e.g., `s['outer']['inner']`), `field_path` contains the path from the
+/// root column to the leaf field (e.g., `["outer", "inner"]`).
+#[derive(Debug, Clone)]
+pub struct PruningColumn {
+    /// The root column reference.
+    pub column: Column,
+    /// Path to nested struct field. Empty for top-level columns.
+    pub field_path: Vec<String>,
+}
+
+impl PruningColumn {
+    /// Returns the name of the root column.
+    pub fn name(&self) -> &str {
+        self.column.name()
+    }
+
+    /// Returns true if this references a nested struct field.
+    pub fn is_nested(&self) -> bool {
+        !self.field_path.is_empty()
+    }
+}
+
+impl From<Column> for PruningColumn {
+    fn from(column: Column) -> Self {
+        Self {
+            column,
+            field_path: vec![],
+        }
+    }
+}
+
+impl From<&Column> for PruningColumn {
+    fn from(column: &Column) -> Self {
+        Self {
+            column: column.clone(),
+            field_path: vec![],
+        }
+    }
+}
+
 /// A source of runtime statistical information to [`PruningPredicate`]s.
 ///
 /// # Supported Information
@@ -68,14 +112,14 @@ pub trait PruningStatistics {
     /// not known for any row, return `None`.
     ///
     /// Note: the returned array must contain [`Self::num_containers`] rows
-    fn min_values(&self, column: &Column) -> Option<ArrayRef>;
+    fn min_values(&self, column: &PruningColumn) -> Option<ArrayRef>;
 
     /// Return the maximum values for the named column, if known.
     ///
     /// See [`Self::min_values`] for when to return `None` and null values.
     ///
     /// Note: the returned array must contain [`Self::num_containers`] rows
-    fn max_values(&self, column: &Column) -> Option<ArrayRef>;
+    fn max_values(&self, column: &PruningColumn) -> Option<ArrayRef>;
 
     /// Return the number of containers (e.g. Row Groups) being pruned with
     /// these statistics.
@@ -93,7 +137,7 @@ pub trait PruningStatistics {
     /// Note: the returned array must contain [`Self::num_containers`] rows
     ///
     /// [`UInt64Array`]: arrow::array::UInt64Array
-    fn null_counts(&self, column: &Column) -> Option<ArrayRef>;
+    fn null_counts(&self, column: &PruningColumn) -> Option<ArrayRef>;
 
     /// Return the number of rows for the named column in each container
     /// as an [`UInt64Array`].
@@ -103,7 +147,7 @@ pub trait PruningStatistics {
     /// Note: the returned array must contain [`Self::num_containers`] rows
     ///
     /// [`UInt64Array`]: arrow::array::UInt64Array
-    fn row_counts(&self, column: &Column) -> Option<ArrayRef>;
+    fn row_counts(&self, column: &PruningColumn) -> Option<ArrayRef>;
 
     /// Returns [`BooleanArray`] where each row represents information known
     /// about specific literal `values` in a column.
@@ -123,7 +167,7 @@ pub trait PruningStatistics {
     /// Note: the returned array must contain [`Self::num_containers`] rows
     fn contained(
         &self,
-        column: &Column,
+        column: &PruningColumn,
         values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray>;
 }
@@ -239,7 +283,7 @@ impl PartitionPruningStatistics {
 
 #[expect(deprecated)]
 impl PruningStatistics for PartitionPruningStatistics {
-    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+    fn min_values(&self, column: &PruningColumn) -> Option<ArrayRef> {
         let index = self.partition_schema.index_of(column.name()).ok()?;
         self.partition_values.get(index).and_then(|v| {
             if v.is_empty() || v.null_count() == v.len() {
@@ -252,7 +296,7 @@ impl PruningStatistics for PartitionPruningStatistics {
         })
     }
 
-    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+    fn max_values(&self, column: &PruningColumn) -> Option<ArrayRef> {
         self.min_values(column)
     }
 
@@ -260,17 +304,17 @@ impl PruningStatistics for PartitionPruningStatistics {
         self.num_containers
     }
 
-    fn null_counts(&self, _column: &Column) -> Option<ArrayRef> {
+    fn null_counts(&self, _column: &PruningColumn) -> Option<ArrayRef> {
         None
     }
 
-    fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
+    fn row_counts(&self, _column: &PruningColumn) -> Option<ArrayRef> {
         None
     }
 
     fn contained(
         &self,
-        column: &Column,
+        column: &PruningColumn,
         values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray> {
         let index = self.partition_schema.index_of(column.name()).ok()?;
@@ -327,7 +371,7 @@ impl PrunableStatistics {
 
     fn get_exact_column_statistics(
         &self,
-        column: &Column,
+        column: &PruningColumn,
         get_stat: impl Fn(&ColumnStatistics) -> &Precision<ScalarValue>,
     ) -> Option<ArrayRef> {
         let index = self.schema.index_of(column.name()).ok()?;
@@ -359,11 +403,11 @@ impl PrunableStatistics {
 }
 
 impl PruningStatistics for PrunableStatistics {
-    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+    fn min_values(&self, column: &PruningColumn) -> Option<ArrayRef> {
         self.get_exact_column_statistics(column, |stat| &stat.min_value)
     }
 
-    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+    fn max_values(&self, column: &PruningColumn) -> Option<ArrayRef> {
         self.get_exact_column_statistics(column, |stat| &stat.max_value)
     }
 
@@ -371,7 +415,7 @@ impl PruningStatistics for PrunableStatistics {
         self.statistics.len()
     }
 
-    fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
+    fn null_counts(&self, column: &PruningColumn) -> Option<ArrayRef> {
         let index = self.schema.index_of(column.name()).ok()?;
         if self.statistics.iter().any(|s| {
             s.column_statistics
@@ -397,7 +441,7 @@ impl PruningStatistics for PrunableStatistics {
         }
     }
 
-    fn row_counts(&self, column: &Column) -> Option<ArrayRef> {
+    fn row_counts(&self, column: &PruningColumn) -> Option<ArrayRef> {
         // If the column does not exist in the schema, return None
         if self.schema.index_of(column.name()).is_err() {
             return None;
@@ -426,7 +470,7 @@ impl PruningStatistics for PrunableStatistics {
 
     fn contained(
         &self,
-        _column: &Column,
+        _column: &PruningColumn,
         _values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray> {
         None
@@ -470,7 +514,7 @@ impl CompositePruningStatistics {
 
 #[expect(deprecated)]
 impl PruningStatistics for CompositePruningStatistics {
-    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+    fn min_values(&self, column: &PruningColumn) -> Option<ArrayRef> {
         for stats in &self.statistics {
             if let Some(array) = stats.min_values(column) {
                 return Some(array);
@@ -479,7 +523,7 @@ impl PruningStatistics for CompositePruningStatistics {
         None
     }
 
-    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+    fn max_values(&self, column: &PruningColumn) -> Option<ArrayRef> {
         for stats in &self.statistics {
             if let Some(array) = stats.max_values(column) {
                 return Some(array);
@@ -492,7 +536,7 @@ impl PruningStatistics for CompositePruningStatistics {
         self.statistics[0].num_containers()
     }
 
-    fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
+    fn null_counts(&self, column: &PruningColumn) -> Option<ArrayRef> {
         for stats in &self.statistics {
             if let Some(array) = stats.null_counts(column) {
                 return Some(array);
@@ -501,7 +545,7 @@ impl PruningStatistics for CompositePruningStatistics {
         None
     }
 
-    fn row_counts(&self, column: &Column) -> Option<ArrayRef> {
+    fn row_counts(&self, column: &PruningColumn) -> Option<ArrayRef> {
         for stats in &self.statistics {
             if let Some(array) = stats.row_counts(column) {
                 return Some(array);
@@ -512,7 +556,7 @@ impl PruningStatistics for CompositePruningStatistics {
 
     fn contained(
         &self,
-        column: &Column,
+        column: &PruningColumn,
         values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray> {
         for stats in &self.statistics {
@@ -535,6 +579,11 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field};
     use std::sync::Arc;
+
+    /// Helper to create a PruningColumn from a column name for tests
+    fn pruning_col(name: &str) -> PruningColumn {
+        Column::new_unqualified(name).into()
+    }
 
     /// return a PartitionPruningStatistics for two columns 'a' and 'b'
     /// and the following stats
@@ -559,8 +608,8 @@ mod tests {
     fn test_partition_pruning_statistics() {
         let partition_stats = partition_pruning_statistics_setup();
 
-        let column_a = Column::new_unqualified("a");
-        let column_b = Column::new_unqualified("b");
+        let column_a = pruning_col("a");
+        let column_b = pruning_col("b");
 
         // Partition values don't know anything about nulls or row counts
         assert!(partition_stats.null_counts(&column_a).is_none());
@@ -616,7 +665,7 @@ mod tests {
     fn test_partition_pruning_statistics_multiple_positive_values() {
         let partition_stats = partition_pruning_statistics_setup();
 
-        let column_a = Column::new_unqualified("a");
+        let column_a = pruning_col("a");
 
         // The two containers have `a` values 1 and 3, so they both only contain values from 1 and 3
         let values = HashSet::from([ScalarValue::from(1i32), ScalarValue::from(3i32)]);
@@ -629,7 +678,7 @@ mod tests {
     fn test_partition_pruning_statistics_multiple_negative_values() {
         let partition_stats = partition_pruning_statistics_setup();
 
-        let column_a = Column::new_unqualified("a");
+        let column_a = pruning_col("a");
 
         // The two containers have `a` values 1 and 3,
         // so the first contains ONLY values from 1,2
@@ -663,9 +712,9 @@ mod tests {
             PartitionPruningStatistics::try_new(partition_values, partition_fields)
                 .unwrap();
 
-        let column_a = Column::new_unqualified("a");
-        let column_b = Column::new_unqualified("b");
-        let column_c = Column::new_unqualified("c");
+        let column_a = pruning_col("a");
+        let column_b = pruning_col("b");
+        let column_c = pruning_col("c");
 
         let values_a = HashSet::from([ScalarValue::from(1i32), ScalarValue::Int32(None)]);
         let contained_a = partition_stats.contained(&column_a, &values_a).unwrap();
@@ -702,8 +751,8 @@ mod tests {
             PartitionPruningStatistics::try_new(partition_values, partition_fields)
                 .unwrap();
 
-        let column_a = Column::new_unqualified("a");
-        let column_b = Column::new_unqualified("b");
+        let column_a = pruning_col("a");
+        let column_b = pruning_col("b");
 
         // Partition values don't know anything about nulls or row counts
         assert!(partition_stats.null_counts(&column_a).is_none());
@@ -766,8 +815,8 @@ mod tests {
         ]));
         let pruning_stats = PrunableStatistics::new(statistics, schema);
 
-        let column_a = Column::new_unqualified("a");
-        let column_b = Column::new_unqualified("b");
+        let column_a = pruning_col("a");
+        let column_b = pruning_col("b");
 
         // Min/max values are the same as the statistics
         let min_values_a = as_int32_array(&pruning_stats.min_values(&column_a).unwrap())
@@ -834,7 +883,7 @@ mod tests {
         assert_eq!(pruning_stats.num_containers(), 2);
 
         // Test with a column that has no statistics
-        let column_c = Column::new_unqualified("c");
+        let column_c = pruning_col("c");
         assert!(pruning_stats.min_values(&column_c).is_none());
         assert!(pruning_stats.max_values(&column_c).is_none());
         assert!(pruning_stats.null_counts(&column_c).is_none());
@@ -852,7 +901,7 @@ mod tests {
         assert!(pruning_stats.contained(&column_c, &values).is_none());
 
         // Test with a column that doesn't exist
-        let column_d = Column::new_unqualified("d");
+        let column_d = pruning_col("d");
         assert!(pruning_stats.min_values(&column_d).is_none());
         assert!(pruning_stats.max_values(&column_d).is_none());
         assert!(pruning_stats.null_counts(&column_d).is_none());
@@ -870,8 +919,8 @@ mod tests {
         ]));
         let pruning_stats = PrunableStatistics::new(statistics, schema);
 
-        let column_a = Column::new_unqualified("a");
-        let column_b = Column::new_unqualified("b");
+        let column_a = pruning_col("a");
+        let column_b = pruning_col("b");
 
         // Min/max values are all missing
         assert!(pruning_stats.min_values(&column_a).is_none());
@@ -956,12 +1005,12 @@ mod tests {
         ]);
 
         // Test accessing columns that are only in partition statistics
-        let part_a = Column::new_unqualified("part_a");
-        let part_b = Column::new_unqualified("part_b");
+        let part_a = pruning_col("part_a");
+        let part_b = pruning_col("part_b");
 
         // Test accessing columns that are only in file statistics
-        let col_x = Column::new_unqualified("col_x");
-        let col_y = Column::new_unqualified("col_y");
+        let col_x = pruning_col("col_x");
+        let col_y = pruning_col("col_y");
 
         // For partition columns, should get values from partition statistics
         let min_values_part_a =
@@ -1045,7 +1094,7 @@ mod tests {
         assert!(composite_stats.contained(&col_x, &values).is_none());
 
         // Non-existent column should return None for everything
-        let non_existent = Column::new_unqualified("non_existent");
+        let non_existent = pruning_col("non_existent");
         assert!(composite_stats.min_values(&non_existent).is_none());
         assert!(composite_stats.max_values(&non_existent).is_none());
         assert!(composite_stats.null_counts(&non_existent).is_none());
@@ -1129,7 +1178,7 @@ mod tests {
             Box::new(second_stats.clone()),
         ]);
 
-        let col_a = Column::new_unqualified("col_a");
+        let col_a = pruning_col("col_a");
 
         // Should get values from first statistics since it has priority
         let min_values = as_int32_array(&composite_stats.min_values(&col_a).unwrap())

@@ -20,9 +20,9 @@ use std::sync::Arc;
 
 use super::{ParquetAccessPlan, ParquetFileMetrics};
 use arrow::array::{ArrayRef, BooleanArray};
-use arrow::datatypes::Schema;
-use datafusion_common::pruning::PruningStatistics;
-use datafusion_common::{Column, Result, ScalarValue};
+use arrow::datatypes::{DataType, Schema};
+use datafusion_common::pruning::{PruningColumn, PruningStatistics};
+use datafusion_common::{DataFusionError, Result, ScalarValue};
 use datafusion_datasource::FileRange;
 use datafusion_physical_expr::PhysicalExprSimplifier;
 use datafusion_physical_expr::expressions::NotExpr;
@@ -524,11 +524,11 @@ impl BloomFilterStatistics {
 }
 
 impl PruningStatistics for BloomFilterStatistics {
-    fn min_values(&self, _column: &Column) -> Option<ArrayRef> {
+    fn min_values(&self, _column: &PruningColumn) -> Option<ArrayRef> {
         None
     }
 
-    fn max_values(&self, _column: &Column) -> Option<ArrayRef> {
+    fn max_values(&self, _column: &PruningColumn) -> Option<ArrayRef> {
         None
     }
 
@@ -536,11 +536,11 @@ impl PruningStatistics for BloomFilterStatistics {
         1
     }
 
-    fn null_counts(&self, _column: &Column) -> Option<ArrayRef> {
+    fn null_counts(&self, _column: &PruningColumn) -> Option<ArrayRef> {
         None
     }
 
-    fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
+    fn row_counts(&self, _column: &PruningColumn) -> Option<ArrayRef> {
         None
     }
 
@@ -551,10 +551,10 @@ impl PruningStatistics for BloomFilterStatistics {
     /// of the values in a column are not present.
     fn contained(
         &self,
-        column: &Column,
+        column: &PruningColumn,
         values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray> {
-        let (sbbf, parquet_type) = self.column_sbbf.get(column.name.as_str())?;
+        let (sbbf, parquet_type) = self.column_sbbf.get(column.name())?;
 
         // Bloom filters are probabilistic data structures that can return false
         // positives (i.e. it might return true even if the value is not
@@ -594,26 +594,104 @@ impl<'a> RowGroupPruningStatistics<'a> {
         self.row_group_metadatas.iter().copied()
     }
 
-    fn statistics_converter<'b>(
+    /// Returns a `StatisticsConverter` for the given column.
+    ///
+    /// For nested struct fields (where `column.is_nested()` is true), resolves
+    /// the field path to a Parquet leaf column index and uses
+    /// [`StatisticsConverter::from_column_index`].
+    /// For top-level columns, uses [`StatisticsConverter::try_new`].
+    fn statistics_converter(
         &'a self,
-        column: &'b Column,
+        column: &PruningColumn,
     ) -> Result<StatisticsConverter<'a>> {
+        if column.is_nested() {
+            let leaf_idx = self.resolve_nested_leaf_index(column).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "could not resolve nested field path {:?} for column '{}'",
+                    column.field_path,
+                    column.name()
+                ))
+            })?;
+
+            let arrow_field = self.resolve_nested_field(column).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "could not resolve Arrow field for nested path {:?} in column '{}'",
+                    column.field_path,
+                    column.name()
+                ))
+            })?;
+
+            return Ok(StatisticsConverter::from_column_index(
+                leaf_idx,
+                arrow_field,
+                self.parquet_schema,
+            )?);
+        }
+
         Ok(StatisticsConverter::try_new(
-            &column.name,
+            column.name(),
             self.arrow_schema,
             self.parquet_schema,
         )?)
     }
+
+    /// Resolve a nested struct field path to the Parquet leaf column index.
+    ///
+    /// For example, given a struct column "s" with field path ["outer", "inner"],
+    /// this finds the leaf column in the Parquet schema corresponding to "s.outer.inner".
+    fn resolve_nested_leaf_index(&self, column: &PruningColumn) -> Option<usize> {
+        let full_path = std::iter::once(column.name().to_string())
+            .chain(column.field_path.iter().cloned())
+            .collect::<Vec<_>>();
+
+        // Search through all leaf columns in the Parquet schema to find
+        // one whose path starts with our full path
+        let num_columns = self.parquet_schema.num_columns();
+        for i in 0..num_columns {
+            let col_descr = self.parquet_schema.column(i);
+            let col_path = col_descr.path().parts();
+
+            if col_path.len() >= full_path.len()
+                && col_path[..full_path.len()] == full_path[..]
+            {
+                return Some(i);
+            }
+        }
+
+        None
+    }
+
+    /// Get the Arrow field for a nested struct field by navigating through the schema.
+    fn resolve_nested_field(
+        &self,
+        column: &PruningColumn,
+    ) -> Option<&arrow::datatypes::Field> {
+        let root_field = self.arrow_schema.field_with_name(column.name()).ok()?;
+
+        let mut current_field = root_field;
+
+        for path_element in &column.field_path {
+            match current_field.data_type() {
+                DataType::Struct(fields) => {
+                    current_field =
+                        fields.iter().find(|f| f.name() == path_element)?.as_ref();
+                }
+                _ => return None,
+            }
+        }
+
+        Some(current_field)
+    }
 }
 
 impl PruningStatistics for RowGroupPruningStatistics<'_> {
-    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+    fn min_values(&self, column: &PruningColumn) -> Option<ArrayRef> {
         self.statistics_converter(column)
             .and_then(|c| Ok(c.row_group_mins(self.metadata_iter())?))
             .ok()
     }
 
-    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+    fn max_values(&self, column: &PruningColumn) -> Option<ArrayRef> {
         self.statistics_converter(column)
             .and_then(|c| Ok(c.row_group_maxes(self.metadata_iter())?))
             .ok()
@@ -623,14 +701,14 @@ impl PruningStatistics for RowGroupPruningStatistics<'_> {
         self.row_group_metadatas.len()
     }
 
-    fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
+    fn null_counts(&self, column: &PruningColumn) -> Option<ArrayRef> {
         self.statistics_converter(column)
             .and_then(|c| Ok(c.row_group_null_counts(self.metadata_iter())?))
             .ok()
             .map(|counts| Arc::new(counts) as ArrayRef)
     }
 
-    fn row_counts(&self, column: &Column) -> Option<ArrayRef> {
+    fn row_counts(&self, column: &PruningColumn) -> Option<ArrayRef> {
         // row counts are the same for all columns in a row group
         self.statistics_converter(column)
             .and_then(|c| Ok(c.row_group_row_counts(self.metadata_iter())?))
@@ -641,7 +719,7 @@ impl PruningStatistics for RowGroupPruningStatistics<'_> {
 
     fn contained(
         &self,
-        _column: &Column,
+        _column: &PruningColumn,
         _values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray> {
         None
@@ -660,12 +738,13 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use datafusion_common::Result;
     use datafusion_expr::{Expr, cast, col, lit};
+    use datafusion_functions::core::get_field;
     use datafusion_physical_expr::planner::logical2physical;
     use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
     use object_store::ObjectStoreExt;
     use parquet::arrow::ArrowSchemaConverter;
     use parquet::arrow::async_reader::ParquetObjectReader;
-    use parquet::basic::LogicalType;
+    use parquet::basic::{LogicalType, Repetition};
     use parquet::data_type::{ByteArray, FixedLenByteArray};
     use parquet::file::metadata::ColumnChunkMetaData;
     use parquet::{
@@ -1796,5 +1875,365 @@ mod tests {
             .await;
 
         Ok(pruned_row_groups)
+    }
+
+    /// Build a Parquet SchemaDescriptor for a struct column.
+    ///
+    /// Creates: `s: struct { value: INT32, label: BYTE_ARRAY }`
+    /// Parquet leaves: s.value (index 0), s.label (index 1)
+    fn get_struct_schema_descr() -> SchemaDescPtr {
+        use parquet::schema::types::Type as SchemaType;
+
+        let value_field = Arc::new(
+            SchemaType::primitive_type_builder("value", PhysicalType::INT32)
+                .build()
+                .unwrap(),
+        );
+        let label_field = Arc::new(
+            SchemaType::primitive_type_builder("label", PhysicalType::BYTE_ARRAY)
+                .with_logical_type(Some(LogicalType::String))
+                .build()
+                .unwrap(),
+        );
+        let struct_group = Arc::new(
+            SchemaType::group_type_builder("s")
+                .with_fields(vec![value_field, label_field])
+                .with_repetition(Repetition::REQUIRED)
+                .build()
+                .unwrap(),
+        );
+        let schema = SchemaType::group_type_builder("schema")
+            .with_fields(vec![struct_group])
+            .build()
+            .unwrap();
+        Arc::new(SchemaDescriptor::new(Arc::new(schema)))
+    }
+
+    /// Test that row group pruning works for struct field predicates.
+    ///
+    /// Creates two row groups with statistics for `s.value`:
+    /// - RG0: s.value min=1, max=10
+    /// - RG1: s.value min=11, max=20
+    ///
+    /// Predicate: `get_field(s, 'value') > 15`
+    /// Expected: RG0 is pruned (max=10 < 15), RG1 remains (max=20 >= 15)
+    #[test]
+    fn row_group_pruning_predicate_struct_field() {
+        let struct_fields: arrow::datatypes::Fields = vec![
+            Arc::new(Field::new("value", DataType::Int32, false)),
+            Arc::new(Field::new("label", DataType::Utf8, false)),
+        ]
+        .into();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(struct_fields),
+            false,
+        )]));
+
+        // get_field(s, 'value') > 15
+        let get_field_expr = get_field().call(vec![
+            col("s"),
+            Expr::Literal(ScalarValue::Utf8(Some("value".to_string())), None),
+        ]);
+        let predicate = get_field_expr.gt(lit(15i32));
+        let expr = logical2physical(&predicate, &schema);
+        let pruning_predicate = PruningPredicate::try_new(expr, schema.clone()).unwrap();
+
+        let schema_descr = get_struct_schema_descr();
+
+        // RG0: s.value min=1, max=10  → should be PRUNED (max < 15)
+        let rgm0 = get_row_group_meta_data(
+            &schema_descr,
+            vec![
+                ParquetStatistics::int32(Some(1), Some(10), None, Some(0), false),
+                ParquetStatistics::byte_array(None, None, None, Some(0), false),
+            ],
+        );
+        // RG1: s.value min=11, max=20  → should REMAIN (max >= 15)
+        let rgm1 = get_row_group_meta_data(
+            &schema_descr,
+            vec![
+                ParquetStatistics::int32(Some(11), Some(20), None, Some(0), false),
+                ParquetStatistics::byte_array(None, None, None, Some(0), false),
+            ],
+        );
+
+        let metrics = parquet_file_metrics();
+        let mut row_groups = RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(2));
+        row_groups.prune_by_statistics(
+            &schema,
+            &schema_descr,
+            &[rgm0, rgm1],
+            &pruning_predicate,
+            &metrics,
+        );
+
+        // Only RG1 (index 1) should remain
+        assert_pruned(row_groups, ExpectedPruning::Some(vec![1]));
+    }
+
+    /// Test that row group pruning works when all row groups match
+    /// the struct field predicate.
+    #[test]
+    fn row_group_pruning_predicate_struct_field_no_pruning() {
+        let struct_fields: arrow::datatypes::Fields =
+            vec![Arc::new(Field::new("value", DataType::Int32, false))].into();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(struct_fields),
+            false,
+        )]));
+
+        // get_field(s, 'value') > 0 — both row groups should pass
+        let get_field_expr = get_field().call(vec![
+            col("s"),
+            Expr::Literal(ScalarValue::Utf8(Some("value".to_string())), None),
+        ]);
+        let predicate = get_field_expr.gt(lit(0i32));
+        let expr = logical2physical(&predicate, &schema);
+        let pruning_predicate = PruningPredicate::try_new(expr, schema.clone()).unwrap();
+
+        // Single leaf column (s.value)
+        let schema_descr = {
+            use parquet::schema::types::Type as SchemaType;
+            let value_field = Arc::new(
+                SchemaType::primitive_type_builder("value", PhysicalType::INT32)
+                    .build()
+                    .unwrap(),
+            );
+            let struct_group = Arc::new(
+                SchemaType::group_type_builder("s")
+                    .with_fields(vec![value_field])
+                    .with_repetition(Repetition::REQUIRED)
+                    .build()
+                    .unwrap(),
+            );
+            let schema = SchemaType::group_type_builder("schema")
+                .with_fields(vec![struct_group])
+                .build()
+                .unwrap();
+            Arc::new(SchemaDescriptor::new(Arc::new(schema)))
+        };
+
+        let rgm0 = get_row_group_meta_data(
+            &schema_descr,
+            vec![ParquetStatistics::int32(
+                Some(1),
+                Some(10),
+                None,
+                Some(0),
+                false,
+            )],
+        );
+        let rgm1 = get_row_group_meta_data(
+            &schema_descr,
+            vec![ParquetStatistics::int32(
+                Some(11),
+                Some(20),
+                None,
+                Some(0),
+                false,
+            )],
+        );
+
+        let metrics = parquet_file_metrics();
+        let mut row_groups = RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(2));
+        row_groups.prune_by_statistics(
+            &schema,
+            &schema_descr,
+            &[rgm0, rgm1],
+            &pruning_predicate,
+            &metrics,
+        );
+
+        // Both row groups should remain (all have max > 0)
+        assert_pruned(row_groups, ExpectedPruning::None);
+    }
+
+    /// Test that row group pruning works when ALL row groups can be pruned
+    /// by the struct field predicate.
+    #[test]
+    fn row_group_pruning_predicate_struct_field_all_pruned() {
+        let struct_fields: arrow::datatypes::Fields =
+            vec![Arc::new(Field::new("value", DataType::Int32, false))].into();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(struct_fields),
+            false,
+        )]));
+
+        // get_field(s, 'value') > 100 — no row groups match
+        let get_field_expr = get_field().call(vec![
+            col("s"),
+            Expr::Literal(ScalarValue::Utf8(Some("value".to_string())), None),
+        ]);
+        let predicate = get_field_expr.gt(lit(100i32));
+        let expr = logical2physical(&predicate, &schema);
+        let pruning_predicate = PruningPredicate::try_new(expr, schema.clone()).unwrap();
+
+        let schema_descr = {
+            use parquet::schema::types::Type as SchemaType;
+            let value_field = Arc::new(
+                SchemaType::primitive_type_builder("value", PhysicalType::INT32)
+                    .build()
+                    .unwrap(),
+            );
+            let struct_group = Arc::new(
+                SchemaType::group_type_builder("s")
+                    .with_fields(vec![value_field])
+                    .with_repetition(Repetition::REQUIRED)
+                    .build()
+                    .unwrap(),
+            );
+            let schema = SchemaType::group_type_builder("schema")
+                .with_fields(vec![struct_group])
+                .build()
+                .unwrap();
+            Arc::new(SchemaDescriptor::new(Arc::new(schema)))
+        };
+
+        // RG0: max=10, RG1: max=20 — both below 100
+        let rgm0 = get_row_group_meta_data(
+            &schema_descr,
+            vec![ParquetStatistics::int32(
+                Some(1),
+                Some(10),
+                None,
+                Some(0),
+                false,
+            )],
+        );
+        let rgm1 = get_row_group_meta_data(
+            &schema_descr,
+            vec![ParquetStatistics::int32(
+                Some(11),
+                Some(20),
+                None,
+                Some(0),
+                false,
+            )],
+        );
+
+        let metrics = parquet_file_metrics();
+        let mut row_groups = RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(2));
+        row_groups.prune_by_statistics(
+            &schema,
+            &schema_descr,
+            &[rgm0, rgm1],
+            &pruning_predicate,
+            &metrics,
+        );
+
+        // All row groups should be pruned
+        assert_pruned(row_groups, ExpectedPruning::All);
+    }
+
+    /// End-to-end test: write a parquet file with struct columns and multiple
+    /// row groups, then verify row group pruning actually skips the right ones.
+    #[test]
+    fn row_group_pruning_struct_field_end_to_end() {
+        use arrow::array::{Int32Array, StringArray, StructArray};
+        use arrow::record_batch::RecordBatch;
+        use datafusion_functions::core::get_field;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use tempfile::NamedTempFile;
+
+        let struct_fields: arrow::datatypes::Fields = vec![
+            Arc::new(Field::new("value", DataType::Int32, false)),
+            Arc::new(Field::new("label", DataType::Utf8, false)),
+        ]
+        .into();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(struct_fields.clone()),
+            false,
+        )]));
+
+        // Write two row groups:
+        // RG0: s.value in [1, 5, 10]
+        // RG1: s.value in [11, 15, 20]
+        let batch0 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StructArray::new(
+                struct_fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 5, 10])) as _,
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])) as _,
+                ],
+                None,
+            ))],
+        )
+        .unwrap();
+
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StructArray::new(
+                struct_fields,
+                vec![
+                    Arc::new(Int32Array::from(vec![11, 15, 20])) as _,
+                    Arc::new(StringArray::from(vec!["d", "e", "f"])) as _,
+                ],
+                None,
+            ))],
+        )
+        .unwrap();
+
+        let file = NamedTempFile::new().unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3)) // force each batch into its own row group
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            file.reopen().unwrap(),
+            Arc::clone(&schema),
+            Some(props),
+        )
+        .unwrap();
+        writer.write(&batch0).unwrap();
+        writer.write(&batch1).unwrap();
+        writer.close().unwrap();
+
+        // Read back and verify two row groups were created
+        let reader_file = file.reopen().unwrap();
+        let builder =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                reader_file,
+            )
+            .unwrap();
+        let metadata = builder.metadata().clone();
+        assert_eq!(
+            metadata.num_row_groups(),
+            2,
+            "expected 2 row groups in test file"
+        );
+
+        let file_schema = builder.schema().clone();
+
+        // Predicate: get_field(s, 'value') > 12
+        // RG0 has max=10, should be pruned
+        // RG1 has max=20, should remain
+        let get_field_expr = get_field().call(vec![
+            col("s"),
+            Expr::Literal(ScalarValue::Utf8(Some("value".to_string())), None),
+        ]);
+        let predicate = get_field_expr.gt(lit(12i32));
+        let expr = logical2physical(&predicate, &file_schema);
+        let pruning_predicate =
+            PruningPredicate::try_new(expr, file_schema.clone()).unwrap();
+
+        let metrics = parquet_file_metrics();
+        let mut row_groups = RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(
+            metadata.num_row_groups(),
+        ));
+        row_groups.prune_by_statistics(
+            &file_schema,
+            metadata.file_metadata().schema_descr(),
+            metadata.row_groups(),
+            &pruning_predicate,
+            &metrics,
+        );
+
+        // Only RG1 should remain
+        assert_pruned(row_groups, ExpectedPruning::Some(vec![1]));
     }
 }

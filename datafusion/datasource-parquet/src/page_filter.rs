@@ -29,7 +29,7 @@ use arrow::{
     datatypes::{Schema, SchemaRef},
 };
 use datafusion_common::ScalarValue;
-use datafusion_common::pruning::PruningStatistics;
+use datafusion_common::pruning::{PruningColumn, PruningStatistics};
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 use datafusion_pruning::PruningPredicate;
 
@@ -463,7 +463,7 @@ impl<'a> PagesPruningStatistics<'a> {
     }
 }
 impl PruningStatistics for PagesPruningStatistics<'_> {
-    fn min_values(&self, _column: &datafusion_common::Column) -> Option<ArrayRef> {
+    fn min_values(&self, _column: &PruningColumn) -> Option<ArrayRef> {
         match self.converter.data_page_mins(
             self.column_index,
             self.offset_index,
@@ -477,7 +477,7 @@ impl PruningStatistics for PagesPruningStatistics<'_> {
         }
     }
 
-    fn max_values(&self, _column: &datafusion_common::Column) -> Option<ArrayRef> {
+    fn max_values(&self, _column: &PruningColumn) -> Option<ArrayRef> {
         match self.converter.data_page_maxes(
             self.column_index,
             self.offset_index,
@@ -495,7 +495,7 @@ impl PruningStatistics for PagesPruningStatistics<'_> {
         self.page_offsets.len()
     }
 
-    fn null_counts(&self, _column: &datafusion_common::Column) -> Option<ArrayRef> {
+    fn null_counts(&self, _column: &PruningColumn) -> Option<ArrayRef> {
         match self.converter.data_page_null_counts(
             self.column_index,
             self.offset_index,
@@ -509,7 +509,7 @@ impl PruningStatistics for PagesPruningStatistics<'_> {
         }
     }
 
-    fn row_counts(&self, _column: &datafusion_common::Column) -> Option<ArrayRef> {
+    fn row_counts(&self, _column: &PruningColumn) -> Option<ArrayRef> {
         match self.converter.data_page_row_counts(
             self.offset_index,
             self.row_group_metadatas,
@@ -525,7 +525,7 @@ impl PruningStatistics for PagesPruningStatistics<'_> {
 
     fn contained(
         &self,
-        _column: &datafusion_common::Column,
+        _column: &PruningColumn,
         _values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray> {
         None

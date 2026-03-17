@@ -22,6 +22,7 @@ datafusion-datasource = { workspace = true }
 datafusion-expr-common = { workspace = true, default-features = true }
 datafusion-physical-expr = { workspace = true }
 datafusion-physical-expr-common = { workspace = true }
+datafusion-functions = { workspace = true }
 datafusion-physical-plan = { workspace = true }
 log = { workspace = true }
 

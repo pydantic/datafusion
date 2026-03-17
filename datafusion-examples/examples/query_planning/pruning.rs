@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, Int32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::pruning::PruningStatistics;
+use datafusion::common::pruning::{PruningColumn, PruningStatistics};
 use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::error::Result;
 use datafusion::execution::context::ExecutionProps;
@@ -148,40 +148,40 @@ impl PruningStatistics for MyCatalog {
         3
     }
 
-    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+    fn min_values(&self, column: &PruningColumn) -> Option<ArrayRef> {
         // The pruning predicate evaluates the bounds for multiple expressions
         // at once, so  return an array with an element for the minimum value in
         // each file
-        match column.name.as_str() {
+        match column.name() {
             "x" => Some(i32_array(self.x_values.iter().map(|(min, _)| min))),
             "y" => Some(i32_array(self.y_values.iter().map(|(min, _)| min))),
             name => panic!("unknown column name: {name}"),
         }
     }
 
-    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+    fn max_values(&self, column: &PruningColumn) -> Option<ArrayRef> {
         // similarly to min_values, return an array with an element for the
         // maximum value in each file
-        match column.name.as_str() {
+        match column.name() {
             "x" => Some(i32_array(self.x_values.iter().map(|(_, max)| max))),
             "y" => Some(i32_array(self.y_values.iter().map(|(_, max)| max))),
             name => panic!("unknown column name: {name}"),
         }
     }
 
-    fn null_counts(&self, _column: &Column) -> Option<ArrayRef> {
+    fn null_counts(&self, _column: &PruningColumn) -> Option<ArrayRef> {
         // In this example, we know nothing about the number of nulls
         None
     }
 
-    fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
+    fn row_counts(&self, _column: &PruningColumn) -> Option<ArrayRef> {
         // In this example, we know nothing about the number of rows in each file
         None
     }
 
     fn contained(
         &self,
-        _column: &Column,
+        _column: &PruningColumn,
         _values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray> {
         // this method can be used to implement Bloom filter like filtering
