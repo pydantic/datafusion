@@ -49,7 +49,8 @@ use datafusion_expr::{
     LogicalPlanBuilder, Operator, Projection, SortExpr, TableScan, Unnest,
     UserDefinedLogicalNode, expr::Alias,
 };
-use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
+use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef, VisitMut};
+use std::ops::ControlFlow;
 use std::{sync::Arc, vec};
 
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]
@@ -413,8 +414,21 @@ impl Unparser<'_> {
                 };
                 // Projection can be top-level plan for derived table
                 if select.already_projected() {
+                    let alias = "derived_projection";
+                    if self.dialect.requires_derived_table_alias() {
+                        // When wrapping this projection as a derived subquery
+                        // with an alias, strip qualifiers from the outer
+                        // SELECT items so they don't reference tables that are
+                        // now hidden inside the subquery.
+                        // Unqualified column names are valid because the derived
+                        // table is the only FROM source.
+                        let items = select.pop_projections();
+                        let dequalified =
+                            items.into_iter().map(dequalify_select_item).collect();
+                        select.projection(dequalified);
+                    }
                     return self.derive_with_dialect_alias(
-                        "derived_projection",
+                        alias,
                         plan,
                         relation,
                         unnest_input_type
@@ -1413,6 +1427,50 @@ impl Unparser<'_> {
             vec![Expr::Literal(ScalarValue::Int64(Some(1)), None)]
         }
     }
+}
+
+/// Strips table qualifiers from column references in a [`ast::SelectItem`].
+///
+/// When a projection is wrapped in a derived subquery (e.g. `(SELECT ...) AS alias`),
+/// column references in the outer SELECT that used the original table qualifier
+/// become invalid because those tables are now hidden inside the subquery.
+/// Stripping the qualifier makes them unqualified, which is valid because the
+/// derived table is the sole FROM source.
+///
+/// For example, `"base"."name"` becomes `"name"`.
+///
+/// This only affects [`ast::Expr::CompoundIdentifier`] nodes with 2+ parts,
+/// keeping only the final column name identifier.
+///
+/// Safety: this strips *all* qualifiers, not just stale ones, so it is only
+/// correct when the derived table is the sole FROM source (no JOINs in the
+/// outer query). The `already_projected()` guard in the caller ensures this.
+fn dequalify_select_item(mut item: ast::SelectItem) -> ast::SelectItem {
+    struct Dequalifier;
+
+    impl ast::VisitorMut for Dequalifier {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &mut ast::Expr) -> ControlFlow<Self::Break> {
+            if let ast::Expr::CompoundIdentifier(idents) = expr
+                && idents.len() >= 2
+            {
+                let col_name = idents.last().unwrap().clone();
+                *expr = ast::Expr::Identifier(col_name);
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut visitor = Dequalifier;
+    match &mut item {
+        ast::SelectItem::UnnamedExpr(expr)
+        | ast::SelectItem::ExprWithAlias { expr, .. } => {
+            let _ = expr.visit(&mut visitor);
+        }
+        ast::SelectItem::QualifiedWildcard(..) | ast::SelectItem::Wildcard(..) => {}
+    }
+    item
 }
 
 impl From<BuilderError> for DataFusionError {

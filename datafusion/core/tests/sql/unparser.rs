@@ -45,7 +45,10 @@ use datafusion_common::Column;
 use datafusion_expr::Expr;
 use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_sql::unparser::Unparser;
-use datafusion_sql::unparser::dialect::DefaultDialect;
+use datafusion_sql::unparser::dialect::{
+    DefaultDialect, Dialect, DuckDBDialect, MySqlDialect, PostgreSqlDialect,
+    SqliteDialect,
+};
 use itertools::Itertools;
 use recursive::{set_minimum_stack_size, set_stack_allocation_size};
 
@@ -140,6 +143,35 @@ fn tpch_queries() -> Vec<TestQuery> {
     println!("Total TPC-H queries found: {}", queries.len());
     queries.sort_unstable_by_key(|q| q.name.clone());
     queries
+}
+
+/// Regression queries for specific bugs found in the unparser.
+fn regression_queries() -> Vec<TestQuery> {
+    vec![
+        // Stacked Projections from CSE + PostgreSqlDialect's required derived table
+        // alias ("derived_projection") break SQL roundtrip: outer column refs keep the
+        // original SubqueryAlias qualifier ("base") which doesn't match the alias.
+        TestQuery {
+            name: "cse_derived_projection".to_string(),
+            sql: "\
+                WITH base AS (SELECT name, salary FROM t) \
+                SELECT name, \
+                    CASE WHEN SUM(salary) > 0 THEN 1 ELSE 0 END AS x, \
+                    CASE WHEN SUM(salary) > 0 THEN SUM(salary) ELSE 0 END AS y \
+                FROM base GROUP BY name"
+                .to_string(),
+        },
+    ]
+}
+
+/// Create a new SessionContext for regression tests.
+async fn regression_test_context() -> Result<SessionContext> {
+    let ctx = SessionContext::new();
+    ctx.sql("CREATE TABLE t (name TEXT, salary DOUBLE) AS VALUES ('a', 1.0), ('b', 2.0)")
+        .await?
+        .collect()
+        .await?;
+    Ok(ctx)
 }
 
 /// Create a new SessionContext for testing that has all Clickbench tables registered.
@@ -284,22 +316,28 @@ impl TestCaseResult {
 ///
 /// This is the core test logic that:
 /// 1. Parses the original SQL and creates a logical plan
-/// 2. Unparses the logical plan back to SQL
-/// 3. Executes both the original and unparsed queries
-/// 4. Compares the results (sorting if the query has no ORDER BY)
-///
-/// This always uses [`DefaultDialect`] for unparsing.
+/// 2. Optionally optimizes the plan (to test unparser against optimizer output like CSE)
+/// 3. Unparses the logical plan back to SQL using the given dialect
+/// 4. Executes both the original and unparsed queries
+/// 5. Compares the results (sorting if the query has no ORDER BY)
 ///
 /// # Arguments
 ///
 /// * `ctx` - Session context with tables registered
 /// * `original` - The original SQL query to test
+/// * `dialect` - The unparser dialect to use
+/// * `optimize` - Whether to optimize the logical plan before unparsing
 ///
 /// # Returns
 ///
 /// A [`TestCaseResult`] indicating success or the specific failure mode.
-async fn collect_results(ctx: &SessionContext, original: &str) -> TestCaseResult {
-    let unparser = Unparser::new(&DefaultDialect {});
+async fn collect_results(
+    ctx: &SessionContext,
+    original: &str,
+    dialect: &dyn Dialect,
+    optimize: bool,
+) -> TestCaseResult {
+    let unparser = Unparser::new(dialect);
 
     // Parse and create logical plan from original SQL
     let df = match ctx.sql(original).await {
@@ -312,8 +350,23 @@ async fn collect_results(ctx: &SessionContext, original: &str) -> TestCaseResult
         }
     };
 
+    // Optionally optimize the plan before unparsing
+    let plan = if optimize {
+        match ctx.state().optimize(df.logical_plan()) {
+            Ok(optimized) => optimized,
+            Err(e) => {
+                return TestCaseResult::ExecutionError {
+                    original: original.to_string(),
+                    error: format!("Failed to optimize plan: {e}"),
+                };
+            }
+        }
+    } else {
+        df.logical_plan().clone()
+    };
+
     // Unparse the logical plan back to SQL
-    let unparsed = match unparser.plan_to_sql(df.logical_plan()) {
+    let unparsed = match unparser.plan_to_sql(&plan) {
         Ok(sql) => format!("{sql:#}"),
         Err(e) => {
             return TestCaseResult::UnparseError {
@@ -419,6 +472,8 @@ async fn run_roundtrip_tests<F, Fut>(
     suite_name: &str,
     queries: Vec<TestQuery>,
     create_context: F,
+    dialect: &dyn Dialect,
+    optimize: bool,
 ) where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<SessionContext>>,
@@ -433,7 +488,7 @@ async fn run_roundtrip_tests<F, Fut>(
                 continue;
             }
         };
-        let result = collect_results(&ctx, &sql.sql).await;
+        let result = collect_results(&ctx, &sql.sql, dialect, optimize).await;
         if result.is_failure() {
             println!("\x1b[31m✗\x1b[0m {} query: {}", suite_name, sql.name);
             errors.push(result.format_error(&sql.name));
@@ -451,10 +506,39 @@ async fn run_roundtrip_tests<F, Fut>(
     }
 }
 
+/// Returns all dialects to test, paired with their display names.
+fn all_dialects() -> Vec<(&'static str, Box<dyn Dialect>)> {
+    vec![
+        ("Default", Box::new(DefaultDialect {})),
+        ("PostgreSQL", Box::new(PostgreSqlDialect {})),
+        ("MySQL", Box::new(MySqlDialect {})),
+        ("SQLite", Box::new(SqliteDialect {})),
+        ("DuckDB", Box::new(DuckDBDialect::default())),
+        // BigQuery has known issues with col_alias_overrides encoding
+        // special characters in CSE-generated column names (e.g.
+        // "sum(base.salary)" becomes "sum_40base_46salary_41"), which
+        // breaks roundtrip tests with optimized plans. Should be fixed
+        // in the BigQuery dialect's unparser.
+        // ("BigQuery", Box::new(BigQueryDialect {})),
+    ]
+}
+
 #[tokio::test]
 async fn test_clickbench_unparser_roundtrip() {
-    run_roundtrip_tests("Clickbench", clickbench_queries(), clickbench_test_context)
-        .await;
+    for (dialect_name, dialect) in all_dialects() {
+        for optimize in [false, true] {
+            let opt_label = if optimize { ", optimized" } else { "" };
+            let suite = format!("Clickbench ({dialect_name}{opt_label})");
+            run_roundtrip_tests(
+                &suite,
+                clickbench_queries(),
+                clickbench_test_context,
+                dialect.as_ref(),
+                optimize,
+            )
+            .await;
+        }
+    }
 }
 
 #[tokio::test]
@@ -462,5 +546,36 @@ async fn test_tpch_unparser_roundtrip() {
     // Grow stacker segments earlier to avoid deep unparser recursion overflow in q20.
     set_minimum_stack_size(512 * 1024);
     set_stack_allocation_size(8 * 1024 * 1024);
-    run_roundtrip_tests("TPC-H", tpch_queries(), tpch_test_context).await;
+    for (dialect_name, dialect) in all_dialects() {
+        for optimize in [false, true] {
+            let opt_label = if optimize { ", optimized" } else { "" };
+            let suite = format!("TPC-H ({dialect_name}{opt_label})");
+            run_roundtrip_tests(
+                &suite,
+                tpch_queries(),
+                tpch_test_context,
+                dialect.as_ref(),
+                optimize,
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_regression_unparser_roundtrip() {
+    for (dialect_name, dialect) in all_dialects() {
+        for optimize in [false, true] {
+            let opt_label = if optimize { ", optimized" } else { "" };
+            let suite = format!("Regression ({dialect_name}{opt_label})");
+            run_roundtrip_tests(
+                &suite,
+                regression_queries(),
+                regression_test_context,
+                dialect.as_ref(),
+                optimize,
+            )
+            .await;
+        }
+    }
 }
