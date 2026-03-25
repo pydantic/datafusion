@@ -22,7 +22,9 @@ use rstest::rstest;
 use datafusion::config::ConfigOptions;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::metrics::Timestamp;
-use datafusion_common::format::ExplainAnalyzeLevel;
+use datafusion_common::format::{
+    ExplainAnalyzeCategories, ExplainAnalyzeLevel, MetricCategory,
+};
 use object_store::path::Path;
 
 #[tokio::test]
@@ -211,6 +213,23 @@ async fn collect_plan_with_context(
         let state = ctx.state_ref();
         let mut state = state.write();
         state.config_mut().options_mut().explain.analyze_level = level;
+    }
+    let dataframe = ctx.sql(sql_str).await.unwrap();
+    let batches = dataframe.collect().await.unwrap();
+    arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string()
+}
+
+async fn collect_plan_with_categories(
+    sql_str: &str,
+    categories: ExplainAnalyzeCategories,
+) -> String {
+    let ctx = SessionContext::new();
+    {
+        let state = ctx.state_ref();
+        let mut state = state.write();
+        state.config_mut().options_mut().explain.analyze_categories = categories;
     }
     let dataframe = ctx.sql(sql_str).await.unwrap();
     let batches = dataframe.collect().await.unwrap();
@@ -1157,6 +1176,81 @@ async fn explain_analyze_hash_join() {
             plan.contains(needle),
             should_contain,
             "plan for level {level:?} unexpected content: {plan}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn explain_analyze_categories() {
+    let sql = "EXPLAIN ANALYZE \
+            SELECT * \
+            FROM generate_series(10) as t1(v1) \
+            ORDER BY v1 DESC";
+
+    for (categories, needle, should_contain) in [
+        // "rows" category: output_rows yes, elapsed_compute no, output_bytes no
+        (
+            ExplainAnalyzeCategories::Only(vec![MetricCategory::Rows]),
+            "output_rows",
+            true,
+        ),
+        (
+            ExplainAnalyzeCategories::Only(vec![MetricCategory::Rows]),
+            "elapsed_compute",
+            false,
+        ),
+        (
+            ExplainAnalyzeCategories::Only(vec![MetricCategory::Rows]),
+            "output_bytes",
+            false,
+        ),
+        // "none" — plan only, no metrics at all
+        (
+            ExplainAnalyzeCategories::Only(vec![]),
+            "output_rows",
+            false,
+        ),
+        (
+            ExplainAnalyzeCategories::Only(vec![]),
+            "elapsed_compute",
+            false,
+        ),
+        // "all" — everything shown
+        (ExplainAnalyzeCategories::All, "output_rows", true),
+        (ExplainAnalyzeCategories::All, "elapsed_compute", true),
+        (ExplainAnalyzeCategories::All, "output_bytes", true),
+        // "rows,bytes" — row + byte metrics, no timing
+        (
+            ExplainAnalyzeCategories::Only(vec![
+                MetricCategory::Rows,
+                MetricCategory::Bytes,
+            ]),
+            "output_rows",
+            true,
+        ),
+        (
+            ExplainAnalyzeCategories::Only(vec![
+                MetricCategory::Rows,
+                MetricCategory::Bytes,
+            ]),
+            "output_bytes",
+            true,
+        ),
+        (
+            ExplainAnalyzeCategories::Only(vec![
+                MetricCategory::Rows,
+                MetricCategory::Bytes,
+            ]),
+            "elapsed_compute",
+            false,
+        ),
+    ] {
+        let plan = collect_plan_with_categories(sql, categories.clone()).await;
+        assert_eq!(
+            plan.contains(needle),
+            should_contain,
+            "plan for categories {categories:?} should{} contain '{needle}':\n{plan}",
+            if should_contain { "" } else { " NOT" }
         );
     }
 }

@@ -66,3 +66,65 @@ Plan with Metrics
 
 statement ok
 reset datafusion.explain.analyze_level;
+
+# ------------------------------------------------
+# Test analyze_categories: filter metrics by kind
+# ------------------------------------------------
+
+# "rows" — only row-count metrics (deterministic), no timing or bytes
+statement ok
+set datafusion.explain.analyze_categories = 'rows';
+
+query TT
+EXPLAIN ANALYZE SELECT * FROM generate_series(100);
+----
+Plan with Metrics LazyMemoryExec: partitions=1, batch_generators=[generate_series: start=0, end=100, batch_size=8192], metrics=[output_rows=101, output_batches=1]
+
+statement ok
+reset datafusion.explain.analyze_categories;
+
+# "none" — plan only, all metrics suppressed (empty brackets)
+statement ok
+set datafusion.explain.analyze_categories = 'none';
+
+query TT
+EXPLAIN ANALYZE SELECT * FROM generate_series(100);
+----
+Plan with Metrics LazyMemoryExec: partitions=1, batch_generators=[generate_series: start=0, end=100, batch_size=8192], metrics=[]
+
+statement ok
+reset datafusion.explain.analyze_categories;
+
+# "rows,bytes" — row + byte metrics, no timing
+statement ok
+set datafusion.explain.analyze_categories = 'rows,bytes';
+
+query TT
+EXPLAIN ANALYZE SELECT * FROM generate_series(100);
+----
+Plan with Metrics LazyMemoryExec: partitions=1, batch_generators=[generate_series: start=0, end=100, batch_size=8192], metrics=[output_rows=101, output_bytes=<slt:ignore>]
+
+statement ok
+reset datafusion.explain.analyze_categories;
+
+# "rows" with dev level — per-expression timing excluded, batches included
+statement ok
+set datafusion.explain.analyze_level = dev;
+
+statement ok
+set datafusion.explain.analyze_categories = 'rows';
+
+query TT
+EXPLAIN ANALYZE
+SELECT a
+FROM generate_series(1, 100) as t1(a);
+----
+Plan with Metrics
+01)ProjectionExec: expr=[value@0 as a], metrics=[output_rows=100, output_batches=1]
+02)--LazyMemoryExec: partitions=1, batch_generators=[generate_series: start=1, end=100, batch_size=8192], metrics=[output_rows=100, output_batches=1]
+
+statement ok
+reset datafusion.explain.analyze_level;
+
+statement ok
+reset datafusion.explain.analyze_categories;

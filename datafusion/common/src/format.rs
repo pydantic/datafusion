@@ -206,6 +206,142 @@ impl ConfigField for ExplainFormat {
     }
 }
 
+/// Classifies a metric by what it measures.
+///
+/// This is orthogonal to [`MetricType`] (SUMMARY / DEV), which controls
+/// *verbosity*. `MetricCategory` controls *what kind of value* is shown,
+/// so that `EXPLAIN ANALYZE` output can be narrowed to only the categories
+/// that are useful in a given context.
+///
+/// For testing, the key property is **determinism**:
+/// - [`Rows`](Self::Rows) and [`Bytes`](Self::Bytes) depend on the plan
+///   and the data, so they are deterministic across runs (given the same
+///   input).
+/// - [`Timing`](Self::Timing) depends on hardware, system load, scheduling,
+///   etc., so it varies from run to run even on the same machine.
+///
+/// [`MetricCategory`] is especially useful in sqllogictest (`.slt`) files:
+/// setting `datafusion.explain.analyze_categories = 'rows'` lets a test
+/// assert on row-count metrics without sprinkling `<slt:ignore>` over every
+/// timing value.
+///
+/// Metrics that do not declare a category (the default for custom
+/// `Count` / `Gauge` metrics) are **always included** unless the config
+/// is set to `'none'`.
+///
+/// [`MetricType`]: datafusion_physical_expr_common::metrics::MetricType
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MetricCategory {
+    /// Row counts and related dimensionless counters: `output_rows`,
+    /// `spilled_rows`, `output_batches`, pruning metrics, ratios, etc.
+    ///
+    /// Deterministic given the same plan and data.
+    Rows,
+    /// Byte measurements: `output_bytes`, `spilled_bytes`,
+    /// `current_memory_usage`, `bytes_scanned`, etc.
+    ///
+    /// Deterministic given the same plan and data.
+    Bytes,
+    /// Wall-clock durations and timestamps: `elapsed_compute`,
+    /// operator-defined `Time` metrics, `start_timestamp` /
+    /// `end_timestamp`, etc.
+    ///
+    /// **Non-deterministic** — varies across runs even on the same hardware.
+    Timing,
+}
+
+/// Controls which [`MetricCategory`] values are shown in `EXPLAIN ANALYZE`.
+///
+/// Set via `SET datafusion.explain.analyze_categories = '...'`.
+///
+/// See [`MetricCategory`] for the determinism properties that motivate
+/// this filter.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ExplainAnalyzeCategories {
+    /// Show all metrics regardless of category (the default).
+    All,
+    /// Show only metrics whose category is in the list.
+    /// Metrics that have no declared category are still included
+    /// (they are treated as "always on").
+    ///
+    /// An **empty** vec means "plan only" — suppress all metrics.
+    Only(Vec<MetricCategory>),
+}
+
+impl Default for ExplainAnalyzeCategories {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+impl FromStr for ExplainAnalyzeCategories {
+    type Err = DataFusionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim().to_lowercase();
+        match s.as_str() {
+            "all" => Ok(Self::All),
+            "none" => Ok(Self::Only(vec![])),
+            other => {
+                let mut cats = Vec::new();
+                for part in other.split(',') {
+                    let part = part.trim();
+                    match part {
+                        "rows" => cats.push(MetricCategory::Rows),
+                        "bytes" => cats.push(MetricCategory::Bytes),
+                        "timing" => cats.push(MetricCategory::Timing),
+                        unknown => {
+                            return Err(DataFusionError::Configuration(format!(
+                                "Invalid metric category '{unknown}'. \
+                                 Expected 'all', 'none', or comma-separated list of \
+                                 'rows', 'bytes', 'timing'."
+                            )));
+                        }
+                    }
+                }
+                cats.dedup();
+                Ok(Self::Only(cats))
+            }
+        }
+    }
+}
+
+impl Display for ExplainAnalyzeCategories {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::All => write!(f, "all"),
+            Self::Only(cats) if cats.is_empty() => write!(f, "none"),
+            Self::Only(cats) => {
+                let mut first = true;
+                for cat in cats {
+                    if !first {
+                        write!(f, ",")?;
+                    }
+                    first = false;
+                    let s = match cat {
+                        MetricCategory::Rows => "rows",
+                        MetricCategory::Bytes => "bytes",
+                        MetricCategory::Timing => "timing",
+                    };
+                    write!(f, "{s}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl ConfigField for ExplainAnalyzeCategories {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        v.some(key, self, description)
+    }
+
+    fn set(&mut self, _: &str, value: &str) -> Result<()> {
+        *self = ExplainAnalyzeCategories::from_str(value)?;
+        Ok(())
+    }
+}
+
 /// Verbosity levels controlling how `EXPLAIN ANALYZE` renders metrics
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExplainAnalyzeLevel {

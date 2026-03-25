@@ -24,6 +24,7 @@ mod expression;
 mod value;
 
 use datafusion_common::HashMap;
+pub use datafusion_common::format::MetricCategory;
 use parking_lot::Mutex;
 use std::{
     borrow::Cow,
@@ -81,6 +82,13 @@ pub struct Metric {
     partition: Option<usize>,
 
     metric_type: MetricType,
+
+    /// Optional semantic category (rows / bytes / timing).
+    ///
+    /// When `None` (the default for custom metrics), the metric is
+    /// **always included** unless the user sets
+    /// `analyze_categories = 'none'`.
+    metric_category: Option<MetricCategory>,
 }
 
 /// Categorizes metrics so the display layer can choose the desired verbosity.
@@ -147,6 +155,7 @@ impl Metric {
             labels: vec![],
             partition,
             metric_type: MetricType::DEV,
+            metric_category: None,
         }
     }
 
@@ -162,12 +171,22 @@ impl Metric {
             labels,
             partition,
             metric_type: MetricType::DEV,
+            metric_category: None,
         }
     }
 
     /// Set the type for this metric. Defaults to [`MetricType::DEV`]
     pub fn with_type(mut self, metric_type: MetricType) -> Self {
         self.metric_type = metric_type;
+        self
+    }
+
+    /// Set the semantic category for this metric.
+    ///
+    /// See [`MetricCategory`] for details on the determinism properties
+    /// of each category.
+    pub fn with_category(mut self, category: MetricCategory) -> Self {
+        self.metric_category = Some(category);
         self
     }
 
@@ -200,6 +219,13 @@ impl Metric {
     /// Return the metric type (verbosity level) associated with this metric
     pub fn metric_type(&self) -> MetricType {
         self.metric_type
+    }
+
+    /// Return the metric category, if one was declared.
+    ///
+    /// `None` means the metric is always included (except in `none` mode).
+    pub fn metric_category(&self) -> Option<MetricCategory> {
+        self.metric_category
     }
 }
 
@@ -327,6 +353,9 @@ impl MetricsSet {
                     let partition = None;
                     let mut accum = Metric::new(metric.value().new_empty(), partition)
                         .with_type(metric.metric_type());
+                    if let Some(cat) = metric.metric_category() {
+                        accum = accum.with_category(cat);
+                    }
                     accum.value_mut().aggregate(metric.value());
                     accum
                 });
@@ -376,6 +405,31 @@ impl MetricsSet {
             .metrics
             .into_iter()
             .filter(|metric| allowed.contains(&metric.metric_type()))
+            .collect::<Vec<_>>();
+        Self { metrics }
+    }
+
+    /// Returns a new `MetricsSet` filtered by [`MetricCategory`].
+    ///
+    /// - Metrics that declared a category are kept only when that
+    ///   category appears in `allowed`.
+    /// - Metrics with **no** declared category (the default) are always
+    ///   kept — they act as a "fallback" that is present regardless of
+    ///   the filter.
+    /// - An **empty** `allowed` slice means "plan only": all metrics are
+    ///   removed.
+    pub fn filter_by_categories(self, allowed: &[MetricCategory]) -> Self {
+        if allowed.is_empty() {
+            return Self { metrics: vec![] };
+        }
+
+        let metrics = self
+            .metrics
+            .into_iter()
+            .filter(|metric| match metric.metric_category() {
+                None => true,
+                Some(cat) => allowed.contains(&cat),
+            })
             .collect::<Vec<_>>();
         Self { metrics }
     }

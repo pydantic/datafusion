@@ -22,7 +22,7 @@ use arrow_ipc::CompressionType;
 #[cfg(feature = "parquet_encryption")]
 use crate::encryption::{FileDecryptionProperties, FileEncryptionProperties};
 use crate::error::_config_err;
-use crate::format::{ExplainAnalyzeLevel, ExplainFormat};
+use crate::format::{ExplainAnalyzeCategories, ExplainAnalyzeLevel, ExplainFormat};
 use crate::parquet_config::DFParquetWriterVersion;
 use crate::parsers::CompressionTypeVariant;
 use crate::utils::get_available_parallelism;
@@ -1212,6 +1212,12 @@ config_namespace! {
         /// "summary" shows common metrics for high-level insights.
         /// "dev" provides deep operator-level introspection for developers.
         pub analyze_level: ExplainAnalyzeLevel, default = ExplainAnalyzeLevel::Dev
+
+        /// Which metric categories to include in "EXPLAIN ANALYZE" output.
+        /// Comma-separated list of: "rows", "bytes", "timing".
+        /// Use "none" to show plan structure only, or "all" (default) to show everything.
+        /// Metrics without a declared category are always shown (except with "none").
+        pub analyze_categories: ExplainAnalyzeCategories, default = ExplainAnalyzeCategories::All
     }
 }
 

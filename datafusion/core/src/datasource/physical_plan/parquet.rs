@@ -235,6 +235,7 @@ mod tests {
                 false,
                 false,
                 vec![MetricType::SUMMARY, MetricType::DEV],
+                None,
                 // use a new ParquetSource to avoid sharing execution metrics
                 self.build_parquet_exec(
                     file_group.clone(),

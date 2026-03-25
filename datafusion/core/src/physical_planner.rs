@@ -64,7 +64,7 @@ use arrow_schema::Field;
 use datafusion_catalog::ScanArgs;
 use datafusion_common::Column;
 use datafusion_common::display::ToStringifiedPlan;
-use datafusion_common::format::ExplainAnalyzeLevel;
+use datafusion_common::format::{ExplainAnalyzeCategories, ExplainAnalyzeLevel};
 use datafusion_common::tree_node::{
     Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor,
 };
@@ -2720,10 +2720,17 @@ impl DefaultPhysicalPlanner {
             ExplainAnalyzeLevel::Summary => vec![MetricType::SUMMARY],
             ExplainAnalyzeLevel::Dev => vec![MetricType::SUMMARY, MetricType::DEV],
         };
+        let analyze_categories =
+            session_state.config_options().explain.analyze_categories.clone();
+        let metric_categories = match analyze_categories {
+            ExplainAnalyzeCategories::All => None,
+            ExplainAnalyzeCategories::Only(cats) => Some(cats),
+        };
         Ok(Arc::new(AnalyzeExec::new(
             a.verbose,
             show_statistics,
             metric_types,
+            metric_categories,
             input,
             schema,
         )))
