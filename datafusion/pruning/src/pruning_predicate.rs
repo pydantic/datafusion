@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow::{
-    array::{ArrayRef, BooleanArray, new_null_array},
+    array::{ArrayRef, BooleanArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::{RecordBatch, RecordBatchOptions},
 };
@@ -41,6 +41,7 @@ use datafusion_common::{
     ScalarValue, internal_datafusion_err, plan_datafusion_err, plan_err,
     tree_node::{Transformed, TreeNode},
 };
+use datafusion_expr::ExprFunctionExt;
 use datafusion_expr_common::operator::Operator;
 use datafusion_physical_expr::expressions::CastColumnExpr;
 use datafusion_physical_expr::utils::{Guarantee, LiteralGuarantee};
@@ -521,52 +522,95 @@ impl PruningPredicate {
         &self,
         statistics: &S,
     ) -> Result<Vec<bool>> {
-        let mut builder = BoolVecBuilder::new(statistics.num_containers());
+        let resolved = crate::statistics::resolve_all_sync(
+            statistics,
+            &self.all_required_expressions(),
+        );
+        self.evaluate(&resolved)
+    }
 
-        // Try to prove the predicate can't be true for the containers based on
-        // literal guarantees
+    /// Evaluates the pruning predicate against pre-resolved statistics.
+    ///
+    /// This is the sync evaluation phase of the two-phase
+    /// resolve-then-evaluate pattern. Statistics are resolved ahead of
+    /// time (possibly asynchronously via [`StatisticsSource`]) into a
+    /// [`ResolvedStatistics`] cache, then this method evaluates the
+    /// predicate against that cache synchronously.
+    ///
+    /// Returns the same `true`/`false` semantics as [`Self::prune`]:
+    /// - `true`: There MAY be rows that match the predicate
+    /// - `false`: There are no rows that could possibly match
+    ///
+    /// Missing entries in `resolved` are treated as unknown (null arrays),
+    /// which is conservative — the container will not be pruned.
+    ///
+    /// [`StatisticsSource`]: crate::StatisticsSource
+    /// [`ResolvedStatistics`]: crate::ResolvedStatistics
+    pub fn evaluate(
+        &self,
+        resolved: &crate::statistics::ResolvedStatistics,
+    ) -> Result<Vec<bool>> {
+        let mut builder = BoolVecBuilder::new(resolved.num_containers());
+
+        // Phase 1: Literal guarantees (InList lookups)
         for literal_guarantee in &self.literal_guarantees {
             let LiteralGuarantee {
                 column,
                 guarantee,
                 literals,
             } = literal_guarantee;
-            if let Some(results) = statistics.contained(column, literals) {
-                match guarantee {
-                    // `In` means the values in the column must be one of the
-                    // values in the set for the predicate to evaluate to true.
-                    // If `contained` returns false, that means the column is
-                    // not any of the values so we can prune the container
-                    Guarantee::In => builder.combine_array(&results),
-                    // `NotIn` means the values in the column must not be
-                    // any of the values in the set for the predicate to
-                    // evaluate to true. If `contained` returns true, it means the
-                    // column is only in the set of values so we can prune the
-                    // container
-                    Guarantee::NotIn => {
-                        builder.combine_array(&arrow::compute::not(&results)?)
-                    }
-                }
-                // if all containers are pruned (has rows that DEFINITELY DO NOT pass the predicate)
-                // can return early without evaluating the rest of predicates.
+
+            // Build the InList Expr that corresponds to this guarantee
+            let in_list_expr = literal_guarantee_to_in_list(
+                column,
+                literals,
+                matches!(guarantee, Guarantee::NotIn),
+            );
+
+            if let Some(array) = resolved.get(&in_list_expr)
+                && let Some(bool_arr) = array.as_any().downcast_ref::<BooleanArray>()
+            {
+                builder.combine_array(bool_arr);
                 if builder.check_all_pruned() {
                     return Ok(builder.build());
                 }
             }
         }
 
-        // Next, try to prove the predicate can't be true for the containers based
-        // on min/max values
-
-        // build a RecordBatch that contains the min/max values in the
-        // appropriate statistics columns for the min/max predicate
+        // Phase 2: Min/max/null_count/row_count predicate
         let statistics_batch =
-            build_statistics_record_batch(statistics, &self.required_columns)?;
-
-        // Evaluate the pruning predicate on that record batch and append any results to the builder
+            build_statistics_record_batch_from_resolved(resolved, &self.required_columns)?;
         builder.combine_value(self.predicate_expr.evaluate(&statistics_batch)?);
 
         Ok(builder.build())
+    }
+
+    /// Returns all expressions needed to fully evaluate this predicate,
+    /// including both aggregate statistics and literal guarantee InLists.
+    ///
+    /// Pass these to [`StatisticsSource::expression_statistics`] or
+    /// [`ResolvedStatistics::resolve`] to pre-fetch the needed data.
+    ///
+    /// [`StatisticsSource::expression_statistics`]: crate::StatisticsSource::expression_statistics
+    /// [`ResolvedStatistics::resolve`]: crate::ResolvedStatistics::resolve
+    pub fn all_required_expressions(&self) -> Vec<datafusion_expr::Expr> {
+        let mut exprs = Vec::new();
+
+        // Aggregate stats from RequiredColumns
+        for (column, statistics_type, _field) in self.required_columns.iter() {
+            exprs.push(stat_type_to_expr(column, *statistics_type));
+        }
+
+        // Literal guarantee InList expressions
+        for lg in &self.literal_guarantees {
+            exprs.push(literal_guarantee_to_in_list(
+                &lg.column,
+                &lg.literals,
+                matches!(lg.guarantee, Guarantee::NotIn),
+            ));
+        }
+
+        exprs
     }
 
     /// Return a reference to the input schema
@@ -913,10 +957,12 @@ impl From<Vec<(phys_expr::Column, StatisticsType, Field)>> for RequiredColumns {
 /// -------+--------
 ///   5    | 1000
 /// ```
+#[cfg(test)]
 fn build_statistics_record_batch<S: PruningStatistics + ?Sized>(
     statistics: &S,
     required_columns: &RequiredColumns,
 ) -> Result<RecordBatch> {
+    use arrow::array::new_null_array;
     let mut arrays = Vec::<ArrayRef>::new();
     // For each needed statistics column:
     for (column, statistics_type, stat_field) in required_columns.iter() {
@@ -1941,6 +1987,96 @@ fn wrap_null_count_check_expr(
         Operator::And,
         statistics_expr,
     )))
+}
+
+/// Convert a [`StatisticsType`] + column into the corresponding logical [`Expr`].
+fn stat_type_to_expr(
+    column: &phys_expr::Column,
+    stat_type: StatisticsType,
+) -> datafusion_expr::Expr {
+    use datafusion_expr::Expr as LExpr;
+    let col_expr = LExpr::Column(Column::new_unqualified(column.name()));
+    match stat_type {
+        StatisticsType::Min => {
+            datafusion_functions_aggregate::min_max::min_udaf()
+                .call(vec![col_expr])
+        }
+        StatisticsType::Max => {
+            datafusion_functions_aggregate::min_max::max_udaf()
+                .call(vec![col_expr])
+        }
+        StatisticsType::NullCount => {
+            let count_expr = datafusion_functions_aggregate::count::count_udaf()
+                .call(vec![LExpr::Literal(ScalarValue::Boolean(Some(true)), None)]);
+            count_expr
+                .filter(LExpr::IsNull(Box::new(col_expr)))
+                .build()
+                .expect("building count filter expr")
+        }
+        StatisticsType::RowCount => {
+            let count_expr = datafusion_functions_aggregate::count::count_udaf()
+                .call(vec![LExpr::Literal(ScalarValue::Boolean(Some(true)), None)]);
+            count_expr
+                .filter(LExpr::IsNotNull(Box::new(col_expr)))
+                .build()
+                .expect("building count filter expr")
+        }
+    }
+}
+
+/// Convert a [`LiteralGuarantee`] into an `Expr::InList`.
+fn literal_guarantee_to_in_list(
+    column: &Column,
+    literals: &HashSet<ScalarValue>,
+    negated: bool,
+) -> datafusion_expr::Expr {
+    datafusion_expr::Expr::InList(datafusion_expr::expr::InList::new(
+        Box::new(datafusion_expr::Expr::Column(column.clone())),
+        literals
+            .iter()
+            .map(|s| datafusion_expr::Expr::Literal(s.clone(), None))
+            .collect(),
+        negated,
+    ))
+}
+
+/// Build a statistics [`RecordBatch`] from a [`ResolvedStatistics`] cache,
+/// looking up each required column's expression and falling back to null
+/// arrays for missing entries.
+fn build_statistics_record_batch_from_resolved(
+    resolved: &crate::statistics::ResolvedStatistics,
+    required_columns: &RequiredColumns,
+) -> Result<RecordBatch> {
+    let mut arrays = Vec::<ArrayRef>::new();
+    let num_containers = resolved.num_containers();
+
+    for (column, statistics_type, stat_field) in required_columns.iter() {
+        let data_type = stat_field.data_type();
+        let stat_expr = stat_type_to_expr(column, *statistics_type);
+
+        let array = resolved.get_or_null(&stat_expr, data_type);
+
+        assert_eq_or_internal_err!(
+            num_containers,
+            array.len(),
+            "mismatched statistics length. Expected {}, got {}",
+            num_containers,
+            array.len()
+        );
+
+        let array = arrow::compute::cast(&array, data_type)?;
+        arrays.push(array);
+    }
+
+    let schema = Arc::new(required_columns.schema());
+    let mut options = RecordBatchOptions::default();
+    options.row_count = Some(num_containers);
+
+    trace!("Creating statistics batch from resolved for {required_columns:#?} with {arrays:#?}");
+
+    RecordBatch::try_new_with_options(schema, arrays, &options).map_err(|err| {
+        plan_datafusion_err!("Can not create statistics record batch: {err}")
+    })
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -5442,5 +5578,102 @@ mod tests {
         let expected =
             "c1_null_count@2 != row_count@3 AND c1_min@0 <= a AND a <= c1_max@1";
         assert_eq!(res.to_string(), expected);
+    }
+
+    /// Test that evaluate() produces the same results as prune() for basic predicates
+    #[test]
+    fn test_evaluate_matches_prune() {
+        // i > 5 with 3 containers
+        let schema = Schema::new(vec![Field::new("i", DataType::Int32, true)]);
+        let statistics = TestStatistics::new().with(
+            "i",
+            ContainerStats::new_i32(
+                vec![Some(1), Some(6), Some(3)],  // min
+                vec![Some(4), Some(10), Some(8)],  // max
+            ),
+        );
+
+        let expr = col("i").gt(lit(5i32));
+        let p = PruningPredicate::try_new(logical2physical(&expr, &schema), Arc::new(schema)).unwrap();
+
+        let prune_result = p.prune(&statistics).unwrap();
+        let resolved = crate::statistics::resolve_all_sync(
+            &statistics,
+            &p.all_required_expressions(),
+        );
+        let evaluate_result = p.evaluate(&resolved).unwrap();
+
+        assert_eq!(prune_result, evaluate_result);
+        // Container 0: max=4, 4 > 5 is false → prune
+        // Container 1: max=10, 10 > 5 is true → keep
+        // Container 2: max=8, 8 > 5 is true → keep
+        assert_eq!(evaluate_result, vec![false, true, true]);
+    }
+
+    /// Test evaluate with null counts and row counts
+    #[test]
+    fn test_evaluate_with_null_counts() {
+        let schema = Schema::new(vec![Field::new("i", DataType::Int32, true)]);
+        let statistics = TestStatistics::new().with(
+            "i",
+            ContainerStats::new_i32(
+                vec![Some(0), Some(0)],
+                vec![Some(0), Some(0)],
+            )
+            .with_null_counts(vec![Some(10), Some(0)])
+            .with_row_counts(vec![Some(10), Some(10)]),
+        );
+
+        // i = 0: first container is all nulls, should be pruned
+        let expr = col("i").eq(lit(0i32));
+        let p = PruningPredicate::try_new(logical2physical(&expr, &schema), Arc::new(schema)).unwrap();
+
+        let prune_result = p.prune(&statistics).unwrap();
+        let resolved = crate::statistics::resolve_all_sync(
+            &statistics,
+            &p.all_required_expressions(),
+        );
+        let evaluate_result = p.evaluate(&resolved).unwrap();
+
+        assert_eq!(prune_result, evaluate_result);
+    }
+
+    /// Test evaluate with missing cache entries (should produce null → conservative keep)
+    #[test]
+    fn test_evaluate_missing_cache_entries() {
+        let schema = Schema::new(vec![Field::new("i", DataType::Int32, true)]);
+        let statistics = TestStatistics::new().with(
+            "i",
+            ContainerStats::new_i32(
+                vec![Some(1), Some(6)],
+                vec![Some(4), Some(10)],
+            ),
+        );
+
+        let expr = col("i").gt(lit(5i32));
+        let p = PruningPredicate::try_new(logical2physical(&expr, &schema), Arc::new(schema)).unwrap();
+
+        // Empty resolved stats — everything should be kept (conservative)
+        let resolved = crate::statistics::ResolvedStatistics::new_empty(2);
+        let evaluate_result = p.evaluate(&resolved).unwrap();
+        assert_eq!(evaluate_result, vec![true, true]);
+    }
+
+    /// Test that all_required_expressions() generates the right Expr types
+    #[test]
+    fn test_all_required_expressions() {
+        let schema = Schema::new(vec![Field::new("i", DataType::Int32, true)]);
+        let expr = col("i").eq(lit(5i32));
+        let p = PruningPredicate::try_new(logical2physical(&expr, &schema), Arc::new(schema)).unwrap();
+
+        let exprs = p.all_required_expressions();
+        // i = 5 requires: min(i), max(i), count(*) filter (where i is null),
+        // count(*) filter (where i is not null)
+        assert!(exprs.len() >= 2, "Expected at least min and max, got {}", exprs.len());
+
+        // Check that we have min and max expressions
+        let expr_strings: Vec<String> = exprs.iter().map(|e| e.to_string()).collect();
+        assert!(expr_strings.iter().any(|s| s.contains("min")), "Expected min expr in {:?}", expr_strings);
+        assert!(expr_strings.iter().any(|s| s.contains("max")), "Expected max expr in {:?}", expr_strings);
     }
 }

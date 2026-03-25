@@ -19,9 +19,11 @@
 
 mod file_pruner;
 mod pruning_predicate;
+mod statistics;
 
 pub use file_pruner::FilePruner;
 pub use pruning_predicate::{
     PredicateRewriter, PruningPredicate, PruningStatistics, RequiredColumns,
     UnhandledPredicateHook, build_pruning_predicate,
 };
+pub use statistics::{ResolvedStatistics, StatisticsSource};
