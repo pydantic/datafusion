@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::array::{new_null_array, ArrayRef};
+use arrow::array::{ArrayRef, new_null_array};
 use datafusion_common::pruning::PruningStatistics;
 use datafusion_expr::Expr;
 use std::collections::{HashMap, HashSet};
@@ -127,7 +127,7 @@ impl<T: PruningStatistics + Send + Sync> StatisticsSource for T {
 /// [`PruningPredicate::evaluate`].
 ///
 /// Keyed by [`Expr`] so that a single cache can serve multiple
-/// [`PruningPredicate`] instances (e.g., after dynamic filter changes
+/// [`PruningPredicate`](crate::PruningPredicate) instances (e.g., after dynamic filter changes
 /// rebuild the predicate but reuse the same resolved stats).
 /// Missing entries are treated as unknown — safe for pruning
 /// (the predicate will conservatively keep the container).
@@ -377,8 +377,8 @@ mod tests {
     #[test]
     fn test_resolve_min() {
         let stats = MockStats::new();
-        let expr = datafusion_functions_aggregate::min_max::min_udaf()
-            .call(vec![col_expr("a")]);
+        let expr =
+            datafusion_functions_aggregate::min_max::min_udaf().call(vec![col_expr("a")]);
         let result = resolve_expression_sync(&stats, &expr);
         assert!(result.is_some());
         let arr = result.unwrap();
@@ -388,8 +388,8 @@ mod tests {
     #[test]
     fn test_resolve_max() {
         let stats = MockStats::new();
-        let expr = datafusion_functions_aggregate::min_max::max_udaf()
-            .call(vec![col_expr("a")]);
+        let expr =
+            datafusion_functions_aggregate::min_max::max_udaf().call(vec![col_expr("a")]);
         let result = resolve_expression_sync(&stats, &expr);
         assert!(result.is_some());
         let arr = result.unwrap();
@@ -400,10 +400,7 @@ mod tests {
     fn test_resolve_count_null() {
         let stats = MockStats::new();
         let expr = datafusion_functions_aggregate::count::count_udaf()
-            .call(vec![Expr::Wildcard {
-                qualifier: None,
-                options: Box::default(),
-            }])
+            .call(vec![Expr::Literal(ScalarValue::Boolean(Some(true)), None)])
             .filter(Expr::IsNull(Box::new(col_expr("a"))))
             .build()
             .unwrap();
@@ -415,10 +412,7 @@ mod tests {
     fn test_resolve_count_not_null() {
         let stats = MockStats::new();
         let expr = datafusion_functions_aggregate::count::count_udaf()
-            .call(vec![Expr::Wildcard {
-                qualifier: None,
-                options: Box::default(),
-            }])
+            .call(vec![Expr::Literal(ScalarValue::Boolean(Some(true)), None)])
             .filter(Expr::IsNotNull(Box::new(col_expr("a"))))
             .build()
             .unwrap();
@@ -449,8 +443,8 @@ mod tests {
 
     #[test]
     fn test_resolve_in_list() {
-        let stats =
-            MockStats::new().with_contained(BooleanArray::from(vec![Some(true), Some(false)]));
+        let stats = MockStats::new()
+            .with_contained(BooleanArray::from(vec![Some(true), Some(false)]));
         let expr = Expr::InList(datafusion_expr::expr::InList::new(
             Box::new(col_expr("a")),
             vec![
@@ -463,14 +457,14 @@ mod tests {
         assert!(result.is_some());
         let arr = result.unwrap();
         let bool_arr = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(bool_arr.value(0), true);
-        assert_eq!(bool_arr.value(1), false);
+        assert!(bool_arr.value(0));
+        assert!(!bool_arr.value(1));
     }
 
     #[test]
     fn test_resolve_not_in_list() {
-        let stats =
-            MockStats::new().with_contained(BooleanArray::from(vec![Some(true), Some(false)]));
+        let stats = MockStats::new()
+            .with_contained(BooleanArray::from(vec![Some(true), Some(false)]));
         let expr = Expr::InList(datafusion_expr::expr::InList::new(
             Box::new(col_expr("a")),
             vec![Expr::Literal(ScalarValue::Int64(Some(1)), None)],
@@ -481,8 +475,8 @@ mod tests {
         let arr = result.unwrap();
         let bool_arr = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
         // Inverted: true→false, false→true
-        assert_eq!(bool_arr.value(0), false);
-        assert_eq!(bool_arr.value(1), true);
+        assert!(!bool_arr.value(0));
+        assert!(bool_arr.value(1));
     }
 
     #[test]
@@ -506,7 +500,7 @@ mod tests {
         let stats = MockStats::new();
         let min_expr =
             datafusion_functions_aggregate::min_max::min_udaf().call(vec![col_expr("a")]);
-        let resolved = resolve_all_sync(&stats, &[min_expr.clone()]);
+        let resolved = resolve_all_sync(&stats, std::slice::from_ref(&min_expr));
 
         // Existing entry
         let arr = resolved.get_or_null(&min_expr, &DataType::Int64);

@@ -578,8 +578,10 @@ impl PruningPredicate {
         }
 
         // Phase 2: Min/max/null_count/row_count predicate
-        let statistics_batch =
-            build_statistics_record_batch_from_resolved(resolved, &self.required_columns)?;
+        let statistics_batch = build_statistics_record_batch_from_resolved(
+            resolved,
+            &self.required_columns,
+        )?;
         builder.combine_value(self.predicate_expr.evaluate(&statistics_batch)?);
 
         Ok(builder.build())
@@ -1989,7 +1991,7 @@ fn wrap_null_count_check_expr(
     )))
 }
 
-/// Convert a [`StatisticsType`] + column into the corresponding logical [`Expr`].
+/// Convert a [`StatisticsType`] + column into the corresponding logical expression.
 fn stat_type_to_expr(
     column: &phys_expr::Column,
     stat_type: StatisticsType,
@@ -1998,12 +2000,10 @@ fn stat_type_to_expr(
     let col_expr = LExpr::Column(Column::new_unqualified(column.name()));
     match stat_type {
         StatisticsType::Min => {
-            datafusion_functions_aggregate::min_max::min_udaf()
-                .call(vec![col_expr])
+            datafusion_functions_aggregate::min_max::min_udaf().call(vec![col_expr])
         }
         StatisticsType::Max => {
-            datafusion_functions_aggregate::min_max::max_udaf()
-                .call(vec![col_expr])
+            datafusion_functions_aggregate::min_max::max_udaf().call(vec![col_expr])
         }
         StatisticsType::NullCount => {
             let count_expr = datafusion_functions_aggregate::count::count_udaf()
@@ -2040,7 +2040,7 @@ fn literal_guarantee_to_in_list(
     ))
 }
 
-/// Build a statistics [`RecordBatch`] from a [`ResolvedStatistics`] cache,
+/// Build a statistics [`RecordBatch`] from a [`crate::ResolvedStatistics`] cache,
 /// looking up each required column's expression and falling back to null
 /// arrays for missing entries.
 fn build_statistics_record_batch_from_resolved(
@@ -2072,7 +2072,9 @@ fn build_statistics_record_batch_from_resolved(
     let mut options = RecordBatchOptions::default();
     options.row_count = Some(num_containers);
 
-    trace!("Creating statistics batch from resolved for {required_columns:#?} with {arrays:#?}");
+    trace!(
+        "Creating statistics batch from resolved for {required_columns:#?} with {arrays:#?}"
+    );
 
     RecordBatch::try_new_with_options(schema, arrays, &options).map_err(|err| {
         plan_datafusion_err!("Can not create statistics record batch: {err}")
@@ -5587,12 +5589,14 @@ mod tests {
             "i",
             ContainerStats::new_i32(
                 vec![Some(1), Some(6), Some(3)],  // min
-                vec![Some(4), Some(10), Some(8)],  // max
+                vec![Some(4), Some(10), Some(8)], // max
             ),
         );
 
         let expr = col("i").gt(lit(5i32));
-        let p = PruningPredicate::try_new(logical2physical(&expr, &schema), Arc::new(schema)).unwrap();
+        let p =
+            PruningPredicate::try_new(logical2physical(&expr, &schema), Arc::new(schema))
+                .unwrap();
 
         let prune_result = p.prune(&statistics).unwrap();
         let resolved = crate::statistics::resolve_all_sync(
@@ -5614,17 +5618,16 @@ mod tests {
         let schema = Schema::new(vec![Field::new("i", DataType::Int32, true)]);
         let statistics = TestStatistics::new().with(
             "i",
-            ContainerStats::new_i32(
-                vec![Some(0), Some(0)],
-                vec![Some(0), Some(0)],
-            )
-            .with_null_counts(vec![Some(10), Some(0)])
-            .with_row_counts(vec![Some(10), Some(10)]),
+            ContainerStats::new_i32(vec![Some(0), Some(0)], vec![Some(0), Some(0)])
+                .with_null_counts(vec![Some(10), Some(0)])
+                .with_row_counts(vec![Some(10), Some(10)]),
         );
 
         // i = 0: first container is all nulls, should be pruned
         let expr = col("i").eq(lit(0i32));
-        let p = PruningPredicate::try_new(logical2physical(&expr, &schema), Arc::new(schema)).unwrap();
+        let p =
+            PruningPredicate::try_new(logical2physical(&expr, &schema), Arc::new(schema))
+                .unwrap();
 
         let prune_result = p.prune(&statistics).unwrap();
         let resolved = crate::statistics::resolve_all_sync(
@@ -5640,16 +5643,15 @@ mod tests {
     #[test]
     fn test_evaluate_missing_cache_entries() {
         let schema = Schema::new(vec![Field::new("i", DataType::Int32, true)]);
-        let statistics = TestStatistics::new().with(
+        let _statistics = TestStatistics::new().with(
             "i",
-            ContainerStats::new_i32(
-                vec![Some(1), Some(6)],
-                vec![Some(4), Some(10)],
-            ),
+            ContainerStats::new_i32(vec![Some(1), Some(6)], vec![Some(4), Some(10)]),
         );
 
         let expr = col("i").gt(lit(5i32));
-        let p = PruningPredicate::try_new(logical2physical(&expr, &schema), Arc::new(schema)).unwrap();
+        let p =
+            PruningPredicate::try_new(logical2physical(&expr, &schema), Arc::new(schema))
+                .unwrap();
 
         // Empty resolved stats — everything should be kept (conservative)
         let resolved = crate::statistics::ResolvedStatistics::new_empty(2);
@@ -5662,16 +5664,28 @@ mod tests {
     fn test_all_required_expressions() {
         let schema = Schema::new(vec![Field::new("i", DataType::Int32, true)]);
         let expr = col("i").eq(lit(5i32));
-        let p = PruningPredicate::try_new(logical2physical(&expr, &schema), Arc::new(schema)).unwrap();
+        let p =
+            PruningPredicate::try_new(logical2physical(&expr, &schema), Arc::new(schema))
+                .unwrap();
 
         let exprs = p.all_required_expressions();
         // i = 5 requires: min(i), max(i), count(*) filter (where i is null),
         // count(*) filter (where i is not null)
-        assert!(exprs.len() >= 2, "Expected at least min and max, got {}", exprs.len());
+        assert!(
+            exprs.len() >= 2,
+            "Expected at least min and max, got {}",
+            exprs.len()
+        );
 
         // Check that we have min and max expressions
         let expr_strings: Vec<String> = exprs.iter().map(|e| e.to_string()).collect();
-        assert!(expr_strings.iter().any(|s| s.contains("min")), "Expected min expr in {:?}", expr_strings);
-        assert!(expr_strings.iter().any(|s| s.contains("max")), "Expected max expr in {:?}", expr_strings);
+        assert!(
+            expr_strings.iter().any(|s| s.contains("min")),
+            "Expected min expr in {expr_strings:?}"
+        );
+        assert!(
+            expr_strings.iter().any(|s| s.contains("max")),
+            "Expected max expr in {expr_strings:?}"
+        );
     }
 }
