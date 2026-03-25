@@ -15,6 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-fn main() {
-    datafusion_benchmarks::benchmark_harness::run_suite_main("nlj");
-}
+datafusion_benchmarks::suite_benchmarks!("nlj");

@@ -34,7 +34,9 @@ workspace = true
 
 [features]
 ci = []
-default = ["mimalloc"]
+codspeed = ["dep:codspeed-divan-compat-walltime"]
+default = ["mimalloc", "native-divan"]
+native-divan = ["dep:divan"]
 snmalloc = ["snmalloc-rs"]
 mimalloc_extended = ["libmimalloc-sys/extended"]
 
@@ -43,7 +45,8 @@ arrow = { workspace = true }
 async-trait = "0.1"
 bytes = { workspace = true }
 clap = { version = "4.5.60", features = ["derive"] }
-criterion = { workspace = true, features = ["async_tokio"] }
+codspeed-divan-compat-walltime = { workspace = true, optional = true }
+divan = { workspace = true, optional = true }
 datafusion = { workspace = true, default-features = true }
 datafusion-common = { workspace = true, default-features = true }
 env_logger = { workspace = true }
@@ -62,7 +65,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "parking_lot"] }
 tokio-util = { version = "0.7.17" }
 
 [dev-dependencies]
-criterion = { workspace = true, features = ["async_tokio"] }
 datafusion-proto = { workspace = true }
 
 [[bench]]
