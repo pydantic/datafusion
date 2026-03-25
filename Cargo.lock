@@ -2543,10 +2543,12 @@ name = "datafusion-pruning"
 version = "52.3.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "datafusion-common",
  "datafusion-datasource",
  "datafusion-expr",
  "datafusion-expr-common",
+ "datafusion-functions-aggregate",
  "datafusion-functions-nested",
  "datafusion-physical-expr",
  "datafusion-physical-expr-common",
@@ -2554,6 +2556,7 @@ dependencies = [
  "insta",
  "itertools 0.14.0",
  "log",
+ "tokio",
 ]
 
 [[package]]
