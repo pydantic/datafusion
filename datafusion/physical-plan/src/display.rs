@@ -469,8 +469,7 @@ impl ExecutionPlanVisitor for IndentVisitor<'_, '_> {
             }
             ShowMetrics::Full => {
                 if let Some(metrics) = plan.metrics() {
-                    let mut metrics =
-                        metrics.filter_by_metric_types(self.metric_types);
+                    let mut metrics = metrics.filter_by_metric_types(self.metric_types);
                     if let Some(cats) = self.metric_categories {
                         metrics = metrics.filter_by_categories(cats);
                     }
@@ -565,8 +564,7 @@ impl ExecutionPlanVisitor for GraphvizVisitor<'_, '_> {
             }
             ShowMetrics::Full => {
                 if let Some(metrics) = plan.metrics() {
-                    let mut metrics =
-                        metrics.filter_by_metric_types(self.metric_types);
+                    let mut metrics = metrics.filter_by_metric_types(self.metric_types);
                     if let Some(cats) = self.metric_categories {
                         metrics = metrics.filter_by_categories(cats);
                     }

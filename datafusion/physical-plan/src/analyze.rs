@@ -321,6 +321,7 @@ mod tests {
             true,
             false,
             vec![MetricType::SUMMARY, MetricType::DEV],
+            None,
             blocking_exec,
             schema,
         ));

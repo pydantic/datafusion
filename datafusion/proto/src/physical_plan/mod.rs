@@ -2320,20 +2320,19 @@ impl protobuf::PhysicalPlanNode {
             codec,
             proto_converter,
         )?;
-        let (has_metric_categories, metric_categories) =
-            match exec.metric_categories() {
-                Some(cats) => (
-                    true,
-                    cats.iter()
-                        .map(|c| match c {
-                            MetricCategory::Rows => "rows".to_string(),
-                            MetricCategory::Bytes => "bytes".to_string(),
-                            MetricCategory::Timing => "timing".to_string(),
-                        })
-                        .collect(),
-                ),
-                None => (false, vec![]),
-            };
+        let (has_metric_categories, metric_categories) = match exec.metric_categories() {
+            Some(cats) => (
+                true,
+                cats.iter()
+                    .map(|c| match c {
+                        MetricCategory::Rows => "rows".to_string(),
+                        MetricCategory::Bytes => "bytes".to_string(),
+                        MetricCategory::Timing => "timing".to_string(),
+                    })
+                    .collect(),
+            ),
+            None => (false, vec![]),
+        };
         Ok(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(PhysicalPlanType::Analyze(Box::new(
                 protobuf::AnalyzeExecNode {

@@ -2720,8 +2720,11 @@ impl DefaultPhysicalPlanner {
             ExplainAnalyzeLevel::Summary => vec![MetricType::SUMMARY],
             ExplainAnalyzeLevel::Dev => vec![MetricType::SUMMARY, MetricType::DEV],
         };
-        let analyze_categories =
-            session_state.config_options().explain.analyze_categories.clone();
+        let analyze_categories = session_state
+            .config_options()
+            .explain
+            .analyze_categories
+            .clone();
         let metric_categories = match analyze_categories {
             ExplainAnalyzeCategories::All => None,
             ExplainAnalyzeCategories::Only(cats) => Some(cats),

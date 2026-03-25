@@ -23,8 +23,7 @@ use std::{any::Any, sync::Arc};
 
 use super::metrics::{
     self, BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricCategory,
-    MetricsSet,
-    RecordOutput,
+    MetricsSet, RecordOutput,
 };
 use super::{DisplayAs, ExecutionPlanProperties, PlanProperties};
 use crate::{

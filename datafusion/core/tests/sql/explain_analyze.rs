@@ -1205,11 +1205,7 @@ async fn explain_analyze_categories() {
             false,
         ),
         // "none" — plan only, no metrics at all
-        (
-            ExplainAnalyzeCategories::Only(vec![]),
-            "output_rows",
-            false,
-        ),
+        (ExplainAnalyzeCategories::Only(vec![]), "output_rows", false),
         (
             ExplainAnalyzeCategories::Only(vec![]),
             "elapsed_compute",

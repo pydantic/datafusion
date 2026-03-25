@@ -18,8 +18,8 @@
 //! Module for tracking Sort Merge Join metrics
 
 use crate::metrics::{
-    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricCategory,
-    SpillMetrics, Time,
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder,
+    MetricCategory, SpillMetrics, Time,
 };
 
 /// Metrics for SortMergeJoinExec
