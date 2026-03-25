@@ -16,8 +16,8 @@
 // under the License.
 
 use datafusion_physical_plan::metrics::{
-    Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricType, PruningMetrics,
-    RatioMergeStrategy, RatioMetrics, Time,
+    Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricCategory, MetricType,
+    PruningMetrics, RatioMergeStrategy, RatioMetrics, Time,
 };
 
 /// Stores metrics about the parquet execution for a particular parquet file.
@@ -126,6 +126,7 @@ impl ParquetFileMetrics {
         let bytes_scanned = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
             .with_type(MetricType::SUMMARY)
+            .with_category(MetricCategory::Bytes)
             .counter("bytes_scanned", partition);
 
         let metadata_load_time = MetricBuilder::new(metrics)
@@ -151,13 +152,16 @@ impl ParquetFileMetrics {
         // -----------------------
         let predicate_evaluation_errors = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
+            .with_category(MetricCategory::Rows)
             .counter("predicate_evaluation_errors", partition);
 
         let pushdown_rows_pruned = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
+            .with_category(MetricCategory::Rows)
             .counter("pushdown_rows_pruned", partition);
         let pushdown_rows_matched = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
+            .with_category(MetricCategory::Rows)
             .counter("pushdown_rows_matched", partition);
 
         let row_pushdown_eval_time = MetricBuilder::new(metrics)
@@ -180,10 +184,12 @@ impl ParquetFileMetrics {
 
         let predicate_cache_inner_records = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
+            .with_category(MetricCategory::Rows)
             .gauge("predicate_cache_inner_records", partition);
 
         let predicate_cache_records = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
+            .with_category(MetricCategory::Rows)
             .gauge("predicate_cache_records", partition);
 
         Self {

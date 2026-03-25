@@ -215,6 +215,7 @@ impl SplitMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             batches_split: MetricBuilder::new(metrics)
+                .with_category(super::MetricCategory::Rows)
                 .counter("batches_split", partition),
         }
     }
