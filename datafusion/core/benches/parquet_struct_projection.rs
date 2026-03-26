@@ -41,10 +41,10 @@ use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tokio::runtime::Runtime;
 
-const NUM_BATCHES: usize = 64;
-const WRITE_RECORD_BATCH_SIZE: usize = 4096;
-const ROW_GROUP_ROW_COUNT: usize = 65536;
-const EXPECTED_ROW_GROUPS: usize = 4;
+const NUM_BATCHES: usize = 4;
+const WRITE_RECORD_BATCH_SIZE: usize = 512;
+const ROW_GROUP_ROW_COUNT: usize = 1024;
+const EXPECTED_ROW_GROUPS: usize = 2;
 const LARGE_STRING_LEN: usize = 128 * 1024;
 
 fn narrow_schema() -> SchemaRef {
