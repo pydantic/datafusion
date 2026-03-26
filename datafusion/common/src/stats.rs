@@ -27,8 +27,8 @@ use arrow::datatypes::{DataType, Schema};
 
 /// Represents a value with a degree of certainty. `Precision` is used to
 /// propagate information the precision of statistical values.
-#[derive(Clone, PartialEq, Eq, Default, Copy)]
-pub enum Precision<T: Debug + Clone + PartialEq + Eq + PartialOrd> {
+#[derive(Clone, Default, Copy)]
+pub enum Precision<T: Debug + Clone> {
     /// The exact value is known. Used for guaranteeing correctness.
     ///
     /// Comes from definitive sources such as:
@@ -60,7 +60,7 @@ pub enum Precision<T: Debug + Clone + PartialEq + Eq + PartialOrd> {
     Absent,
 }
 
-impl<T: Debug + Clone + PartialEq + Eq + PartialOrd> Precision<T> {
+impl<T: Debug + Clone> Precision<T> {
     /// If we have some value (exact or inexact), it returns that value.
     /// Otherwise, it returns `None`.
     pub fn get_value(&self) -> Option<&T> {
@@ -75,7 +75,7 @@ impl<T: Debug + Clone + PartialEq + Eq + PartialOrd> Precision<T> {
     pub fn map<U, F>(self, f: F) -> Precision<U>
     where
         F: Fn(T) -> U,
-        U: Debug + Clone + PartialEq + Eq + PartialOrd,
+        U: Debug + Clone,
     {
         match self {
             Precision::Exact(val) => Precision::Exact(f(val)),
@@ -94,6 +94,16 @@ impl<T: Debug + Clone + PartialEq + Eq + PartialOrd> Precision<T> {
         }
     }
 
+    /// Demotes the precision state from exact to inexact (if present).
+    pub fn to_inexact(self) -> Self {
+        match self {
+            Precision::Exact(value) => Precision::Inexact(value),
+            _ => self,
+        }
+    }
+}
+
+impl<T: Debug + Clone + PartialOrd> Precision<T> {
     /// Returns the maximum of two (possibly inexact) values, conservatively
     /// propagating exactness information. If one of the input values is
     /// [`Precision::Absent`], the result is `Absent` too.
@@ -125,14 +135,6 @@ impl<T: Debug + Clone + PartialEq + Eq + PartialOrd> Precision<T> {
                 Precision::Inexact(if a >= b { b.clone() } else { a.clone() })
             }
             (_, _) => Precision::Absent,
-        }
-    }
-
-    /// Demotes the precision state from exact to inexact (if present).
-    pub fn to_inexact(self) -> Self {
-        match self {
-            Precision::Exact(value) => Precision::Inexact(value),
-            _ => self,
         }
     }
 }
@@ -318,7 +320,23 @@ impl Precision<ScalarValue> {
     }
 }
 
-impl<T: Debug + Clone + PartialEq + Eq + PartialOrd> Debug for Precision<T> {
+impl<T: Debug + Clone> PartialEq for Precision<T>
+where
+    T: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Precision::Exact(a), Precision::Exact(b)) => a == b,
+            (Precision::Inexact(a), Precision::Inexact(b)) => a == b,
+            (Precision::Absent, Precision::Absent) => true,
+            _ => false,
+        }
+    }
+}
+
+impl<T: Debug + Clone + Eq> Eq for Precision<T> {}
+
+impl<T: Debug + Clone> Debug for Precision<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Precision::Exact(inner) => write!(f, "Exact({inner:?})"),
@@ -328,7 +346,7 @@ impl<T: Debug + Clone + PartialEq + Eq + PartialOrd> Debug for Precision<T> {
     }
 }
 
-impl<T: Debug + Clone + PartialEq + Eq + PartialOrd> Display for Precision<T> {
+impl<T: Debug + Clone> Display for Precision<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Precision::Exact(inner) => write!(f, "Exact({inner:?})"),
