@@ -132,7 +132,7 @@ pub struct DisplayableExecutionPlan<'a> {
 
 impl<'a> DisplayableExecutionPlan<'a> {
     fn default_metric_types() -> Vec<MetricType> {
-        vec![MetricType::SUMMARY, MetricType::DEV]
+        vec![MetricType::Summary, MetricType::Dev]
     }
 
     /// Create a wrapper around an [`ExecutionPlan`] which can be

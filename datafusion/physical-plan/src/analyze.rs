@@ -321,7 +321,7 @@ mod tests {
         let analyze_exec = Arc::new(AnalyzeExec::new(
             true,
             false,
-            vec![MetricType::SUMMARY, MetricType::DEV],
+            vec![MetricType::Summary, MetricType::Dev],
             None,
             blocking_exec,
             schema,

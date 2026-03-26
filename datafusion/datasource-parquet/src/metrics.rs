@@ -105,42 +105,42 @@ impl ParquetFileMetrics {
         // -----------------------
         let row_groups_pruned_bloom_filter = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
-            .with_type(MetricType::SUMMARY)
+            .with_type(MetricType::Summary)
             .pruning_metrics("row_groups_pruned_bloom_filter", partition);
 
         let limit_pruned_row_groups = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
-            .with_type(MetricType::SUMMARY)
+            .with_type(MetricType::Summary)
             .pruning_metrics("limit_pruned_row_groups", partition);
 
         let row_groups_pruned_statistics = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
-            .with_type(MetricType::SUMMARY)
+            .with_type(MetricType::Summary)
             .pruning_metrics("row_groups_pruned_statistics", partition);
 
         let page_index_pages_pruned = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
-            .with_type(MetricType::SUMMARY)
+            .with_type(MetricType::Summary)
             .pruning_metrics("page_index_pages_pruned", partition);
 
         let bytes_scanned = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
-            .with_type(MetricType::SUMMARY)
+            .with_type(MetricType::Summary)
             .with_category(MetricCategory::Bytes)
             .counter("bytes_scanned", partition);
 
         let metadata_load_time = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
-            .with_type(MetricType::SUMMARY)
+            .with_type(MetricType::Summary)
             .subset_time("metadata_load_time", partition);
 
         let files_ranges_pruned_statistics = MetricBuilder::new(metrics)
-            .with_type(MetricType::SUMMARY)
+            .with_type(MetricType::Summary)
             .pruning_metrics("files_ranges_pruned_statistics", partition);
 
         let scan_efficiency_ratio = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
-            .with_type(MetricType::SUMMARY)
+            .with_type(MetricType::Summary)
             .ratio_metrics_with_strategy(
                 "scan_efficiency_ratio",
                 partition,

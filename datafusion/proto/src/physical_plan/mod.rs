@@ -1835,14 +1835,7 @@ impl protobuf::PhysicalPlanNode {
             let cats: Result<Vec<MetricCategory>> = analyze
                 .metric_categories
                 .iter()
-                .map(|s| match s.as_str() {
-                    "rows" => Ok(MetricCategory::Rows),
-                    "bytes" => Ok(MetricCategory::Bytes),
-                    "timing" => Ok(MetricCategory::Timing),
-                    other => Err(DataFusionError::Internal(format!(
-                        "Unknown metric category: {other}"
-                    ))),
-                })
+                .map(|s| s.parse::<MetricCategory>())
                 .collect();
             Some(cats?)
         } else {
@@ -1851,7 +1844,7 @@ impl protobuf::PhysicalPlanNode {
         Ok(Arc::new(AnalyzeExec::new(
             analyze.verbose,
             analyze.show_statistics,
-            vec![MetricType::SUMMARY, MetricType::DEV],
+            vec![MetricType::Summary, MetricType::Dev],
             metric_categories,
             input,
             Arc::new(convert_required!(analyze.schema)?),
@@ -2321,16 +2314,7 @@ impl protobuf::PhysicalPlanNode {
             proto_converter,
         )?;
         let (has_metric_categories, metric_categories) = match exec.metric_categories() {
-            Some(cats) => (
-                true,
-                cats.iter()
-                    .map(|c| match c {
-                        MetricCategory::Rows => "rows".to_string(),
-                        MetricCategory::Bytes => "bytes".to_string(),
-                        MetricCategory::Timing => "timing".to_string(),
-                    })
-                    .collect(),
-            ),
+            Some(cats) => (true, cats.iter().map(|c| c.to_string()).collect()),
             None => (false, vec![]),
         };
         Ok(protobuf::PhysicalPlanNode {

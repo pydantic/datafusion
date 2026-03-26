@@ -76,7 +76,7 @@ impl<'a> MetricBuilder<'a> {
             metrics,
             partition: None,
             labels: vec![],
-            metric_type: MetricType::DEV,
+            metric_type: MetricType::Dev,
             metric_category: None,
         }
     }

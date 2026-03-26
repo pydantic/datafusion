@@ -1442,11 +1442,11 @@ impl BuildProbeJoinMetrics {
             .counter("input_rows", partition);
 
         let probe_hit_rate = MetricBuilder::new(metrics)
-            .with_type(MetricType::SUMMARY)
+            .with_type(MetricType::Summary)
             .ratio_metrics("probe_hit_rate", partition);
 
         let avg_fanout = MetricBuilder::new(metrics)
-            .with_type(MetricType::SUMMARY)
+            .with_type(MetricType::Summary)
             .ratio_metrics("avg_fanout", partition);
 
         Self {

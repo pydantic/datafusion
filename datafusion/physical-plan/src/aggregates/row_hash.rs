@@ -652,7 +652,7 @@ impl GroupedHashAggregateStream {
         let reduction_factor = if agg.mode == AggregateMode::Partial {
             Some(
                 MetricBuilder::new(&agg.metrics)
-                    .with_type(metrics::MetricType::SUMMARY)
+                    .with_type(metrics::MetricType::Summary)
                     .ratio_metrics("reduction_factor", partition),
             )
         } else {

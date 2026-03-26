@@ -22,9 +22,7 @@ use rstest::rstest;
 use datafusion::config::ConfigOptions;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::metrics::Timestamp;
-use datafusion_common::format::{
-    ExplainAnalyzeCategories, ExplainAnalyzeLevel, MetricCategory,
-};
+use datafusion_common::format::{ExplainAnalyzeCategories, MetricCategory, MetricType};
 use object_store::path::Path;
 
 #[tokio::test]
@@ -207,7 +205,7 @@ fn nanos_from_timestamp(ts: &Timestamp) -> i64 {
 async fn collect_plan_with_context(
     sql_str: &str,
     ctx: &SessionContext,
-    level: ExplainAnalyzeLevel,
+    level: MetricType,
 ) -> String {
     {
         let state = ctx.state_ref();
@@ -238,7 +236,7 @@ async fn collect_plan_with_categories(
         .to_string()
 }
 
-async fn collect_plan(sql_str: &str, level: ExplainAnalyzeLevel) -> String {
+async fn collect_plan(sql_str: &str, level: MetricType) -> String {
     let ctx = SessionContext::new();
     collect_plan_with_context(sql_str, &ctx, level).await
 }
@@ -251,14 +249,14 @@ async fn explain_analyze_level() {
             ORDER BY v1 DESC";
 
     for (level, needle, should_contain) in [
-        (ExplainAnalyzeLevel::Summary, "spill_count", false),
-        (ExplainAnalyzeLevel::Summary, "output_batches", false),
-        (ExplainAnalyzeLevel::Summary, "output_rows", true),
-        (ExplainAnalyzeLevel::Summary, "output_bytes", true),
-        (ExplainAnalyzeLevel::Dev, "spill_count", true),
-        (ExplainAnalyzeLevel::Dev, "output_rows", true),
-        (ExplainAnalyzeLevel::Dev, "output_bytes", true),
-        (ExplainAnalyzeLevel::Dev, "output_batches", true),
+        (MetricType::Summary, "spill_count", false),
+        (MetricType::Summary, "output_batches", false),
+        (MetricType::Summary, "output_rows", true),
+        (MetricType::Summary, "output_bytes", true),
+        (MetricType::Dev, "spill_count", true),
+        (MetricType::Dev, "output_rows", true),
+        (MetricType::Dev, "output_bytes", true),
+        (MetricType::Dev, "output_batches", true),
     ] {
         let plan = collect_plan(sql, level).await;
         assert_eq!(
@@ -282,10 +280,10 @@ async fn explain_analyze_level_datasource_parquet() {
         .expect("register parquet table for explain analyze test");
 
     for (level, needle, should_contain) in [
-        (ExplainAnalyzeLevel::Summary, "metadata_load_time", true),
-        (ExplainAnalyzeLevel::Summary, "page_index_eval_time", false),
-        (ExplainAnalyzeLevel::Dev, "metadata_load_time", true),
-        (ExplainAnalyzeLevel::Dev, "page_index_eval_time", true),
+        (MetricType::Summary, "metadata_load_time", true),
+        (MetricType::Summary, "page_index_eval_time", false),
+        (MetricType::Dev, "metadata_load_time", true),
+        (MetricType::Dev, "page_index_eval_time", true),
     ] {
         let plan = collect_plan_with_context(&sql, &ctx, level).await;
 
@@ -318,8 +316,7 @@ async fn explain_analyze_parquet_pruning_metrics() {
             "explain analyze select * from {table_name} where l_orderkey = {l_orderkey};"
         );
 
-        let plan =
-            collect_plan_with_context(&sql, &ctx, ExplainAnalyzeLevel::Summary).await;
+        let plan = collect_plan_with_context(&sql, &ctx, MetricType::Summary).await;
 
         let expected_metrics =
             format!("files_ranges_pruned_statistics={expected_pruning_metrics}");
@@ -1168,8 +1165,8 @@ async fn explain_analyze_hash_join() {
             ON t1.a=t2.b";
 
     for (level, needle, should_contain) in [
-        (ExplainAnalyzeLevel::Summary, "probe_hit_rate", true),
-        (ExplainAnalyzeLevel::Summary, "avg_fanout", true),
+        (MetricType::Summary, "probe_hit_rate", true),
+        (MetricType::Summary, "avg_fanout", true),
     ] {
         let plan = collect_plan(sql, level).await;
         assert_eq!(
@@ -1236,6 +1233,25 @@ async fn explain_analyze_categories() {
             ExplainAnalyzeCategories::Only(vec![
                 MetricCategory::Rows,
                 MetricCategory::Bytes,
+            ]),
+            "elapsed_compute",
+            false,
+        ),
+        // "rows,bytes,uncategorized" — everything except timing
+        (
+            ExplainAnalyzeCategories::Only(vec![
+                MetricCategory::Rows,
+                MetricCategory::Bytes,
+                MetricCategory::Uncategorized,
+            ]),
+            "output_rows",
+            true,
+        ),
+        (
+            ExplainAnalyzeCategories::Only(vec![
+                MetricCategory::Rows,
+                MetricCategory::Bytes,
+                MetricCategory::Uncategorized,
             ]),
             "elapsed_compute",
             false,
