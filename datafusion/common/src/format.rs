@@ -256,9 +256,10 @@ pub enum MetricCategory {
 ///
 /// See [`MetricCategory`] for the determinism properties that motivate
 /// this filter.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum ExplainAnalyzeCategories {
     /// Show all metrics regardless of category (the default).
+    #[default]
     All,
     /// Show only metrics whose category is in the list.
     /// Metrics that have no declared category are still included
@@ -266,12 +267,6 @@ pub enum ExplainAnalyzeCategories {
     ///
     /// An **empty** vec means "plan only" — suppress all metrics.
     Only(Vec<MetricCategory>),
-}
-
-impl Default for ExplainAnalyzeCategories {
-    fn default() -> Self {
-        Self::All
-    }
 }
 
 impl FromStr for ExplainAnalyzeCategories {

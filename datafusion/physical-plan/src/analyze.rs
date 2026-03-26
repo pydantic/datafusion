@@ -241,6 +241,7 @@ impl ExecutionPlan for AnalyzeExec {
 }
 
 /// Creates the output of AnalyzeExec as a RecordBatch
+#[expect(clippy::too_many_arguments)]
 fn create_output_batch(
     verbose: bool,
     show_statistics: bool,
