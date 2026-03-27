@@ -66,9 +66,12 @@ pub use table_schema::TableSchema;
 #[expect(deprecated)]
 pub use statistics::add_row_stats;
 pub use statistics::compute_all_files_statistics;
+use std::any::TypeId;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
+
+use datafusion_execution::config::AnyMap;
 
 /// Stream of files get listed from object store
 #[deprecated(
@@ -147,8 +150,12 @@ pub struct PartitionedFile {
     /// underlying format (for example, Parquet `sorting_columns`), but it may also be set
     /// explicitly via [`Self::with_ordering`].
     pub ordering: Option<LexOrdering>,
-    /// An optional field for user defined per object metadata
-    pub extensions: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// A type map for user defined per object metadata.
+    ///
+    /// Multiple extensions of different types can be stored simultaneously.
+    /// Use [`Self::with_extension`] and [`Self::get_extension`] to interact
+    /// with the extensions.
+    pub extensions: AnyMap,
     /// The estimated size of the parquet metadata, in bytes
     pub metadata_size_hint: Option<usize>,
 }
@@ -168,7 +175,7 @@ impl PartitionedFile {
             range: None,
             statistics: None,
             ordering: None,
-            extensions: None,
+            extensions: AnyMap::default(),
             metadata_size_hint: None,
         }
     }
@@ -181,7 +188,7 @@ impl PartitionedFile {
             range: None,
             statistics: None,
             ordering: None,
-            extensions: None,
+            extensions: AnyMap::default(),
             metadata_size_hint: None,
         }
     }
@@ -200,7 +207,7 @@ impl PartitionedFile {
             range: Some(FileRange { start, end }),
             statistics: None,
             ordering: None,
-            extensions: None,
+            extensions: AnyMap::default(),
             metadata_size_hint: None,
         }
         .with_range(start, end)
@@ -256,15 +263,31 @@ impl PartitionedFile {
         self
     }
 
-    /// Update the user defined extensions for this file.
+    /// Add a typed extension to this file.
     ///
-    /// This can be used to pass reader specific information.
-    pub fn with_extensions(
-        mut self,
-        extensions: Arc<dyn std::any::Any + Send + Sync>,
-    ) -> Self {
-        self.extensions = Some(extensions);
+    /// Multiple extensions of different types can be stored simultaneously.
+    /// This can be used to pass reader specific information, such as a
+    /// [`ParquetAccessPlan`].
+    ///
+    /// See [`Self::get_extension`] to retrieve an extension by type.
+    ///
+    /// [`ParquetAccessPlan`]: https://docs.rs/datafusion/latest/datafusion/datasource/physical_plan/parquet/struct.ParquetAccessPlan.html
+    pub fn with_extension<T: Send + Sync + 'static>(mut self, ext: Arc<T>) -> Self {
+        let ext = ext as Arc<dyn std::any::Any + Send + Sync + 'static>;
+        let id = TypeId::of::<T>();
+        self.extensions.insert(id, ext);
         self
+    }
+
+    /// Retrieve a typed extension from this file, if one exists.
+    ///
+    /// See [`Self::with_extension`] to add an extension by type.
+    pub fn get_extension<T: Send + Sync + 'static>(&self) -> Option<Arc<T>> {
+        let id = TypeId::of::<T>();
+        self.extensions
+            .get(&id)
+            .cloned()
+            .map(|ext| Arc::downcast(ext).expect("TypeId unique"))
     }
 
     /// Update the statistics for this file.
@@ -337,7 +360,7 @@ impl From<ObjectMeta> for PartitionedFile {
             range: None,
             statistics: None,
             ordering: None,
-            extensions: None,
+            extensions: AnyMap::default(),
             metadata_size_hint: None,
         }
     }
@@ -534,7 +557,7 @@ pub fn generate_test_files(num_files: usize, overlap_factor: f64) -> Vec<FileGro
                 }],
             })),
             ordering: None,
-            extensions: None,
+            extensions: AnyMap::default(),
             metadata_size_hint: None,
         };
         files.push(file);
