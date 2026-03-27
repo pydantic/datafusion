@@ -206,8 +206,12 @@ fn query(ctx: &SessionContext, rt: &Runtime, sql: &str) {
 }
 
 fn narrow_benchmarks(c: &mut Criterion) {
+<<<<<<< HEAD
     let temp_file = NARROW_FILE
         .get_or_init(|| generate_file(narrow_schema(), narrow_batch, "narrow_struct"));
+=======
+    let temp_file = generate_file(narrow_schema(), narrow_batch, "narrow_struct");
+>>>>>>> friendlymatthew/update-projections-for-structs
     let file_path = temp_file.path().display().to_string();
     assert!(Path::new(&file_path).exists(), "path not found");
 
@@ -215,8 +219,11 @@ fn narrow_benchmarks(c: &mut Criterion) {
     let ctx = create_context(&rt, &file_path, "t");
 
     let mut group = c.benchmark_group("narrow_struct");
+<<<<<<< HEAD
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(2));
+=======
+>>>>>>> friendlymatthew/update-projections-for-structs
 
     // baseline: full struct, must decode both leaves
     group.bench_function("select_struct", |b| {
@@ -249,11 +256,19 @@ fn narrow_benchmarks(c: &mut Criterion) {
     });
 
     group.finish();
+<<<<<<< HEAD
 }
 
 fn wide_benchmarks(c: &mut Criterion) {
     let temp_file =
         WIDE_FILE.get_or_init(|| generate_file(wide_schema(), wide_batch, "wide_struct"));
+=======
+    drop(temp_file);
+}
+
+fn wide_benchmarks(c: &mut Criterion) {
+    let temp_file = generate_file(wide_schema(), wide_batch, "wide_struct");
+>>>>>>> friendlymatthew/update-projections-for-structs
     let file_path = temp_file.path().display().to_string();
     assert!(Path::new(&file_path).exists(), "path not found");
 
@@ -261,8 +276,11 @@ fn wide_benchmarks(c: &mut Criterion) {
     let ctx = create_context(&rt, &file_path, "t");
 
     let mut group = c.benchmark_group("wide_struct");
+<<<<<<< HEAD
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(2));
+=======
+>>>>>>> friendlymatthew/update-projections-for-structs
 
     // baseline: full struct, must decode all 5 leaves
     group.bench_function("select_struct", |b| {
@@ -295,6 +313,10 @@ fn wide_benchmarks(c: &mut Criterion) {
     });
 
     group.finish();
+<<<<<<< HEAD
+=======
+    drop(temp_file);
+>>>>>>> friendlymatthew/update-projections-for-structs
 }
 
 fn nested_schema() -> SchemaRef {
@@ -360,8 +382,12 @@ fn nested_batch(batch_id: usize) -> RecordBatch {
 }
 
 fn nested_benchmarks(c: &mut Criterion) {
+<<<<<<< HEAD
     let temp_file = NESTED_FILE
         .get_or_init(|| generate_file(nested_schema(), nested_batch, "nested_struct"));
+=======
+    let temp_file = generate_file(nested_schema(), nested_batch, "nested_struct");
+>>>>>>> friendlymatthew/update-projections-for-structs
     let file_path = temp_file.path().display().to_string();
     assert!(Path::new(&file_path).exists(), "path not found");
 
@@ -369,8 +395,11 @@ fn nested_benchmarks(c: &mut Criterion) {
     let ctx = create_context(&rt, &file_path, "t");
 
     let mut group = c.benchmark_group("nested_struct");
+<<<<<<< HEAD
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(2));
+=======
+>>>>>>> friendlymatthew/update-projections-for-structs
 
     // baseline: full outer struct, decode all 3 leaves
     group.bench_function("select_struct", |b| {
@@ -403,6 +432,10 @@ fn nested_benchmarks(c: &mut Criterion) {
     });
 
     group.finish();
+<<<<<<< HEAD
+=======
+    drop(temp_file);
+>>>>>>> friendlymatthew/update-projections-for-structs
 }
 
 criterion_group!(
