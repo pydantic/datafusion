@@ -496,12 +496,12 @@ struct PushdownColumns {
 /// This allows the row filter to project only the specific Parquet leaf columns
 /// needed by the filter, rather than all leaves of the struct.
 #[derive(Debug, Clone)]
-struct StructFieldAccess {
+pub(crate) struct StructFieldAccess {
     /// Arrow root column index of the struct in the file schema.
-    root_index: usize,
+    pub(crate) root_index: usize,
     /// Field names forming the path into the struct.
     /// e.g., `["value"]` for `s['value']`, `["outer", "inner"]` for `s['outer']['inner']`.
-    field_path: Vec<String>,
+    pub(crate) field_path: Vec<String>,
 }
 
 /// Checks if a given expression can be pushed down to the parquet decoder.
@@ -579,7 +579,7 @@ pub(crate) fn build_parquet_read_plan(
     )))
 }
 
-fn leaf_indices_for_roots<I>(
+pub(crate) fn leaf_indices_for_roots<I>(
     root_indices: I,
     schema_descr: &SchemaDescriptor,
 ) -> Vec<usize>
@@ -606,7 +606,7 @@ where
 /// For every `StructFieldAccess`, finds the leaf columns in the Parquet schema
 /// whose path matches the struct root name + field path. This avoids reading all
 /// leaves of a struct when only specific fields are needed
-fn resolve_struct_field_leaves(
+pub(crate) fn resolve_struct_field_leaves(
     accesses: &[StructFieldAccess],
     file_schema: &Schema,
     schema_descr: &SchemaDescriptor,
@@ -649,7 +649,7 @@ fn resolve_struct_field_leaves(
 /// For struct columns accessed via `get_field`, a pruned struct type is created
 /// containing only the fields along the access path. Note: it must match the schema
 /// that the Parquet reader produces when projecting specific struct leaves
-fn build_filter_schema(
+pub(crate) fn build_filter_schema(
     file_schema: &Schema,
     regular_indices: &[usize],
     struct_field_accesses: &[StructFieldAccess],
@@ -699,7 +699,7 @@ fn build_filter_schema(
     Arc::new(Schema::new(fields))
 }
 
-fn prune_struct_type(dt: &DataType, paths: &[&[String]]) -> DataType {
+pub(crate) fn prune_struct_type(dt: &DataType, paths: &[&[String]]) -> DataType {
     let DataType::Struct(fields) = dt else {
         return dt.clone();
     };

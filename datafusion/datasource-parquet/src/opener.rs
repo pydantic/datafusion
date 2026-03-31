@@ -18,19 +18,27 @@
 //! [`ParquetOpener`] for opening Parquet files
 
 use crate::page_filter::PagePruningAccessPlanFilter;
+use crate::row_filter::{
+    self, StructFieldAccess, build_filter_schema, leaf_indices_for_roots,
+    resolve_struct_field_leaves,
+};
 use crate::row_group_filter::RowGroupAccessPlanFilter;
 use crate::{
     ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
-    apply_file_schema_type_coercions, coerce_int96_to_resolution, row_filter,
+    apply_file_schema_type_coercions, coerce_int96_to_resolution,
 };
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{DataType, Schema};
+use datafusion_common::tree_node::TreeNode;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
+use datafusion_functions::core::getfield::GetFieldFunc;
+use datafusion_physical_expr::ScalarFunctionExpr;
+use datafusion_physical_expr::expressions::{Column, Literal};
 use datafusion_physical_expr::projection::{ProjectionExprs, Projector};
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
 use parquet::errors::ParquetError;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -584,8 +592,38 @@ impl FileOpener for ParquetOpener {
             let arrow_reader_metrics = ArrowReaderMetrics::enabled();
 
             let indices = projection.column_indices();
-            let mask =
-                ProjectionMask::roots(reader_metadata.parquet_schema(), indices.clone());
+
+            // check if projection expressions access struct fields via get_field.
+            // if so, use leaf-level projection to read only the needed struct
+            // leaves instead of all leaves of the struct column.
+            let (regular_indices, struct_accesses) =
+                collect_projection_struct_accesses(&projection, &physical_file_schema);
+
+            let (mask, has_struct_accesses) = if struct_accesses.is_empty() {
+                // no struct field accesses — use root-level projection
+                let mask = ProjectionMask::roots(
+                    reader_metadata.parquet_schema(),
+                    indices.clone(),
+                );
+                (mask, false)
+            } else {
+                // build leaf-level projection mask
+                let schema_descr = reader_metadata.parquet_schema();
+                let mut leaf_indices =
+                    leaf_indices_for_roots(regular_indices.iter().copied(), schema_descr);
+                let struct_leaf_indices = resolve_struct_field_leaves(
+                    &struct_accesses,
+                    &physical_file_schema,
+                    schema_descr,
+                );
+                leaf_indices.extend_from_slice(&struct_leaf_indices);
+                leaf_indices.sort_unstable();
+                leaf_indices.dedup();
+
+                let mask =
+                    ProjectionMask::leaves(schema_descr, leaf_indices.iter().copied());
+                (mask, true)
+            };
 
             let decoder = builder
                 .with_projection(mask)
@@ -601,7 +639,17 @@ impl FileOpener for ParquetOpener {
             // Rebase column indices to match the narrowed stream schema.
             // The projection expressions have indices based on physical_file_schema,
             // but the stream only contains the columns selected by the ProjectionMask.
-            let stream_schema = Arc::new(physical_file_schema.project(&indices)?);
+            // when struct field accesses are present, the schema has pruned
+            // struct types (only the accessed fields).
+            let stream_schema = if has_struct_accesses {
+                build_filter_schema(
+                    &physical_file_schema,
+                    &regular_indices,
+                    &struct_accesses,
+                )
+            } else {
+                Arc::new(physical_file_schema.project(&indices)?)
+            };
             let replace_schema = stream_schema != output_schema;
             let projection = projection
                 .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
@@ -786,6 +834,94 @@ fn constant_value_from_stats(
     }
 
     None
+}
+
+/// collect struct field accesses from projection expressions.
+///
+/// walks each expression to detect `get_field(Column("s"), "field", ...)` patterns.
+/// returns the regular (non-struct-field) column indices and the struct field accesses.
+/// if a struct column is referenced both directly and via get_field, it is treated
+/// as a regular column (root-level projection).
+fn collect_projection_struct_accesses(
+    projection: &ProjectionExprs,
+    file_schema: &Schema,
+) -> (Vec<usize>, Vec<StructFieldAccess>) {
+    use datafusion_common::tree_node::TreeNodeRecursion;
+
+    let mut struct_accesses = Vec::new();
+    let mut struct_roots_via_get_field = BTreeSet::new();
+    let mut regular_indices = Vec::new();
+    let mut struct_roots_used_directly = BTreeSet::new();
+
+    for proj_expr in projection.iter() {
+        let _ = proj_expr.expr.apply(
+            |node: &Arc<dyn PhysicalExpr>| -> Result<TreeNodeRecursion> {
+                // check for get_field(Column("s"), "field_name", ...)
+                if let Some(func) =
+                    ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(node.as_ref())
+                {
+                    let args = func.args();
+                    if let Some(column) = args
+                        .first()
+                        .and_then(|a| a.as_any().downcast_ref::<Column>())
+                    {
+                        let field_path = args[1..]
+                            .iter()
+                            .map(|arg: &Arc<dyn PhysicalExpr>| {
+                                arg.as_any().downcast_ref::<Literal>().and_then(
+                                    |lit: &Literal| {
+                                        lit.value()
+                                            .try_as_str()
+                                            .flatten()
+                                            .map(|s: &str| s.to_string())
+                                    },
+                                )
+                            })
+                            .collect::<Option<Vec<_>>>();
+
+                        if let Some(path) = field_path
+                            && let Ok(idx) = file_schema.index_of(column.name())
+                        {
+                            struct_accesses.push(StructFieldAccess {
+                                root_index: idx,
+                                field_path: path,
+                            });
+                            struct_roots_via_get_field.insert(idx);
+                            return Ok(TreeNodeRecursion::Jump);
+                        }
+                    }
+                }
+
+                // regular column reference (not inside a get_field)
+                if let Some(column) = node.as_any().downcast_ref::<Column>()
+                    && let Ok(idx) = file_schema.index_of(column.name())
+                {
+                    let field = file_schema.field(idx);
+                    if field.data_type().is_nested() {
+                        struct_roots_used_directly.insert(idx);
+                    }
+                    regular_indices.push(idx);
+                }
+
+                Ok(TreeNodeRecursion::Continue)
+            },
+        );
+    }
+
+    // if a struct column is accessed both directly and via get_field,
+    // fall back to root-level for that column
+    for idx in &struct_roots_used_directly {
+        struct_roots_via_get_field.remove(idx);
+        struct_accesses.retain(|a| a.root_index != *idx);
+    }
+
+    // remove struct-only columns from regular_indices
+    // (they'll be handled via struct_accesses)
+    regular_indices.retain(|idx| !struct_roots_via_get_field.contains(idx));
+    regular_indices.sort_unstable();
+    regular_indices.dedup();
+
+    (regular_indices, struct_accesses)
 }
 
 /// Wraps an inner RecordBatchStream and a [`FilePruner`]
