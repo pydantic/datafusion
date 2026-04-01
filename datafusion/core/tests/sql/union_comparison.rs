@@ -433,6 +433,68 @@ async fn test_union_cast_compatible_variant() -> Result<()> {
     Ok(())
 }
 
+/// Tests TRY_CAST from union type to scalar type.
+/// TRY_CAST should extract the matching variant and return NULL for non-matching ones,
+/// just like CAST, but also return NULL (instead of erroring) for cast failures.
+#[tokio::test]
+async fn test_union_try_cast() -> Result<()> {
+    let union_array = create_sparse_union_array(vec![
+        UnionValue::Int(Some(10)),
+        UnionValue::Str(Some("hello")),
+        UnionValue::Int(Some(30)),
+        UnionValue::Str(Some("42")),
+    ]);
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "val",
+            DataType::Union(
+                UnionFields::new(
+                    vec![0, 1],
+                    vec![
+                        Field::new("int", DataType::Int32, true),
+                        Field::new("str", DataType::Utf8, true),
+                    ],
+                ),
+                UnionMode::Sparse,
+            ),
+            true,
+        ),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+            Arc::new(union_array),
+        ],
+    )?;
+
+    let ctx = SessionContext::new();
+    ctx.register_batch("test", batch)?;
+
+    // TRY_CAST to INT should extract int variants, NULL for string variants
+    let df = ctx
+        .sql("SELECT id, TRY_CAST(val AS INT) as val_int FROM test")
+        .await?;
+    let results = df.collect().await?;
+
+    let expected = [
+        "+----+---------+",
+        "| id | val_int |",
+        "+----+---------+",
+        "| 1  | 10      |",
+        "| 2  |         |",
+        "| 3  | 30      |",
+        "| 4  |         |",
+        "+----+---------+",
+    ];
+    assert_batches_eq!(expected, &results);
+
+    Ok(())
+}
+
 /// Tests union-to-union equality comparison (supported via arrow-ord).
 #[tokio::test]
 async fn test_union_eq_same_union() -> Result<()> {
@@ -481,9 +543,7 @@ async fn test_union_eq_same_union() -> Result<()> {
     ctx.register_batch("test", batch)?;
 
     // Row 1: Int(10) = Int(10) -> true; Row 2: Str("hello") = Str("world") -> false
-    let df = ctx
-        .sql("SELECT id FROM test WHERE val1 = val2")
-        .await?;
+    let df = ctx.sql("SELECT id FROM test WHERE val1 = val2").await?;
     let results = df.collect().await?;
 
     let expected = ["+----+", "| id |", "+----+", "| 1  |", "+----+"];

@@ -20,7 +20,7 @@
 use arrow::buffer::NullBuffer;
 use arrow::{
     array::{Array, ArrayRef, Date32Array, Date64Array, NullArray},
-    compute::{can_cast_types, CastOptions, kernels, max, min},
+    compute::{CastOptions, can_cast_types, kernels, max, min},
     datatypes::DataType,
     error::ArrowError,
     util::pretty::pretty_format_columns,
@@ -322,7 +322,8 @@ fn cast_array_by_name(
         _ if datafusion_common::nested_struct::requires_nested_struct_cast(
             array.data_type(),
             cast_type,
-        ) => {
+        ) =>
+        {
             datafusion_common::nested_struct::cast_column(array, cast_type, cast_options)
         }
         _ => {
@@ -346,7 +347,7 @@ fn cast_union_array(
     to_type: &DataType,
     cast_options: &CastOptions,
 ) -> Result<ArrayRef, ArrowError> {
-    use arrow::array::{make_array, new_null_array, UInt32Array, UnionArray};
+    use arrow::array::{UInt32Array, UnionArray, make_array, new_null_array};
     use arrow::compute::cast_with_options;
     use arrow::datatypes::UnionMode;
 
