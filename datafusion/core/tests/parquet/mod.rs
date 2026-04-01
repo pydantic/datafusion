@@ -56,6 +56,7 @@ mod page_pruning;
 mod row_group_pruning;
 mod schema;
 mod schema_coercion;
+mod stats_propagation_mre;
 mod utils;
 
 #[cfg(test)]
