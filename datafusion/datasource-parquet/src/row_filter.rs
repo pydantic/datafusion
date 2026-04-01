@@ -68,7 +68,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use arrow::array::BooleanArray;
+use arrow::array::{Array, BooleanArray, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
@@ -78,7 +78,7 @@ use parquet::arrow::arrow_reader::{ArrowPredicate, RowFilter};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
-use datafusion_common::Result;
+use datafusion_common::{Result, ScalarValue};
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_physical_expr::ScalarFunctionExpr;
@@ -391,6 +391,25 @@ impl<'schema> PushdownChecker<'schema> {
     }
 }
 
+/// Known Parquet Variant UDF name prefixes. These UDFs take a Variant struct
+/// column as their first argument and handle the internal shredded structure
+/// navigation at runtime (metadata dictionary + typed_value sub-columns).
+///
+/// See <https://github.com/datafusion-contrib/datafusion-variant> for the
+/// `datafusion-variant` crate that defines these UDFs.
+const VARIANT_UDF_NAMES: &[&str] = &[
+    "variant_get",       // variant_get, variant_get_str, variant_get_int, etc.
+    "is_variant_null",
+];
+
+/// Checks if a function name belongs to a Variant UDF that accesses a
+/// Variant struct column.
+fn is_variant_udf_name(name: &str) -> bool {
+    VARIANT_UDF_NAMES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
 impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
     type Node = Arc<dyn PhysicalExpr>;
 
@@ -474,6 +493,91 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
                                 return Ok(recursion);
                             }
                         }
+                    }
+
+                    return Ok(TreeNodeRecursion::Jump);
+                }
+            }
+        }
+
+        // Handle Parquet Variant UDFs like `variant_get_str(variant_col, 'region')`.
+        //
+        // Variant columns are stored as `Struct<metadata, value, typed_value<...>>`
+        // where `typed_value` contains shredded sub-columns for hot fields.
+        //
+        // We intercept variant UDFs so the visitor never reaches the raw
+        // `Column("variant_col")` node (which would be rejected as a struct).
+        //
+        // The path argument (2nd arg) tells us which shredded field is accessed,
+        // so we can prune to just the needed leaves:
+        //   - `metadata` — always needed (variant metadata dictionary)
+        //   - `value` — always needed (fallback for non-shredded values)
+        //   - `typed_value.<path...>` — the specific shredded field(s)
+        if let Some(func_expr) = node.as_any().downcast_ref::<ScalarFunctionExpr>() {
+            if is_variant_udf_name(func_expr.name()) {
+                if let Some(column) = func_expr
+                    .args()
+                    .first()
+                    .and_then(|a| a.as_any().downcast_ref::<Column>())
+                {
+                    let Ok(root_idx) = self.file_schema.index_of(column.name()) else {
+                        self.projected_columns = true;
+                        return Ok(TreeNodeRecursion::Jump);
+                    };
+
+                    // Extract the variant path from the second argument.
+                    // It can be a string literal or a list of string literals.
+                    let variant_path: Option<Vec<String>> =
+                        func_expr.args().get(1).and_then(|arg| {
+                            let lit = arg.as_any().downcast_ref::<Literal>()?;
+                            match lit.value() {
+                                ScalarValue::Utf8(Some(s))
+                                | ScalarValue::Utf8View(Some(s))
+                                | ScalarValue::LargeUtf8(Some(s)) => {
+                                    Some(vec![s.to_string()])
+                                }
+                                ScalarValue::List(arr) if !arr.is_null(0) => {
+                                    let values = arr.value(0);
+                                    let strings =
+                                        values.as_any().downcast_ref::<StringArray>()?;
+                                    let path: Vec<String> = (0..strings.len())
+                                        .filter_map(|i| {
+                                            strings
+                                                .is_valid(i)
+                                                .then(|| strings.value(i).to_string())
+                                        })
+                                        .collect();
+                                    Some(path)
+                                }
+                                _ => None,
+                            }
+                        });
+
+                    // Record struct field accesses for the variant sub-fields:
+                    // metadata, value, and typed_value.<path>
+                    self.struct_field_accesses.push(StructFieldAccess {
+                        root_index: root_idx,
+                        field_path: vec!["metadata".to_string()],
+                    });
+                    self.struct_field_accesses.push(StructFieldAccess {
+                        root_index: root_idx,
+                        field_path: vec!["value".to_string()],
+                    });
+
+                    if let Some(path) = variant_path {
+                        // typed_value.<field1>.<field2>...
+                        let mut typed_value_path = vec!["typed_value".to_string()];
+                        typed_value_path.extend(path);
+                        self.struct_field_accesses.push(StructFieldAccess {
+                            root_index: root_idx,
+                            field_path: typed_value_path,
+                        });
+                    } else {
+                        // Can't determine path statically — read entire typed_value
+                        self.struct_field_accesses.push(StructFieldAccess {
+                            root_index: root_idx,
+                            field_path: vec!["typed_value".to_string()],
+                        });
                     }
 
                     return Ok(TreeNodeRecursion::Jump);
