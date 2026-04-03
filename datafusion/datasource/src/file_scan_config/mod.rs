@@ -24,7 +24,8 @@ use crate::file_groups::FileGroup;
 use crate::{
     PartitionedFile, display::FileGroupsDisplay, file::FileSource,
     file_compression_type::FileCompressionType, file_stream::FileStreamBuilder,
-    source::DataSource, statistics::MinMaxStatistics,
+    file_stream::work_source::SharedWorkSource, source::DataSource,
+    statistics::MinMaxStatistics,
 };
 use arrow::datatypes::FieldRef;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
@@ -55,7 +56,13 @@ use datafusion_physical_plan::{
     metrics::ExecutionPlanMetricsSet,
 };
 use log::{debug, warn};
-use std::{any::Any, fmt::Debug, fmt::Formatter, fmt::Result as FmtResult, sync::Arc};
+use std::{
+    any::Any,
+    fmt::Debug,
+    fmt::Formatter,
+    fmt::Result as FmtResult,
+    sync::{Arc, OnceLock},
+};
 
 /// [`FileScanConfig`] represents scanning data from a group of files
 ///
@@ -209,6 +216,11 @@ pub struct FileScanConfig {
     /// If the number of file partitions > target_partitions, the file partitions will be grouped
     /// in a round-robin fashion such that number of file partitions = target_partitions.
     pub partitioned_by_file_group: bool,
+    /// Shared queue of unopened files for sibling streams in this scan.
+    ///
+    /// This is initialized once per `FileScanConfig` and reused by reorderable
+    /// `FileStream`s created from that config.
+    pub(crate) shared_work_source: Arc<OnceLock<SharedWorkSource>>,
 }
 
 /// A builder for [`FileScanConfig`]'s.
@@ -551,7 +563,31 @@ impl FileScanConfigBuilder {
             expr_adapter_factory: expr_adapter,
             statistics,
             partitioned_by_file_group,
+            shared_work_source: Arc::new(OnceLock::new()),
         }
+    }
+}
+
+impl FileScanConfig {
+    /// Returns the shared unopened-file queue for reorderable streams in this scan.
+    ///
+    /// The queue is initialized once from all file groups so sibling streams
+    /// can begin stealing work immediately, even if they are built or polled
+    /// before every sibling `FileStream` has been constructed.
+    pub(crate) fn shared_work_source(&self) -> Option<SharedWorkSource> {
+        if self.preserve_order || self.partitioned_by_file_group {
+            return None;
+        }
+
+        Some(
+            self.shared_work_source
+                .get_or_init(|| {
+                    SharedWorkSource::new(
+                        self.file_groups.iter().flat_map(FileGroup::iter).cloned(),
+                    )
+                })
+                .clone(),
+        )
     }
 }
 

@@ -19,12 +19,24 @@ use std::sync::Arc;
 
 use crate::file_scan_config::FileScanConfig;
 use crate::file_stream::scan_state::ScanState;
+use crate::file_stream::work_source::{SharedWorkSource, WorkSource};
 use crate::morsel::{FileOpenerMorselizer, Morselizer};
 use datafusion_common::{Result, internal_err};
 use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 
 use super::metrics::FileStreamMetrics;
 use super::{FileOpener, FileStream, FileStreamState, OnError};
+
+/// Whether this stream may reorder work across sibling `FileStream`s.
+///
+/// This is derived entirely from [`FileScanConfig`]. Streams that must
+/// preserve file order or file-group partition boundaries are not reorderable.
+enum Reorderable {
+    /// This stream may reorder work using a shared queue of unopened files.
+    Yes(SharedWorkSource),
+    /// This stream must keep its own local file order.
+    No,
+}
 
 /// Builder for constructing a [`FileStream`].
 pub struct FileStreamBuilder<'a> {
@@ -33,17 +45,24 @@ pub struct FileStreamBuilder<'a> {
     morselizer: Option<Box<dyn Morselizer>>,
     metrics: Option<&'a ExecutionPlanMetricsSet>,
     on_error: OnError,
+    reorderable: Reorderable,
 }
 
 impl<'a> FileStreamBuilder<'a> {
-    /// Create a new builder.
+    /// Create a new builder for [`FileStream`].
     pub fn new(config: &'a FileScanConfig) -> Self {
+        let reorderable = match config.shared_work_source() {
+            Some(shared_work_source) => Reorderable::Yes(shared_work_source),
+            None => Reorderable::No,
+        };
+
         Self {
             config,
             partition: None,
             morselizer: None,
             metrics: None,
             on_error: OnError::Fail,
+            reorderable,
         }
     }
 
@@ -89,6 +108,7 @@ impl<'a> FileStreamBuilder<'a> {
             morselizer,
             metrics,
             on_error,
+            reorderable,
         } = self;
 
         let Some(partition) = partition else {
@@ -106,10 +126,14 @@ impl<'a> FileStreamBuilder<'a> {
                 "FileStreamBuilder invalid partition index: {partition}"
             );
         };
+        let work_source = match reorderable {
+            Reorderable::Yes(shared) => WorkSource::Shared(shared),
+            Reorderable::No => WorkSource::Local(file_group.into_inner().into()),
+        };
 
         let file_stream_metrics = FileStreamMetrics::new(metrics, partition);
         let scan_state = Box::new(ScanState::new(
-            file_group.into_inner(),
+            work_source,
             config.limit,
             morselizer,
             on_error,
