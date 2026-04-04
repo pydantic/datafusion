@@ -976,7 +976,7 @@ fn build_statistics_record_batch<S: PruningStatistics + ?Sized>(
             StatisticsType::Min => statistics.min_values(&column),
             StatisticsType::Max => statistics.max_values(&column),
             StatisticsType::NullCount => statistics.null_counts(&column),
-            StatisticsType::RowCount => statistics.row_counts(&column),
+            StatisticsType::RowCount => statistics.row_counts(),
         };
         let array = array.unwrap_or_else(|| new_null_array(data_type, num_containers));
 
@@ -2420,9 +2420,7 @@ mod tests {
                 .unwrap_or(None)
         }
 
-        fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
-            // Row count is container-level, not column-specific.
-            // Return row counts from any column that has them.
+        fn row_counts(&self) -> Option<ArrayRef> {
             self.stats
                 .values()
                 .find_map(|container_stats| container_stats.row_counts())
@@ -2463,7 +2461,7 @@ mod tests {
             None
         }
 
-        fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
+        fn row_counts(&self) -> Option<ArrayRef> {
             None
         }
 

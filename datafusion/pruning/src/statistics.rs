@@ -457,12 +457,8 @@ fn resolve_aggregate_function(
                     return stats.null_counts(col);
                 }
             } else {
-                // count(*) without filter → total row count.
-                // PruningStatistics::row_counts takes a column parameter
-                // but the value is container-level (not column-specific),
-                // so all implementations return the same result regardless
-                // of column.
-                return stats.row_counts(&Column::new_unqualified(""));
+                // count(*) without filter → total row count
+                return stats.row_counts();
             }
         }
         _ => {}
@@ -557,7 +553,7 @@ mod tests {
         fn null_counts(&self, _column: &Column) -> Option<ArrayRef> {
             Some(Arc::clone(&self.null_counts))
         }
-        fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
+        fn row_counts(&self) -> Option<ArrayRef> {
             Some(Arc::clone(&self.row_counts))
         }
         fn contained(
