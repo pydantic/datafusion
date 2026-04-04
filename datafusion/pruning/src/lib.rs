@@ -26,4 +26,9 @@ pub use pruning_predicate::{
     PredicateRewriter, PruningPredicate, PruningStatistics, RequiredColumns,
     UnhandledPredicateHook, build_pruning_predicate,
 };
-pub use statistics::{ResolvedStatistics, StatisticsSource};
+pub use statistics::{
+    ResolvedStatistics, StatisticsSource, stat_column_distinct_count,
+    stat_column_distinct_count_with_filter, stat_column_max, stat_column_max_with_filter,
+    stat_column_min, stat_column_min_with_filter, stat_column_null_count,
+    stat_column_null_count_with_filter, stat_row_count, stat_row_count_with_filter,
+};

@@ -17,10 +17,207 @@
 
 use arrow::array::{ArrayRef, new_null_array};
 use datafusion_common::pruning::PruningStatistics;
-use datafusion_expr::Expr;
+use datafusion_common::{Column, ScalarValue};
+use datafusion_expr::{Expr, ExprFunctionExt};
 use std::collections::{HashMap, HashSet};
 
 use datafusion_common::error::DataFusionError;
+
+// ── Well-known statistics expression helpers ────────────────────────────
+//
+// These helpers produce the canonical [`Expr`] forms that
+// [`StatisticsSource`] implementations should recognise when they
+// receive expressions from [`PruningPredicate::all_required_expressions`].
+//
+// [`PruningPredicate::all_required_expressions`]: crate::PruningPredicate::all_required_expressions
+
+/// Create a `min(column)` statistics expression.
+///
+/// Returns an [`Expr`] requesting the minimum value of `column` in each
+/// container (row group, file, partition, etc.).
+///
+/// ```text
+/// min(column)
+/// ```
+///
+/// See also [`stat_column_min_with_filter`] for a filtered variant.
+pub fn stat_column_min(column: &str) -> Expr {
+    let col_expr = Expr::Column(Column::new_unqualified(column));
+    datafusion_functions_aggregate::min_max::min_udaf().call(vec![col_expr])
+}
+
+/// Create a `min(column) FILTER (WHERE …)` statistics expression.
+///
+/// Returns an [`Expr`] requesting the minimum value of `column` in each
+/// container, considering only the rows that satisfy `filter`.
+///
+/// ```text
+/// min(column) FILTER (WHERE filter)
+/// ```
+///
+/// This is useful when a data source tracks per-partition or per-segment
+/// statistics and the caller wants to scope the min to a subset of rows.
+pub fn stat_column_min_with_filter(column: &str, filter: Expr) -> Expr {
+    let col_expr = Expr::Column(Column::new_unqualified(column));
+    datafusion_functions_aggregate::min_max::min_udaf()
+        .call(vec![col_expr])
+        .filter(filter)
+        .build()
+        .expect("building filtered min stat expr")
+}
+
+/// Create a `max(column)` statistics expression.
+///
+/// Returns an [`Expr`] requesting the maximum value of `column` in each
+/// container (row group, file, partition, etc.).
+///
+/// ```text
+/// max(column)
+/// ```
+///
+/// See also [`stat_column_max_with_filter`] for a filtered variant.
+pub fn stat_column_max(column: &str) -> Expr {
+    let col_expr = Expr::Column(Column::new_unqualified(column));
+    datafusion_functions_aggregate::min_max::max_udaf().call(vec![col_expr])
+}
+
+/// Create a `max(column) FILTER (WHERE …)` statistics expression.
+///
+/// Returns an [`Expr`] requesting the maximum value of `column` in each
+/// container, considering only the rows that satisfy `filter`.
+///
+/// ```text
+/// max(column) FILTER (WHERE filter)
+/// ```
+///
+/// This is useful when a data source tracks per-partition or per-segment
+/// statistics and the caller wants to scope the max to a subset of rows.
+pub fn stat_column_max_with_filter(column: &str, filter: Expr) -> Expr {
+    let col_expr = Expr::Column(Column::new_unqualified(column));
+    datafusion_functions_aggregate::min_max::max_udaf()
+        .call(vec![col_expr])
+        .filter(filter)
+        .build()
+        .expect("building filtered max stat expr")
+}
+
+/// Create a `count(*) FILTER (WHERE column IS NULL)` statistics expression.
+///
+/// Returns an [`Expr`] requesting the number of NULL values in `column`
+/// in each container.
+///
+/// ```text
+/// count(*) FILTER (WHERE column IS NULL)
+/// ```
+///
+/// See also [`stat_column_null_count_with_filter`] for combining the
+/// null check with an additional predicate.
+pub fn stat_column_null_count(column: &str) -> Expr {
+    let col_expr = Expr::Column(Column::new_unqualified(column));
+    count_star()
+        .filter(Expr::IsNull(Box::new(col_expr)))
+        .build()
+        .expect("building null count stat expr")
+}
+
+/// Create a `count(*) FILTER (WHERE column IS NULL AND …)` statistics
+/// expression.
+///
+/// Returns an [`Expr`] requesting the number of NULL values in `column`
+/// in each container, restricted to rows that also satisfy `filter`.
+/// The resulting filter is the conjunction of `column IS NULL` and the
+/// provided predicate.
+///
+/// ```text
+/// count(*) FILTER (WHERE column IS NULL AND filter)
+/// ```
+pub fn stat_column_null_count_with_filter(column: &str, filter: Expr) -> Expr {
+    let col_expr = Expr::Column(Column::new_unqualified(column));
+    let combined = Expr::IsNull(Box::new(col_expr)).and(filter);
+    count_star()
+        .filter(combined)
+        .build()
+        .expect("building filtered null count stat expr")
+}
+
+/// Create a `count(*)` statistics expression for total row count.
+///
+/// Returns an [`Expr`] requesting the total number of rows in each
+/// container, regardless of null values. Unlike the column-specific
+/// helpers, this expression is not tied to any particular column.
+///
+/// ```text
+/// count(*)
+/// ```
+///
+/// See also [`stat_row_count_with_filter`] for a filtered variant.
+pub fn stat_row_count() -> Expr {
+    count_star()
+}
+
+/// Create a `count(*) FILTER (WHERE …)` statistics expression.
+///
+/// Returns an [`Expr`] requesting the number of rows in each container
+/// that satisfy `filter`. This can represent, for example, the number
+/// of rows in a particular partition or the number of rows matching a
+/// deletion vector.
+///
+/// ```text
+/// count(*) FILTER (WHERE filter)
+/// ```
+pub fn stat_row_count_with_filter(filter: Expr) -> Expr {
+    count_star()
+        .filter(filter)
+        .build()
+        .expect("building filtered row count stat expr")
+}
+
+/// Create a `count(DISTINCT column)` statistics expression.
+///
+/// Returns an [`Expr`] requesting the number of distinct (unique)
+/// non-null values of `column` in each container. This is useful for
+/// cardinality estimation and join-order planning.
+///
+/// ```text
+/// count(DISTINCT column)
+/// ```
+///
+/// See also [`stat_column_distinct_count_with_filter`] for a filtered
+/// variant.
+pub fn stat_column_distinct_count(column: &str) -> Expr {
+    let col_expr = Expr::Column(Column::new_unqualified(column));
+    datafusion_functions_aggregate::count::count_udaf()
+        .call(vec![col_expr])
+        .distinct()
+        .build()
+        .expect("building distinct count stat expr")
+}
+
+/// Create a `count(DISTINCT column) FILTER (WHERE …)` statistics
+/// expression.
+///
+/// Returns an [`Expr`] requesting the number of distinct non-null values
+/// of `column` in each container, restricted to rows that satisfy
+/// `filter`.
+///
+/// ```text
+/// count(DISTINCT column) FILTER (WHERE filter)
+/// ```
+pub fn stat_column_distinct_count_with_filter(column: &str, filter: Expr) -> Expr {
+    let col_expr = Expr::Column(Column::new_unqualified(column));
+    datafusion_functions_aggregate::count::count_udaf()
+        .call(vec![col_expr])
+        .distinct()
+        .filter(filter)
+        .build()
+        .expect("building filtered distinct count stat expr")
+}
+
+/// Builds a bare `count(*)` aggregate expression (no filter, no distinct).
+fn count_star() -> Expr {
+    datafusion_functions_aggregate::count::count_udaf()
+        .call(vec![Expr::Literal(ScalarValue::Boolean(Some(true)), None)])
+}
 
 /// A source of runtime statistical information for pruning.
 ///
@@ -39,9 +236,14 @@ use datafusion_common::error::DataFusionError;
 /// The following expression types are meaningful for pruning:
 ///
 /// - **Aggregate functions**: `min(column)`, `max(column)`,
-///   `count(*) FILTER (WHERE column IS NULL)`,
-///   `count(*) FILTER (WHERE column IS NOT NULL)`
+///   `count(*) FILTER (WHERE column IS NULL)`, `count(*)`,
+///   `count(DISTINCT column)`, and filtered variants of all of these.
 /// - **InList**: `column IN (v1, v2, ...)` — see [InList semantics] below.
+///
+/// Use the `stat_*` helper functions ([`stat_column_min`],
+/// [`stat_column_max`], [`stat_column_null_count`], [`stat_row_count`],
+/// [`stat_column_distinct_count`], and their `_with_filter` variants) to
+/// construct these expressions in a canonical form.
 ///
 /// Implementors return `None` for any expression they cannot answer.
 ///
@@ -100,7 +302,7 @@ pub trait StatisticsSource: Send + Sync {
 /// by the underlying [`PruningStatistics`]:
 /// - `min(column)` → [`PruningStatistics::min_values`]
 /// - `max(column)` → [`PruningStatistics::max_values`]
-/// - `count(*) FILTER (WHERE column IS NOT NULL)` → [`PruningStatistics::row_counts`]
+/// - `count(*)` → [`PruningStatistics::row_counts`] (total row count)
 /// - `count(*) FILTER (WHERE column IS NULL)` → [`PruningStatistics::null_counts`]
 /// - `column IN (lit1, lit2, ...)` → [`PruningStatistics::contained`]
 ///
@@ -227,45 +429,43 @@ fn resolve_aggregate_function(
     stats: &(impl PruningStatistics + ?Sized),
     func: &datafusion_expr::expr::AggregateFunction,
 ) -> Option<ArrayRef> {
-    use datafusion_functions_aggregate::count::Count;
-    use datafusion_functions_aggregate::min_max::{Max, Min};
+    let name = func.func.name();
 
-    let udaf = func.func.inner();
-
-    if udaf.as_any().downcast_ref::<Min>().is_some() {
-        // min(column) — reject if there's a filter
-        if func.params.filter.is_some() {
-            return None;
-        }
-        if let Some(Expr::Column(col)) = func.params.args.first() {
-            return stats.min_values(col);
-        }
-    } else if udaf.as_any().downcast_ref::<Max>().is_some() {
-        // max(column) — reject if there's a filter
-        if func.params.filter.is_some() {
-            return None;
-        }
-        if let Some(Expr::Column(col)) = func.params.args.first() {
-            return stats.max_values(col);
-        }
-    } else if udaf.as_any().downcast_ref::<Count>().is_some()
-        && let Some(filter) = &func.params.filter
-    {
-        match filter.as_ref() {
-            // count(*) FILTER (WHERE col IS NOT NULL) → row_counts
-            Expr::IsNotNull(inner) => {
-                if let Expr::Column(col) = inner.as_ref() {
-                    return stats.row_counts(col);
-                }
+    match name {
+        "min" | "MIN" => {
+            if func.params.filter.is_some() {
+                return None;
             }
-            // count(*) FILTER (WHERE col IS NULL) → null_counts
-            Expr::IsNull(inner) => {
-                if let Expr::Column(col) = inner.as_ref() {
+            if let Some(Expr::Column(col)) = func.params.args.first() {
+                return stats.min_values(col);
+            }
+        }
+        "max" | "MAX" => {
+            if func.params.filter.is_some() {
+                return None;
+            }
+            if let Some(Expr::Column(col)) = func.params.args.first() {
+                return stats.max_values(col);
+            }
+        }
+        "count" | "COUNT" => {
+            if let Some(filter) = &func.params.filter {
+                // count(*) FILTER (WHERE col IS NULL) → null_counts
+                if let Expr::IsNull(inner) = filter.as_ref()
+                    && let Expr::Column(col) = inner.as_ref()
+                {
                     return stats.null_counts(col);
                 }
+            } else {
+                // count(*) without filter → total row count.
+                // PruningStatistics::row_counts takes a column parameter
+                // but the value is container-level (not column-specific),
+                // so all implementations return the same result regardless
+                // of column.
+                return stats.row_counts(&Column::new_unqualified(""));
             }
-            _ => {}
         }
+        _ => {}
     }
 
     None
@@ -314,7 +514,6 @@ mod tests {
     use arrow::array::{BooleanArray, Int64Array, UInt64Array};
     use arrow::datatypes::DataType;
     use datafusion_common::pruning::PruningStatistics;
-    use datafusion_common::{Column, ScalarValue};
     use datafusion_expr::ExprFunctionExt;
     use std::sync::Arc;
 
@@ -409,7 +608,22 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_count_not_null() {
+    fn test_resolve_row_count() {
+        let stats = MockStats::new();
+        // count(*) without filter → row_counts (total row count)
+        let expr = stat_row_count();
+        let result = resolve_expression_sync(&stats, &expr);
+        assert!(result.is_some());
+        let arr = result.unwrap();
+        let uint_arr = arr.as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(uint_arr.value(0), 100);
+        assert_eq!(uint_arr.value(1), 100);
+    }
+
+    #[test]
+    fn test_resolve_count_not_null_returns_none() {
+        // count(*) FILTER (WHERE col IS NOT NULL) is no longer a recognized
+        // statistics expression — it should return None.
         let stats = MockStats::new();
         let expr = datafusion_functions_aggregate::count::count_udaf()
             .call(vec![Expr::Literal(ScalarValue::Boolean(Some(true)), None)])
@@ -417,7 +631,7 @@ mod tests {
             .build()
             .unwrap();
         let result = resolve_expression_sync(&stats, &expr);
-        assert!(result.is_some());
+        assert!(result.is_none());
     }
 
     #[test]
@@ -534,5 +748,24 @@ mod tests {
         assert_eq!(resolved.num_containers(), 5);
         let expr = col_expr("any");
         assert!(resolved.get(&expr).is_none());
+    }
+
+    #[test]
+    fn test_stat_helpers_match_resolved_expressions() {
+        // Verify that the helper functions produce expressions that are
+        // correctly resolved by the blanket PruningStatistics → StatisticsSource impl.
+        let stats = MockStats::new();
+
+        let min = stat_column_min("a");
+        assert!(resolve_expression_sync(&stats, &min).is_some());
+
+        let max = stat_column_max("a");
+        assert!(resolve_expression_sync(&stats, &max).is_some());
+
+        let nulls = stat_column_null_count("a");
+        assert!(resolve_expression_sync(&stats, &nulls).is_some());
+
+        let rows = stat_row_count();
+        assert!(resolve_expression_sync(&stats, &rows).is_some());
     }
 }

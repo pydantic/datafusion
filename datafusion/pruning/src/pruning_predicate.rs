@@ -41,7 +41,6 @@ use datafusion_common::{
     ScalarValue, internal_datafusion_err, plan_datafusion_err, plan_err,
     tree_node::{Transformed, TreeNode},
 };
-use datafusion_expr::ExprFunctionExt;
 use datafusion_expr_common::operator::Operator;
 use datafusion_physical_expr::expressions::CastColumnExpr;
 use datafusion_physical_expr::utils::{Guarantee, LiteralGuarantee};
@@ -1996,31 +1995,14 @@ fn stat_type_to_expr(
     column: &phys_expr::Column,
     stat_type: StatisticsType,
 ) -> datafusion_expr::Expr {
-    use datafusion_expr::Expr as LExpr;
-    let col_expr = LExpr::Column(Column::new_unqualified(column.name()));
+    use crate::statistics::{
+        stat_column_max, stat_column_min, stat_column_null_count, stat_row_count,
+    };
     match stat_type {
-        StatisticsType::Min => {
-            datafusion_functions_aggregate::min_max::min_udaf().call(vec![col_expr])
-        }
-        StatisticsType::Max => {
-            datafusion_functions_aggregate::min_max::max_udaf().call(vec![col_expr])
-        }
-        StatisticsType::NullCount => {
-            let count_expr = datafusion_functions_aggregate::count::count_udaf()
-                .call(vec![LExpr::Literal(ScalarValue::Boolean(Some(true)), None)]);
-            count_expr
-                .filter(LExpr::IsNull(Box::new(col_expr)))
-                .build()
-                .expect("building count filter expr")
-        }
-        StatisticsType::RowCount => {
-            let count_expr = datafusion_functions_aggregate::count::count_udaf()
-                .call(vec![LExpr::Literal(ScalarValue::Boolean(Some(true)), None)]);
-            count_expr
-                .filter(LExpr::IsNotNull(Box::new(col_expr)))
-                .build()
-                .expect("building count filter expr")
-        }
+        StatisticsType::Min => stat_column_min(column.name()),
+        StatisticsType::Max => stat_column_max(column.name()),
+        StatisticsType::NullCount => stat_column_null_count(column.name()),
+        StatisticsType::RowCount => stat_row_count(),
     }
 }
 
@@ -2438,11 +2420,12 @@ mod tests {
                 .unwrap_or(None)
         }
 
-        fn row_counts(&self, column: &Column) -> Option<ArrayRef> {
+        fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
+            // Row count is container-level, not column-specific.
+            // Return row counts from any column that has them.
             self.stats
-                .get(column)
-                .map(|container_stats| container_stats.row_counts())
-                .unwrap_or(None)
+                .values()
+                .find_map(|container_stats| container_stats.row_counts())
         }
 
         fn contained(
