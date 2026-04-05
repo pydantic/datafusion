@@ -21,6 +21,7 @@ use datafusion_expr::ScalarUDF;
 use std::sync::Arc;
 
 pub mod arrow_cast;
+pub mod arrow_field;
 pub mod arrow_metadata;
 pub mod arrow_try_cast;
 pub mod arrowtypeof;
@@ -59,6 +60,7 @@ make_udf_function!(union_extract::UnionExtractFun, union_extract);
 make_udf_function!(union_tag::UnionTagFunc, union_tag);
 make_udf_function!(version::VersionFunc, version);
 make_udf_function!(arrow_metadata::ArrowMetadataFunc, arrow_metadata);
+make_udf_function!(arrow_field::ArrowFieldFunc, arrow_field);
 
 pub mod expr_fn {
     use datafusion_expr::{Expr, Literal};
@@ -90,6 +92,10 @@ pub mod expr_fn {
     ),(
         arrow_typeof,
         "Returns the Arrow type of the input expression.",
+        arg1
+    ),(
+        arrow_field,
+        "Returns the Arrow field info (name, data_type, nullable, metadata) of the input expression.",
         arg1
     ),(
         arrow_metadata,
@@ -147,6 +153,7 @@ pub fn functions() -> Vec<Arc<ScalarUDF>> {
         nullif(),
         arrow_cast(),
         arrow_try_cast(),
+        arrow_field(),
         arrow_metadata(),
         nvl(),
         nvl2(),
