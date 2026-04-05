@@ -29,6 +29,7 @@ pub mod expr_ext;
 pub mod getfield;
 pub mod greatest;
 mod greatest_least_utils;
+pub mod is_nullable;
 pub mod least;
 pub mod named_struct;
 pub mod nullif;
@@ -59,6 +60,7 @@ make_udf_function!(union_extract::UnionExtractFun, union_extract);
 make_udf_function!(union_tag::UnionTagFunc, union_tag);
 make_udf_function!(version::VersionFunc, version);
 make_udf_function!(arrow_metadata::ArrowMetadataFunc, arrow_metadata);
+make_udf_function!(is_nullable::IsNullableFunc, is_nullable);
 
 pub mod expr_fn {
     use datafusion_expr::{Expr, Literal};
@@ -119,6 +121,10 @@ pub mod expr_fn {
         union_tag,
         "Returns the name of the currently selected field in the union",
         arg1
+    ),(
+        is_nullable,
+        "Returns whether the input expression is nullable",
+        arg1
     ));
 
     #[doc = "Returns the value of the field with the given name from the struct"]
@@ -168,5 +174,6 @@ pub fn functions() -> Vec<Arc<ScalarUDF>> {
         union_tag(),
         version(),
         r#struct(),
+        is_nullable(),
     ]
 }
