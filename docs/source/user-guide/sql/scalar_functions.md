@@ -5286,6 +5286,7 @@ union_tag(union_expression)
 - [arrow_try_cast](#arrow_try_cast)
 - [arrow_typeof](#arrow_typeof)
 - [get_field](#get_field)
+- [is_nullable](#is_nullable)
 - [version](#version)
 
 ### `arrow_cast`
@@ -5455,6 +5456,29 @@ get_field(expression, field_name[, field_name2, ...])
 +--------+
 | 42     |
 +--------+
+```
+
+### `is_nullable`
+
+Returns true if the expression's field is nullable, false otherwise. This reflects the schema-level nullability, not whether a specific runtime value is NULL.
+
+```sql
+is_nullable(expression)
+```
+
+#### Arguments
+
+- **expression**: Expression to evaluate. The expression can be a constant, column, or function, and any combination of operators.
+
+#### Example
+
+```sql
+> select is_nullable(name), is_nullable(ts) from table_with_metadata limit 1;
++----------------------------+------------------------+
+| is_nullable(table_with_metadata.name) | is_nullable(table_with_metadata.ts) |
++----------------------------+------------------------+
+| true                       | false                  |
++----------------------------+------------------------+
 ```
 
 ### `version`
