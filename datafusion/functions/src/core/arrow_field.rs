@@ -36,7 +36,7 @@ use std::sync::Arc;
 +----------------------------------------------+
 | arrow_field(Int64(1))                        |
 +----------------------------------------------+
-| {name: Int64(1), data_type: Int64, ...}      |
+| {name: lit, data_type: Int64, ...}      |
 +----------------------------------------------+
 
 > select arrow_field(1)['data_type'];
@@ -51,7 +51,7 @@ use std::sync::Arc;
         description = "Expression to evaluate. The expression can be a constant, column, or function, and any combination of operators."
     )
 )]
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ArrowFieldFunc {
     signature: Signature,
 }
@@ -107,15 +107,14 @@ impl ScalarUDFImpl for ArrowFieldFunc {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let [_arg] = take_function_args(self.name(), args.args)?;
-        let field = &args.arg_fields[0];
+        let [field] = take_function_args(self.name(), args.arg_fields)?;
 
         // Build the name array
         let name_array =
             Arc::new(StringArray::from(vec![field.name().as_str()])) as Arc<dyn Array>;
 
         // Build the data_type array
-        let data_type_str = format!("{}", field.data_type());
+        let data_type_str = field.data_type().to_string();
         let data_type_array =
             Arc::new(StringArray::from(vec![data_type_str.as_str()])) as Arc<dyn Array>;
 
@@ -140,7 +139,7 @@ impl ScalarUDFImpl for ArrowFieldFunc {
         let metadata_array = Arc::new(map_builder.finish()) as Arc<dyn Array>;
 
         // Build the struct
-        let DataType::Struct(fields) = Self::return_struct_type() else {
+        let &DataType::Struct(fields) = args.return_type() else {
             unreachable!()
         };
 
