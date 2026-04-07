@@ -107,6 +107,7 @@ impl ScalarUDFImpl for ArrowFieldFunc {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let return_type = args.return_type().clone();
         let [field] = take_function_args(self.name(), args.arg_fields)?;
 
         // Build the name array
@@ -139,7 +140,7 @@ impl ScalarUDFImpl for ArrowFieldFunc {
         let metadata_array = Arc::new(map_builder.finish()) as Arc<dyn Array>;
 
         // Build the struct
-        let &DataType::Struct(fields) = args.return_type() else {
+        let DataType::Struct(fields) = return_type else {
             unreachable!()
         };
 

@@ -51,6 +51,24 @@ SELECT arrow_field(ARRAY[1,2,3])
 ----
 {name: lit, data_type: List(Int64), nullable: false, metadata: {}}
 
+# arrow_field on map
+query ?
+SELECT arrow_field(MAP {'a': 1, 'b': 2})
+----
+{name: lit, data_type: Map("entries": non-null Struct("key": non-null Utf8, "value": Int64), unsorted), nullable: false, metadata: {}}
+
+# arrow_field on struct
+query ?
+SELECT arrow_field({a: 1, b: 'foo'})
+----
+{name: lit, data_type: Struct("a": Int64, "b": Utf8), nullable: false, metadata: {}}
+
+# arrow_field on dictionary
+query ?
+SELECT arrow_field(arrow_cast('foo', 'Dictionary(Int32, Utf8)'))
+----
+{name: lit, data_type: Dictionary(Int32, Utf8), nullable: false, metadata: {}}
+
 # arrow_field struct field access - data_type
 query T
 SELECT arrow_field(1)['data_type']
