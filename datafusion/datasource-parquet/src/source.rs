@@ -518,7 +518,7 @@ impl FileSource for ParquetSource {
         _partition: usize,
     ) -> datafusion_common::Result<Arc<dyn FileOpener>> {
         datafusion_common::internal_err!(
-            "ParquetSource::create_file_opener called but it supports the Morsel API"
+            "ParquetSource::create_file_opener called but it supports the Morsel API, please use that instead"
         )
     }
 

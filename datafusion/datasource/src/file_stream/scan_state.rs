@@ -28,19 +28,39 @@ use futures::{FutureExt as _, StreamExt as _};
 
 use super::{FileStreamMetrics, OnError};
 
-/// State [`FileStreamState::Scan`]
+/// State [`FileStreamState::Scan`].
 ///
-/// Groups together ready planners, ready morsels, the active reader,
-/// pending planner I/O, the remaining files and limit, and the metrics
-/// associated with processing that work.
+/// There is one `ScanState` per `FileStream`, and thus per output partition.
+///
+/// It groups together the lifecycle of scanning that partition's files:
+/// unopened files, CPU-ready planners, pending planner I/O, ready morsels,
+/// the active reader, and the metrics associated with processing that work.
+///
+/// # State Transitions
+///
+/// ```text
+/// file_iter
+///    |
+///    v
+/// morselizer.plan_file(file)
+///    |
+///    v
+/// ready_planners ---> plan() ---> ready_morsels ---> into_stream() ---> reader ---> RecordBatches
+///       ^               |
+///       |               v
+///       |          pending_planner
+///       |               |
+///       |               v
+///       +-------- poll until ready
+/// ```
 ///
 /// [`FileStreamState::Scan`]: super::FileStreamState::Scan
 pub(super) struct ScanState {
     /// Files that still need to be planned.
     file_iter: VecDeque<PartitionedFile>,
-    /// Remaining record limit, if any.
+    /// Remaining row limit, if any.
     remain: Option<usize>,
-    /// The morselizer used to plan files
+    /// The morselizer used to plan files.
     morselizer: Box<dyn Morselizer>,
     /// Behavior if opening or scanning a file fails.
     on_error: OnError,
@@ -50,7 +70,7 @@ pub(super) struct ScanState {
     ready_morsels: VecDeque<Box<dyn Morsel>>,
     /// The active reader, if any.
     reader: Option<BoxStream<'static, Result<RecordBatch>>>,
-    /// Planner currently doing I/O
+    /// The single planner currently blocked on I/O, if any.
     pending_planner: Option<PendingMorselPlanner>,
     /// Metrics for the active scan queues.
     metrics: FileStreamMetrics,
@@ -83,8 +103,14 @@ impl ScanState {
         self.on_error = on_error;
     }
 
-    /// Drives one iteration of the active scan state, reading from morsels,
-    /// planners, pending planner I/O, or unopened files from `self`.
+    /// Drives one iteration of the active scan state.
+    ///
+    /// Work is attempted in this order:
+    /// 1. resolve any pending planner I/O
+    /// 2. poll the active reader
+    /// 3. turn a ready morsel into the active reader
+    /// 4. run CPU planning on a ready planner
+    /// 5. morselize the next unopened file
     ///
     /// The return [`ScanAndReturn`] tells `poll_inner` how to update the
     /// outer `FileStreamState`.
@@ -120,17 +146,16 @@ impl ScanState {
             }
         }
 
-        // Next try and get the net batch from the active reader, if any
+        // Next try and get the next batch from the active reader, if any.
         if let Some(reader) = self.reader.as_mut() {
             match reader.poll_next_unpin(cx) {
-                // According to the API contract, readers should always be ready
-                // but in practice they may actually be waiting on IO, and if
-                // that happens wait for it here.
+                // Morsels should ideally only expose ready-to-decode streams,
+                // but tolerate pending readers here.
                 Poll::Pending => return ScanAndReturn::Return(Poll::Pending),
                 Poll::Ready(Some(Ok(batch))) => {
                     self.metrics.time_scanning_until_data.stop();
                     self.metrics.time_scanning_total.stop();
-                    // check limit
+                    // Apply any remaining row limit.
                     let (batch, finished) = match &mut self.remain {
                         Some(remain) => {
                             if *remain > batch.num_rows() {
@@ -179,9 +204,8 @@ impl ScanState {
             }
         }
 
-        // Don't have a reader but have morsels ready to turn into a reader, so do that.
+        // No active reader, but a morsel is ready to become the reader.
         if let Some(morsel) = self.ready_morsels.pop_front() {
-            self.metrics.files_opened.add(1);
             self.metrics.time_opening.stop();
             self.metrics.time_scanning_until_data.start();
             self.metrics.time_scanning_total.start();
@@ -189,11 +213,11 @@ impl ScanState {
             return ScanAndReturn::Continue;
         }
 
-        // Don't have a morsel or stream, so try and plan some more morsels
+        // No reader or morsel, so try to produce more work via CPU planning.
         if let Some(planner) = self.ready_planners.pop_front() {
             return match planner.plan() {
                 Ok(Some(mut plan)) => {
-                    // Get all morsels and planners and try again
+                    // Queue any newly-ready morsels, planners, or planner I/O.
                     self.ready_morsels.extend(plan.take_morsels());
                     self.ready_planners.extend(plan.take_ready_planners());
                     if let Some(pending_planner) = plan.take_pending_planner() {
@@ -220,7 +244,7 @@ impl ScanState {
             };
         }
 
-        // No planners, morsels, or active reader, so try and open the next file and plan it.
+        // No outstanding work remains, so morselize the next unopened file.
         let part_file = match self.file_iter.pop_front() {
             Some(part_file) => part_file,
             None => return ScanAndReturn::Done(None),
@@ -229,6 +253,7 @@ impl ScanState {
         self.metrics.time_opening.start();
         match self.morselizer.plan_file(part_file) {
             Ok(planner) => {
+                self.metrics.files_opened.add(1);
                 self.ready_planners.push_back(planner);
                 ScanAndReturn::Continue
             }
@@ -247,7 +272,7 @@ impl ScanState {
 
 /// What should be done on the next iteration of [`ScanState::poll_scan`]?
 pub(super) enum ScanAndReturn {
-    /// Poll again
+    /// Poll again.
     Continue,
     /// Return the provided result without changing the outer state.
     Return(Poll<Option<Result<RecordBatch>>>),

@@ -748,7 +748,7 @@ mod tests {
     }
 
     /// Verifies that a planner can traverse two sequential I/O phases before
-    /// producing one batch (similar to Parquet which does this0.
+    /// producing one batch, similar to Parquet.
     #[tokio::test]
     async fn morsel_two_ios_one_batch() -> Result<()> {
         let test = FileStreamMorselTest::new().with_file(
