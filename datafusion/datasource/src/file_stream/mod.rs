@@ -980,15 +980,15 @@ mod tests {
 
         // Partition 0 starts with 3 files, but Partition 1 is polled first.
         // Since Partition is polled first, it will run all the files even those
-        // that were assigned to Partition 0.
+        // that were asssigned to Partition 0.
         insta::assert_snapshot!(test.run().await.unwrap(), @r"
         ----- Partition 0 -----
         Done
         ----- Partition 1 -----
+        Batch: 201
         Batch: 101
         Batch: 102
         Batch: 103
-        Batch: 201
         Done
         ----- File Stream Events -----
         (omitted due to with_file_stream_events(false))
@@ -1120,10 +1120,10 @@ mod tests {
         // partition 0 has populated the shared queue.
         insta::assert_snapshot!(test.run().await.unwrap(), @r"
         ----- Partition 0 -----
+        Batch: 101
         Batch: 102
         Done
         ----- Partition 1 -----
-        Batch: 101
         Done
         ----- File Stream Events -----
         (omitted due to with_file_stream_events(false))
@@ -1173,11 +1173,11 @@ mod tests {
         ----- Partition 0 -----
         Done
         ----- Partition 1 -----
-        Batch: 103
+        Batch: 101
         Done
         ----- Partition 2 -----
-        Batch: 101
         Batch: 102
+        Batch: 103
         Done
         ----- File Stream Events -----
         (omitted due to with_file_stream_events(false))

@@ -568,29 +568,6 @@ impl FileScanConfigBuilder {
     }
 }
 
-impl FileScanConfig {
-    /// Returns the shared unopened-file queue for reorderable streams in this scan.
-    ///
-    /// The queue is initialized once from all file groups so sibling streams
-    /// can begin stealing work immediately, even if they are built or polled
-    /// before every sibling `FileStream` has been constructed.
-    pub(crate) fn shared_work_source(&self) -> Option<SharedWorkSource> {
-        if self.preserve_order || self.partitioned_by_file_group {
-            return None;
-        }
-
-        Some(
-            self.shared_work_source
-                .get_or_init(|| {
-                    SharedWorkSource::new(
-                        self.file_groups.iter().flat_map(FileGroup::iter).cloned(),
-                    )
-                })
-                .clone(),
-        )
-    }
-}
-
 impl From<FileScanConfig> for FileScanConfigBuilder {
     fn from(config: FileScanConfig) -> Self {
         Self {

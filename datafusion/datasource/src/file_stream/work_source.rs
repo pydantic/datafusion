@@ -17,6 +17,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::PartitionedFile;
 use parking_lot::Mutex;
@@ -64,17 +65,27 @@ pub(crate) struct SharedWorkSource {
 #[derive(Debug, Default)]
 pub(super) struct SharedWorkSourceInner {
     files: Mutex<VecDeque<PartitionedFile>>,
+    /// bookkeeping for the participating siblings and is intended to support
+    /// later coordination improvements.
+    active_streams: AtomicUsize,
 }
 
 impl SharedWorkSource {
-    /// Create a shared work source containing the provided unopened files.
-    pub(crate) fn new(files: impl IntoIterator<Item = PartitionedFile>) -> Self {
-        let files = files.into_iter().collect();
+    /// Create an empty shared work source.
+    pub(crate) fn new() -> Self {
         Self {
-            inner: Arc::new(SharedWorkSourceInner {
-                files: Mutex::new(files),
-            }),
+            inner: Arc::new(SharedWorkSourceInner::default()),
         }
+    }
+
+    /// Register one active stream that may pull from this shared queue.
+    pub(super) fn register_stream(&self) {
+        self.inner.active_streams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add newly discovered files into the shared work queue.
+    pub(super) fn push_files(&self, files: impl IntoIterator<Item = PartitionedFile>) {
+        self.inner.files.lock().extend(files);
     }
 
     /// Pop the next file from the shared work queue.
@@ -85,5 +96,13 @@ impl SharedWorkSource {
     /// Return the number of files still waiting in the shared queue.
     fn len(&self) -> usize {
         self.inner.files.lock().len()
+    }
+}
+
+impl Drop for SharedWorkSource {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.inner) > 1 {
+            self.inner.active_streams.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }

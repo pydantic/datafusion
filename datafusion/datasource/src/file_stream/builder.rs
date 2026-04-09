@@ -51,9 +51,14 @@ pub struct FileStreamBuilder<'a> {
 impl<'a> FileStreamBuilder<'a> {
     /// Create a new builder for [`FileStream`].
     pub fn new(config: &'a FileScanConfig) -> Self {
-        let reorderable = match config.shared_work_source() {
-            Some(shared_work_source) => Reorderable::Yes(shared_work_source),
-            None => Reorderable::No,
+        let reorderable = if config.preserve_order || config.partitioned_by_file_group {
+            Reorderable::No
+        } else {
+            let shared_work_source = config
+                .shared_work_source
+                .get_or_init(SharedWorkSource::new)
+                .clone();
+            Reorderable::Yes(shared_work_source)
         };
 
         Self {
@@ -126,9 +131,14 @@ impl<'a> FileStreamBuilder<'a> {
                 "FileStreamBuilder invalid partition index: {partition}"
             );
         };
+        let files = file_group.into_inner();
         let work_source = match reorderable {
-            Reorderable::Yes(shared) => WorkSource::Shared(shared),
-            Reorderable::No => WorkSource::Local(file_group.into_inner().into()),
+            Reorderable::Yes(shared) => {
+                shared.register_stream();
+                shared.push_files(files);
+                WorkSource::Shared(shared)
+            }
+            Reorderable::No => WorkSource::Local(files.into()),
         };
 
         let file_stream_metrics = FileStreamMetrics::new(metrics, partition);
