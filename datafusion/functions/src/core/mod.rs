@@ -40,6 +40,7 @@ pub mod r#struct;
 pub mod union_extract;
 pub mod union_tag;
 pub mod version;
+pub mod with_metadata;
 
 // create UDFs
 make_udf_function!(arrow_cast::ArrowCastFunc, arrow_cast);
@@ -59,6 +60,7 @@ make_udf_function!(union_extract::UnionExtractFun, union_extract);
 make_udf_function!(union_tag::UnionTagFunc, union_tag);
 make_udf_function!(version::VersionFunc, version);
 make_udf_function!(arrow_metadata::ArrowMetadataFunc, arrow_metadata);
+make_udf_function!(with_metadata::WithMetadataFunc, with_metadata);
 
 pub mod expr_fn {
     use datafusion_expr::{Expr, Literal};
@@ -94,6 +96,10 @@ pub mod expr_fn {
     ),(
         arrow_metadata,
         "Returns the metadata of the input expression",
+        args,
+    ),(
+        with_metadata,
+        "Attaches Arrow field metadata (key/value pairs) to the input expression",
         args,
     ),(
         r#struct,
@@ -148,6 +154,7 @@ pub fn functions() -> Vec<Arc<ScalarUDF>> {
         arrow_cast(),
         arrow_try_cast(),
         arrow_metadata(),
+        with_metadata(),
         nvl(),
         nvl2(),
         overlay(),
