@@ -175,6 +175,7 @@ mod tests {
     use crate::morsel::mocks::{
         IoFutureId, MockMorselizer, MockPlanner, MorselId, PollsToResolve,
     };
+    use crate::source::DataSource;
     use crate::tests::make_partition;
     use crate::{PartitionedFile, TableSchema};
     use arrow::array::{AsArray, RecordBatch};
@@ -190,6 +191,7 @@ mod tests {
 
     use crate::file_stream::{
         FileOpenFuture, FileOpener, FileStream, FileStreamBuilder, OnError,
+        work_source::SharedWorkSource,
     };
     use crate::test_util::MockSource;
 
@@ -985,10 +987,10 @@ mod tests {
         ----- Partition 0 -----
         Done
         ----- Partition 1 -----
-        Batch: 201
         Batch: 101
         Batch: 102
         Batch: 103
+        Batch: 201
         Done
         ----- File Stream Events -----
         (omitted due to with_file_stream_events(false))
@@ -1088,9 +1090,9 @@ mod tests {
         Ok(())
     }
 
-    /// Ensures that if an sibling is built and polled
+    /// Ensures that if a sibling is built and polled
     /// before another sibling has been built and contributed its files to the
-    /// shared queue, the first sibling does not finish prematurely
+    /// shared queue, the first sibling does not finish prematurely.
     #[tokio::test]
     async fn morsel_empty_sibling_can_finish_before_shared_work_exists() -> Result<()> {
         let test = FileStreamMorselTest::new()
@@ -1120,10 +1122,10 @@ mod tests {
         // partition 0 has populated the shared queue.
         insta::assert_snapshot!(test.run().await.unwrap(), @r"
         ----- Partition 0 -----
-        Batch: 101
         Batch: 102
         Done
         ----- Partition 1 -----
+        Batch: 101
         Done
         ----- File Stream Events -----
         (omitted due to with_file_stream_events(false))
@@ -1173,11 +1175,11 @@ mod tests {
         ----- Partition 0 -----
         Done
         ----- Partition 1 -----
-        Batch: 101
+        Batch: 103
         Done
         ----- Partition 2 -----
+        Batch: 101
         Batch: 102
-        Batch: 103
         Done
         ----- File Stream Events -----
         (omitted due to with_file_stream_events(false))
@@ -1321,10 +1323,20 @@ mod tests {
             }
 
             let config = self.test_config();
+            // `DataSourceExec::execute` creates one execution-local shared
+            // state object via `create_sibling_state()` and then passes it
+            // to `open_with_sibling_state(...)`. These tests build
+            // `FileStream`s directly, bypassing `DataSourceExec`, so they must
+            // perform the same setup explicitly when exercising sibling-stream
+            // work stealing.
+            let shared_work_source = config.create_sibling_state().and_then(|state| {
+                state.as_ref().downcast_ref::<SharedWorkSource>().cloned()
+            });
             if !self.build_streams_on_first_read {
                 for partition in build_order {
                     let stream = FileStreamBuilder::new(&config)
                         .with_partition(partition)
+                        .with_shared_work_source(shared_work_source.clone())
                         .with_morselizer(Box::new(self.morselizer.clone()))
                         .with_metrics(&metrics_set)
                         .build()?;
@@ -1351,6 +1363,7 @@ mod tests {
                 if self.build_streams_on_first_read && !partition_state.built {
                     let stream = FileStreamBuilder::new(&config)
                         .with_partition(partition)
+                        .with_shared_work_source(shared_work_source.clone())
                         .with_morselizer(Box::new(self.morselizer.clone()))
                         .with_metrics(&metrics_set)
                         .build()?;

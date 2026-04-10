@@ -27,17 +27,6 @@ use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet
 use super::metrics::FileStreamMetrics;
 use super::{FileOpener, FileStream, FileStreamState, OnError};
 
-/// Whether this stream may reorder work across sibling `FileStream`s.
-///
-/// This is derived entirely from [`FileScanConfig`]. Streams that must
-/// preserve file order or file-group partition boundaries are not reorderable.
-enum Reorderable {
-    /// This stream may reorder work using a shared queue of unopened files.
-    Yes(SharedWorkSource),
-    /// This stream must keep its own local file order.
-    No,
-}
-
 /// Builder for constructing a [`FileStream`].
 pub struct FileStreamBuilder<'a> {
     config: &'a FileScanConfig,
@@ -45,29 +34,19 @@ pub struct FileStreamBuilder<'a> {
     morselizer: Option<Box<dyn Morselizer>>,
     metrics: Option<&'a ExecutionPlanMetricsSet>,
     on_error: OnError,
-    reorderable: Reorderable,
+    shared_work_source: Option<SharedWorkSource>,
 }
 
 impl<'a> FileStreamBuilder<'a> {
     /// Create a new builder for [`FileStream`].
     pub fn new(config: &'a FileScanConfig) -> Self {
-        let reorderable = if config.preserve_order || config.partitioned_by_file_group {
-            Reorderable::No
-        } else {
-            let shared_work_source = config
-                .shared_work_source
-                .get_or_init(SharedWorkSource::new)
-                .clone();
-            Reorderable::Yes(shared_work_source)
-        };
-
         Self {
             config,
             partition: None,
             morselizer: None,
             metrics: None,
             on_error: OnError::Fail,
-            reorderable,
+            shared_work_source: None,
         }
     }
 
@@ -105,6 +84,15 @@ impl<'a> FileStreamBuilder<'a> {
         self
     }
 
+    /// Configure the shared unopened-file queue used for sibling work stealing.
+    pub(crate) fn with_shared_work_source(
+        mut self,
+        shared_work_source: Option<SharedWorkSource>,
+    ) -> Self {
+        self.shared_work_source = shared_work_source;
+        self
+    }
+
     /// Build the configured [`FileStream`].
     pub fn build(self) -> Result<FileStream> {
         let Self {
@@ -113,7 +101,7 @@ impl<'a> FileStreamBuilder<'a> {
             morselizer,
             metrics,
             on_error,
-            reorderable,
+            shared_work_source,
         } = self;
 
         let Some(partition) = partition else {
@@ -131,14 +119,9 @@ impl<'a> FileStreamBuilder<'a> {
                 "FileStreamBuilder invalid partition index: {partition}"
             );
         };
-        let files = file_group.into_inner();
-        let work_source = match reorderable {
-            Reorderable::Yes(shared) => {
-                shared.register_stream();
-                shared.push_files(files);
-                WorkSource::Shared(shared)
-            }
-            Reorderable::No => WorkSource::Local(files.into()),
+        let work_source = match shared_work_source {
+            Some(shared) => WorkSource::Shared(shared),
+            None => WorkSource::Local(file_group.into_inner().into()),
         };
 
         let file_stream_metrics = FileStreamMetrics::new(metrics, partition);

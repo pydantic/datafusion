@@ -17,9 +17,10 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::PartitionedFile;
+use crate::file_groups::FileGroup;
+use crate::file_scan_config::FileScanConfig;
 use parking_lot::Mutex;
 
 /// Source of unopened files for one `ScanState`.
@@ -54,9 +55,9 @@ impl WorkSource {
 
 /// Shared source of unopened files that sibling `FileStream`s may steal from.
 ///
-/// Each sibling contributes its initial file group into the shared queue during
-/// construction. Later, whichever stream becomes idle first may take the next
-/// unopened file from the front of that queue.
+/// The queue is created once per execution and shared by all reorderable
+/// sibling streams for that execution. Whichever stream becomes idle first may
+/// take the next unopened file from the front of the queue.
 #[derive(Debug, Clone)]
 pub(crate) struct SharedWorkSource {
     inner: Arc<SharedWorkSourceInner>,
@@ -65,27 +66,22 @@ pub(crate) struct SharedWorkSource {
 #[derive(Debug, Default)]
 pub(super) struct SharedWorkSourceInner {
     files: Mutex<VecDeque<PartitionedFile>>,
-    /// bookkeeping for the participating siblings and is intended to support
-    /// later coordination improvements.
-    active_streams: AtomicUsize,
 }
 
 impl SharedWorkSource {
-    /// Create an empty shared work source.
-    pub(crate) fn new() -> Self {
+    /// Create a shared work source containing the provided unopened files.
+    pub(crate) fn new(files: impl IntoIterator<Item = PartitionedFile>) -> Self {
+        let files = files.into_iter().collect();
         Self {
-            inner: Arc::new(SharedWorkSourceInner::default()),
+            inner: Arc::new(SharedWorkSourceInner {
+                files: Mutex::new(files),
+            }),
         }
     }
 
-    /// Register one active stream that may pull from this shared queue.
-    pub(super) fn register_stream(&self) {
-        self.inner.active_streams.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Add newly discovered files into the shared work queue.
-    pub(super) fn push_files(&self, files: impl IntoIterator<Item = PartitionedFile>) {
-        self.inner.files.lock().extend(files);
+    /// Create a shared work source for the unopened files in `config`.
+    pub(crate) fn from_config(config: &FileScanConfig) -> Self {
+        Self::new(config.file_groups.iter().flat_map(FileGroup::iter).cloned())
     }
 
     /// Pop the next file from the shared work queue.
@@ -96,13 +92,5 @@ impl SharedWorkSource {
     /// Return the number of files still waiting in the shared queue.
     fn len(&self) -> usize {
         self.inner.files.lock().len()
-    }
-}
-
-impl Drop for SharedWorkSource {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.inner) > 1 {
-            self.inner.active_streams.fetch_sub(1, Ordering::Relaxed);
-        }
     }
 }

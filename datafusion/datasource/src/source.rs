@@ -20,7 +20,7 @@
 use std::any::Any;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_plan::execution_plan::{
@@ -123,12 +123,23 @@ use datafusion_physical_plan::filter_pushdown::{
 ///    └─────────────────────┘
 /// ```
 pub trait DataSource: Send + Sync + Debug {
+    /// Open the specified output partition and return its stream of
+    /// [`RecordBatch`]es.
+    ///
+    /// This should be used by data sources that do not need any sibling
+    /// coordination. Data sources that want to use per-execution shared state
+    /// (for example, to reorder work across partitions at runtime) should implement
+    /// [`Self::open_with_sibling_state`] instead.
+    ///
+    /// [`RecordBatch`]: arrow::record_batch::RecordBatch
     fn open(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream>;
+
     fn as_any(&self) -> &dyn Any;
+
     /// Format this source for display in explain plans
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result;
 
@@ -246,6 +257,28 @@ pub trait DataSource: Send + Sync + Debug {
     ) -> Option<Arc<dyn DataSource>> {
         None
     }
+
+    /// Create execution-local state to share across sibling instances of this
+    /// data source during one execution.
+    ///
+    /// The default implementation returns `None`, meaning this data source has
+    /// no sibling-shared execution state.
+    fn create_sibling_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
+
+    /// Open a partition using optional sibling-shared execution state.
+    ///
+    /// The default implementation ignores the shared state and delegates to
+    /// [`Self::open`].
+    fn open_with_sibling_state(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+        _state: Option<Arc<dyn Any + Send + Sync>>,
+    ) -> Result<SendableRecordBatchStream> {
+        self.open(partition, context)
+    }
 }
 
 /// [`ExecutionPlan`] that reads one or more files
@@ -266,6 +299,12 @@ pub struct DataSourceExec {
     data_source: Arc<dyn DataSource>,
     /// Cached plan properties such as sort order
     cache: Arc<PlanProperties>,
+    /// Execution-local state shared across partitions of this plan.
+    ///
+    /// The concrete state is created by [`DataSource::create_sibling_state`]
+    /// and then passed to
+    /// [`DataSource::open_with_sibling_state`].
+    execution_state: Arc<OnceLock<Option<Arc<dyn Any + Send + Sync>>>>,
 }
 
 impl DisplayAs for DataSourceExec {
@@ -339,8 +378,17 @@ impl ExecutionPlan for DataSourceExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let stream = self.data_source.open(partition, Arc::clone(&context))?;
+        let shared_state = self
+            .execution_state
+            .get_or_init(|| self.data_source.create_sibling_state())
+            .clone();
+        let stream = self.data_source.open_with_sibling_state(
+            partition,
+            Arc::clone(&context),
+            shared_state,
+        )?;
         let batch_size = context.session_config().batch_size();
+
         log::debug!(
             "Batch splitting enabled for partition {partition}: batch_size={batch_size}"
         );
@@ -377,8 +425,13 @@ impl ExecutionPlan for DataSourceExec {
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
         let data_source = self.data_source.with_fetch(limit)?;
         let cache = Arc::clone(&self.cache);
+        let execution_state = Arc::new(OnceLock::new());
 
-        Some(Arc::new(Self { data_source, cache }))
+        Some(Arc::new(Self {
+            data_source,
+            cache,
+            execution_state,
+        }))
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -471,6 +524,12 @@ impl ExecutionPlan for DataSourceExec {
                     as Arc<dyn ExecutionPlan>
             })
     }
+
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        let mut new_exec = Arc::unwrap_or_clone(self);
+        new_exec.execution_state = Arc::new(OnceLock::new());
+        Ok(Arc::new(new_exec))
+    }
 }
 
 impl DataSourceExec {
@@ -484,6 +543,7 @@ impl DataSourceExec {
         Self {
             data_source,
             cache: Arc::new(cache),
+            execution_state: Arc::new(OnceLock::new()),
         }
     }
 
@@ -495,6 +555,7 @@ impl DataSourceExec {
     pub fn with_data_source(mut self, data_source: Arc<dyn DataSource>) -> Self {
         self.cache = Arc::new(Self::compute_properties(&data_source));
         self.data_source = data_source;
+        self.execution_state = Arc::new(OnceLock::new());
         self
     }
 
