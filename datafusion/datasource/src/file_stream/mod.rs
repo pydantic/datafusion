@@ -982,7 +982,7 @@ mod tests {
 
         // Partition 0 starts with 3 files, but Partition 1 is polled first.
         // Since Partition is polled first, it will run all the files even those
-        // that were asssigned to Partition 0.
+        // that were assigned to Partition 0.
         insta::assert_snapshot!(test.run().await.unwrap(), @r"
         ----- Partition 0 -----
         Done
