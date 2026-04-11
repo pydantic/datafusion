@@ -5782,9 +5782,6 @@ impl serde::Serialize for ParquetOptions {
         if self.pushdown_filters {
             len += 1;
         }
-        if self.reorder_filters {
-            len += 1;
-        }
         if self.force_filter_selections {
             len += 1;
         }
@@ -5869,6 +5866,15 @@ impl serde::Serialize for ParquetOptions {
         if self.max_predicate_cache_size_opt.is_some() {
             len += 1;
         }
+        if self.filter_collecting_byte_ratio_threshold_opt.is_some() {
+            len += 1;
+        }
+        if self.filter_confidence_z_opt.is_some() {
+            len += 1;
+        }
+        if self.filter_pushdown_min_bytes_per_sec_opt.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion_common.ParquetOptions", len)?;
         if self.enable_page_index {
             struct_ser.serialize_field("enablePageIndex", &self.enable_page_index)?;
@@ -5881,9 +5887,6 @@ impl serde::Serialize for ParquetOptions {
         }
         if self.pushdown_filters {
             struct_ser.serialize_field("pushdownFilters", &self.pushdown_filters)?;
-        }
-        if self.reorder_filters {
-            struct_ser.serialize_field("reorderFilters", &self.reorder_filters)?;
         }
         if self.force_filter_selections {
             struct_ser.serialize_field("forceFilterSelections", &self.force_filter_selections)?;
@@ -6037,6 +6040,27 @@ impl serde::Serialize for ParquetOptions {
                 }
             }
         }
+        if let Some(v) = self.filter_collecting_byte_ratio_threshold_opt.as_ref() {
+            match v {
+                parquet_options::FilterCollectingByteRatioThresholdOpt::FilterCollectingByteRatioThreshold(v) => {
+                    struct_ser.serialize_field("filterCollectingByteRatioThreshold", v)?;
+                }
+            }
+        }
+        if let Some(v) = self.filter_confidence_z_opt.as_ref() {
+            match v {
+                parquet_options::FilterConfidenceZOpt::FilterConfidenceZ(v) => {
+                    struct_ser.serialize_field("filterConfidenceZ", v)?;
+                }
+            }
+        }
+        if let Some(v) = self.filter_pushdown_min_bytes_per_sec_opt.as_ref() {
+            match v {
+                parquet_options::FilterPushdownMinBytesPerSecOpt::FilterPushdownMinBytesPerSec(v) => {
+                    struct_ser.serialize_field("filterPushdownMinBytesPerSec", v)?;
+                }
+            }
+        }
         struct_ser.end()
     }
 }
@@ -6054,8 +6078,6 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             "skipMetadata",
             "pushdown_filters",
             "pushdownFilters",
-            "reorder_filters",
-            "reorderFilters",
             "force_filter_selections",
             "forceFilterSelections",
             "data_pagesize_limit",
@@ -6110,6 +6132,12 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             "coerceInt96",
             "max_predicate_cache_size",
             "maxPredicateCacheSize",
+            "filter_collecting_byte_ratio_threshold",
+            "filterCollectingByteRatioThreshold",
+            "filter_confidence_z",
+            "filterConfidenceZ",
+            "filter_pushdown_min_bytes_per_sec",
+            "filterPushdownMinBytesPerSec",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -6118,7 +6146,6 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             Pruning,
             SkipMetadata,
             PushdownFilters,
-            ReorderFilters,
             ForceFilterSelections,
             DataPagesizeLimit,
             WriteBatchSize,
@@ -6147,6 +6174,9 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             BloomFilterNdv,
             CoerceInt96,
             MaxPredicateCacheSize,
+            FilterCollectingByteRatioThreshold,
+            FilterConfidenceZ,
+            FilterPushdownMinBytesPerSec,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -6172,7 +6202,6 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             "pruning" => Ok(GeneratedField::Pruning),
                             "skipMetadata" | "skip_metadata" => Ok(GeneratedField::SkipMetadata),
                             "pushdownFilters" | "pushdown_filters" => Ok(GeneratedField::PushdownFilters),
-                            "reorderFilters" | "reorder_filters" => Ok(GeneratedField::ReorderFilters),
                             "forceFilterSelections" | "force_filter_selections" => Ok(GeneratedField::ForceFilterSelections),
                             "dataPagesizeLimit" | "data_pagesize_limit" => Ok(GeneratedField::DataPagesizeLimit),
                             "writeBatchSize" | "write_batch_size" => Ok(GeneratedField::WriteBatchSize),
@@ -6201,6 +6230,9 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             "bloomFilterNdv" | "bloom_filter_ndv" => Ok(GeneratedField::BloomFilterNdv),
                             "coerceInt96" | "coerce_int96" => Ok(GeneratedField::CoerceInt96),
                             "maxPredicateCacheSize" | "max_predicate_cache_size" => Ok(GeneratedField::MaxPredicateCacheSize),
+                            "filterCollectingByteRatioThreshold" | "filter_collecting_byte_ratio_threshold" => Ok(GeneratedField::FilterCollectingByteRatioThreshold),
+                            "filterConfidenceZ" | "filter_confidence_z" => Ok(GeneratedField::FilterConfidenceZ),
+                            "filterPushdownMinBytesPerSec" | "filter_pushdown_min_bytes_per_sec" => Ok(GeneratedField::FilterPushdownMinBytesPerSec),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -6224,7 +6256,6 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                 let mut pruning__ = None;
                 let mut skip_metadata__ = None;
                 let mut pushdown_filters__ = None;
-                let mut reorder_filters__ = None;
                 let mut force_filter_selections__ = None;
                 let mut data_pagesize_limit__ = None;
                 let mut write_batch_size__ = None;
@@ -6253,6 +6284,9 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                 let mut bloom_filter_ndv_opt__ = None;
                 let mut coerce_int96_opt__ = None;
                 let mut max_predicate_cache_size_opt__ = None;
+                let mut filter_collecting_byte_ratio_threshold_opt__ = None;
+                let mut filter_confidence_z_opt__ = None;
+                let mut filter_pushdown_min_bytes_per_sec_opt__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::EnablePageIndex => {
@@ -6278,12 +6312,6 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                                 return Err(serde::de::Error::duplicate_field("pushdownFilters"));
                             }
                             pushdown_filters__ = Some(map_.next_value()?);
-                        }
-                        GeneratedField::ReorderFilters => {
-                            if reorder_filters__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("reorderFilters"));
-                            }
-                            reorder_filters__ = Some(map_.next_value()?);
                         }
                         GeneratedField::ForceFilterSelections => {
                             if force_filter_selections__.is_some() {
@@ -6467,6 +6495,24 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             }
                             max_predicate_cache_size_opt__ = map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| parquet_options::MaxPredicateCacheSizeOpt::MaxPredicateCacheSize(x.0));
                         }
+                        GeneratedField::FilterCollectingByteRatioThreshold => {
+                            if filter_collecting_byte_ratio_threshold_opt__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("filterCollectingByteRatioThreshold"));
+                            }
+                            filter_collecting_byte_ratio_threshold_opt__ = map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| parquet_options::FilterCollectingByteRatioThresholdOpt::FilterCollectingByteRatioThreshold(x.0));
+                        }
+                        GeneratedField::FilterConfidenceZ => {
+                            if filter_confidence_z_opt__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("filterConfidenceZ"));
+                            }
+                            filter_confidence_z_opt__ = map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| parquet_options::FilterConfidenceZOpt::FilterConfidenceZ(x.0));
+                        }
+                        GeneratedField::FilterPushdownMinBytesPerSec => {
+                            if filter_pushdown_min_bytes_per_sec_opt__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("filterPushdownMinBytesPerSec"));
+                            }
+                            filter_pushdown_min_bytes_per_sec_opt__ = map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| parquet_options::FilterPushdownMinBytesPerSecOpt::FilterPushdownMinBytesPerSec(x.0));
+                        }
                     }
                 }
                 Ok(ParquetOptions {
@@ -6474,7 +6520,6 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                     pruning: pruning__.unwrap_or_default(),
                     skip_metadata: skip_metadata__.unwrap_or_default(),
                     pushdown_filters: pushdown_filters__.unwrap_or_default(),
-                    reorder_filters: reorder_filters__.unwrap_or_default(),
                     force_filter_selections: force_filter_selections__.unwrap_or_default(),
                     data_pagesize_limit: data_pagesize_limit__.unwrap_or_default(),
                     write_batch_size: write_batch_size__.unwrap_or_default(),
@@ -6503,6 +6548,9 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                     bloom_filter_ndv_opt: bloom_filter_ndv_opt__,
                     coerce_int96_opt: coerce_int96_opt__,
                     max_predicate_cache_size_opt: max_predicate_cache_size_opt__,
+                    filter_collecting_byte_ratio_threshold_opt: filter_collecting_byte_ratio_threshold_opt__,
+                    filter_confidence_z_opt: filter_confidence_z_opt__,
+                    filter_pushdown_min_bytes_per_sec_opt: filter_pushdown_min_bytes_per_sec_opt__,
                 })
             }
         }

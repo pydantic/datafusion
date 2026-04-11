@@ -379,7 +379,7 @@ mod parquet {
                     parquet_options::MetadataSizeHintOpt::MetadataSizeHint(size as u64)
                 }),
                 pushdown_filters: global_options.global.pushdown_filters,
-                reorder_filters: global_options.global.reorder_filters,
+
                 force_filter_selections: global_options.global.force_filter_selections,
                 data_pagesize_limit: global_options.global.data_pagesize_limit as u64,
                 write_batch_size: global_options.global.write_batch_size as u64,
@@ -433,6 +433,9 @@ mod parquet {
                         norm_level: cdc.norm_level,
                     }
                 }),
+                filter_pushdown_min_bytes_per_sec_opt: Some(parquet_options::FilterPushdownMinBytesPerSecOpt::FilterPushdownMinBytesPerSec(global_options.global.filter_pushdown_min_bytes_per_sec)),
+                filter_collecting_byte_ratio_threshold_opt: Some(parquet_options::FilterCollectingByteRatioThresholdOpt::FilterCollectingByteRatioThreshold(global_options.global.filter_collecting_byte_ratio_threshold)),
+                filter_confidence_z_opt: Some(parquet_options::FilterConfidenceZOpt::FilterConfidenceZ(global_options.global.filter_confidence_z)),
             }),
             column_specific_options: column_specific_options.into_iter().map(|(column_name, options)| {
                 ParquetColumnSpecificOptions {
@@ -482,7 +485,7 @@ mod parquet {
                 parquet_options::MetadataSizeHintOpt::MetadataSizeHint(size) => *size as usize,
             }),
             pushdown_filters: proto.pushdown_filters,
-            reorder_filters: proto.reorder_filters,
+
             force_filter_selections: proto.force_filter_selections,
             data_pagesize_limit: proto.data_pagesize_limit as usize,
             write_batch_size: proto.write_batch_size as usize,
@@ -535,14 +538,20 @@ mod parquet {
             use_content_defined_chunking: proto.content_defined_chunking.map(|cdc| {
                 let defaults = CdcOptions::default();
                 CdcOptions {
-                    // proto3 uses 0 as the wire default for uint64; a zero chunk size is
-                    // invalid, so treat it as "field not set" and fall back to the default.
                     min_chunk_size: if cdc.min_chunk_size != 0 { cdc.min_chunk_size as usize } else { defaults.min_chunk_size },
                     max_chunk_size: if cdc.max_chunk_size != 0 { cdc.max_chunk_size as usize } else { defaults.max_chunk_size },
-                    // norm_level = 0 is a valid value (and the default), so pass it through directly.
                     norm_level: cdc.norm_level,
                 }
             }),
+            filter_pushdown_min_bytes_per_sec: proto.filter_pushdown_min_bytes_per_sec_opt.as_ref().map(|opt| match opt {
+                parquet_options::FilterPushdownMinBytesPerSecOpt::FilterPushdownMinBytesPerSec(v) => *v,
+            }).unwrap_or(f64::INFINITY),
+            filter_collecting_byte_ratio_threshold: proto.filter_collecting_byte_ratio_threshold_opt.as_ref().map(|opt| match opt {
+                parquet_options::FilterCollectingByteRatioThresholdOpt::FilterCollectingByteRatioThreshold(v) => *v,
+            }).unwrap_or(0.2),
+            filter_confidence_z: proto.filter_confidence_z_opt.as_ref().map(|opt| match opt {
+                parquet_options::FilterConfidenceZOpt::FilterConfidenceZ(v) => *v,
+            }).unwrap_or(2.0),
         }
         }
     }

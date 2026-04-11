@@ -1023,7 +1023,7 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
                 })
                 .unwrap_or(None),
             pushdown_filters: value.pushdown_filters,
-            reorder_filters: value.reorder_filters,
+
             force_filter_selections: value.force_filter_selections,
             data_pagesize_limit: value.data_pagesize_limit as usize,
             write_batch_size: value.write_batch_size as usize,
@@ -1092,14 +1092,20 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
             use_content_defined_chunking: value.content_defined_chunking.map(|cdc| {
                 let defaults = CdcOptions::default();
                 CdcOptions {
-                    // proto3 uses 0 as the wire default for uint64; a zero chunk size is
-                    // invalid, so treat it as "field not set" and fall back to the default.
                     min_chunk_size: if cdc.min_chunk_size != 0 { cdc.min_chunk_size as usize } else { defaults.min_chunk_size },
                     max_chunk_size: if cdc.max_chunk_size != 0 { cdc.max_chunk_size as usize } else { defaults.max_chunk_size },
-                    // norm_level = 0 is a valid value (and the default), so pass it through directly.
                     norm_level: cdc.norm_level,
                 }
             }),
+            filter_pushdown_min_bytes_per_sec: value.filter_pushdown_min_bytes_per_sec_opt.map(|opt| match opt {
+                protobuf::parquet_options::FilterPushdownMinBytesPerSecOpt::FilterPushdownMinBytesPerSec(v) => v,
+            }).unwrap_or(f64::INFINITY),
+            filter_collecting_byte_ratio_threshold: value.filter_collecting_byte_ratio_threshold_opt.map(|opt| match opt {
+                protobuf::parquet_options::FilterCollectingByteRatioThresholdOpt::FilterCollectingByteRatioThreshold(v) => v,
+            }).unwrap_or(0.2),
+            filter_confidence_z: value.filter_confidence_z_opt.map(|opt| match opt {
+                protobuf::parquet_options::FilterConfidenceZOpt::FilterConfidenceZ(v) => v,
+            }).unwrap_or(2.0),
         })
     }
 }
