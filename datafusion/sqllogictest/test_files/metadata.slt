@@ -468,5 +468,11 @@ select with_metadata(id, name, 'v') from table_with_metadata;
 statement error with_metadata requires argument 1 \(key\) to be a non-empty constant string
 select with_metadata(id, '', 'v') from table_with_metadata;
 
+# with_metadata: empty values are allowed
+query T
+select arrow_metadata(with_metadata(id, 'unit', ''), 'unit') from table_with_metadata limit 1;
+----
+(empty)
+
 statement ok
 drop table table_with_metadata;

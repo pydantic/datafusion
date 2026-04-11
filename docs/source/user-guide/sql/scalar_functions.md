@@ -5479,7 +5479,7 @@ version()
 
 ### `with_metadata`
 
-Attaches Arrow field metadata (key/value pairs) to the input expression. Keys and values must be non-empty constant strings. Existing metadata on the input field is preserved; new keys overwrite on collision. This is the inverse of `arrow_metadata`.
+Attaches Arrow field metadata (key/value pairs) to the input expression. Keys must be non-empty constant strings and values must be constant strings (empty values are allowed). Existing metadata on the input field is preserved; new keys overwrite on collision. This is the inverse of `arrow_metadata`.
 
 ```sql
 with_metadata(expression, key1, value1[, key2, value2, ...])
@@ -5489,7 +5489,7 @@ with_metadata(expression, key1, value1[, key2, value2, ...])
 
 - **expression**: The expression whose output Arrow field should be annotated. Values flow through unchanged.
 - **key**: Metadata key. Must be a non-empty constant string literal.
-- **value**: Metadata value. Must be a non-empty constant string literal.
+- **value**: Metadata value. Must be a constant string literal (may be empty).
 
 #### Example
 

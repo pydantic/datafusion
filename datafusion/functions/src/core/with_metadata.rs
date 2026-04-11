@@ -25,7 +25,7 @@ use datafusion_macros::user_doc;
 
 #[user_doc(
     doc_section(label = "Other Functions"),
-    description = "Attaches Arrow field metadata (key/value pairs) to the input expression. Keys and values must be non-empty constant strings. Existing metadata on the input field is preserved; new keys overwrite on collision. This is the inverse of `arrow_metadata`.",
+    description = "Attaches Arrow field metadata (key/value pairs) to the input expression. Keys must be non-empty constant strings and values must be constant strings (empty values are allowed). Existing metadata on the input field is preserved; new keys overwrite on collision. This is the inverse of `arrow_metadata`.",
     syntax_example = "with_metadata(expression, key1, value1[, key2, value2, ...])",
     sql_example = r#"```sql
 > select arrow_metadata(with_metadata(column1, 'unit', 'ms'), 'unit') from (values (1));
@@ -49,7 +49,7 @@ use datafusion_macros::user_doc;
     ),
     argument(
         name = "value",
-        description = "Metadata value. Must be a non-empty constant string literal."
+        description = "Metadata value. Must be a constant string literal (may be empty)."
     )
 )]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -290,6 +290,27 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("at least one"));
+    }
+
+    #[test]
+    fn allows_empty_value() {
+        let udf = WithMetadataFunc::new();
+        let input = field("c", DataType::Int32, true);
+        let k = str_lit("unit");
+        let v = str_lit("");
+        let fields = [
+            Arc::clone(&input),
+            field("", DataType::Utf8, false),
+            field("", DataType::Utf8, false),
+        ];
+        let scalars = [None, Some(&k), Some(&v)];
+        let ret = udf
+            .return_field_from_args(ReturnFieldArgs {
+                arg_fields: &fields,
+                scalar_arguments: &scalars,
+            })
+            .unwrap();
+        assert_eq!(ret.metadata().get("unit").map(String::as_str), Some(""));
     }
 
     #[test]
