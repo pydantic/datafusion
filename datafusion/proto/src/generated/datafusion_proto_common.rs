@@ -790,9 +790,6 @@ pub struct ParquetOptions {
     #[prost(bool, tag = "5")]
     pub pushdown_filters: bool,
     /// default = false
-    #[prost(bool, tag = "6")]
-    pub reorder_filters: bool,
-    /// default = false
     #[prost(bool, tag = "34")]
     pub force_filter_selections: bool,
     /// default = 1024 * 1024
@@ -874,6 +871,21 @@ pub struct ParquetOptions {
     pub max_predicate_cache_size_opt: ::core::option::Option<
         parquet_options::MaxPredicateCacheSizeOpt,
     >,
+    #[prost(
+        oneof = "parquet_options::FilterCollectingByteRatioThresholdOpt",
+        tags = "40"
+    )]
+    pub filter_collecting_byte_ratio_threshold_opt: ::core::option::Option<
+        parquet_options::FilterCollectingByteRatioThresholdOpt,
+    >,
+    #[prost(oneof = "parquet_options::FilterConfidenceZOpt", tags = "41")]
+    pub filter_confidence_z_opt: ::core::option::Option<
+        parquet_options::FilterConfidenceZOpt,
+    >,
+    #[prost(oneof = "parquet_options::FilterPushdownMinBytesPerSecOpt", tags = "42")]
+    pub filter_pushdown_min_bytes_per_sec_opt: ::core::option::Option<
+        parquet_options::FilterPushdownMinBytesPerSecOpt,
+    >,
 }
 /// Nested message and enum types in `ParquetOptions`.
 pub mod parquet_options {
@@ -931,6 +943,21 @@ pub mod parquet_options {
     pub enum MaxPredicateCacheSizeOpt {
         #[prost(uint64, tag = "33")]
         MaxPredicateCacheSize(u64),
+    }
+    #[derive(Clone, Copy, PartialEq, ::prost::Oneof)]
+    pub enum FilterCollectingByteRatioThresholdOpt {
+        #[prost(double, tag = "40")]
+        FilterCollectingByteRatioThreshold(f64),
+    }
+    #[derive(Clone, Copy, PartialEq, ::prost::Oneof)]
+    pub enum FilterConfidenceZOpt {
+        #[prost(double, tag = "41")]
+        FilterConfidenceZ(f64),
+    }
+    #[derive(Clone, Copy, PartialEq, ::prost::Oneof)]
+    pub enum FilterPushdownMinBytesPerSecOpt {
+        #[prost(double, tag = "42")]
+        FilterPushdownMinBytesPerSec(f64),
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

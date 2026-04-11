@@ -903,9 +903,6 @@ statement ok
 set datafusion.execution.parquet.pushdown_filters = true;
 
 statement ok
-set datafusion.execution.parquet.reorder_filters = true;
-
-statement ok
 COPY (
   SELECT
     arrow_cast(chr(65 + (row_num % 26)), 'Dictionary(Int32, Utf8)') as tag1,
@@ -934,9 +931,6 @@ A 78
 # Cleanup
 statement ok
 set datafusion.execution.parquet.pushdown_filters = false;
-
-statement ok
-set datafusion.execution.parquet.reorder_filters = false;
 
 statement ok
 DROP TABLE dict_filter_bug;

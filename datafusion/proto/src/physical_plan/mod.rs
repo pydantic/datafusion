@@ -863,6 +863,12 @@ impl protobuf::PhysicalPlanNode {
             let reader_factory =
                 Arc::new(CachedParquetFileReaderFactory::new(store, metadata_cache));
 
+            options.global.filter_pushdown_min_bytes_per_sec = ctx
+                .session_config()
+                .options()
+                .execution
+                .parquet
+                .filter_pushdown_min_bytes_per_sec;
             let mut source = ParquetSource::new(table_schema)
                 .with_parquet_file_reader_factory(reader_factory)
                 .with_table_parquet_options(options);
