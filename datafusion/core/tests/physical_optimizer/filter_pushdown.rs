@@ -83,7 +83,7 @@ fn test_pushdown_into_scan() {
     // expect the predicate to be pushed down into the DataSource
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = foo
@@ -118,7 +118,7 @@ fn test_pushdown_volatile_functions_not_allowed() {
     // expect the filter to not be pushed down
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = random()
@@ -145,7 +145,7 @@ fn test_pushdown_into_scan_with_config_options() {
             FilterPushdown::new(),
             false
         ),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = foo
@@ -164,7 +164,7 @@ fn test_pushdown_into_scan_with_config_options() {
             FilterPushdown::new(),
             true
         ),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = foo
@@ -261,11 +261,11 @@ async fn test_dynamic_filter_pushdown_through_hash_join_with_topk() {
     // Test that filters are pushed down correctly to each side of the join
     insta::assert_snapshot!(
         format_plan_for_test(&plan),
-        @r"
+        @"
     - SortExec: TopK(fetch=2), expr=[e@4 ASC], preserve_partitioning=[false]
     -   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)]
     -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
-    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, e, f], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ] AND DynamicFilter [ empty ]
+    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, e, f], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ empty ]) AND DynamicFilter [ empty ]
     "
     );
 
@@ -285,11 +285,11 @@ async fn test_dynamic_filter_pushdown_through_hash_join_with_topk() {
     // NOTE: We dropped the CASE expression here because we now optimize that away if there's only 1 partition
     insta::assert_snapshot!(
         format_plan_for_test(&plan),
-        @r"
+        @"
     - SortExec: TopK(fetch=2), expr=[e@4 ASC], preserve_partitioning=[false], filter=[e@4 IS NULL OR e@4 < bb]
     -   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)]
     -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
-    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, e, f], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ d@0 >= aa AND d@0 <= ab AND d@0 IN (SET) ([aa, ab]) ] AND DynamicFilter [ e@1 IS NULL OR e@1 < bb ]
+    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, e, f], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ d@0 >= aa AND d@0 <= ab AND d@0 IN (SET) ([aa, ab]) ]) AND DynamicFilter [ e@1 IS NULL OR e@1 < bb ]
     "
     );
 }
@@ -385,7 +385,7 @@ async fn test_static_filter_pushdown_through_hash_join() {
     // Test that filters are pushed down correctly to each side of the join
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = d@3
@@ -439,7 +439,7 @@ async fn test_static_filter_pushdown_through_hash_join() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: e@4 = ba
@@ -468,7 +468,7 @@ fn test_filter_collapse() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: b@1 = bar
@@ -497,7 +497,7 @@ fn test_filter_with_projection() {
     // expect the predicate to be pushed down into the DataSource but the FilterExec to be converted to ProjectionExec
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = foo, projection=[b@1, a@0]
@@ -521,7 +521,7 @@ fn test_filter_with_projection() {
     );
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(),true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = foo, projection=[b@1]
@@ -550,7 +550,7 @@ fn test_filter_collapse_outer_fetch_preserved() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: b@1 = bar, fetch=10
@@ -580,7 +580,7 @@ fn test_filter_collapse_inner_fetch_preserved() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: b@1 = bar
@@ -616,7 +616,7 @@ fn test_filter_collapse_both_fetch_uses_minimum() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: b@1 = bar, fetch=10
@@ -646,7 +646,7 @@ fn test_filter_with_fetch_fully_pushed_to_scan() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = foo, fetch=10
@@ -677,7 +677,7 @@ fn test_filter_with_fetch_and_projection_fully_pushed_to_scan() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = foo, projection=[b@1, a@0], fetch=5
@@ -727,7 +727,7 @@ fn test_filter_with_fetch_partially_pushed_to_scan() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = foo AND a@0 = random(), fetch=7
@@ -755,7 +755,7 @@ fn test_filter_with_fetch_not_pushed_to_unsupportive_scan() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = foo, fetch=3
@@ -783,7 +783,7 @@ fn test_push_down_through_transparent_nodes() {
     // expect the predicate to be pushed down into the DataSource
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(),true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: b@1 = bar
@@ -848,7 +848,7 @@ fn test_pushdown_through_aggregates_on_grouping_columns() {
     // Both filters should be pushed down to the DataSource since both reference grouping columns
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: b@1 = bar
@@ -874,7 +874,7 @@ fn test_node_handles_child_pushdown_result() {
     let plan = Arc::new(TestNode::new(true, Arc::clone(&scan), predicate));
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - TestInsertExec { inject_filter: true }
@@ -893,7 +893,7 @@ fn test_node_handles_child_pushdown_result() {
     let plan = Arc::new(TestNode::new(true, Arc::clone(&scan), predicate));
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - TestInsertExec { inject_filter: true }
@@ -913,7 +913,7 @@ fn test_node_handles_child_pushdown_result() {
     let plan = Arc::new(TestNode::new(false, Arc::clone(&scan), predicate));
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - TestInsertExec { inject_filter: false }
@@ -961,7 +961,7 @@ async fn test_topk_dynamic_filter_pushdown() {
     // expect the predicate to be pushed down into the DataSource
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new_post_optimization(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - SortExec: TopK(fetch=1), expr=[b@1 DESC NULLS LAST], preserve_partitioning=[false]
@@ -993,7 +993,7 @@ async fn test_topk_dynamic_filter_pushdown() {
     // Now check what our filter looks like
     insta::assert_snapshot!(
         format!("{}", format_plan_for_test(&plan)),
-        @r"
+        @"
     - SortExec: TopK(fetch=1), expr=[b@1 DESC NULLS LAST], preserve_partitioning=[false], filter=[b@1 > bd]
     -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ b@1 > bd ]
     "
@@ -1044,7 +1044,7 @@ async fn test_topk_dynamic_filter_pushdown_multi_column_sort() {
     // expect the predicate to be pushed down into the DataSource
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new_post_optimization(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - SortExec: TopK(fetch=2), expr=[b@1 ASC NULLS LAST, a@0 DESC], preserve_partitioning=[false]
@@ -1086,7 +1086,7 @@ async fn test_topk_dynamic_filter_pushdown_multi_column_sort() {
     // Now check what our filter looks like
     insta::assert_snapshot!(
         format!("{}", format_plan_for_test(&plan)),
-        @r"
+        @"
     - SortExec: TopK(fetch=2), expr=[b@1 ASC NULLS LAST, a@0 DESC], preserve_partitioning=[false], filter=[b@1 < bb OR b@1 = bb AND (a@0 IS NULL OR a@0 > ac)]
     -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ b@1 < bb OR b@1 = bb AND (a@0 IS NULL OR a@0 > ac) ]
     "
@@ -1148,7 +1148,7 @@ async fn test_topk_filter_passes_through_coalesce_partitions() {
     // if it properly implements from_children (not all_unsupported)
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new_post_optimization(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - SortExec: TopK(fetch=1), expr=[b@1 DESC NULLS LAST], preserve_partitioning=[false]
@@ -1235,7 +1235,7 @@ async fn test_hashjoin_dynamic_filter_pushdown() {
     // expect the predicate to be pushed down into the probe side DataSource
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new_post_optimization(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
@@ -1245,7 +1245,7 @@ async fn test_hashjoin_dynamic_filter_pushdown() {
         Ok:
           - HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
           -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ empty ])
     ",
     );
 
@@ -1276,10 +1276,10 @@ async fn test_hashjoin_dynamic_filter_pushdown() {
     // Now check what our filter looks like
     insta::assert_snapshot!(
         format!("{}", format_plan_for_test(&plan)),
-        @r"
+        @"
     - HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
     -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
-    -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= ba AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}, {c0:ab,c1:bb}]) ]
+    -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= ba AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}, {c0:ab,c1:bb}]) ])
     "
     );
 }
@@ -1437,7 +1437,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
     // expect the predicate to be pushed down into the probe side DataSource
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new_post_optimization(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
@@ -1455,7 +1455,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
           -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
           -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
           -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
-          -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
+          -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ empty ])
     "
     );
 
@@ -1482,14 +1482,14 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
     #[cfg(not(feature = "force_hash_collisions"))]
     insta::assert_snapshot!(
         format!("{}", format_plan_for_test(&plan)),
-        @r"
+        @"
     - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
     -   CoalescePartitionsExec
     -     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
     -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
     -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
     -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
-    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ CASE hash_repartition % 12 WHEN 5 THEN a@0 >= ab AND a@0 <= ab AND b@1 >= bb AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:ab,c1:bb}]) WHEN 8 THEN a@0 >= aa AND a@0 <= aa AND b@1 >= ba AND b@1 <= ba AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}]) ELSE false END ]
+    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ CASE hash_repartition % 12 WHEN 5 THEN a@0 >= ab AND a@0 <= ab AND b@1 >= bb AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:ab,c1:bb}]) WHEN 8 THEN a@0 >= aa AND a@0 <= aa AND b@1 >= ba AND b@1 <= ba AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}]) ELSE false END ])
     "
     );
 
@@ -1507,7 +1507,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
     -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
     -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
     -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
-    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= ba AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}, {c0:ab,c1:bb}]) ]
+    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= ba AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}, {c0:ab,c1:bb}]) ])
     "
     );
 
@@ -1522,7 +1522,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
 
     insta::assert_snapshot!(
         result,
-        @r"
+        @"
     +----+----+-----+----+----+-----+
     | a  | b  | c   | a  | b  | e   |
     +----+----+-----+----+----+-----+
@@ -1631,7 +1631,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_collect_left() {
     // expect the predicate to be pushed down into the probe side DataSource
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new_post_optimization(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
@@ -1647,7 +1647,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_collect_left() {
           -     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
           -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
           -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
-          -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
+          -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ empty ])
     "
     );
 
@@ -1673,13 +1673,13 @@ async fn test_hashjoin_dynamic_filter_pushdown_collect_left() {
     // Now check what our filter looks like
     insta::assert_snapshot!(
         format!("{}", format_plan_for_test(&plan)),
-        @r"
+        @"
     - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
     -   CoalescePartitionsExec
     -     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
     -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
     -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
-    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= ba AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}, {c0:ab,c1:bb}]) ]
+    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= ba AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}, {c0:ab,c1:bb}]) ])
     "
     );
 
@@ -1694,7 +1694,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_collect_left() {
 
     insta::assert_snapshot!(
         result,
-        @r"
+        @"
     +----+----+-----+----+----+-----+
     | a  | b  | c   | a  | b  | e   |
     +----+----+-----+----+----+-----+
@@ -1808,7 +1808,7 @@ async fn test_nested_hashjoin_dynamic_filter_pushdown() {
     // Test that dynamic filters are pushed down correctly through nested joins
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&outer_join), FilterPushdown::new_post_optimization(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, b@0)]
@@ -1821,8 +1821,8 @@ async fn test_nested_hashjoin_dynamic_filter_pushdown() {
           - HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, b@0)]
           -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, x], file_type=test, pushdown_supported=true
           -   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@1, d@0)]
-          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[b, c, y], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
-          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, z], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
+          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[b, c, y], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ empty ])
+          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, z], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ empty ])
     ",
     );
 
@@ -1848,12 +1848,12 @@ async fn test_nested_hashjoin_dynamic_filter_pushdown() {
     // Verify that both the inner and outer join have updated dynamic filters
     insta::assert_snapshot!(
         format!("{}", format_plan_for_test(&plan)),
-        @r"
+        @"
     - HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, b@0)]
     -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, x], file_type=test, pushdown_supported=true
     -   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@1, d@0)]
-    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[b, c, y], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ b@0 >= aa AND b@0 <= ab AND b@0 IN (SET) ([aa, ab]) ]
-    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, z], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ d@0 >= ca AND d@0 <= cb AND d@0 IN (SET) ([ca, cb]) ]
+    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[b, c, y], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ b@0 >= aa AND b@0 <= ab AND b@0 IN (SET) ([aa, ab]) ])
+    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, z], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ d@0 >= ca AND d@0 <= cb AND d@0 IN (SET) ([ca, cb]) ])
     "
     );
 }
@@ -1945,7 +1945,7 @@ async fn test_hashjoin_parent_filter_pushdown() {
     // Test that filters are pushed down correctly to each side of the join
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = d@3
@@ -2016,7 +2016,7 @@ fn test_hashjoin_parent_filter_pushdown_same_column_names() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: probe_val@3 = x
@@ -2083,7 +2083,7 @@ fn test_hashjoin_parent_filter_pushdown_mark_join() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: mark@2 = true
@@ -2159,7 +2159,7 @@ fn test_hashjoin_parent_filter_pushdown_semi_anti_join() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: v@1 = y
@@ -2185,6 +2185,11 @@ async fn test_topk_dynamic_filter_pushdown_integration() {
     let mut cfg = SessionConfig::new();
     cfg.options_mut().execution.parquet.pushdown_filters = true;
     cfg.options_mut().execution.parquet.max_row_group_size = 128;
+    // Always pushdown filters into row filters for this test
+    cfg.options_mut()
+        .execution
+        .parquet
+        .filter_pushdown_min_bytes_per_sec = 0.0;
     let ctx = SessionContext::new_with_config(cfg);
     ctx.register_object_store(
         ObjectStoreUrl::parse("memory://").unwrap().as_ref(),
@@ -2246,7 +2251,7 @@ fn test_filter_pushdown_through_union() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = foo
@@ -2275,7 +2280,7 @@ fn test_filter_pushdown_through_union_mixed_support() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = foo
@@ -3164,7 +3169,7 @@ async fn test_aggregate_filter_pushdown() {
     // Even with aggregate functions, filter on grouping column should be pushed through
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = x
@@ -3233,7 +3238,7 @@ async fn test_no_pushdown_filter_on_aggregate_result() {
     // The filter should NOT be pushed through the aggregate since it's on an aggregate result
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: count[count]@1 > 5
@@ -3286,7 +3291,7 @@ fn test_pushdown_filter_on_non_first_grouping_column() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: b@1 = bar
@@ -3355,7 +3360,7 @@ fn test_no_pushdown_grouping_sets_filter_on_missing_column() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = foo
@@ -3425,7 +3430,7 @@ fn test_pushdown_grouping_sets_filter_on_common_column() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: b@1 = bar
@@ -3477,7 +3482,7 @@ fn test_pushdown_with_empty_group_by() {
     // The filter should be pushed down even with empty GROUP BY
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = foo
@@ -3552,7 +3557,7 @@ fn test_pushdown_through_aggregate_with_reordered_input_columns() {
     // The filter should be pushed down
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: b@1 = bar
@@ -3641,7 +3646,7 @@ fn test_pushdown_through_aggregate_grouping_sets_with_reordered_input() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: b@1 = bar
@@ -3662,7 +3667,7 @@ fn test_pushdown_through_aggregate_grouping_sets_with_reordered_input() {
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: a@0 = foo
@@ -3782,7 +3787,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_through_aggregate_with_reordered_
     // through the aggregate and reach the probe-side DataSource.
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new_post_optimization(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(a@0, a@0)]
@@ -3796,7 +3801,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_through_aggregate_with_reordered_
           -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a], file_type=test, pushdown_supported=true
           -   AggregateExec: mode=Single, gby=[a@1 as a], aggr=[min_value]
           -     ProjectionExec: expr=[value@1 as value, a@0 as a]
-          -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, value], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
+          -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, value], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ empty ])
     "
     );
 
@@ -3821,12 +3826,12 @@ async fn test_hashjoin_dynamic_filter_pushdown_through_aggregate_with_reordered_
     // After execution, the dynamic filter should be populated with values
     insta::assert_snapshot!(
         format!("{}", format_plan_for_test(&plan)),
-        @r"
+        @"
     - HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(a@0, a@0)]
     -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a], file_type=test, pushdown_supported=true
     -   AggregateExec: mode=Single, gby=[a@1 as a], aggr=[min_value]
     -     ProjectionExec: expr=[value@1 as value, a@0 as a]
-    -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, value], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ a@0 >= h1 AND a@0 <= h2 AND a@0 IN (SET) ([h1, h2]) ]
+    -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, value], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ a@0 >= h1 AND a@0 <= h2 AND a@0 IN (SET) ([h1, h2]) ])
     "
     );
 }
@@ -3878,7 +3883,7 @@ fn test_pushdown_with_computed_grouping_key() {
     // The filter should be pushed down because 'c' is extracted from the grouping expression (c + 1.0)
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - AggregateExec: mode=Final, gby=[c@2 + 1 as c_plus_1], aggr=[cnt]
@@ -3989,12 +3994,12 @@ async fn test_hashjoin_dynamic_filter_all_partitions_empty() {
 
     insta::assert_snapshot!(
         format_plan_for_test(&plan),
-        @r"
+        @"
     - HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
     -   RepartitionExec: partitioning=Hash([a@0, b@1], 4), input_partitions=1
     -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true
     -   RepartitionExec: partitioning=Hash([a@0, b@1], 4), input_partitions=1
-    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
+    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ empty ])
     "
     );
 
@@ -4014,12 +4019,12 @@ async fn test_hashjoin_dynamic_filter_all_partitions_empty() {
     // Test that filters are pushed down correctly to each side of the join
     insta::assert_snapshot!(
         format_plan_for_test(&plan),
-        @r"
+        @"
     - HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
     -   RepartitionExec: partitioning=Hash([a@0, b@1], 4), input_partitions=1
     -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true
     -   RepartitionExec: partitioning=Hash([a@0, b@1], 4), input_partitions=1
-    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ false ]
+    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ false ])
     "
     );
 }
@@ -4118,10 +4123,10 @@ async fn test_hashjoin_dynamic_filter_with_nulls() {
 
     insta::assert_snapshot!(
         format_plan_for_test(&plan),
-        @r"
+        @"
     - HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
     -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true
-    -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
+    -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ empty ])
     "
     );
 
@@ -4141,10 +4146,10 @@ async fn test_hashjoin_dynamic_filter_with_nulls() {
     // Test that filters are pushed down correctly to each side of the join
     insta::assert_snapshot!(
         format_plan_for_test(&plan),
-        @r"
+        @"
     - HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
     -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true
-    -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= 1 AND b@1 <= 2 AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:1}, {c0:,c1:2}, {c0:ab,c1:}]) ]
+    -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= 1 AND b@1 <= 2 AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:1}, {c0:,c1:2}, {c0:ab,c1:}]) ])
     "
     );
 
@@ -4314,7 +4319,7 @@ async fn test_hashjoin_hash_table_pushdown_partitioned() {
     // Results should be identical to the InList version
     insta::assert_snapshot!(
         result,
-        @r"
+        @"
     +----+----+-----+----+----+-----+
     | a  | b  | c   | a  | b  | e   |
     +----+----+-----+----+----+-----+
@@ -4465,7 +4470,7 @@ async fn test_hashjoin_hash_table_pushdown_collect_left() {
     // Results should be identical to the InList version
     insta::assert_snapshot!(
         result,
-        @r"
+        @"
     +----+----+-----+----+----+-----+
     | a  | b  | c   | a  | b  | e   |
     +----+----+-----+----+----+-----+
@@ -4586,7 +4591,7 @@ async fn test_hashjoin_hash_table_pushdown_integer_keys() {
 
     insta::assert_snapshot!(
         result,
-        @r"
+        @"
     +-----+-----+-------+-----+-----+------+
     | id1 | id2 | value | id1 | id2 | data |
     +-----+-----+-------+-----+-----+------+
@@ -4781,11 +4786,31 @@ async fn test_discover_dynamic_filters_via_expressions_api() {
     use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 
     fn count_dynamic_filters(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        use datafusion_physical_expr_common::physical_expr::OptionalFilterPhysicalExpr;
+
         let mut count = 0;
 
-        // Check expressions from this node using apply_expressions
+        // Check expressions from this node using apply_expressions. Dynamic
+        // join filters pushed into consumers are wrapped in
+        // `OptionalFilterPhysicalExpr`, so peel that wrapper before the
+        // downcast to keep the producer/consumer count symmetric.
         let _ = plan.apply_expressions(&mut |expr| {
-            if let Some(_df) = expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
+            // Dynamic join filters pushed into consumers are wrapped in
+            // `OptionalFilterPhysicalExpr`; peel it off before the downcast.
+            let unwrapped_owner;
+            let inner: &dyn PhysicalExpr = if let Some(wrapper) =
+                expr.as_any().downcast_ref::<OptionalFilterPhysicalExpr>()
+            {
+                unwrapped_owner = wrapper.inner();
+                unwrapped_owner.as_ref()
+            } else {
+                expr
+            };
+            if inner
+                .as_any()
+                .downcast_ref::<DynamicFilterPhysicalExpr>()
+                .is_some()
+            {
                 count += 1;
             }
             Ok(TreeNodeRecursion::Continue)
@@ -4945,7 +4970,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_left_join() {
     // Expect the dynamic filter predicate to be pushed down into the probe side DataSource
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new_post_optimization(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - HashJoinExec: mode=CollectLeft, join_type=Left, on=[(a@0, a@0), (b@1, b@1)]
@@ -4955,7 +4980,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_left_join() {
         Ok:
           - HashJoinExec: mode=CollectLeft, join_type=Left, on=[(a@0, a@0), (b@1, b@1)]
           -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ empty ])
     ",
     );
 
@@ -4986,10 +5011,10 @@ async fn test_hashjoin_dynamic_filter_pushdown_left_join() {
     // After execution, verify the dynamic filter was populated with bounds and IN-list
     insta::assert_snapshot!(
         format!("{}", format_plan_for_test(&plan)),
-        @r"
+        @"
     - HashJoinExec: mode=CollectLeft, join_type=Left, on=[(a@0, a@0), (b@1, b@1)]
     -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
-    -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= ba AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}, {c0:ab,c1:bb}]) ]
+    -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= ba AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}, {c0:ab,c1:bb}]) ])
     "
     );
 
@@ -5000,7 +5025,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_left_join() {
     let result = format!("{}", pretty_format_batches(&batches).unwrap());
     insta::assert_snapshot!(
         result,
-        @r"
+        @"
     +----+----+-----+----+----+-----+
     | a  | b  | c   | a  | b  | e   |
     +----+----+-----+----+----+-----+
@@ -5083,7 +5108,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_left_semi_join() {
     // Expect the dynamic filter predicate to be pushed down into the probe side DataSource
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new_post_optimization(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - HashJoinExec: mode=CollectLeft, join_type=LeftSemi, on=[(a@0, a@0), (b@1, b@1)]
@@ -5093,7 +5118,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_left_semi_join() {
         Ok:
           - HashJoinExec: mode=CollectLeft, join_type=LeftSemi, on=[(a@0, a@0), (b@1, b@1)]
           -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ empty ])
     ",
     );
 
@@ -5124,10 +5149,10 @@ async fn test_hashjoin_dynamic_filter_pushdown_left_semi_join() {
     // After execution, verify the dynamic filter was populated with bounds and IN-list
     insta::assert_snapshot!(
         format!("{}", format_plan_for_test(&plan)),
-        @r"
+        @"
     - HashJoinExec: mode=CollectLeft, join_type=LeftSemi, on=[(a@0, a@0), (b@1, b@1)]
     -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
-    -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= ba AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}, {c0:ab,c1:bb}]) ]
+    -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= ba AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}, {c0:ab,c1:bb}]) ])
     "
     );
 
@@ -5136,7 +5161,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_left_semi_join() {
     let result = format!("{}", pretty_format_batches(&batches).unwrap());
     insta::assert_snapshot!(
         result,
-        @r"
+        @"
     +----+----+-----+
     | a  | b  | c   |
     +----+----+-----+
