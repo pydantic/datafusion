@@ -1513,12 +1513,17 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
 
     let result = format!("{}", pretty_format_batches(&batches).unwrap());
 
-    let probe_scan_metrics = probe_scan.metrics().unwrap();
-
-    // The probe side had 4 rows, but after applying the dynamic filter only 2 rows should remain.
-    // The number of output rows from the probe side scan should stay consistent across executions.
-    // Issue: https://github.com/apache/datafusion/issues/17451
-    assert_eq!(probe_scan_metrics.output_rows().unwrap(), 2);
+    // Previously this test asserted `probe_scan.metrics().output_rows() == 2`
+    // — that the probe scan emitted only the rows matching the finalized
+    // dynamic filter. That relied on all partitions blocking on a shared
+    // barrier inside `SharedBuildAccumulator` before any probing started,
+    // which deadlocked with `RepartitionExec`'s global backpressure gate
+    // under Q18-style plans (#21625). With the barrier removed, probing
+    // can begin before the last partition has reported, so the scan may
+    // emit its first batch against the placeholder filter. The join
+    // itself still applies the filter correctly (result batches are
+    // snapshot-asserted below). Restoring scan-level early filtering
+    // under the non-blocking design is a follow-up optimization.
 
     insta::assert_snapshot!(
         result,
@@ -1685,12 +1690,17 @@ async fn test_hashjoin_dynamic_filter_pushdown_collect_left() {
 
     let result = format!("{}", pretty_format_batches(&batches).unwrap());
 
-    let probe_scan_metrics = probe_scan.metrics().unwrap();
-
-    // The probe side had 4 rows, but after applying the dynamic filter only 2 rows should remain.
-    // The number of output rows from the probe side scan should stay consistent across executions.
-    // Issue: https://github.com/apache/datafusion/issues/17451
-    assert_eq!(probe_scan_metrics.output_rows().unwrap(), 2);
+    // Previously this test asserted `probe_scan.metrics().output_rows() == 2`
+    // — that the probe scan emitted only the rows matching the finalized
+    // dynamic filter. That relied on all partitions blocking on a shared
+    // barrier inside `SharedBuildAccumulator` before any probing started,
+    // which deadlocked with `RepartitionExec`'s global backpressure gate
+    // under Q18-style plans (#21625). With the barrier removed, probing
+    // can begin before the last partition has reported, so the scan may
+    // emit its first batch against the placeholder filter. The join
+    // itself still applies the filter correctly (result batches are
+    // snapshot-asserted below). Restoring scan-level early filtering
+    // under the non-blocking design is a follow-up optimization.
 
     insta::assert_snapshot!(
         result,
@@ -4306,10 +4316,8 @@ async fn test_hashjoin_hash_table_pushdown_partitioned() {
 
     let result = format!("{}", pretty_format_batches(&batches).unwrap());
 
-    let probe_scan_metrics = probe_scan.metrics().unwrap();
-
-    // The probe side had 4 rows, but after applying the dynamic filter only 2 rows should remain.
-    assert_eq!(probe_scan_metrics.output_rows().unwrap(), 2);
+    // Scan-level row-count assertion removed; see the explanation in
+    // `test_hashjoin_dynamic_filter_pushdown_partitioned` (#21625).
 
     // Results should be identical to the InList version
     insta::assert_snapshot!(
@@ -4457,10 +4465,8 @@ async fn test_hashjoin_hash_table_pushdown_collect_left() {
 
     let result = format!("{}", pretty_format_batches(&batches).unwrap());
 
-    let probe_scan_metrics = probe_scan.metrics().unwrap();
-
-    // The probe side had 4 rows, but after applying the dynamic filter only 2 rows should remain.
-    assert_eq!(probe_scan_metrics.output_rows().unwrap(), 2);
+    // Scan-level row-count assertion removed; see the explanation in
+    // `test_hashjoin_dynamic_filter_pushdown_partitioned` (#21625).
 
     // Results should be identical to the InList version
     insta::assert_snapshot!(
@@ -4580,9 +4586,8 @@ async fn test_hashjoin_hash_table_pushdown_integer_keys() {
 
     let result = format!("{}", pretty_format_batches(&batches).unwrap());
 
-    let probe_scan_metrics = probe_scan.metrics().unwrap();
-    // Only 2 rows from probe side match the build side
-    assert_eq!(probe_scan_metrics.output_rows().unwrap(), 2);
+    // Scan-level row-count assertion removed; see the explanation in
+    // `test_hashjoin_dynamic_filter_pushdown_partitioned` (#21625).
 
     insta::assert_snapshot!(
         result,
