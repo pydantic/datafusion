@@ -20,6 +20,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::ExecutionPlan;
 use crate::ExecutionPlanProperties;
@@ -42,7 +43,6 @@ use datafusion_physical_expr::expressions::{
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef, ScalarFunctionExpr};
 
 use parking_lot::Mutex;
-use tokio::sync::Barrier;
 
 /// Represents the minimum and maximum values for a specific column.
 /// Used in dynamic filter pushdown to establish value boundaries.
@@ -216,7 +216,18 @@ fn create_bounds_predicate(
 pub(crate) struct SharedBuildAccumulator {
     /// Build-side data protected by a single mutex to avoid ordering concerns
     inner: Mutex<AccumulatedBuildData>,
-    barrier: Barrier,
+    /// Number of `report_build_data` calls still expected before the dynamic
+    /// filter can be finalized. Each call decrements the counter; the caller
+    /// that brings it to zero is responsible for publishing the filter.
+    ///
+    /// This intentionally does NOT block partitions on a barrier: callers to
+    /// `report_build_data` return as soon as they have stored their build-side
+    /// slice. Blocking all partitions until every partition arrived used to
+    /// cause a deadlock with RepartitionExec's global-gate backpressure, because
+    /// a partition parked on the barrier held its build-side receiver alive
+    /// long enough for the shared gate to close across unrelated hash join
+    /// instances. See issue #21625 for the TPCH Q18 reproducer.
+    remaining: AtomicUsize,
     /// Dynamic filter for pushdown to probe side
     dynamic_filter: Arc<DynamicFilterPhysicalExpr>,
     /// Right side join expressions needed for creating filter expressions
@@ -337,7 +348,7 @@ impl SharedBuildAccumulator {
 
         Self {
             inner: Mutex::new(mode_data),
-            barrier: Barrier::new(expected_calls),
+            remaining: AtomicUsize::new(expected_calls),
             dynamic_filter,
             on_right,
             repartition_random_state,
@@ -357,7 +368,7 @@ impl SharedBuildAccumulator {
     ///
     /// # Returns
     /// * `Result<()>` - Ok if successful, Err if filter update failed or mode mismatch
-    pub(crate) async fn report_build_data(&self, data: PartitionBuildData) -> Result<()> {
+    pub(crate) fn report_build_data(&self, data: PartitionBuildData) -> Result<()> {
         // Store data in the accumulator
         {
             let mut guard = self.inner.lock();
@@ -393,8 +404,13 @@ impl SharedBuildAccumulator {
             }
         }
 
-        // Wait for all partitions to report
-        if self.barrier.wait().await.is_leader() {
+        // Decrement the expected-calls counter. The caller that brings it to
+        // zero is the leader and publishes the final filter expression.
+        //
+        // `AcqRel` pairs with the other reporters' stores into `inner` above:
+        // the leader's subsequent read of `inner` happens-after every
+        // store by any partition that decremented before it.
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             // All partitions have reported, so we can create and update the filter
             let inner = self.inner.lock();
 

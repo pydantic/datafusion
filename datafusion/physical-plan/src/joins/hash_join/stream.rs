@@ -125,8 +125,6 @@ impl BuildSide {
 pub(super) enum HashJoinStreamState {
     /// Initial state for HashJoinStream indicating that build-side data not collected yet
     WaitBuildSide,
-    /// Waiting for bounds to be reported by all partitions
-    WaitPartitionBoundsReport,
     /// Indicates that build-side has been collected, and stream is ready for fetching probe-side
     FetchProbeBatch,
     /// Indicates that non-empty batch has been fetched from probe-side, and is ready to be processed
@@ -216,9 +214,6 @@ pub(super) struct HashJoinStream {
     right_side_ordered: bool,
     /// Shared build accumulator for coordinating dynamic filter updates (collects hash maps and/or bounds, optional)
     build_accumulator: Option<Arc<SharedBuildAccumulator>>,
-    /// Optional future to signal when build information has been reported by all partitions
-    /// and the dynamic filter has been updated
-    build_waiter: Option<OnceFut<()>>,
     /// Partitioning mode to use
     mode: PartitionMode,
     /// Output buffer for coalescing small batches into larger ones with optional fetch limit.
@@ -399,22 +394,20 @@ impl HashJoinStream {
             build_indices_buffer: Vec::with_capacity(batch_size),
             right_side_ordered,
             build_accumulator,
-            build_waiter: None,
             mode,
             output_buffer,
             null_aware,
         }
     }
 
-    /// Returns the next state after the build side has been fully collected
-    /// and any required build-side coordination has completed.
+    /// Returns the next state after the build side has been fully collected.
+    ///
+    /// Short-circuits to `Completed` when the build side is empty and the
+    /// join semantics guarantee an empty result.
     fn state_after_build_ready(&self, left_data: &JoinLeftData) -> HashJoinStreamState {
-        let is_empty = left_data.map().is_empty();
-        let produces_empty = self.join_type.empty_build_side_produces_empty_result();
-        let coordinated = self.build_accumulator.is_some();
-        let is_initial_collect = matches!(self.state, HashJoinStreamState::WaitBuildSide);
-
-        if is_empty && produces_empty && (!coordinated || !is_initial_collect) {
+        if left_data.map().is_empty()
+            && self.join_type.empty_build_side_produces_empty_result()
+        {
             HashJoinStreamState::Completed
         } else {
             HashJoinStreamState::FetchProbeBatch
@@ -445,9 +438,6 @@ impl HashJoinStream {
                 HashJoinStreamState::WaitBuildSide => {
                     handle_state!(ready!(self.collect_build_side(cx)))
                 }
-                HashJoinStreamState::WaitPartitionBoundsReport => {
-                    handle_state!(ready!(self.wait_for_partition_bounds_report(cx)))
-                }
                 HashJoinStreamState::FetchProbeBatch => {
                     handle_state!(ready!(self.fetch_probe_batch(cx)))
                 }
@@ -466,27 +456,6 @@ impl HashJoinStream {
                 HashJoinStreamState::Completed => Poll::Ready(None),
             };
         }
-    }
-
-    /// Optional step to wait until build-side information (hash maps or bounds) has been reported by all partitions.
-    /// This state is only entered if a build accumulator is present.
-    ///
-    /// ## Why wait?
-    ///
-    /// The dynamic filter is only built once all partitions have reported their information (hash maps or bounds).
-    /// If we do not wait here, the probe-side scan may start before the filter is ready.
-    /// This can lead to the probe-side scan missing the opportunity to apply the filter
-    /// and skip reading unnecessary data.
-    fn wait_for_partition_bounds_report(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
-        if let Some(ref mut fut) = self.build_waiter {
-            ready!(fut.get_shared(cx))?;
-        }
-        let build_side = self.build_side.try_as_ready()?;
-        self.state = self.state_after_build_ready(build_side.left_data.as_ref());
-        Poll::Ready(Ok(StatefulStreamResult::Continue))
     }
 
     /// Collects build-side data by polling `OnceFut` future from initialized build-side
@@ -516,8 +485,6 @@ impl HashJoinStream {
         // Report hash maps (Partitioned mode) or bounds (CollectLeft mode) to the accumulator
         // which will handle synchronization and filter updates
         if let Some(ref build_accumulator) = self.build_accumulator {
-            let build_accumulator = Arc::clone(build_accumulator);
-
             let left_side_partition_id = match self.mode {
                 PartitionMode::Partitioned => self.partition,
                 PartitionMode::CollectLeft => 0,
@@ -551,14 +518,17 @@ impl HashJoinStream {
                 ),
             };
 
-            self.build_waiter = Some(OnceFut::new(async move {
-                build_accumulator.report_build_data(build_data).await
-            }));
-            self.state = HashJoinStreamState::WaitPartitionBoundsReport;
-        } else {
-            self.state = self.state_after_build_ready(left_data.as_ref());
+            // Report build-side data without blocking this stream. The
+            // accumulator publishes the dynamic filter when the last
+            // partition reports; all other partitions return immediately and
+            // start probing. Any probe batches read before the filter is
+            // finalized simply see the placeholder filter, which is safe —
+            // the dynamic filter is an optimization, not a correctness
+            // constraint.
+            build_accumulator.report_build_data(build_data)?;
         }
 
+        self.state = self.state_after_build_ready(left_data.as_ref());
         self.build_side = BuildSide::Ready(BuildSideReadyState { left_data });
         Poll::Ready(Ok(StatefulStreamResult::Continue))
     }
@@ -666,20 +636,7 @@ impl HashJoinStream {
         if is_empty {
             // Invariant: state_after_build_ready should have already completed
             // join types whose result is fixed to empty when the build side is empty.
-            //
-            // However, when dynamic filtering is enabled, we skip the short-circuit
-            // in state_after_build_ready to ensure all partitions report their
-            // build-side data. In this case, we might reach here with an empty
-            // build side even for join types that produce empty results.
-            if self.build_accumulator.is_none() {
-                debug_assert!(!self.join_type.empty_build_side_produces_empty_result());
-            }
-
-            if self.join_type.empty_build_side_produces_empty_result() {
-                timer.done();
-                self.state = HashJoinStreamState::FetchProbeBatch;
-                return Ok(StatefulStreamResult::Continue);
-            }
+            debug_assert!(!self.join_type.empty_build_side_produces_empty_result());
 
             let result = build_batch_empty_build_side(
                 &self.schema,
