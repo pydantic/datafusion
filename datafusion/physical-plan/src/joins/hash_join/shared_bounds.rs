@@ -600,3 +600,157 @@ impl fmt::Debug for SharedBuildAccumulator {
         write!(f, "SharedBuildAccumulator")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion_physical_expr::expressions::Column;
+    use std::time::Duration;
+
+    /// How long a single `report_build_data` call is allowed to take before
+    /// the test fails. `report_build_data` is synchronous and should return
+    /// in microseconds; this bound exists so a regression to a blocking
+    /// implementation fails the test instead of hanging the test runner.
+    const REPORT_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// Build an accumulator in Partitioned mode expecting `expected_calls`
+    /// reports over `num_partitions` partitions, plus the dynamic filter it
+    /// guards so tests can inspect its completion state.
+    fn partitioned_accumulator(
+        expected_calls: usize,
+        num_partitions: usize,
+    ) -> (SharedBuildAccumulator, Arc<DynamicFilterPhysicalExpr>) {
+        let probe_schema = Arc::new(Schema::new(vec![Field::new(
+            "k",
+            DataType::Int64,
+            false,
+        )]));
+        let col = Arc::new(Column::new("k", 0)) as PhysicalExprRef;
+        let filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&col)],
+            lit(true),
+        ));
+        let accum = SharedBuildAccumulator {
+            inner: Mutex::new(AccumulatedBuildData::Partitioned {
+                partitions: vec![None; num_partitions],
+            }),
+            remaining: AtomicUsize::new(expected_calls),
+            dynamic_filter: Arc::clone(&filter),
+            on_right: vec![col],
+            repartition_random_state: HASH_JOIN_SEED,
+            probe_schema,
+        };
+        (accum, filter)
+    }
+
+    fn empty_partitioned_report(partition_id: usize) -> PartitionBuildData {
+        PartitionBuildData::Partitioned {
+            partition_id,
+            pushdown: PushdownStrategy::Empty,
+            bounds: PartitionBounds::new(vec![]),
+        }
+    }
+
+    /// Call `report_build_data` under a timeout so a regression to a blocking
+    /// implementation fails the test instead of hanging. The body of the
+    /// inner `async` block is what differs between the current (synchronous)
+    /// implementation and any past or future blocking one.
+    async fn report_with_timeout(
+        accum: &SharedBuildAccumulator,
+        data: PartitionBuildData,
+        what: &str,
+    ) {
+        tokio::time::timeout(REPORT_TIMEOUT, async {
+            accum.report_build_data(data).unwrap();
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "report_build_data blocked for >{:?} while reporting {what} — \
+                 SharedBuildAccumulator must never wait on other partitions",
+                REPORT_TIMEOUT
+            )
+        });
+    }
+
+    /// Regression test for #21625.
+    ///
+    /// `report_build_data` must return without waiting for other partitions.
+    /// Previously it parked on a `tokio::sync::Barrier`, which combined with
+    /// `RepartitionExec`'s global backpressure gate could deadlock the
+    /// pipeline. This test creates an accumulator expecting four partitions
+    /// and reports from only one — the call must still return immediately
+    /// and the dynamic filter must remain in its placeholder (not-yet-
+    /// complete) state.
+    #[tokio::test]
+    async fn report_build_data_does_not_block_on_partial_reports() {
+        let (accum, filter) = partitioned_accumulator(4, 4);
+
+        report_with_timeout(&accum, empty_partitioned_report(0), "partition 0").await;
+
+        // With 3 partitions still outstanding, the filter must NOT have
+        // been published yet.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), filter.wait_complete())
+                .await
+                .is_err(),
+            "dynamic filter was marked complete after only 1/4 partitions reported"
+        );
+    }
+
+    /// Exactly one caller — the one that decrements `remaining` to zero —
+    /// must run the leader body (publish the filter expression and mark it
+    /// complete). All earlier callers leave the filter in the `InProgress`
+    /// placeholder state. Each report is itself under a timeout so a
+    /// blocking implementation fails instead of hanging.
+    #[tokio::test]
+    async fn last_reporter_publishes_filter_and_marks_complete() {
+        let (accum, filter) = partitioned_accumulator(2, 2);
+
+        report_with_timeout(&accum, empty_partitioned_report(0), "first of two").await;
+        // First of two reporters: filter still in placeholder state.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), filter.wait_complete())
+                .await
+                .is_err(),
+            "first reporter (out of 2) must not mark the dynamic filter complete"
+        );
+
+        report_with_timeout(&accum, empty_partitioned_report(1), "second of two").await;
+        // Second (last) reporter: filter must be complete.
+        tokio::time::timeout(Duration::from_millis(500), filter.wait_complete())
+            .await
+            .expect("last reporter must mark the dynamic filter complete");
+    }
+
+    /// Concurrent reports from every partition must still elect exactly
+    /// one leader. The test exercises the `AcqRel` decrement and its
+    /// happens-before pairing with the `inner` writes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_reporters_elect_exactly_one_leader() {
+        let (accum, filter) = partitioned_accumulator(8, 8);
+        let accum = Arc::new(accum);
+
+        let handles: Vec<_> = (0..8)
+            .map(|pid| {
+                let accum = Arc::clone(&accum);
+                tokio::spawn(async move {
+                    tokio::time::timeout(REPORT_TIMEOUT, async {
+                        accum.report_build_data(empty_partitioned_report(pid))
+                    })
+                    .await
+                    .expect("report_build_data must not block")
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        // Every partition reported; the leader must have run mark_complete.
+        tokio::time::timeout(Duration::from_secs(1), filter.wait_complete())
+            .await
+            .expect("filter must be complete after all partitions report");
+    }
+}
