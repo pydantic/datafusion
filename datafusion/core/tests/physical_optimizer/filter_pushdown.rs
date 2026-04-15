@@ -1522,8 +1522,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
     // can begin before the last partition has reported, so the scan may
     // emit its first batch against the placeholder filter. The join
     // itself still applies the filter correctly (result batches are
-    // snapshot-asserted below). Restoring scan-level early filtering
-    // under the non-blocking design is a follow-up optimization.
+    // snapshot-asserted below).
 
     insta::assert_snapshot!(
         result,
@@ -1699,8 +1698,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_collect_left() {
     // can begin before the last partition has reported, so the scan may
     // emit its first batch against the placeholder filter. The join
     // itself still applies the filter correctly (result batches are
-    // snapshot-asserted below). Restoring scan-level early filtering
-    // under the non-blocking design is a follow-up optimization.
+    // snapshot-asserted below).
 
     insta::assert_snapshot!(
         result,
