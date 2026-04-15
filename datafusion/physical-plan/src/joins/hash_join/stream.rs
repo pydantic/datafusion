@@ -518,13 +518,6 @@ impl HashJoinStream {
                 ),
             };
 
-            // Report build-side data without blocking this stream. The
-            // accumulator publishes the dynamic filter when the last
-            // partition reports; all other partitions return immediately and
-            // start probing. Any probe batches read before the filter is
-            // finalized simply see the placeholder filter, which is safe —
-            // the dynamic filter is an optimization, not a correctness
-            // constraint.
             build_accumulator.report_build_data(build_data)?;
         }
 

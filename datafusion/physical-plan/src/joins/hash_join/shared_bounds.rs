@@ -219,14 +219,6 @@ pub(crate) struct SharedBuildAccumulator {
     /// Number of `report_build_data` calls still expected before the dynamic
     /// filter can be finalized. Each call decrements the counter; the caller
     /// that brings it to zero is responsible for publishing the filter.
-    ///
-    /// This intentionally does NOT block partitions on a barrier: callers to
-    /// `report_build_data` return as soon as they have stored their build-side
-    /// slice. Blocking all partitions until every partition arrived used to
-    /// cause a deadlock with RepartitionExec's global-gate backpressure, because
-    /// a partition parked on the barrier held its build-side receiver alive
-    /// long enough for the shared gate to close across unrelated hash join
-    /// instances. See issue #21625 for the TPCH Q18 reproducer.
     remaining: AtomicUsize,
     /// Dynamic filter for pushdown to probe side
     dynamic_filter: Arc<DynamicFilterPhysicalExpr>,
