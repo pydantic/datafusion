@@ -620,11 +620,8 @@ mod tests {
         expected_calls: usize,
         num_partitions: usize,
     ) -> (SharedBuildAccumulator, Arc<DynamicFilterPhysicalExpr>) {
-        let probe_schema = Arc::new(Schema::new(vec![Field::new(
-            "k",
-            DataType::Int64,
-            false,
-        )]));
+        let probe_schema =
+            Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
         let col = Arc::new(Column::new("k", 0)) as PhysicalExprRef;
         let filter = Arc::new(DynamicFilterPhysicalExpr::new(
             vec![Arc::clone(&col)],
@@ -666,9 +663,8 @@ mod tests {
         .await
         .unwrap_or_else(|_| {
             panic!(
-                "report_build_data blocked for >{:?} while reporting {what} — \
-                 SharedBuildAccumulator must never wait on other partitions",
-                REPORT_TIMEOUT
+                "report_build_data blocked for >{REPORT_TIMEOUT:?} while reporting \
+                 {what} — SharedBuildAccumulator must never wait on other partitions"
             )
         });
     }
@@ -728,13 +724,15 @@ mod tests {
     /// happens-before pairing with the `inner` writes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_reporters_elect_exactly_one_leader() {
+        use datafusion_common_runtime::SpawnedTask;
+
         let (accum, filter) = partitioned_accumulator(8, 8);
         let accum = Arc::new(accum);
 
         let handles: Vec<_> = (0..8)
             .map(|pid| {
                 let accum = Arc::clone(&accum);
-                tokio::spawn(async move {
+                SpawnedTask::spawn(async move {
                     tokio::time::timeout(REPORT_TIMEOUT, async {
                         accum.report_build_data(empty_partitioned_report(pid))
                     })
@@ -745,7 +743,7 @@ mod tests {
             .collect();
 
         for h in handles {
-            h.await.unwrap().unwrap();
+            h.join().await.unwrap().unwrap();
         }
 
         // Every partition reported; the leader must have run mark_complete.
