@@ -1036,11 +1036,7 @@ mod test {
         );
 
         // Inner expr is NOT detectable as optional
-        assert!(
-            inner
-                .downcast_ref::<OptionalFilterPhysicalExpr>()
-                .is_none()
-        );
+        assert!(inner.downcast_ref::<OptionalFilterPhysicalExpr>().is_none());
     }
 
     #[test]

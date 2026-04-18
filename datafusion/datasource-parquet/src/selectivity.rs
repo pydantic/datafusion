@@ -540,10 +540,7 @@ impl SelectivityTrackerInner {
         post_scan: &mut Vec<(FilterId, Arc<dyn PhysicalExpr>)>,
         stats_map: &HashMap<FilterId, Mutex<SelectivityStats>>,
     ) {
-        if expr
-            .downcast_ref::<OptionalFilterPhysicalExpr>()
-            .is_none()
-        {
+        if expr.downcast_ref::<OptionalFilterPhysicalExpr>().is_none() {
             self.filter_states.insert(id, FilterState::PostScan);
             post_scan.push((id, Arc::clone(expr)));
             // Reset stats for this filter so it can be re-evaluated as a post-scan filter.
@@ -640,29 +637,9 @@ impl SelectivityTrackerInner {
             let state = self.filter_states.get(&id).copied();
 
             let Some(state) = state else {
-                // New filter: decide initial placement.
-
-                // Optional/dynamic filters (e.g. hash join pushdown) always start
-                // PostScan because their selectivity is unknown and they can be
-                // dropped if ineffective. This is especially important for
-                // single-file tables where there's no second file to adapt.
-                let is_optional = expr
-                    .downcast_ref::<OptionalFilterPhysicalExpr>()
-                    .is_some();
-                if is_optional {
-                    debug!(
-                        "FilterId {id}: New optional filter → Post-scan (conservative) — {expr}"
-                    );
-                    self.filter_states.insert(id, FilterState::PostScan);
-                    if !stats_map.contains_key(&id) {
-                        new_filter_ids.push(id);
-                    }
-                    post_scan_filters.push((id, expr));
-                    continue;
-                }
-
-                // Static filters: use filter_bytes / projection_bytes to decide
-                // initial placement. This ratio captures the I/O tradeoff:
+                // New filter: decide initial placement using the
+                // filter_bytes / projection_bytes ratio. This ratio captures
+                // the I/O tradeoff:
                 //
                 // - Low ratio (filter columns are small vs projection): row-filter
                 //   enables late materialization — the large non-filter portion of
@@ -757,9 +734,7 @@ impl SelectivityTrackerInner {
                         let stats = entry.lock();
                         if let Some(ub) = stats.confidence_upper_bound(confidence_z)
                             && ub < config.min_bytes_per_sec
-                            && expr
-                                .downcast_ref::<OptionalFilterPhysicalExpr>()
-                                .is_some()
+                            && expr.downcast_ref::<OptionalFilterPhysicalExpr>().is_some()
                         {
                             drop(stats);
                             debug!(
