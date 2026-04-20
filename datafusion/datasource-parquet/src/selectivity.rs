@@ -149,10 +149,20 @@ impl SelectivityStats {
         self.eval_nanos += eval_nanos;
         self.bytes_seen += batch_bytes;
 
-        // Feed Welford's algorithm with per-batch effectiveness
-        if total > 0 && eval_nanos > 0 && batch_bytes > 0 {
+        // Feed Welford's algorithm with per-batch effectiveness. We admit
+        // samples with `batch_bytes == 0` — that legitimately represents a
+        // filter whose projection is a subset of its referenced columns, so
+        // late materialization has nothing to save even when the filter
+        // does prune rows. Recording `batch_eff = 0` for such batches lets
+        // the mid-stream skip path detect "CPU spent, no late-
+        // materialization payoff" and drop the filter if it is optional.
+        if total > 0 && eval_nanos > 0 {
             let rows_pruned = total - matched;
-            let bytes_per_row = batch_bytes as f64 / total as f64;
+            let bytes_per_row = if total > 0 {
+                batch_bytes as f64 / total as f64
+            } else {
+                0.0
+            };
             let batch_eff =
                 (rows_pruned as f64 * bytes_per_row) * 1e9 / eval_nanos as f64;
 
