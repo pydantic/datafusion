@@ -77,6 +77,15 @@ use parquet::basic::Type;
 use parquet::bloom_filter::Sbbf;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 
+/// Default soft upper bound on the number of rows packed into a single
+/// row-group morsel. Adjacent row groups are coalesced until this limit would
+/// be exceeded. A single oversized row group still becomes its own morsel.
+pub(crate) const DEFAULT_MORSEL_MAX_ROWS: u64 = 100_000;
+
+/// Default soft upper bound on the compressed byte size of a single row-group
+/// morsel. See [`DEFAULT_MORSEL_MAX_ROWS`].
+pub(crate) const DEFAULT_MORSEL_MAX_COMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Stateless Parquet morselizer implementation.
 ///
 /// Reading a Parquet file is a multi-stage process, with multiple CPU-intensive
@@ -136,6 +145,15 @@ pub(super) struct ParquetMorselizer {
     pub max_predicate_cache_size: Option<usize>,
     /// Whether to read row groups in reverse order
     pub reverse_row_groups: bool,
+    /// Upper bound on the number of rows coalesced into a single morsel.
+    ///
+    /// Row groups are packed greedily until the next row group would push
+    /// the total past this limit; a single oversized row group still becomes
+    /// its own morsel.
+    pub morsel_max_rows: u64,
+    /// Upper bound on the compressed byte size coalesced into a single
+    /// morsel. See [`Self::morsel_max_rows`].
+    pub morsel_max_compressed_bytes: u64,
 }
 
 impl fmt::Debug for ParquetMorselizer {
@@ -228,8 +246,12 @@ enum ParquetOpenState {
     ///
     /// TODO: split state as this currently does both I/O and CPU work.
     BuildStream(Box<RowGroupsPrunedParquetOpen>),
-    /// Terminal state: the final opened stream is ready to return.
-    Ready(BoxStream<'static, Result<RecordBatch>>),
+    /// Terminal state: one or more per-morsel streams are ready to return.
+    ///
+    /// Each stream corresponds to one row-group-sized chunk of the file and
+    /// will be wrapped in a [`ParquetStreamMorsel`] so sibling
+    /// `FileStream`s can consume them independently.
+    Ready(Vec<BoxStream<'static, Result<RecordBatch>>>),
     /// Terminal state: reading complete
     Done,
 }
@@ -287,6 +309,8 @@ struct PreparedParquetOpen {
     max_predicate_cache_size: Option<usize>,
     reverse_row_groups: bool,
     preserve_order: bool,
+    morsel_max_rows: u64,
+    morsel_max_compressed_bytes: u64,
     #[cfg(feature = "parquet_encryption")]
     file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
 }
@@ -399,7 +423,7 @@ impl ParquetOpenState {
             ParquetOpenState::BuildStream(prepared) => {
                 Ok(ParquetOpenState::Ready(prepared.build_stream()?))
             }
-            ParquetOpenState::Ready(stream) => Ok(ParquetOpenState::Ready(stream)),
+            ParquetOpenState::Ready(streams) => Ok(ParquetOpenState::Ready(streams)),
             ParquetOpenState::Done => {
                 panic!("ParquetOpenFuture polled after completion");
             }
@@ -515,9 +539,18 @@ impl MorselPlanner for ParquetMorselPlanner {
                     )))
                 })))
             }
-            ParquetOpenState::Ready(stream) => {
-                let morsels: Vec<Box<dyn Morsel>> =
-                    vec![Box::new(ParquetStreamMorsel::new(stream))];
+            ParquetOpenState::Ready(streams) => {
+                if streams.is_empty() {
+                    // No row groups survived pruning, so there's nothing to
+                    // feed the executor — terminate this file's planner.
+                    return Ok(None);
+                }
+                let morsels: Vec<Box<dyn Morsel>> = streams
+                    .into_iter()
+                    .map(|stream| {
+                        Box::new(ParquetStreamMorsel::new(stream)) as Box<dyn Morsel>
+                    })
+                    .collect();
                 Ok(Some(MorselPlan::new().with_morsels(morsels)))
             }
             ParquetOpenState::Done => Ok(None),
@@ -656,6 +689,8 @@ impl ParquetMorselizer {
             max_predicate_cache_size: self.max_predicate_cache_size,
             reverse_row_groups: self.reverse_row_groups,
             preserve_order: self.preserve_order,
+            morsel_max_rows: self.morsel_max_rows,
+            morsel_max_compressed_bytes: self.morsel_max_compressed_bytes,
             #[cfg(feature = "parquet_encryption")]
             file_decryption_properties: None,
         })
@@ -1055,8 +1090,15 @@ impl BloomFiltersLoadedParquetOpen {
 }
 
 impl RowGroupsPrunedParquetOpen {
-    /// Build the final parquet stream once all pruning work is complete.
-    fn build_stream(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    /// Build one or more per-morsel streams once all pruning work is complete.
+    ///
+    /// Row groups are packed into chunks of up to [`MORSEL_MAX_ROWS`] rows and
+    /// [`MORSEL_MAX_COMPRESSED_BYTES`] compressed bytes. Each chunk becomes an
+    /// independent stream that can be wrapped in a `ParquetStreamMorsel`,
+    /// letting the driver interleave row-group work with other operators and
+    /// unblocking the follow-on work of sharing row-group-level work across
+    /// sibling `FileStream`s.
+    fn build_stream(self) -> Result<Vec<BoxStream<'static, Result<RecordBatch>>>> {
         let RowGroupsPrunedParquetOpen {
             prepared,
             mut row_groups,
@@ -1074,32 +1116,6 @@ impl RowGroupsPrunedParquetOpen {
 
         let file_metadata = Arc::clone(reader_metadata.metadata());
         let rg_metadata = file_metadata.row_groups();
-
-        // Filter pushdown: evaluate predicates during scan
-        let row_filter = if let Some(predicate) = prepared
-            .pushdown_filters
-            .then_some(prepared.predicate.clone())
-            .flatten()
-        {
-            let row_filter = row_filter::build_row_filter(
-                &predicate,
-                &prepared.physical_file_schema,
-                file_metadata.as_ref(),
-                prepared.reorder_predicates,
-                &prepared.file_metrics,
-            );
-
-            match row_filter {
-                Ok(Some(filter)) => Some(filter),
-                Ok(None) => None,
-                Err(e) => {
-                    debug!("Ignoring error building row filter for '{predicate:?}': {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
 
         // Prune by limit if limit is set and limit order is not sensitive
         if let (Some(limit), false) = (prepared.limit, prepared.preserve_order) {
@@ -1123,98 +1139,170 @@ impl RowGroupsPrunedParquetOpen {
             );
         }
 
-        // Prepare the access plan (extract row groups and row selection)
-        let mut prepared_plan = access_plan.prepare(rg_metadata)?;
-
-        // Potentially reverse the access plan for performance.
-        // See `ParquetSource::try_pushdown_sort` for the rationale.
-        if prepared.reverse_row_groups {
-            prepared_plan = prepared_plan.reverse(file_metadata.as_ref())?;
+        if access_plan.row_group_index_iter().next().is_none() {
+            return Ok(Vec::new());
         }
 
-        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
-        let read_plan = build_projection_read_plan(
-            prepared.projection.expr_iter(),
-            &prepared.physical_file_schema,
-            reader_metadata.parquet_schema(),
+        let mut chunk_plans = access_plan.split_into_chunks(
+            rg_metadata,
+            prepared.morsel_max_rows,
+            prepared.morsel_max_compressed_bytes,
         );
 
-        let mut decoder_builder =
-            ParquetPushDecoderBuilder::new_with_metadata(reader_metadata)
-                .with_projection(read_plan.projection_mask)
-                .with_batch_size(prepared.batch_size)
-                .with_metrics(arrow_reader_metrics.clone());
-
-        if let Some(row_filter) = row_filter {
-            decoder_builder = decoder_builder.with_row_filter(row_filter);
+        // Reverse chunk order so that, when `reverse_row_groups` is set, the
+        // first emitted morsel corresponds to the file's last row groups.
+        // Each chunk's `PreparedAccessPlan` is also reversed below so that
+        // within a chunk the row-group read order mirrors the file-wide
+        // reversal. See `ParquetSource::try_pushdown_sort` for the rationale.
+        if prepared.reverse_row_groups {
+            chunk_plans.reverse();
         }
-        if prepared.force_filter_selections {
+
+        // The reader that was used for metadata / page index / bloom filter
+        // loads may have warmed object-store caches. Hand it to the first
+        // chunk so no work is wasted; mint fresh readers for the rest from
+        // the same factory.
+        let mut initial_reader: Option<Box<dyn AsyncFileReader>> =
+            Some(prepared.async_file_reader);
+        let mut file_pruner = prepared.file_pruner;
+        let mut streams: Vec<BoxStream<'static, Result<RecordBatch>>> =
+            Vec::with_capacity(chunk_plans.len());
+
+        for (chunk_idx, chunk_plan) in chunk_plans.into_iter().enumerate() {
+            let mut prepared_plan = chunk_plan.prepare(rg_metadata)?;
+            if prepared.reverse_row_groups {
+                prepared_plan = prepared_plan.reverse(file_metadata.as_ref())?;
+            }
+
+            // `RowFilter` is not `Clone` because it owns `Box<dyn ArrowPredicate>`s,
+            // so a fresh filter has to be built per chunk.
+            let row_filter = if let Some(predicate) = prepared
+                .pushdown_filters
+                .then_some(prepared.predicate.clone())
+                .flatten()
+            {
+                match row_filter::build_row_filter(
+                    &predicate,
+                    &prepared.physical_file_schema,
+                    file_metadata.as_ref(),
+                    prepared.reorder_predicates,
+                    &prepared.file_metrics,
+                ) {
+                    Ok(Some(filter)) => Some(filter),
+                    Ok(None) => None,
+                    Err(e) => {
+                        debug!(
+                            "Ignoring error building row filter for '{predicate:?}': {e}"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+            let read_plan = build_projection_read_plan(
+                prepared.projection.expr_iter(),
+                &prepared.physical_file_schema,
+                reader_metadata.parquet_schema(),
+            );
+
+            let mut decoder_builder =
+                ParquetPushDecoderBuilder::new_with_metadata(reader_metadata.clone())
+                    .with_projection(read_plan.projection_mask)
+                    .with_batch_size(prepared.batch_size)
+                    .with_metrics(arrow_reader_metrics.clone());
+
+            if let Some(row_filter) = row_filter {
+                decoder_builder = decoder_builder.with_row_filter(row_filter);
+            }
+            if prepared.force_filter_selections {
+                decoder_builder = decoder_builder
+                    .with_row_selection_policy(RowSelectionPolicy::Selectors);
+            }
+            if let Some(row_selection) = prepared_plan.row_selection {
+                decoder_builder = decoder_builder.with_row_selection(row_selection);
+            }
             decoder_builder =
-                decoder_builder.with_row_selection_policy(RowSelectionPolicy::Selectors);
-        }
-        if let Some(row_selection) = prepared_plan.row_selection {
-            decoder_builder = decoder_builder.with_row_selection(row_selection);
-        }
-        decoder_builder =
-            decoder_builder.with_row_groups(prepared_plan.row_group_indexes);
-        if let Some(limit) = prepared.limit {
-            decoder_builder = decoder_builder.with_limit(limit);
-        }
-        if let Some(max_predicate_cache_size) = prepared.max_predicate_cache_size {
-            decoder_builder =
-                decoder_builder.with_max_predicate_cache_size(max_predicate_cache_size);
-        }
+                decoder_builder.with_row_groups(prepared_plan.row_group_indexes);
+            // `ScanState.remain` enforces the true outer limit across all
+            // morsels; passing the per-chunk limit here is a conservative
+            // per-chunk cap that bounds wasted decode once the outer cap is
+            // hit.
+            if let Some(limit) = prepared.limit {
+                decoder_builder = decoder_builder.with_limit(limit);
+            }
+            if let Some(max_predicate_cache_size) = prepared.max_predicate_cache_size {
+                decoder_builder = decoder_builder
+                    .with_max_predicate_cache_size(max_predicate_cache_size);
+            }
 
-        let decoder = decoder_builder.build()?;
+            let decoder = decoder_builder.build()?;
 
-        let predicate_cache_inner_records =
-            prepared.file_metrics.predicate_cache_inner_records.clone();
-        let predicate_cache_records =
-            prepared.file_metrics.predicate_cache_records.clone();
+            let reader = match initial_reader.take() {
+                Some(r) => r,
+                None => prepared.parquet_file_reader_factory.create_reader(
+                    prepared.partition_index,
+                    prepared.partitioned_file.clone(),
+                    prepared.metadata_size_hint,
+                    &prepared.metrics,
+                )?,
+            };
 
-        // Check if we need to replace the schema to handle things like differing nullability or metadata.
-        // See note below about file vs. output schema.
-        let stream_schema = read_plan.projected_schema;
-        let replace_schema = stream_schema != prepared.output_schema;
+            // Rebase column indices to match the narrowed stream schema.
+            // The projection expressions have indices based on physical_file_schema,
+            // but the stream only contains the columns selected by the ProjectionMask.
+            let stream_schema = read_plan.projected_schema;
+            let replace_schema = stream_schema != prepared.output_schema;
+            let projection = prepared
+                .projection
+                .clone()
+                .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
+            let projector = projection.make_projector(&stream_schema)?;
 
-        // Rebase column indices to match the narrowed stream schema.
-        // The projection expressions have indices based on physical_file_schema,
-        // but the stream only contains the columns selected by the ProjectionMask.
-        let projection = prepared
-            .projection
-            .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
-        let projector = projection.make_projector(&stream_schema)?;
-        let output_schema = Arc::clone(&prepared.output_schema);
-        let files_ranges_pruned_statistics =
-            prepared.file_metrics.files_ranges_pruned_statistics.clone();
-        let stream = futures::stream::unfold(
-            PushDecoderStreamState {
-                decoder,
-                reader: prepared.async_file_reader,
-                projector,
-                output_schema,
-                replace_schema,
-                arrow_reader_metrics,
-                predicate_cache_inner_records,
-                predicate_cache_records,
-                baseline_metrics: prepared.baseline_metrics,
-            },
-            |state| async move { state.transition().await },
-        )
-        .fuse();
+            let predicate_cache_inner_records =
+                prepared.file_metrics.predicate_cache_inner_records.clone();
+            let predicate_cache_records =
+                prepared.file_metrics.predicate_cache_records.clone();
 
-        // Wrap the stream so a dynamic filter can stop the file scan early.
-        if let Some(file_pruner) = prepared.file_pruner {
-            let stream = stream.boxed();
-            Ok(EarlyStoppingStream::new(
-                stream,
-                file_pruner,
-                files_ranges_pruned_statistics,
+            let stream = futures::stream::unfold(
+                PushDecoderStreamState {
+                    decoder,
+                    reader,
+                    projector,
+                    output_schema: Arc::clone(&prepared.output_schema),
+                    replace_schema,
+                    arrow_reader_metrics,
+                    predicate_cache_inner_records,
+                    predicate_cache_records,
+                    baseline_metrics: prepared.baseline_metrics.clone(),
+                },
+                |state| async move { state.transition().await },
             )
-            .boxed())
-        } else {
-            Ok(stream.boxed())
+            .fuse();
+
+            // `FilePruner` is not `Clone` and holds stateful predicate-generation
+            // counters, so it can only wrap a single stream. Attach it to the
+            // first chunk so the whole file scan can still early-stop when a
+            // dynamic filter narrows.
+            let boxed: BoxStream<'static, Result<RecordBatch>> = if chunk_idx == 0
+                && let Some(pruner) = file_pruner.take()
+            {
+                EarlyStoppingStream::new(
+                    stream.boxed(),
+                    pruner,
+                    prepared.file_metrics.files_ranges_pruned_statistics.clone(),
+                )
+                .boxed()
+            } else {
+                stream.boxed()
+            };
+
+            streams.push(boxed);
         }
+
+        Ok(streams)
     }
 }
 
@@ -1629,8 +1717,7 @@ mod test {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use bytes::{BufMut, BytesMut};
     use datafusion_common::{
-        ColumnStatistics, ScalarValue, Statistics, internal_err, record_batch,
-        stats::Precision,
+        ColumnStatistics, ScalarValue, Statistics, record_batch, stats::Precision,
     };
     use datafusion_datasource::morsel::{Morsel, Morselizer};
     use datafusion_datasource::{PartitionedFile, TableSchema};
@@ -1676,6 +1763,8 @@ mod test {
         max_predicate_cache_size: Option<usize>,
         reverse_row_groups: bool,
         preserve_order: bool,
+        morsel_max_rows: u64,
+        morsel_max_compressed_bytes: u64,
     }
 
     impl ParquetMorselizerBuilder {
@@ -1702,6 +1791,8 @@ mod test {
                 max_predicate_cache_size: None,
                 reverse_row_groups: false,
                 preserve_order: false,
+                morsel_max_rows: DEFAULT_MORSEL_MAX_ROWS,
+                morsel_max_compressed_bytes: DEFAULT_MORSEL_MAX_COMPRESSED_BYTES,
             }
         }
 
@@ -1765,6 +1856,19 @@ mod test {
             self
         }
 
+        /// Override the per-morsel row budget.
+        fn with_morsel_max_rows(mut self, limit: u64) -> Self {
+            self.morsel_max_rows = limit;
+            self
+        }
+
+        /// Override the per-morsel compressed byte budget.
+        #[expect(dead_code)]
+        fn with_morsel_max_compressed_bytes(mut self, limit: u64) -> Self {
+            self.morsel_max_compressed_bytes = limit;
+            self
+        }
+
         /// Build the ParquetMorselizer instance.
         ///
         /// # Panics
@@ -1816,6 +1920,8 @@ mod test {
                 encryption_factory: None,
                 max_predicate_cache_size: self.max_predicate_cache_size,
                 reverse_row_groups: self.reverse_row_groups,
+                morsel_max_rows: self.morsel_max_rows,
+                morsel_max_compressed_bytes: self.morsel_max_compressed_bytes,
             }
         }
     }
@@ -1830,32 +1936,49 @@ mod test {
         morselizer: &ParquetMorselizer,
         file: PartitionedFile,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        let morsels = collect_all_morsels(morselizer, file).await?;
+        if let Some(first) = morsels.into_iter().next() {
+            Ok(Box::pin(first.into_stream()))
+        } else {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    /// Drives the morselizer to completion and returns every morsel it
+    /// produced, in order. Useful for asserting how a file is split into
+    /// row-group morsels.
+    async fn collect_all_morsels(
+        morselizer: &ParquetMorselizer,
+        file: PartitionedFile,
+    ) -> Result<Vec<Box<dyn Morsel>>> {
         let mut planners = VecDeque::from([morselizer.plan_file(file)?]);
-        let mut morsels: VecDeque<Box<dyn Morsel>> = VecDeque::new();
+        let mut morsels: Vec<Box<dyn Morsel>> = Vec::new();
 
-        loop {
-            if let Some(morsel) = morsels.pop_front() {
-                return Ok(Box::pin(morsel.into_stream()));
-            }
-
-            let Some(planner) = planners.pop_front() else {
-                return Ok(Box::pin(futures::stream::empty()));
+        while let Some(planner) = planners.pop_front() {
+            let Some(mut plan) = planner.plan()? else {
+                continue;
             };
+            morsels.extend(plan.take_morsels());
+            planners.extend(plan.take_ready_planners());
 
-            if let Some(mut plan) = planner.plan()? {
-                morsels.extend(plan.take_morsels());
-                planners.extend(plan.take_ready_planners());
-
-                if let Some(pending_planner) = plan.take_pending_planner() {
-                    planners.push_front(pending_planner.await?);
-                    continue;
-                }
-
-                if morsels.is_empty() && planners.is_empty() {
-                    return internal_err!("planner returned an empty morsel plan");
-                }
+            if let Some(pending_planner) = plan.take_pending_planner() {
+                planners.push_front(pending_planner.await?);
             }
         }
+
+        Ok(morsels)
+    }
+
+    /// Concatenate all batches produced by `streams`, returning the int32
+    /// values from the first column of each batch.
+    async fn collect_int32_values_across(
+        streams: Vec<BoxStream<'static, Result<RecordBatch>>>,
+    ) -> Vec<i32> {
+        let mut values = vec![];
+        for stream in streams {
+            values.extend(collect_int32_values(stream).await);
+        }
+        values
     }
 
     fn constant_int_stats() -> (Statistics, SchemaRef) {
@@ -2649,6 +2772,216 @@ mod test {
             vec![7, 5, 1],
             "Reverse scan with non-contiguous row groups should correctly map RowSelection"
         );
+    }
+
+    /// A multi-row-group file whose pruned access plan exceeds the per-morsel
+    /// row budget produces multiple morsels, and their concatenated output
+    /// matches the single-morsel reference.
+    #[tokio::test]
+    async fn test_row_group_split_produces_multiple_morsels() {
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+
+        // Three row groups of 3 rows each. Packing stops at 3 rows/morsel, so
+        // we expect three morsels.
+        let batch1 =
+            record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let batch2 =
+            record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
+        let batch3 =
+            record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch1.clone(), batch2, batch3],
+            Some(props),
+        )
+        .await;
+        let schema = batch1.schema();
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        );
+
+        let morselizer = ParquetMorselizerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[0])
+            .with_morsel_max_rows(3)
+            .build();
+        let morsels = collect_all_morsels(&morselizer, file.clone())
+            .await
+            .unwrap();
+        assert_eq!(morsels.len(), 3, "one morsel per row group");
+
+        let streams = morsels
+            .into_iter()
+            .map(|m| Box::pin(m.into_stream()) as BoxStream<_>)
+            .collect();
+        let values = collect_int32_values_across(streams).await;
+        assert_eq!(values, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+        // Reference: default budget keeps everything in one morsel.
+        let reference_morselizer = ParquetMorselizerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(schema)
+            .with_projection_indices(&[0])
+            .build();
+        let reference_stream = open_file(&reference_morselizer, file).await.unwrap();
+        assert_eq!(
+            collect_int32_values(reference_stream).await,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+    }
+
+    /// When adjacent row groups fit inside the morsel budget they should be
+    /// packed together rather than emitted one-per-morsel.
+    #[tokio::test]
+    async fn test_row_group_split_packs_within_budget() {
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+
+        let batch1 =
+            record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let batch2 =
+            record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
+        let batch3 =
+            record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch1.clone(), batch2, batch3],
+            Some(props),
+        )
+        .await;
+        let schema = batch1.schema();
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        );
+
+        // Budget fits exactly 2 row groups; expect two morsels: [0+1], [2].
+        let morselizer = ParquetMorselizerBuilder::new()
+            .with_store(store)
+            .with_schema(schema)
+            .with_projection_indices(&[0])
+            .with_morsel_max_rows(6)
+            .build();
+        let morsels = collect_all_morsels(&morselizer, file).await.unwrap();
+        assert_eq!(morsels.len(), 2);
+    }
+
+    /// A user-supplied access plan with a `Skip` entry between scanned row
+    /// groups should preserve the skip across chunking.
+    #[tokio::test]
+    async fn test_row_group_split_honors_user_skip() {
+        use crate::ParquetAccessPlan;
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+
+        let batch1 =
+            record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let batch2 =
+            record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
+        let batch3 =
+            record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch1.clone(), batch2, batch3],
+            Some(props),
+        )
+        .await;
+        let schema = batch1.schema();
+
+        let mut access_plan = ParquetAccessPlan::new_all(3);
+        access_plan.skip(1);
+
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        )
+        .with_extensions(Arc::new(access_plan));
+
+        let morselizer = ParquetMorselizerBuilder::new()
+            .with_store(store)
+            .with_schema(schema)
+            .with_projection_indices(&[0])
+            .with_morsel_max_rows(3)
+            .build();
+        let morsels = collect_all_morsels(&morselizer, file).await.unwrap();
+        let streams = morsels
+            .into_iter()
+            .map(|m| Box::pin(m.into_stream()) as BoxStream<_>)
+            .collect();
+        let values = collect_int32_values_across(streams).await;
+        assert_eq!(values, vec![1, 2, 3, 7, 8, 9], "row group 1 is skipped");
+    }
+
+    /// When `reverse_row_groups` is set the per-morsel split should preserve
+    /// the reverse output order: the first morsel emits the file's last row
+    /// group.
+    #[tokio::test]
+    async fn test_row_group_split_with_reverse() {
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+
+        let batch1 =
+            record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let batch2 =
+            record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
+        let batch3 =
+            record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch1.clone(), batch2, batch3],
+            Some(props),
+        )
+        .await;
+        let schema = batch1.schema();
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        );
+
+        let morselizer = ParquetMorselizerBuilder::new()
+            .with_store(store)
+            .with_schema(schema)
+            .with_projection_indices(&[0])
+            .with_morsel_max_rows(3)
+            .with_reverse_row_groups(true)
+            .build();
+        let morsels = collect_all_morsels(&morselizer, file).await.unwrap();
+        assert_eq!(morsels.len(), 3);
+
+        // First morsel should emit the originally-last row group.
+        let streams: Vec<_> = morsels
+            .into_iter()
+            .map(|m| Box::pin(m.into_stream()) as BoxStream<_>)
+            .collect();
+        let values = collect_int32_values_across(streams).await;
+        assert_eq!(values, vec![7, 8, 9, 4, 5, 6, 1, 2, 3]);
     }
 
     /// Test that page pruning predicates are only built and applied when `enable_page_index` is true.
