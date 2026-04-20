@@ -1433,6 +1433,15 @@ fn apply_post_scan_filters_with_stats(
     let mut combined_mask: Option<BooleanArray> = None;
 
     for (i, (id, expr)) in filters.iter().enumerate() {
+        // Mid-stream drop, mirror of `DatafusionArrowPredicate::evaluate`.
+        // Set by the tracker on `OptionalFilterPhysicalExpr` whose CI
+        // upper bound has fallen below `min_bytes_per_sec`; correctness is
+        // preserved because the originating join independently enforces
+        // the predicate. We do not update the tracker for a skipped batch.
+        if tracker.is_filter_skipped(*id) {
+            continue;
+        }
+
         let start = datafusion_common::instant::Instant::now();
         let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
         let bool_arr = as_boolean_array(result.as_ref())?;

@@ -26,6 +26,7 @@ use parking_lot::{Mutex, RwLock};
 use parquet::file::metadata::ParquetMetaData;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr_common::physical_expr::{
@@ -34,6 +35,11 @@ use datafusion_physical_expr_common::physical_expr::{
 
 /// Stable identifier for a filter conjunct, assigned by `ParquetSource::with_predicate`.
 pub type FilterId = usize;
+
+/// Re-evaluate the per-filter skip flag every Nth batch update. The CI
+/// upper bound is a couple of arithmetic ops so this cap mostly serves to
+/// keep cache lines for `is_optional` / `skip_flags` cold on the hot path.
+const SKIP_FLAG_CHECK_INTERVAL: u64 = 4;
 
 /// Per-filter lifecycle state in the adaptive filter system.
 ///
@@ -211,6 +217,8 @@ impl TrackerConfig {
         SelectivityTracker {
             config: self,
             filter_stats: RwLock::new(HashMap::new()),
+            skip_flags: RwLock::new(HashMap::new()),
+            is_optional: RwLock::new(HashMap::new()),
             inner: Mutex::new(SelectivityTrackerInner::new()),
         }
     }
@@ -334,6 +342,25 @@ pub struct SelectivityTracker {
     /// counters, so concurrent `update()` calls on *different* filters
     /// proceed in parallel with zero contention.
     filter_stats: RwLock<HashMap<FilterId, Mutex<SelectivityStats>>>,
+    /// Per-filter "skip" flags — when set, the corresponding filter is
+    /// treated as a no-op by both the row-filter
+    /// (`DatafusionArrowPredicate::evaluate`) and the post-scan path
+    /// (`apply_post_scan_filters_with_stats`). This is the mid-stream
+    /// equivalent of dropping an optional filter: once the per-batch
+    /// `update()` path proves an `OptionalFilterPhysicalExpr` is
+    /// CPU-dominated and ineffective, it flips the flag and subsequent
+    /// batches stop paying the evaluation cost. The decoder still decodes
+    /// the filter columns (we cannot rebuild it mid-scan), so I/O is not
+    /// reclaimed; only the predicate evaluation is skipped.
+    ///
+    /// Only ever set for filters whose `is_optional` entry is `true` —
+    /// mandatory filters must always execute or queries return wrong rows.
+    skip_flags: RwLock<HashMap<FilterId, Arc<AtomicBool>>>,
+    /// Whether each filter is wrapped in an `OptionalFilterPhysicalExpr`,
+    /// captured at first-encounter in `partition_filters` so the per-batch
+    /// `update()` path can decide whether the filter is safe to no-op
+    /// without re-inspecting the expression tree on every batch.
+    is_optional: RwLock<HashMap<FilterId, bool>>,
     /// Filter lifecycle state machine and dynamic-filter generation tracking.
     ///
     /// Only `partition_filters()` acquires this lock (once per file open).
@@ -372,6 +399,16 @@ impl SelectivityTracker {
     /// before `partition_filters()` has registered the filter — in practice
     /// this cannot happen because `partition_filters()` runs during file open
     /// before any batches are processed).
+    ///
+    /// **Mid-stream drop:** after every `SKIP_FLAG_CHECK_INTERVAL`'th batch
+    /// we evaluate the CI upper bound; if it falls below
+    /// `min_bytes_per_sec` and the filter is wrapped in
+    /// `OptionalFilterPhysicalExpr`, we set the per-filter skip flag.
+    /// Subsequent calls to `DatafusionArrowPredicate::evaluate` (row-level)
+    /// and `apply_post_scan_filters_with_stats` (post-scan) observe the
+    /// flag and short-circuit their work for that filter. Mandatory
+    /// filters are never flagged because doing so would change the result
+    /// set.
     pub(crate) fn update(
         &self,
         id: FilterId,
@@ -380,10 +417,75 @@ impl SelectivityTracker {
         eval_nanos: u64,
         batch_bytes: u64,
     ) {
-        let map = self.filter_stats.read();
-        if let Some(entry) = map.get(&id) {
-            entry.lock().update(matched, total, eval_nanos, batch_bytes);
+        let stats_map = self.filter_stats.read();
+        let Some(entry) = stats_map.get(&id) else {
+            return;
+        };
+        let mut stats = entry.lock();
+        stats.update(matched, total, eval_nanos, batch_bytes);
+
+        // Mid-stream drop check. Only consult the skip mechanism for
+        // filters we already know to be optional, and only after enough
+        // samples for `confidence_upper_bound` to be defined. The modulo
+        // gate keeps the per-batch overhead tiny on the hot path.
+        if !self.config.min_bytes_per_sec.is_finite()
+            || !stats.sample_count.is_multiple_of(SKIP_FLAG_CHECK_INTERVAL)
+        {
+            return;
         }
+        let Some(ub) = stats.confidence_upper_bound(self.config.confidence_z) else {
+            return;
+        };
+        if ub >= self.config.min_bytes_per_sec {
+            return;
+        }
+        drop(stats);
+        drop(stats_map);
+
+        // Optionality is captured at first sight in `partition_filters` so
+        // we can answer this without re-walking the expression tree.
+        let is_optional = self.is_optional.read().get(&id).copied().unwrap_or(false);
+        if !is_optional {
+            return;
+        }
+        if let Some(flag) = self.skip_flags.read().get(&id)
+            && !flag.swap(true, Ordering::Release)
+        {
+            debug!(
+                "FilterId {id}: mid-stream skip — CI upper bound {ub} < {} bytes/sec",
+                self.config.min_bytes_per_sec
+            );
+        }
+    }
+
+    /// Returns the shared skip flag for `id`, creating one if absent.
+    ///
+    /// Cloned into [`crate::row_filter::DatafusionArrowPredicate`] so the
+    /// row-filter path can short-circuit when the per-batch update path
+    /// decides the filter has stopped pulling its weight. The post-scan
+    /// path uses [`Self::is_filter_skipped`] instead — it does not need a
+    /// long-lived handle.
+    pub(crate) fn skip_flag(&self, id: FilterId) -> Arc<AtomicBool> {
+        if let Some(existing) = self.skip_flags.read().get(&id) {
+            return Arc::clone(existing);
+        }
+        let mut write = self.skip_flags.write();
+        Arc::clone(
+            write
+                .entry(id)
+                .or_insert_with(|| Arc::new(AtomicBool::new(false))),
+        )
+    }
+
+    /// Returns `true` when `id` has been mid-stream-dropped by the tracker.
+    ///
+    /// Cheap: a single `RwLock::read` plus an atomic load. Called from the
+    /// post-scan filter loop in `apply_post_scan_filters_with_stats`.
+    pub(crate) fn is_filter_skipped(&self, id: FilterId) -> bool {
+        self.skip_flags
+            .read()
+            .get(&id)
+            .is_some_and(|f| f.load(Ordering::Acquire))
     }
 
     /// Partition filters into row-level predicates vs post-scan filters.
@@ -420,10 +522,20 @@ impl SelectivityTracker {
         // Phase 2: if new filters were seen, briefly acquire write lock to insert entries
         if !result.new_filter_ids.is_empty() {
             let mut stats_write = self.filter_stats.write();
-            for id in result.new_filter_ids {
+            for id in &result.new_filter_ids {
                 stats_write
-                    .entry(id)
+                    .entry(*id)
                     .or_insert_with(|| Mutex::new(SelectivityStats::default()));
+            }
+        }
+        if !result.new_optional_flags.is_empty() {
+            let mut optional_write = self.is_optional.write();
+            let mut skip_write = self.skip_flags.write();
+            for (id, is_optional) in result.new_optional_flags {
+                optional_write.entry(id).or_insert(is_optional);
+                skip_write
+                    .entry(id)
+                    .or_insert_with(|| Arc::new(AtomicBool::new(false)));
             }
         }
 
@@ -455,6 +567,12 @@ impl SelectivityTracker {
 struct PartitionResult {
     partitioned: PartitionedFilters,
     new_filter_ids: Vec<FilterId>,
+    /// `(FilterId, is_optional)` entries observed for the first time in this
+    /// `partition_filters` call. The outer `SelectivityTracker` records
+    /// optionality alongside `filter_stats` so that the hot `update()` path
+    /// can decide whether the per-filter skip flag is safe to flip without
+    /// inspecting the expression tree.
+    new_optional_flags: Vec<(FilterId, bool)>,
 }
 
 /// Filter state-machine and generation tracking, guarded by the `Mutex`
@@ -578,6 +696,7 @@ impl SelectivityTrackerInner {
         stats_map: &HashMap<FilterId, Mutex<SelectivityStats>>,
     ) -> PartitionResult {
         let mut new_filter_ids = Vec::new();
+        let mut new_optional_flags: Vec<(FilterId, bool)> = Vec::new();
 
         // If min_bytes_per_sec is INFINITY -> all filters are post-scan.
         if config.min_bytes_per_sec.is_infinite() {
@@ -586,9 +705,10 @@ impl SelectivityTrackerInner {
                 filters.len()
             );
             // Register all filter IDs so update() can find them
-            for &(id, _) in &filters {
-                if !stats_map.contains_key(&id) {
-                    new_filter_ids.push(id);
+            for (id, expr) in &filters {
+                if !stats_map.contains_key(id) {
+                    new_filter_ids.push(*id);
+                    new_optional_flags.push((*id, is_optional_filter(expr)));
                 }
             }
             return PartitionResult {
@@ -597,6 +717,7 @@ impl SelectivityTrackerInner {
                     post_scan: filters,
                 },
                 new_filter_ids,
+                new_optional_flags,
             };
         }
         // If min_bytes_per_sec is 0 -> all filters are promoted.
@@ -606,9 +727,10 @@ impl SelectivityTrackerInner {
                 filters.len()
             );
             // Register all filter IDs so update() can find them
-            for &(id, _) in &filters {
-                if !stats_map.contains_key(&id) {
-                    new_filter_ids.push(id);
+            for (id, expr) in &filters {
+                if !stats_map.contains_key(id) {
+                    new_filter_ids.push(*id);
+                    new_optional_flags.push((*id, is_optional_filter(expr)));
                 }
             }
             return PartitionResult {
@@ -617,6 +739,7 @@ impl SelectivityTrackerInner {
                     post_scan: Vec::new(),
                 },
                 new_filter_ids,
+                new_optional_flags,
             };
         }
 
@@ -667,6 +790,7 @@ impl SelectivityTrackerInner {
 
                 if !stats_map.contains_key(&id) {
                     new_filter_ids.push(id);
+                    new_optional_flags.push((id, is_optional_filter(&expr)));
                 }
 
                 if byte_ratio <= config.byte_ratio_threshold {
@@ -787,8 +911,14 @@ impl SelectivityTrackerInner {
                 post_scan: post_scan_filters,
             },
             new_filter_ids,
+            new_optional_flags,
         }
     }
+}
+
+/// Returns `true` if `expr` is wrapped in [`OptionalFilterPhysicalExpr`].
+fn is_optional_filter(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.downcast_ref::<OptionalFilterPhysicalExpr>().is_some()
 }
 
 /// Calculate the estimated number of bytes needed to evaluate a filter based on the columns

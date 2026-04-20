@@ -138,6 +138,15 @@ pub(crate) struct DatafusionArrowPredicate {
     /// paths disagreed, the tracker would rank row-filter and post-scan
     /// candidates on incomparable axes and mis-promote or mis-demote.
     other_projected_bytes_per_row: f64,
+    /// Mid-stream "drop" flag, shared with the
+    /// [`crate::selectivity::SelectivityTracker`]. The tracker flips this
+    /// when an `OptionalFilterPhysicalExpr` proves CPU-dominated and
+    /// ineffective; once set, [`Self::evaluate`] returns an all-true mask
+    /// without invoking `physical_expr`. Filter columns are still decoded
+    /// (the parquet decoder cannot be reconfigured mid-scan), so this only
+    /// reclaims CPU, not I/O. Flagged only for filters known to be
+    /// optional, so correctness is preserved by the join itself.
+    skip_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DatafusionArrowPredicate {
@@ -153,6 +162,7 @@ impl DatafusionArrowPredicate {
     ) -> Result<Self> {
         let physical_expr =
             reassign_expr_columns(candidate.expr, &candidate.read_plan.projected_schema)?;
+        let skip_flag = tracker.skip_flag(filter_id);
 
         Ok(Self {
             physical_expr,
@@ -163,6 +173,7 @@ impl DatafusionArrowPredicate {
             filter_id,
             tracker,
             other_projected_bytes_per_row,
+            skip_flag,
         })
     }
 }
@@ -173,6 +184,20 @@ impl ArrowPredicate for DatafusionArrowPredicate {
     }
 
     fn evaluate(&mut self, batch: RecordBatch) -> ArrowResult<BooleanArray> {
+        // Mid-stream drop: the tracker has decided this optional filter is
+        // pulling its weight no longer. Return an all-true mask to bypass
+        // expression evaluation entirely. We still bump `rows_matched` so
+        // the per-predicate count stays consistent with input rows; the
+        // tracker is intentionally NOT updated for skipped batches because
+        // (a) we have nothing meaningful to report and (b) flooding it
+        // with zero-cost samples would mask the underlying effectiveness
+        // signal if the flag is ever cleared.
+        if self.skip_flag.load(std::sync::atomic::Ordering::Acquire) {
+            let rows_in_batch = batch.num_rows();
+            self.rows_matched.add(rows_in_batch);
+            return Ok(BooleanArray::from(vec![true; rows_in_batch]));
+        }
+
         // scoped timer updates on drop
         let mut timer = self.time.timer();
         let start_nanos = datafusion_common::instant::Instant::now();
