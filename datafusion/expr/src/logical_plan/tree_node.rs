@@ -215,11 +215,13 @@ impl TreeNode for LogicalPlan {
             }),
             LogicalPlan::Analyze(Analyze {
                 verbose,
+                format,
                 input,
                 schema,
             }) => input.map_elements(f)?.update_data(|input| {
                 LogicalPlan::Analyze(Analyze {
                     verbose,
+                    format,
                     input,
                     schema,
                 })

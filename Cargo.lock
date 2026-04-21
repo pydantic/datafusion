@@ -2532,6 +2532,7 @@ dependencies = [
  "rand 0.9.4",
  "rstest",
  "rstest_reuse",
+ "serde_json",
  "tokio",
 ]
 

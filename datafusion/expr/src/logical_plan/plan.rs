@@ -1092,6 +1092,7 @@ impl LogicalPlan {
                 let input = self.only_input(inputs)?;
                 Ok(LogicalPlan::Analyze(Analyze {
                     verbose: a.verbose,
+                    format: a.format.clone(),
                     schema: Arc::clone(&a.schema),
                     input: Arc::new(input),
                 }))
@@ -3299,13 +3300,17 @@ impl PartialOrd for Explain {
 pub struct Analyze {
     /// Should extra detail be included?
     pub verbose: bool,
+    /// Output syntax/format for the rendered physical plan + metrics.
+    pub format: ExplainFormat,
     /// The logical plan that is being EXPLAIN ANALYZE'd
     pub input: Arc<LogicalPlan>,
     /// The output schema of the explain (2 columns of text)
     pub schema: DFSchemaRef,
 }
 
-// Manual implementation needed because of `schema` field. Comparison excludes this field.
+// Manual implementation needed because of `schema` field, and because
+// `ExplainFormat` does not implement `PartialOrd`. Comparison excludes both
+// fields.
 impl PartialOrd for Analyze {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         match self.verbose.partial_cmp(&other.verbose) {

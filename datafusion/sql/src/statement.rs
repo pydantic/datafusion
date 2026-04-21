@@ -1940,29 +1940,40 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return plan_err!("EXPLAIN VERBOSE with FORMAT is not supported");
         }
 
+        // Resolve the requested output format.
+        //
+        // Verbose mode only supports indent format, and for EXPLAIN ANALYZE
+        // only `Indent` and `PostgresJSON` are supported today — `Tree` and
+        // `Graphviz` require additional work to render with live metrics.
+        let options = self.context_provider.options();
+        let format = if verbose {
+            ExplainFormat::Indent
+        } else if let Some(format) = format {
+            ExplainFormat::from_str(&format)?
+        } else if analyze {
+            ExplainFormat::Indent
+        } else {
+            options.explain.format.clone()
+        };
+
         if analyze {
-            if format.is_some() {
-                return plan_err!("EXPLAIN ANALYZE with FORMAT is not supported");
+            match format {
+                ExplainFormat::Indent | ExplainFormat::PostgresJSON => {}
+                ExplainFormat::Tree | ExplainFormat::Graphviz => {
+                    return plan_err!(
+                        "EXPLAIN ANALYZE with FORMAT {format} is not supported"
+                    );
+                }
             }
             Ok(LogicalPlan::Analyze(Analyze {
                 verbose,
+                format,
                 input: plan,
                 schema,
             }))
         } else {
             let stringified_plans =
                 vec![plan.to_stringified(PlanType::InitialLogicalPlan)];
-
-            // default to configuration value
-            // verbose mode only supports indent format
-            let options = self.context_provider.options();
-            let format = if verbose {
-                ExplainFormat::Indent
-            } else if let Some(format) = format {
-                ExplainFormat::from_str(&format)?
-            } else {
-                options.explain.format.clone()
-            };
 
             Ok(LogicalPlan::Explain(Explain {
                 verbose,

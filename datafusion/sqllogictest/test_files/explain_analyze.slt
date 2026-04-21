@@ -293,6 +293,78 @@ reset datafusion.explain.analyze_categories;
 statement ok
 reset datafusion.explain.analyze_level;
 
+# ---- pgjson format: structural golden with all metric values suppressed ----
+# `analyze_categories = 'none'` removes every metric, making the JSON output
+# fully deterministic regardless of timing / batching / partition counts.
+
+statement ok
+set datafusion.explain.analyze_categories = 'none';
+
+query TT
+explain analyze format pgjson select * from (values (1), (2), (3)) t(x);
+----
+Plan with Metrics
+01)[
+02)--{
+03)----"Plan": {
+04)------"Node Type": "ProjectionExec",
+05)------"Details": "ProjectionExec: expr=[column1@0 as x]",
+06)------"Plans": [
+07)--------{
+08)----------"Node Type": "DataSourceExec",
+09)----------"Details": "DataSourceExec: partitions=1, partition_sizes=[1]",
+10)----------"Plans": []
+11)--------}
+12)------]
+13)----}
+14)--}
+15)]
+
+statement ok
+reset datafusion.explain.analyze_categories;
+
+# ---- pgjson with `analyze_categories = 'rows'`: deterministic row-count
+# metrics surface as `Actual Rows`, batch counts land in `Extras`, and
+# timing/bytes metrics are filtered out so the output stays stable.
+
+statement ok
+set datafusion.explain.analyze_categories = 'rows';
+
+query TT
+explain analyze format pgjson select * from (values (1), (2), (3)) t(x);
+----
+Plan with Metrics
+01)[
+02)--{
+03)----"Plan": {
+04)------"Node Type": "ProjectionExec",
+05)------"Details": "ProjectionExec: expr=[column1@0 as x]",
+06)------"Actual Rows": 3,
+07)------"Extras": {
+08)--------"output_batches": 1
+09)------},
+10)------"Plans": [
+11)--------{
+12)----------"Node Type": "DataSourceExec",
+13)----------"Details": "DataSourceExec: partitions=1, partition_sizes=[1]",
+14)----------"Plans": []
+15)--------}
+16)------]
+17)----}
+18)--}
+19)]
+
+statement ok
+reset datafusion.explain.analyze_categories;
+
+# ---- Reject formats that AnalyzeExec cannot render with live metrics ----
+
+query error DataFusion error: Error during planning: EXPLAIN ANALYZE with FORMAT tree is not supported
+explain analyze format tree select 1;
+
+query error DataFusion error: Error during planning: EXPLAIN ANALYZE with FORMAT graphviz is not supported
+explain analyze format graphviz select 1;
+
 # --- Teardown ---
 
 statement ok
