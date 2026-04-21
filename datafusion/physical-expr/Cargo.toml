@@ -44,7 +44,6 @@ name = "datafusion_physical_expr"
 recursive_protection = ["dep:recursive"]
 
 [dependencies]
-ahash = { workspace = true }
 arrow = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
@@ -65,13 +64,16 @@ arrow = { workspace = true, features = ["test_utils"] }
 criterion = { workspace = true }
 datafusion-functions = { workspace = true }
 insta = { workspace = true }
-paste = { workspace = true }
 rand = { workspace = true }
 rstest = { workspace = true }
 
 [[bench]]
 harness = false
 name = "in_list"
+
+[[bench]]
+harness = false
+name = "in_list_strategy"
 
 [[bench]]
 harness = false
@@ -88,6 +90,10 @@ name = "binary_op"
 [[bench]]
 harness = false
 name = "simplify"
+
+[[bench]]
+harness = false
+name = "string_concat"
 
 [package.metadata.cargo-machete]
 ignored = ["half"]

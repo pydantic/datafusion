@@ -18,7 +18,7 @@
 use super::{
     from_aggregate_rel, from_cast, from_cross_rel, from_exchange_rel, from_fetch_rel,
     from_field_reference, from_filter_rel, from_if_then, from_join_rel, from_literal,
-    from_project_rel, from_read_rel, from_scalar_function, from_set_rel,
+    from_nested, from_project_rel, from_read_rel, from_scalar_function, from_set_rel,
     from_singular_or_list, from_sort_rel, from_subquery, from_substrait_rel,
     from_substrait_rex, from_window_function,
 };
@@ -350,10 +350,10 @@ pub trait SubstraitConsumer: Send + Sync + Sized {
 
     async fn consume_nested(
         &self,
-        _expr: &Nested,
-        _input_schema: &DFSchema,
+        expr: &Nested,
+        input_schema: &DFSchema,
     ) -> datafusion::common::Result<Expr> {
-        not_impl_err!("Nested expression not supported")
+        from_nested(self, expr, input_schema).await
     }
 
     async fn consume_enum(
@@ -366,10 +366,22 @@ pub trait SubstraitConsumer: Send + Sync + Sized {
 
     async fn consume_dynamic_parameter(
         &self,
-        _expr: &DynamicParameter,
+        expr: &DynamicParameter,
         _input_schema: &DFSchema,
     ) -> datafusion::common::Result<Expr> {
-        not_impl_err!("Dynamic Parameter expression not supported")
+        let id = format!("${}", expr.parameter_reference + 1);
+        let field = expr
+            .r#type
+            .as_ref()
+            .map(|t| {
+                super::from_substrait_type_without_names(self, t).map(|dt| {
+                    Arc::new(datafusion::arrow::datatypes::Field::new(&id, dt, true))
+                })
+            })
+            .transpose()?;
+        Ok(Expr::Placeholder(
+            datafusion::logical_expr::expr::Placeholder::new_with_field(id, field),
+        ))
     }
 
     // Outer Schema Stack
@@ -588,7 +600,7 @@ impl SubstraitConsumer for DefaultSubstraitConsumer<'_> {
 mod tests {
     use super::*;
     use crate::logical_plan::consumer::utils::tests::test_consumer;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::datatypes::{Field, Schema};
 
     fn make_schema(fields: &[(&str, DataType)]) -> Arc<DFSchema> {
         let arrow_fields: Vec<Field> = fields
