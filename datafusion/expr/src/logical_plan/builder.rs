@@ -1329,6 +1329,8 @@ impl LogicalPlanBuilder {
                 verbose: explain_option.verbose,
                 input: self.plan,
                 schema,
+                analyze_level: None,
+                analyze_categories: None,
             })))
         } else {
             let stringified_plans =
@@ -1341,6 +1343,7 @@ impl LogicalPlanBuilder {
                 stringified_plans,
                 schema,
                 logical_optimization_succeeded: false,
+                show_statistics: explain_option.show_statistics,
             })))
         }
     }
