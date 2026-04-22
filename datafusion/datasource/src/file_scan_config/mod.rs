@@ -210,6 +210,18 @@ pub struct FileScanConfig {
     /// If the number of file partitions > target_partitions, the file partitions will be grouped
     /// in a round-robin fashion such that number of file partitions = target_partitions.
     pub partitioned_by_file_group: bool,
+    /// Desired-but-not-required ordering for the shared work queue that
+    /// feeds [`SharedWorkSource`].
+    ///
+    /// Populated by Inexact sort pushdown so that workers pull files in
+    /// globally best-first order (e.g., highest-max for DESC TopK), letting
+    /// dynamic filters tighten fastest across the whole scan.
+    ///
+    /// Distinct from [`Self::output_ordering`]: `output_ordering` is a
+    /// contract the scan guarantees, while this is only a scheduling hint.
+    /// Has no effect when `SharedWorkSource` is not used (i.e. when
+    /// `preserve_order` or `partitioned_by_file_group` is true).
+    pub(crate) work_order_hint: Option<LexOrdering>,
 }
 
 /// A builder for [`FileScanConfig`]'s.
@@ -280,6 +292,7 @@ pub struct FileScanConfigBuilder {
     batch_size: Option<usize>,
     expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
     partitioned_by_file_group: bool,
+    work_order_hint: Option<LexOrdering>,
 }
 
 impl FileScanConfigBuilder {
@@ -306,6 +319,7 @@ impl FileScanConfigBuilder {
             batch_size: None,
             expr_adapter_factory: None,
             partitioned_by_file_group: false,
+            work_order_hint: None,
         }
     }
 
@@ -527,6 +541,7 @@ impl FileScanConfigBuilder {
             batch_size,
             expr_adapter_factory: expr_adapter,
             partitioned_by_file_group,
+            work_order_hint,
         } = self;
 
         let constraints = constraints.unwrap_or_default();
@@ -552,6 +567,7 @@ impl FileScanConfigBuilder {
             expr_adapter_factory: expr_adapter,
             statistics,
             partitioned_by_file_group,
+            work_order_hint,
         }
     }
 }
@@ -571,6 +587,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             batch_size: config.batch_size,
             expr_adapter_factory: config.expr_adapter_factory,
             partitioned_by_file_group: config.partitioned_by_file_group,
+            work_order_hint: config.work_order_hint,
         }
     }
 }
@@ -2664,6 +2681,97 @@ mod tests {
         assert_eq!(files[1].object_meta.location.as_ref(), "file2");
         assert_eq!(files[2].object_meta.location.as_ref(), "file3");
         assert!(pushed_config.output_ordering.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn sort_pushdown_inexact_populates_work_order_hint() -> Result<()> {
+        // Inexact pushdown (via Unsupported → try_sort_file_groups_by_statistics)
+        // must leave a sort hint on the config so SharedWorkSource can
+        // seed its queue in globally best-first order.
+        let file_schema =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Float64, false)]));
+        let table_schema = TableSchema::new(Arc::clone(&file_schema), vec![]);
+        let file_source = Arc::new(MockSource::new(table_schema));
+
+        // Two groups whose min/max values interleave — per-group sort from
+        // #21182 is not sufficient to give workers globally best-first files.
+        // Intra-group ordering must be non-natural so that
+        // `try_sort_file_groups_by_statistics` reorders → Inexact.
+        let file_groups = vec![
+            FileGroup::new(vec![
+                make_file_with_stats("g0_hi", 50.0, 60.0),
+                make_file_with_stats("g0_mid", 30.0, 40.0),
+            ]),
+            FileGroup::new(vec![
+                make_file_with_stats("g1_top", 70.0, 80.0),
+                make_file_with_stats("g1_lo", 10.0, 20.0),
+            ]),
+        ];
+
+        let sort_expr = PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)));
+        let config =
+            FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), file_source)
+                .with_file_groups(file_groups)
+                .build();
+
+        let result = config.try_pushdown_sort(std::slice::from_ref(&sort_expr))?;
+        let SortOrderPushdownResult::Inexact { inner } = result else {
+            panic!("Expected Inexact result, got {result:?}");
+        };
+        let pushed = inner
+            .downcast_ref::<FileScanConfig>()
+            .expect("Expected FileScanConfig");
+
+        // The hint must be populated and match the requested ordering.
+        let hint = pushed
+            .work_order_hint
+            .as_ref()
+            .expect("work_order_hint must be set on Inexact");
+        assert_eq!(hint.len(), 1);
+        assert_eq!(hint[0], sort_expr);
+
+        // Partition count must be unchanged — groups drive output_partitioning.
+        assert_eq!(pushed.file_groups.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn sort_pushdown_rebuild_reverse_leaves_hint_none() -> Result<()> {
+        // When the requested order is the reverse of the scan's declared
+        // output_ordering, rebuild_with_source reverses files per group
+        // instead of stats-sorting. A globally-ascending hint would defeat
+        // that reversal, so the hint must stay None on this path.
+        let file_schema =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Float64, false)]));
+        let table_schema = TableSchema::new(Arc::clone(&file_schema), vec![]);
+        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::new(table_schema));
+
+        let file_groups = vec![FileGroup::new(vec![
+            make_file_with_stats("f1", 0.0, 9.0),
+            make_file_with_stats("f2", 10.0, 19.0),
+            make_file_with_stats("f3", 20.0, 30.0),
+        ])];
+
+        let asc = PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)));
+        // Use `.reverse()` so both `descending` and `nulls_first` flip,
+        // which is what `LexOrdering::is_reverse` requires.
+        let desc = asc.reverse();
+        let declared: LexOrdering = [asc.clone()].into();
+
+        let config =
+            FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), file_source)
+                .with_file_groups(file_groups)
+                .with_output_ordering(vec![declared])
+                .build();
+
+        // is_exact=false → Inexact path, the one that could populate the hint.
+        let rebuilt = config.rebuild_with_source(
+            Arc::clone(&config.file_source),
+            false,
+            &[desc],
+        )?;
+        assert!(rebuilt.work_order_hint.is_none());
         Ok(())
     }
 
