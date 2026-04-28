@@ -1760,8 +1760,18 @@ fn apply_post_scan_filters_with_stats(
         let nanos = start.elapsed().as_nanos() as u64;
         let num_matched = bool_arr.true_count() as u64;
 
-        let other_bytes = (other_bytes_per_row[i] * input_rows as f64) as u64;
-        tracker.update(*id, num_matched, input_rows, nanos, other_bytes);
+        // Convert the raw "all the non-filter projection bytes for this
+        // batch" into a *scatter-aware* skippable count: only the
+        // [`SKIP_WINDOW_ROWS`]-sized sub-windows of the bool array that
+        // contain zero survivors represent decode work that
+        // late-materialization would actually skip. A 50% filter on
+        // uniform data scores 0 here (every window keeps a survivor —
+        // no I/O won); a 50% filter on contiguous data scores ~0.5
+        // (half the windows are empty).
+        let total_other_bytes = (other_bytes_per_row[i] * input_rows as f64) as u64;
+        let skippable_bytes =
+            crate::selectivity::count_skippable_bytes(bool_arr, total_other_bytes);
+        tracker.update(*id, num_matched, input_rows, nanos, skippable_bytes);
 
         if num_matched < input_rows {
             combined_mask = Some(match combined_mask {

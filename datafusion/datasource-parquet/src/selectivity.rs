@@ -21,6 +21,7 @@
 //! per-filter lifecycle, `PartitionedFilters` for the output consumed by
 //! `ParquetOpener::open`, and [`FilterId`] for stable filter identification.
 
+use arrow::array::BooleanArray;
 use log::debug;
 use parking_lot::{Mutex, RwLock};
 use parquet::file::metadata::ParquetMetaData;
@@ -32,6 +33,74 @@ use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr_common::physical_expr::{
     OptionalFilterPhysicalExpr, PhysicalExpr, snapshot_generation,
 };
+
+/// Window size for the per-batch scatter analysis fed to
+/// [`count_skippable_bytes`]. Approximates a parquet data page so that
+/// "windows with zero survivors" tracks "pages a row-level decoder
+/// could skip". Hardcoded for now; making this configurable (or
+/// deriving it from per-row-group page metadata) is a natural follow-up.
+pub(crate) const SKIP_WINDOW_ROWS: usize = 8192;
+
+/// Compute the bytes that late-materialization can plausibly skip for a
+/// batch given the predicate output `bool_arr` and the total non-filter
+/// projection bytes for that batch.
+///
+/// Splits `bool_arr` into [`SKIP_WINDOW_ROWS`]-sized windows; each window
+/// with zero survivors represents a page-sized chunk whose
+/// other-projection columns the row-level decoder can skip outright.
+/// Returns `total_other_bytes × (empty_windows / total_windows)` —
+/// scatter-discounted skippable bytes.
+///
+/// Interpretation depends on which side calls this:
+///
+/// - **Post-scan path**: a *prediction* of bytes-saved-per-sec the
+///   row-level path would achieve. The bool_arr we see is over the wide
+///   batch in the same row order the decoder would emit, so for single-
+///   predicate filters the prediction is faithful (modulo `W` matching
+///   the actual parquet page size).
+///
+/// - **Row-level path**: a conservative *measurement* of what the
+///   decoder actually skipped — within-window RowSelection narrowing is
+///   an additional uncounted bonus. So at row-level this is a *lower
+///   bound* of real savings, which is the safe direction for the
+///   demote-or-not decision.
+pub(crate) fn count_skippable_bytes(
+    bool_arr: &BooleanArray,
+    total_other_bytes: u64,
+) -> u64 {
+    let n = bool_arr.len();
+    if n == 0 || total_other_bytes == 0 {
+        return 0;
+    }
+    // Short-circuit on the two extremes: avoids a redundant per-window
+    // SIMD scan over the same buffer when the answer is already
+    // determined by the batch-level total. The whole helper otherwise
+    // costs ~2× per-batch `true_count` for nothing.
+    let total_matched = bool_arr.true_count();
+    if total_matched == 0 {
+        // Every window empty: full skippable.
+        return total_other_bytes;
+    }
+    if total_matched == n {
+        // No window empty: nothing skippable.
+        return 0;
+    }
+    let total_windows = n.div_ceil(SKIP_WINDOW_ROWS);
+    if total_windows == 1 {
+        // One-window batch with mixed matches → not skippable. Avoids
+        // a wasted slice+`true_count`.
+        return 0;
+    }
+    let mut empty_windows: u64 = 0;
+    for i in 0..total_windows {
+        let start = i * SKIP_WINDOW_ROWS;
+        let len = SKIP_WINDOW_ROWS.min(n - start);
+        if bool_arr.slice(start, len).true_count() == 0 {
+            empty_windows += 1;
+        }
+    }
+    ((total_other_bytes as f64 * empty_windows as f64) / total_windows as f64) as u64
+}
 
 /// Stable identifier for a filter conjunct, assigned by `ParquetSource::with_predicate`.
 pub type FilterId = usize;
@@ -110,18 +179,17 @@ struct SelectivityStats {
 }
 
 impl SelectivityStats {
-    /// Returns the effectiveness as an opaque ordering score (higher = run first).
+    /// Returns the cumulative effectiveness as an opaque ordering score
+    /// (higher = run first).
     ///
-    /// Currently computed as bytes/sec throughput using self-contained stats.
+    /// Computed from `eff_mean` so it matches the Welford-tracked metric
+    /// fed to CI bounds: per-batch scatter-aware bytes-saved-per-second.
     /// Callers should not assume the unit.
     fn effectiveness(&self) -> Option<f64> {
-        if self.rows_total == 0 || self.eval_nanos == 0 || self.bytes_seen == 0 {
+        if self.sample_count == 0 {
             return None;
         }
-        let rows_pruned = self.rows_total - self.rows_matched;
-        let bytes_per_row = self.bytes_seen as f64 / self.rows_total as f64;
-        let bytes_saved = rows_pruned as f64 * bytes_per_row;
-        Some(bytes_saved * 1_000_000_000.0 / self.eval_nanos as f64)
+        Some(self.eff_mean)
     }
 
     /// Returns the lower bound of a confidence interval on mean effectiveness.
@@ -151,28 +219,28 @@ impl SelectivityStats {
     }
 
     /// Update stats with new observations.
-    fn update(&mut self, matched: u64, total: u64, eval_nanos: u64, batch_bytes: u64) {
+    ///
+    /// `skippable_bytes` is the caller's already-computed estimate of
+    /// non-filter projection bytes that late-materialization would
+    /// actually save for this batch — see [`count_skippable_bytes`] for
+    /// the windowed scatter calculation. The Welford accumulator tracks
+    /// `skippable_bytes × 1e9 / eval_nanos` (= scatter-aware
+    /// bytes-saved-per-second), which is what the promote/demote
+    /// gates compare against `min_bytes_per_sec`.
+    fn update(
+        &mut self,
+        matched: u64,
+        total: u64,
+        eval_nanos: u64,
+        skippable_bytes: u64,
+    ) {
         self.rows_matched += matched;
         self.rows_total += total;
         self.eval_nanos += eval_nanos;
-        self.bytes_seen += batch_bytes;
+        self.bytes_seen += skippable_bytes;
 
-        // Feed Welford's algorithm with per-batch effectiveness. We admit
-        // samples with `batch_bytes == 0` — that legitimately represents a
-        // filter whose projection is a subset of its referenced columns, so
-        // late materialization has nothing to save even when the filter
-        // does prune rows. Recording `batch_eff = 0` for such batches lets
-        // the mid-stream skip path detect "CPU spent, no late-
-        // materialization payoff" and drop the filter if it is optional.
         if total > 0 && eval_nanos > 0 {
-            let rows_pruned = total - matched;
-            let bytes_per_row = if total > 0 {
-                batch_bytes as f64 / total as f64
-            } else {
-                0.0
-            };
-            let batch_eff =
-                (rows_pruned as f64 * bytes_per_row) * 1e9 / eval_nanos as f64;
+            let batch_eff = skippable_bytes as f64 * 1e9 / eval_nanos as f64;
 
             self.sample_count += 1;
             let delta = batch_eff - self.eff_mean;
@@ -875,40 +943,27 @@ impl SelectivityTrackerInner {
                     row_filters.push((id, expr));
                 }
                 FilterState::PostScan => {
-                    // Should we promote this filter based on CI lower bound?
-                    //
-                    // Two gates:
-                    // 1. CI lower bound on bytes-saved-per-sec ≥
-                    //    `min_bytes_per_sec` — the historical metric.
-                    // 2. The filter actually prunes a meaningful fraction
-                    //    of its input. Without this gate, a fast,
-                    //    *un*-selective filter (e.g.
-                    //    `MobilePhoneModel <> ''` where ~70% of rows
-                    //    pass) racks up enough bytes/sec to clear the
-                    //    threshold, gets promoted, and then loses to
-                    //    post-scan because row-level evaluation cost
-                    //    isn't recouped by saving ~30% of subsequent
-                    //    decode. ClickBench Q10/Q11/Q13/Q14/Q26 all
-                    //    pattern-match this. Gate at >= 50% pruning so
-                    //    the late-materialization payoff dominates the
-                    //    row-level CPU cost; highly-selective filters
-                    //    (Q23's `URL LIKE '%google%'`, Q22's `Title
-                    //    LIKE '%Google%'`) easily clear it.
+                    // Promote when the CI lower bound on the
+                    // *scatter-aware* bytes-saved-per-sec metric clears
+                    // `min_bytes_per_sec`. The metric counts only
+                    // batches that the filter prunes *entirely* —
+                    // those are the batches whose other-projection-
+                    // column decode work the row-level path would
+                    // actually skip. So the gate naturally fails for
+                    // un-clustered moderately-selective filters (where
+                    // every batch keeps at least one survivor and the
+                    // RowSelection-based scatter loses to a contiguous
+                    // post-scan read) and passes for clustered/very-
+                    // selective filters (TopK, hash-join, Title LIKE
+                    // '%Google%') where most batches drop entirely.
                     if let Some(entry) = stats_map.get(&id) {
                         let stats = entry.lock();
-                        let prune_rate = if stats.rows_total > 0 {
-                            (stats.rows_total - stats.rows_matched) as f64
-                                / stats.rows_total as f64
-                        } else {
-                            0.0
-                        };
                         if let Some(lb) = stats.confidence_lower_bound(confidence_z)
                             && lb >= config.min_bytes_per_sec
-                            && prune_rate >= 0.99
                         {
                             drop(stats);
                             debug!(
-                                "FilterId {id}: Post-scan → Row filter via CI lower bound {lb} >= {} bytes/sec, prune_rate {prune_rate:.4} >= 0.99 — {expr}",
+                                "FilterId {id}: Post-scan → Row filter via CI lower bound {lb} >= {} bytes/sec — {expr}",
                                 config.min_bytes_per_sec
                             );
                             self.promote(id, expr, &mut row_filters, stats_map);

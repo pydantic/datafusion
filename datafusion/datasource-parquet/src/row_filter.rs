@@ -225,22 +225,26 @@ impl ArrowPredicate for DatafusionArrowPredicate {
         match result {
             Ok((bool_arr, num_matched)) => {
                 let eval_nanos = start_nanos.elapsed().as_nanos() as u64;
-                // Report *late-materialization savings* (bytes of non-filter
-                // projection columns the decoder would have had to read for
-                // each pruned row), matching the post-scan path. This is the
-                // quantity the SelectivityTracker converts into the
-                // "bytes saved per second of evaluation time" effectiveness
-                // metric. Reporting the filter's own byte cost instead
-                // would invert the promote/demote rankings.
-                let batch_bytes = (rows_in_batch as f64
+                // Scatter-aware skippable bytes: same units as the
+                // post-scan path (see `apply_post_scan_filters_with_stats`).
+                // At row-level this is a conservative *measurement* of
+                // what the decoder skipped — it counts only fully-empty
+                // sub-windows and ignores the additional savings from
+                // within-window RowSelection narrowing, which biases
+                // the demote-or-not decision in the safe direction.
+                let total_other_bytes = (rows_in_batch as f64
                     * self.other_projected_bytes_per_row)
                     .round() as u64;
+                let skippable_bytes = crate::selectivity::count_skippable_bytes(
+                    &bool_arr,
+                    total_other_bytes,
+                );
                 self.tracker.update(
                     self.filter_id,
                     num_matched as u64,
                     rows_in_batch as u64,
                     eval_nanos,
-                    batch_bytes,
+                    skippable_bytes,
                 );
                 Ok(bool_arr)
             }
