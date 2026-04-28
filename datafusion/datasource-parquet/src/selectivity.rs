@@ -781,30 +781,40 @@ impl SelectivityTrackerInner {
             let state = self.filter_states.get(&id).copied();
 
             let Some(state) = state else {
-                // New filter: decide initial placement using the
-                // **extra**-bytes / projection-bytes ratio. The numerator
-                // is bytes for filter columns *not already in the user
-                // projection* — those are the only ones that cost extra
-                // I/O to push the filter to row-level, since columns that
-                // are already in the projection get decoded anyway.
+                // New filter: decide initial placement.
                 //
-                // - Low ratio (filter pulls in little or no extra I/O):
-                //   row-filter is essentially free; late materialization
-                //   skips the rest of the projection for pruned rows.
+                // We start at row-level only when the filter pulls in a
+                // small amount of *extra* I/O — bytes for filter columns
+                // **not already in the user projection** — relative to the
+                // projection. These are the cases where the row-level
+                // I/O cost is bounded and late materialization on a
+                // selective filter is a clear win (think a small int
+                // column predicate against a heavy string projection).
                 //
-                // - High ratio (filter would pull in lots of extra I/O):
-                //   even a modestly selective filter may not save enough
-                //   downstream decode to pay for the extra columns;
-                //   start at post-scan and let the tracker promote it
-                //   later if measured throughput justifies it.
+                // Two cases default to post-scan instead, with the
+                // tracker free to promote later if measured
+                // bytes-saved-per-sec exceeds `min_bytes_per_sec`:
                 //
-                // Why this differs from a naive `filter_bytes /
-                // projection_bytes` ratio: queries like
-                // `SELECT col, COUNT(*) ... GROUP BY col WHERE col <> ''`
-                // have the filter column already in the projection. Naive
-                // ratio gives `col_bytes / col_bytes ≈ 1.0` and pushes
-                // such filters to post-scan even though row-level would
-                // be strictly better.
+                // - `extra_bytes == 0`: filter cols are entirely in the
+                //   projection (e.g. `WHERE col <> '' GROUP BY col`).
+                //   There's no I/O to save; the only payoff is late
+                //   materialization on the *non*-filter projection
+                //   columns, which depends on selectivity we don't know
+                //   yet. Empirically (ClickBench Q10/11/13/14/26)
+                //   defaulting these to row-level loses to post-scan
+                //   because predicate-cache eviction on heavy string
+                //   columns means the filter column is decoded twice.
+                //
+                // - `byte_ratio > byte_ratio_threshold`: extra I/O is
+                //   too high to justify before we have evidence the
+                //   filter is selective.
+                //
+                // Pre-existing snapshot-generation handling
+                // ([`SelectivityTrackerInner::note_generation`]) keeps
+                // dynamic filters (hash-join, TopK) at post-scan when
+                // they re-arm with new values — those rely on row-group
+                // statistics pruning rather than row-level I/O savings,
+                // so post-scan is correct for them too.
                 let filter_columns: Vec<usize> = collect_columns(&expr)
                     .iter()
                     .map(|col| col.index())
@@ -827,17 +837,18 @@ impl SelectivityTrackerInner {
                     new_optional_flags.push((id, is_optional_filter(&expr)));
                 }
 
-                if byte_ratio <= config.byte_ratio_threshold {
+                let row_level =
+                    extra_bytes > 0 && byte_ratio <= config.byte_ratio_threshold;
+                if row_level {
                     debug!(
-                        "FilterId {id}: New filter → Row filter (byte_ratio {byte_ratio:.4} <= {}) — {expr}",
+                        "FilterId {id}: New filter → Row filter (byte_ratio {byte_ratio:.4} <= {}, extra_bytes={extra_bytes}) — {expr}",
                         config.byte_ratio_threshold
                     );
                     self.filter_states.insert(id, FilterState::RowFilter);
                     row_filters.push((id, expr));
                 } else {
                     debug!(
-                        "FilterId {id}: New filter → Post-scan (byte_ratio {byte_ratio:.4} > {}) — {expr}",
-                        config.byte_ratio_threshold
+                        "FilterId {id}: New filter → Post-scan (byte_ratio {byte_ratio:.4}, extra_bytes={extra_bytes}) — {expr}",
                     );
                     self.filter_states.insert(id, FilterState::PostScan);
                     post_scan_filters.push((id, expr));
