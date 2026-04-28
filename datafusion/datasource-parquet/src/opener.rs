@@ -1380,7 +1380,6 @@ impl RowGroupsPrunedParquetOpen {
                 post_scan_filters,
                 post_scan_other_bytes_per_row,
                 filter_apply_time,
-                batches_seen: 0,
                 projector,
                 output_schema,
                 replace_schema,
@@ -1474,13 +1473,6 @@ struct AdaptiveParquetStream {
     /// so promote/demote rankings compare on a single axis.
     post_scan_other_bytes_per_row: Vec<f64>,
     filter_apply_time: datafusion_physical_plan::metrics::Time,
-    /// Monotonic batch counter used to gate per-batch tracker
-    /// bookkeeping (`Instant` + `Mutex<SelectivityStats>` lock). At
-    /// 12-partition scale every partition contends on the same
-    /// per-filter mutex, so sampling 1-in-32 batches ends up faster
-    /// than running the full path every batch. The Welford
-    /// accumulator still gets enough samples to converge over a query.
-    batches_seen: u64,
     projector: Projector,
     output_schema: Arc<Schema>,
     replace_schema: bool,
@@ -1572,9 +1564,7 @@ impl AdaptiveParquetStream {
                     &self.post_scan_filters,
                     &self.post_scan_other_bytes_per_row,
                     &self.tracker,
-                    self.batches_seen,
                 );
-                self.batches_seen = self.batches_seen.wrapping_add(1);
                 self.filter_apply_time.add_elapsed(start);
                 r
             };
@@ -1734,7 +1724,6 @@ fn apply_post_scan_filters_with_stats(
     filters: &[(crate::selectivity::FilterId, Arc<dyn PhysicalExpr>)],
     other_bytes_per_row: &[f64],
     tracker: &crate::selectivity::SelectivityTracker,
-    batches_seen: u64,
 ) -> Result<RecordBatch> {
     use arrow::array::BooleanArray;
     use arrow::compute::{and, filter_record_batch};
@@ -1757,46 +1746,28 @@ fn apply_post_scan_filters_with_stats(
             continue;
         }
 
-        // Per-batch tracker bookkeeping. We sample the
-        // `Instant + tracker.update` path 1-in-N batches: locally the
-        // single-process measurement makes the un-sampled version
-        // look fine, but on a 12-core GKE bench every partition
-        // contends on the same per-filter `Mutex<SelectivityStats>`,
-        // and the lock contention dominates. Sampling preserves
-        // enough Welford samples to converge while keeping the hot
-        // path lightweight. Always sample the *first* batch on each
-        // partition so a fast-finishing query still produces a
-        // well-defined CI bound for its filters.
-        const STATS_SAMPLE_INTERVAL: u64 = 32;
-        let sample = batches_seen
-            .wrapping_add(i as u64)
-            .is_multiple_of(STATS_SAMPLE_INTERVAL);
+        // Per-batch tracker bookkeeping. We measure every batch (no
+        // sampling): the `Instant + tracker.update` path is hot, but
+        // skipping samples delays first-promotion by N× and that
+        // dominates the steady-state lock contention on
+        // strongly-selective queries (Q22 / Q23 / Q24). The Welford
+        // accumulator converges within the first row group either way.
+        let start = datafusion_common::instant::Instant::now();
+        let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let bool_arr = as_boolean_array(result.as_ref())?;
+        let nanos = start.elapsed().as_nanos() as u64;
+        let num_matched = bool_arr.true_count() as u64;
 
-        let result;
-        let bool_arr;
-        let num_matched;
-        if sample {
-            let start = datafusion_common::instant::Instant::now();
-            result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
-            bool_arr = as_boolean_array(result.as_ref())?;
-            let nanos = start.elapsed().as_nanos() as u64;
-            num_matched = bool_arr.true_count() as u64;
-
-            // Convert the raw "all the non-filter projection bytes for
-            // this batch" into a *scatter-aware* skippable count: only
-            // the sub-windows of the bool array with zero survivors
-            // represent decode work that late-materialization would
-            // actually skip. A 50% filter on uniform data scores 0
-            // here; a 50% filter on contiguous data scores ~0.5.
-            let total_other_bytes = (other_bytes_per_row[i] * input_rows as f64) as u64;
-            let skippable_bytes =
-                crate::selectivity::count_skippable_bytes(bool_arr, total_other_bytes);
-            tracker.update(*id, num_matched, input_rows, nanos, skippable_bytes);
-        } else {
-            result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
-            bool_arr = as_boolean_array(result.as_ref())?;
-            num_matched = bool_arr.true_count() as u64;
-        }
+        // Convert the raw "all the non-filter projection bytes for
+        // this batch" into a *scatter-aware* skippable count: only
+        // the sub-windows of the bool array with zero survivors
+        // represent decode work that late-materialization would
+        // actually skip. A 50% filter on uniform data scores 0
+        // here; a 50% filter on contiguous data scores ~0.5.
+        let total_other_bytes = (other_bytes_per_row[i] * input_rows as f64) as u64;
+        let skippable_bytes =
+            crate::selectivity::count_skippable_bytes(bool_arr, total_other_bytes);
+        tracker.update(*id, num_matched, input_rows, nanos, skippable_bytes);
 
         if num_matched < input_rows {
             combined_mask = Some(match combined_mask {
