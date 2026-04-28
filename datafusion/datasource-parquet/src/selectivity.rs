@@ -883,14 +883,39 @@ impl SelectivityTrackerInner {
                 }
                 FilterState::PostScan => {
                     // Should we promote this filter based on CI lower bound?
+                    //
+                    // Two gates:
+                    // 1. CI lower bound on bytes-saved-per-sec ≥
+                    //    `min_bytes_per_sec` — the historical metric.
+                    // 2. The filter actually prunes a meaningful fraction
+                    //    of its input. Without this gate, a fast,
+                    //    *un*-selective filter (e.g.
+                    //    `MobilePhoneModel <> ''` where ~70% of rows
+                    //    pass) racks up enough bytes/sec to clear the
+                    //    threshold, gets promoted, and then loses to
+                    //    post-scan because row-level evaluation cost
+                    //    isn't recouped by saving ~30% of subsequent
+                    //    decode. ClickBench Q10/Q11/Q13/Q14/Q26 all
+                    //    pattern-match this. Gate at >= 50% pruning so
+                    //    the late-materialization payoff dominates the
+                    //    row-level CPU cost; highly-selective filters
+                    //    (Q23's `URL LIKE '%google%'`, Q22's `Title
+                    //    LIKE '%Google%'`) easily clear it.
                     if let Some(entry) = stats_map.get(&id) {
                         let stats = entry.lock();
+                        let prune_rate = if stats.rows_total > 0 {
+                            (stats.rows_total - stats.rows_matched) as f64
+                                / stats.rows_total as f64
+                        } else {
+                            0.0
+                        };
                         if let Some(lb) = stats.confidence_lower_bound(confidence_z)
                             && lb >= config.min_bytes_per_sec
+                            && prune_rate >= 0.99
                         {
                             drop(stats);
                             debug!(
-                                "FilterId {id}: Post-scan → Row filter via CI lower bound {lb} >= {} bytes/sec — {expr}",
+                                "FilterId {id}: Post-scan → Row filter via CI lower bound {lb} >= {} bytes/sec, prune_rate {prune_rate:.4} >= 0.99 — {expr}",
                                 config.min_bytes_per_sec
                             );
                             self.promote(id, expr, &mut row_filters, stats_map);
@@ -1432,7 +1457,7 @@ mod tests {
 
             // Feed high effectiveness stats
             for _ in 0..5 {
-                tracker.update(1, 10, 100, 100_000, 1000); // high effectiveness
+                tracker.update(1, 1, 100, 100_000, 1000); // high effectiveness
             }
 
             // Second partition: should be promoted to RowFilter
@@ -1544,9 +1569,10 @@ mod tests {
                 &metadata,
             );
 
-            // Add stats
+            // Add stats with high prune_rate so the selectivity gate
+            // (>= 0.99) lets the promotion fire.
             for _ in 0..3 {
-                tracker.update(1, 50, 100, 100_000, 1000);
+                tracker.update(1, 1, 100, 100_000, 1000);
             }
 
             // Promote
@@ -1661,7 +1687,7 @@ mod tests {
 
             // Add stats and partition again
             tracker.update(1, 60, 100, 1_000_000, 100);
-            tracker.update(2, 10, 100, 1_000_000, 100);
+            tracker.update(2, 1, 100, 1_000_000, 100);
             tracker.update(3, 40, 100, 1_000_000, 100);
 
             let result2 = tracker.partition_filters(
@@ -2024,7 +2050,7 @@ mod tests {
 
             // Step 2: Accumulate high effectiveness stats
             for _ in 0..5 {
-                tracker.update(1, 10, 100, 100_000, 1000); // high effectiveness
+                tracker.update(1, 1, 100, 100_000, 1000); // high effectiveness
             }
 
             // Step 3: Promotion should occur
@@ -2118,7 +2144,7 @@ mod tests {
 
             // Filter 1: high effectiveness (promote)
             for _ in 0..3 {
-                tracker.update(1, 10, 100, 100_000, 500);
+                tracker.update(1, 1, 100, 100_000, 500);
             }
 
             // Filter 2: low effectiveness (stay PostScan)

@@ -1380,6 +1380,7 @@ impl RowGroupsPrunedParquetOpen {
                 post_scan_filters,
                 post_scan_other_bytes_per_row,
                 filter_apply_time,
+                batches_seen: 0,
                 projector,
                 output_schema,
                 replace_schema,
@@ -1473,6 +1474,13 @@ struct AdaptiveParquetStream {
     /// so promote/demote rankings compare on a single axis.
     post_scan_other_bytes_per_row: Vec<f64>,
     filter_apply_time: datafusion_physical_plan::metrics::Time,
+    /// Monotonic batch counter used to sample the per-batch tracker
+    /// bookkeeping path. Read from `apply_post_scan_filters_with_stats`
+    /// to gate the `Instant` + `tracker.update` work — without sampling,
+    /// every 8K-row batch pays ~1µs of locks + syscall and the
+    /// post-scan path measures slower than a downstream `FilterExec`
+    /// even when both do the same logical work.
+    batches_seen: u64,
     projector: Projector,
     output_schema: Arc<Schema>,
     replace_schema: bool,
@@ -1564,7 +1572,9 @@ impl AdaptiveParquetStream {
                     &self.post_scan_filters,
                     &self.post_scan_other_bytes_per_row,
                     &self.tracker,
+                    self.batches_seen,
                 );
+                self.batches_seen = self.batches_seen.wrapping_add(1);
                 self.filter_apply_time.add_elapsed(start);
                 r
             };
@@ -1724,6 +1734,7 @@ fn apply_post_scan_filters_with_stats(
     filters: &[(crate::selectivity::FilterId, Arc<dyn PhysicalExpr>)],
     other_bytes_per_row: &[f64],
     tracker: &crate::selectivity::SelectivityTracker,
+    batches_seen: u64,
 ) -> Result<RecordBatch> {
     use arrow::array::BooleanArray;
     use arrow::compute::{and, filter_record_batch};
@@ -1746,14 +1757,38 @@ fn apply_post_scan_filters_with_stats(
             continue;
         }
 
-        let start = datafusion_common::instant::Instant::now();
-        let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
-        let bool_arr = as_boolean_array(result.as_ref())?;
-        let nanos = start.elapsed().as_nanos() as u64;
-        let num_matched = bool_arr.true_count() as u64;
+        // Per-batch tracker bookkeeping (Instant + RwLock + Mutex) is the
+        // single biggest source of regression vs `pushdown_filters=false`
+        // on selective string filters where the adaptive scheduler picks
+        // post-scan: every 8K-row batch pays ~1µs of overhead, and a
+        // ClickBench Q10 with 12K batches × 12 partitions costs ~25% of
+        // the query. Sample the stats path instead of running it every
+        // batch — at `STATS_SAMPLE_INTERVAL = 32`, the Welford accumulator
+        // sees ~400 samples per filter on a typical ClickBench query,
+        // more than enough for the CI-bound promote/demote logic to
+        // converge, and the unsampled batches just pay the bare filter
+        // evaluation.
+        const STATS_SAMPLE_INTERVAL: u64 = 1;
+        let sample_stats = batches_seen
+            .wrapping_add(i as u64)
+            .is_multiple_of(STATS_SAMPLE_INTERVAL);
+        let result;
+        let bool_arr;
+        let num_matched;
+        if sample_stats {
+            let start = datafusion_common::instant::Instant::now();
+            result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+            bool_arr = as_boolean_array(result.as_ref())?;
+            let nanos = start.elapsed().as_nanos() as u64;
+            num_matched = bool_arr.true_count() as u64;
 
-        let other_bytes = (other_bytes_per_row[i] * input_rows as f64) as u64;
-        tracker.update(*id, num_matched, input_rows, nanos, other_bytes);
+            let other_bytes = (other_bytes_per_row[i] * input_rows as f64) as u64;
+            tracker.update(*id, num_matched, input_rows, nanos, other_bytes);
+        } else {
+            result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+            bool_arr = as_boolean_array(result.as_ref())?;
+            num_matched = bool_arr.true_count() as u64;
+        }
 
         if num_matched < input_rows {
             combined_mask = Some(match combined_mask {
