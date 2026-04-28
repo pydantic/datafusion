@@ -1134,23 +1134,22 @@ impl RowGroupsPrunedParquetOpen {
         // based on stats accumulated across earlier files. The same split
         // is re-evaluated mid-stream at row-group boundaries via
         // `AdaptiveParquetStream::maybe_swap_strategy`.
-        let projection_compressed_bytes = {
-            // User-projection bytes only — the heuristic compares filter
-            // column bytes against this to decide initial placement.
-            let projection_columns: Vec<usize> =
-                datafusion_physical_expr::utils::collect_columns(
-                    &datafusion_physical_expr::conjunction(
-                        prepared.projection.expr_iter(),
-                    ),
-                )
-                .iter()
-                .map(|c| c.index())
-                .collect();
-            row_filter::total_compressed_bytes(
-                &projection_columns,
-                file_metadata.as_ref(),
+        //
+        // The set of leaf-column indices in the user projection — passed
+        // to the tracker so its byte-ratio heuristic only counts filter
+        // columns *not already in the projection* (a column that's in
+        // the projection costs zero extra I/O to push down).
+        let projection_columns: std::collections::HashSet<usize> =
+            datafusion_physical_expr::utils::collect_columns(
+                &datafusion_physical_expr::conjunction(prepared.projection.expr_iter()),
             )
-        };
+            .iter()
+            .map(|c| c.index())
+            .collect();
+        let projection_compressed_bytes = row_filter::total_compressed_bytes(
+            &projection_columns.iter().copied().collect::<Vec<_>>(),
+            file_metadata.as_ref(),
+        );
 
         let (row_filter_conjuncts, mut post_scan_conjuncts) = if prepared.pushdown_filters
             && let Some(conjuncts) = prepared.predicate_conjuncts.clone()
@@ -1158,6 +1157,7 @@ impl RowGroupsPrunedParquetOpen {
         {
             let partitioned = prepared.selectivity_tracker.partition_filters(
                 conjuncts,
+                &projection_columns,
                 projection_compressed_bytes,
                 file_metadata.as_ref(),
             );
@@ -1248,16 +1248,29 @@ impl RowGroupsPrunedParquetOpen {
         let arrow_reader_metrics = ArrowReaderMetrics::enabled();
 
         // Build the decoder's projection over the UNION of the user
-        // projection and every post-scan filter's columns, so that
-        // post-scan filters can be evaluated against the wide batch the
-        // decoder produces. Filter-only columns are stripped when the
-        // projector is applied. The mask is fixed for the file (we don't
-        // narrow it on swap) so the projector's input schema stays stable.
+        // projection and **every** predicate conjunct's columns, regardless
+        // of whether each conjunct is currently row-level or post-scan.
+        //
+        // Why all conjuncts (not just post-scan): a mid-stream
+        // `maybe_swap_strategy` call can demote a row-level filter to
+        // post-scan when its measured throughput drops below
+        // `min_bytes_per_sec`. The decoder's projection mask is fixed for
+        // the file (we don't grow it on swap), so any column that *might*
+        // be referenced by a post-scan filter at some point during the
+        // file must already be in the mask — otherwise the post-scan
+        // rebase fails with a schema-lookup error.
+        //
+        // Filter-only columns are stripped when the projector runs after
+        // post-scan filters, so the user-visible output schema is
+        // unchanged.
         let read_plan = build_projection_read_plan(
-            prepared
-                .projection
-                .expr_iter()
-                .chain(post_scan_conjuncts.iter().map(|(_, expr)| Arc::clone(expr))),
+            prepared.projection.expr_iter().chain(
+                prepared
+                    .predicate_conjuncts
+                    .iter()
+                    .flatten()
+                    .map(|(_, expr)| Arc::clone(expr)),
+            ),
             &prepared.physical_file_schema,
             reader_metadata.parquet_schema(),
         );
@@ -1361,6 +1374,7 @@ impl RowGroupsPrunedParquetOpen {
                 file_metrics: prepared.file_metrics.clone(),
                 tracker: Arc::clone(&prepared.selectivity_tracker),
                 all_conjuncts: prepared.predicate_conjuncts.unwrap_or_default(),
+                projection_columns,
                 projection_compressed_bytes,
                 active_row_filter_ids,
                 post_scan_filters,
@@ -1439,6 +1453,11 @@ struct AdaptiveParquetStream {
     /// FilterIds), re-fed to `partition_filters` at every row-group
     /// boundary.
     all_conjuncts: Vec<(crate::selectivity::FilterId, Arc<dyn PhysicalExpr>)>,
+    /// Leaf-column indices in the user projection — passed to the tracker
+    /// so its byte-ratio heuristic can subtract overlap with the
+    /// projection (a filter column already in the projection costs no
+    /// extra I/O at row-level).
+    projection_columns: std::collections::HashSet<usize>,
     /// Total compressed bytes for the user projection. Constant across
     /// the file; reused at every swap decision.
     projection_compressed_bytes: usize,
@@ -1585,6 +1604,7 @@ impl AdaptiveParquetStream {
         }
         let partitioned = self.tracker.partition_filters(
             self.all_conjuncts.clone(),
+            &self.projection_columns,
             self.projection_compressed_bytes,
             self.file_metadata.as_ref(),
         );

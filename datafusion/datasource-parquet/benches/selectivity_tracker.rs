@@ -131,7 +131,12 @@ fn warm_tracker(
     // Seed with a round-trip so HashMap entries exist; otherwise the first
     // bench iteration pays the "new filter" insertion cost and later ones
     // don't.
-    let _ = tracker.partition_filters(filters.to_vec(), 1_000_000, metadata);
+    let _ = tracker.partition_filters(
+        filters.to_vec(),
+        &std::collections::HashSet::new(),
+        1_000_000,
+        metadata,
+    );
     tracker
 }
 
@@ -193,6 +198,7 @@ fn bench_partition_filters(c: &mut Criterion) {
             |tracker| {
                 std::hint::black_box(tracker.partition_filters(
                     filters.clone(),
+                    &std::collections::HashSet::new(),
                     projection_bytes,
                     &metadata,
                 ));
@@ -208,6 +214,7 @@ fn bench_partition_filters(c: &mut Criterion) {
         b.iter(|| {
             std::hint::black_box(warm.partition_filters(
                 filters.clone(),
+                &std::collections::HashSet::new(),
                 projection_bytes,
                 &metadata,
             ));
@@ -228,6 +235,7 @@ fn bench_partition_filters(c: &mut Criterion) {
         b.iter(|| {
             std::hint::black_box(promoted.partition_filters(
                 filters.clone(),
+                &std::collections::HashSet::new(),
                 projection_bytes,
                 &metadata,
             ));
@@ -255,6 +263,7 @@ fn bench_file_scan_simulation(c: &mut Criterion) {
             for _morsel in 0..MORSELS_PER_FILE {
                 std::hint::black_box(warm.partition_filters(
                     filters.clone(),
+                    &std::collections::HashSet::new(),
                     projection_bytes,
                     &metadata,
                 ));
@@ -294,6 +303,7 @@ fn bench_query_simulation(c: &mut Criterion) {
                             for _morsel in 0..morsels_per_file {
                                 std::hint::black_box(tracker.partition_filters(
                                     filters.clone(),
+                                    &std::collections::HashSet::new(),
                                     projection_bytes,
                                     &metadata,
                                 ));
