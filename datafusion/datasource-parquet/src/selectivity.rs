@@ -943,27 +943,42 @@ impl SelectivityTrackerInner {
                     row_filters.push((id, expr));
                 }
                 FilterState::PostScan => {
-                    // Promote when the CI lower bound on the
-                    // *scatter-aware* bytes-saved-per-sec metric clears
-                    // `min_bytes_per_sec`. The metric counts only
-                    // batches that the filter prunes *entirely* —
-                    // those are the batches whose other-projection-
-                    // column decode work the row-level path would
-                    // actually skip. So the gate naturally fails for
-                    // un-clustered moderately-selective filters (where
-                    // every batch keeps at least one survivor and the
-                    // RowSelection-based scatter loses to a contiguous
-                    // post-scan read) and passes for clustered/very-
-                    // selective filters (TopK, hash-join, Title LIKE
-                    // '%Google%') where most batches drop entirely.
+                    // Two gates, both required:
+                    //
+                    // 1. Scatter-aware CI lower bound on
+                    //    bytes-saved-per-sec ≥ `min_bytes_per_sec`.
+                    //    The metric (see [`SelectivityStats::update`])
+                    //    counts only batches the filter empties out, so
+                    //    a 50% uniform filter scores ~0 and stays at
+                    //    post-scan; a TopK / hash-join / `Title LIKE`
+                    //    style filter where most batches drop entirely
+                    //    blows past the threshold.
+                    //
+                    // 2. Raw prune rate ≥ 99%. Belt-and-braces guard
+                    //    against marginal promotions: ClickBench data
+                    //    has columns with natural runs of empty values
+                    //    (`MobilePhoneModel`, `SearchPhrase`) that
+                    //    occasionally cluster enough to score positive
+                    //    on the scatter metric even though the filter's
+                    //    overall selectivity isn't high enough for
+                    //    row-level to win once we factor in the
+                    //    arrow-rs predicate-cache double-decode of
+                    //    heavy string columns.
                     if let Some(entry) = stats_map.get(&id) {
                         let stats = entry.lock();
+                        let prune_rate = if stats.rows_total > 0 {
+                            (stats.rows_total - stats.rows_matched) as f64
+                                / stats.rows_total as f64
+                        } else {
+                            0.0
+                        };
                         if let Some(lb) = stats.confidence_lower_bound(confidence_z)
                             && lb >= config.min_bytes_per_sec
+                            && prune_rate >= 0.99
                         {
                             drop(stats);
                             debug!(
-                                "FilterId {id}: Post-scan → Row filter via CI lower bound {lb} >= {} bytes/sec — {expr}",
+                                "FilterId {id}: Post-scan → Row filter via CI lower bound {lb} >= {} bytes/sec, prune_rate {prune_rate:.4} >= 0.99 — {expr}",
                                 config.min_bytes_per_sec
                             );
                             self.promote(id, expr, &mut row_filters, stats_map);
