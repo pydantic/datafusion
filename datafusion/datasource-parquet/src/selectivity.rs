@@ -36,11 +36,6 @@ use datafusion_physical_expr_common::physical_expr::{
 /// Stable identifier for a filter conjunct, assigned by `ParquetSource::with_predicate`.
 pub type FilterId = usize;
 
-/// Re-evaluate the per-filter skip flag every Nth batch update. The CI
-/// upper bound is a couple of arithmetic ops so this cap mostly serves to
-/// keep cache lines for `is_optional` / `skip_flags` cold on the hot path.
-const SKIP_FLAG_CHECK_INTERVAL: u64 = 4;
-
 /// Per-filter lifecycle state in the adaptive filter system.
 ///
 /// State transitions:
@@ -104,6 +99,14 @@ struct SelectivityStats {
     eff_mean: f64,
     /// Welford's online algorithm: running sum of squared deviations (M2)
     eff_m2: f64,
+    /// Whether the underlying expression is wrapped in
+    /// `OptionalFilterPhysicalExpr`. Cached here (rather than looked up
+    /// in [`SelectivityTracker::is_optional`]) so the per-batch hot path
+    /// in [`SelectivityTracker::update`] can skip the
+    /// SKIP_FLAG/CI-bound work entirely for non-optional filters with a
+    /// single field load on the already-held stats lock — no extra
+    /// HashMap or `RwLock::read()` per batch.
+    is_optional: bool,
 }
 
 impl SelectivityStats {
@@ -234,7 +237,6 @@ impl TrackerConfig {
             config: self,
             filter_stats: RwLock::new(HashMap::new()),
             skip_flags: RwLock::new(HashMap::new()),
-            is_optional: RwLock::new(HashMap::new()),
             inner: Mutex::new(SelectivityTrackerInner::new()),
         }
     }
@@ -369,14 +371,10 @@ pub struct SelectivityTracker {
     /// the filter columns (we cannot rebuild it mid-scan), so I/O is not
     /// reclaimed; only the predicate evaluation is skipped.
     ///
-    /// Only ever set for filters whose `is_optional` entry is `true` —
-    /// mandatory filters must always execute or queries return wrong rows.
+    /// Only ever set for filters whose `is_optional` flag (cached on the
+    /// per-filter [`SelectivityStats`]) is `true` — mandatory filters
+    /// must always execute or queries return wrong rows.
     skip_flags: RwLock<HashMap<FilterId, Arc<AtomicBool>>>,
-    /// Whether each filter is wrapped in an `OptionalFilterPhysicalExpr`,
-    /// captured at first-encounter in `partition_filters` so the per-batch
-    /// `update()` path can decide whether the filter is safe to no-op
-    /// without re-inspecting the expression tree on every batch.
-    is_optional: RwLock<HashMap<FilterId, bool>>,
     /// Filter lifecycle state machine and dynamic-filter generation tracking.
     ///
     /// Only `partition_filters()` acquires this lock (once per file open).
@@ -441,13 +439,22 @@ impl SelectivityTracker {
         let mut stats = entry.lock();
         stats.update(matched, total, eval_nanos, batch_bytes);
 
-        // Mid-stream drop check. Only consult the skip mechanism for
-        // filters we already know to be optional, and only after enough
-        // samples for `confidence_upper_bound` to be defined. The modulo
-        // gate keeps the per-batch overhead tiny on the hot path.
-        if !self.config.min_bytes_per_sec.is_finite()
-            || !stats.sample_count.is_multiple_of(SKIP_FLAG_CHECK_INTERVAL)
-        {
+        // Fast path for non-optional filters: nothing else to do. The
+        // SKIP_FLAG mid-stream drop only applies to
+        // `OptionalFilterPhysicalExpr`-wrapped filters (hash-join /
+        // TopK dynamic), and `is_optional` is cached inline on
+        // `SelectivityStats` at filter registration so this is a single
+        // field load on the already-held lock.
+        if !stats.is_optional {
+            return;
+        }
+
+        // Optional filter: do the SKIP_FLAG check every batch — there's
+        // no SKIP_FLAG_CHECK_INTERVAL gate here on purpose. We want
+        // join/TopK skip flags to fire as soon as stats prove the
+        // filter's selectivity has collapsed, even mid-row-group. The
+        // CI-bound calc is cheap arithmetic on already-locked stats.
+        if !self.config.min_bytes_per_sec.is_finite() {
             return;
         }
         let Some(ub) = stats.confidence_upper_bound(self.config.confidence_z) else {
@@ -459,12 +466,6 @@ impl SelectivityTracker {
         drop(stats);
         drop(stats_map);
 
-        // Optionality is captured at first sight in `partition_filters` so
-        // we can answer this without re-walking the expression tree.
-        let is_optional = self.is_optional.read().get(&id).copied().unwrap_or(false);
-        if !is_optional {
-            return;
-        }
         if let Some(flag) = self.skip_flags.read().get(&id)
             && !flag.swap(true, Ordering::Release)
         {
@@ -539,20 +540,21 @@ impl SelectivityTracker {
         drop(stats_map);
         drop(guard);
 
-        // Phase 2: if new filters were seen, briefly acquire write lock to insert entries
-        if !result.new_filter_ids.is_empty() {
-            let mut stats_write = self.filter_stats.write();
-            for id in &result.new_filter_ids {
-                stats_write
-                    .entry(*id)
-                    .or_insert_with(|| Mutex::new(SelectivityStats::default()));
-            }
-        }
+        // Phase 2: if new filters were seen, briefly acquire write locks
+        // to insert per-filter `Mutex<SelectivityStats>` (with
+        // `is_optional` cached inline so the per-batch `update()` hot
+        // path can fast-return for mandatory filters) and an
+        // `AtomicBool` skip-flag (only consulted for optional filters).
         if !result.new_optional_flags.is_empty() {
-            let mut optional_write = self.is_optional.write();
+            let mut stats_write = self.filter_stats.write();
             let mut skip_write = self.skip_flags.write();
             for (id, is_optional) in result.new_optional_flags {
-                optional_write.entry(id).or_insert(is_optional);
+                stats_write.entry(id).or_insert_with(|| {
+                    Mutex::new(SelectivityStats {
+                        is_optional,
+                        ..Default::default()
+                    })
+                });
                 skip_write
                     .entry(id)
                     .or_insert_with(|| Arc::new(AtomicBool::new(false)));
@@ -580,18 +582,15 @@ impl SelectivityTracker {
 
 /// Internal result from [`SelectivityTrackerInner::partition_filters`].
 ///
-/// Carries both the partitioned filters and a list of newly-seen filter IDs
-/// back to the outer [`SelectivityTracker::partition_filters`], which uses
-/// `new_filter_ids` to insert per-filter `Mutex` entries into `filter_stats`
+/// Carries both the partitioned filters and the `(FilterId, is_optional)`
+/// entries seen for the first time, so the outer
+/// [`SelectivityTracker::partition_filters`] can insert per-filter
+/// `Mutex<SelectivityStats>` entries (with `is_optional` cached inline)
 /// in a brief Phase 2 write lock.
 struct PartitionResult {
     partitioned: PartitionedFilters,
-    new_filter_ids: Vec<FilterId>,
-    /// `(FilterId, is_optional)` entries observed for the first time in this
-    /// `partition_filters` call. The outer `SelectivityTracker` records
-    /// optionality alongside `filter_stats` so that the hot `update()` path
-    /// can decide whether the per-filter skip flag is safe to flip without
-    /// inspecting the expression tree.
+    /// `(FilterId, is_optional)` entries observed for the first time in
+    /// this `partition_filters` call.
     new_optional_flags: Vec<(FilterId, bool)>,
 }
 
@@ -716,7 +715,6 @@ impl SelectivityTrackerInner {
         config: &TrackerConfig,
         stats_map: &HashMap<FilterId, Mutex<SelectivityStats>>,
     ) -> PartitionResult {
-        let mut new_filter_ids = Vec::new();
         let mut new_optional_flags: Vec<(FilterId, bool)> = Vec::new();
 
         // If min_bytes_per_sec is INFINITY -> all filters are post-scan.
@@ -728,7 +726,6 @@ impl SelectivityTrackerInner {
             // Register all filter IDs so update() can find them
             for (id, expr) in &filters {
                 if !stats_map.contains_key(id) {
-                    new_filter_ids.push(*id);
                     new_optional_flags.push((*id, is_optional_filter(expr)));
                 }
             }
@@ -737,7 +734,6 @@ impl SelectivityTrackerInner {
                     row_filters: Vec::new(),
                     post_scan: filters,
                 },
-                new_filter_ids,
                 new_optional_flags,
             };
         }
@@ -750,7 +746,6 @@ impl SelectivityTrackerInner {
             // Register all filter IDs so update() can find them
             for (id, expr) in &filters {
                 if !stats_map.contains_key(id) {
-                    new_filter_ids.push(*id);
                     new_optional_flags.push((*id, is_optional_filter(expr)));
                 }
             }
@@ -759,7 +754,6 @@ impl SelectivityTrackerInner {
                     row_filters: filters,
                     post_scan: Vec::new(),
                 },
-                new_filter_ids,
                 new_optional_flags,
             };
         }
@@ -833,7 +827,6 @@ impl SelectivityTrackerInner {
                 };
 
                 if !stats_map.contains_key(&id) {
-                    new_filter_ids.push(id);
                     new_optional_flags.push((id, is_optional_filter(&expr)));
                 }
 
@@ -980,7 +973,6 @@ impl SelectivityTrackerInner {
                 row_filters,
                 post_scan: post_scan_filters,
             },
-            new_filter_ids,
             new_optional_flags,
         }
     }
