@@ -45,13 +45,14 @@ use std::sync::Arc;
 
 // create a Union(Int32, Utf8) sparse union array
 fn create_sparse_union_array(values: Vec<UnionValue>) -> UnionArray {
-    let union_fields = UnionFields::new(
+    let union_fields = UnionFields::try_new(
         vec![0, 1],
         vec![
             Field::new("int", DataType::Int32, true),
             Field::new("str", DataType::Utf8, true),
         ],
-    );
+    )
+    .unwrap();
 
     let mut int_values = Vec::new();
     let mut str_values = Vec::new();
@@ -91,23 +92,22 @@ enum UnionValue {
     Str(Option<&'static str>),
 }
 
-// right now arrow does not support union cast support
-// maybe the right thing to do is add functionality there...
+// arrow now supports union cast natively (arrow-rs #9544, #9666)
 #[test]
 fn test_arrow_union_cast_support() {
-    let union_fields = UnionFields::new(
+    let union_fields = UnionFields::try_new(
         vec![0, 1],
         vec![
             Field::new("int", DataType::Int32, true),
             Field::new("str", DataType::Utf8, true),
         ],
-    );
+    )
+    .unwrap();
     let union_type = DataType::Union(union_fields, UnionMode::Sparse);
 
-    // Arrow doesn't support casting Union types natively
-    assert!(!can_cast_types(&union_type, &DataType::Int64));
-    assert!(!can_cast_types(&union_type, &DataType::Int32));
-    assert!(!can_cast_types(&union_type, &DataType::Utf8));
+    assert!(can_cast_types(&union_type, &DataType::Int64));
+    assert!(can_cast_types(&union_type, &DataType::Int32));
+    assert!(can_cast_types(&union_type, &DataType::Utf8));
 }
 
 #[tokio::test]
@@ -123,13 +123,14 @@ async fn test_union_eq_int32() -> Result<()> {
         Field::new(
             "val",
             DataType::Union(
-                UnionFields::new(
+                UnionFields::try_new(
                     vec![0, 1],
                     vec![
                         Field::new("int", DataType::Int32, true),
                         Field::new("str", DataType::Utf8, true),
                     ],
-                ),
+                )
+                .unwrap(),
                 UnionMode::Sparse,
             ),
             true,
@@ -171,13 +172,14 @@ async fn test_union_eq_string() -> Result<()> {
         Field::new(
             "val",
             DataType::Union(
-                UnionFields::new(
+                UnionFields::try_new(
                     vec![0, 1],
                     vec![
                         Field::new("int", DataType::Int32, true),
                         Field::new("str", DataType::Utf8, true),
                     ],
-                ),
+                )
+                .unwrap(),
                 UnionMode::Sparse,
             ),
             true,
@@ -218,13 +220,14 @@ async fn test_union_comparison_operators() -> Result<()> {
         Field::new(
             "val",
             DataType::Union(
-                UnionFields::new(
+                UnionFields::try_new(
                     vec![0, 1],
                     vec![
                         Field::new("int", DataType::Int32, true),
                         Field::new("str", DataType::Utf8, true),
                     ],
-                ),
+                )
+                .unwrap(),
                 UnionMode::Sparse,
             ),
             true,
@@ -283,13 +286,14 @@ async fn test_union_with_null_values() -> Result<()> {
         Field::new(
             "val",
             DataType::Union(
-                UnionFields::new(
+                UnionFields::try_new(
                     vec![0, 1],
                     vec![
                         Field::new("int", DataType::Int32, true),
                         Field::new("str", DataType::Utf8, true),
                     ],
-                ),
+                )
+                .unwrap(),
                 UnionMode::Sparse,
             ),
             true,
@@ -338,13 +342,14 @@ async fn test_union_non_matching_variants_are_null() -> Result<()> {
         Field::new(
             "val",
             DataType::Union(
-                UnionFields::new(
+                UnionFields::try_new(
                     vec![0, 1],
                     vec![
                         Field::new("int", DataType::Int32, true),
                         Field::new("str", DataType::Utf8, true),
                     ],
-                ),
+                )
+                .unwrap(),
                 UnionMode::Sparse,
             ),
             true,
@@ -388,13 +393,14 @@ async fn test_union_non_matching_variants_are_null() -> Result<()> {
 // when comparing Union(Int32, Utf8) with Int64, it finds the Int32 variant and casts it
 #[tokio::test]
 async fn test_union_cast_compatible_variant() -> Result<()> {
-    let union_fields = UnionFields::new(
+    let union_fields = UnionFields::try_new(
         vec![0, 1],
         vec![
             Field::new("int", DataType::Int32, true),
             Field::new("str", DataType::Utf8, true),
         ],
-    );
+    )
+    .unwrap();
 
     let union_array = create_sparse_union_array(vec![
         UnionValue::Int(Some(10)),
@@ -433,17 +439,17 @@ async fn test_union_cast_compatible_variant() -> Result<()> {
     Ok(())
 }
 
-// todo: this should also be fixed since arrow-ord now has support for union arrays...
-// test this with arrow pointed to main...
+/// Tests union-to-union equality comparison (supported via arrow-ord).
 #[tokio::test]
 async fn test_union_eq_same_union() -> Result<()> {
-    let union_fields = UnionFields::new(
+    let union_fields = UnionFields::try_new(
         vec![0, 1],
         vec![
             Field::new("int", DataType::Int32, true),
             Field::new("str", DataType::Utf8, true),
         ],
-    );
+    )
+    .unwrap();
 
     let union_array1 = create_sparse_union_array(vec![
         UnionValue::Int(Some(10)),
@@ -481,15 +487,12 @@ async fn test_union_eq_same_union() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_batch("test", batch)?;
 
-    let df = ctx
-        .sql("SELECT id FROM test WHERE val1 = val2")
-        .await
-        .unwrap();
+    // Row 1: Int(10) = Int(10) -> true; Row 2: Str("hello") = Str("world") -> false
+    let df = ctx.sql("SELECT id FROM test WHERE val1 = val2").await?;
+    let results = df.collect().await?;
 
-    let exec_result = df.collect().await;
-    assert!(exec_result.is_err());
-    let err = exec_result.unwrap_err();
-    assert!(err.to_string().contains("no natural order"),);
+    let expected = ["+----+", "| id |", "+----+", "| 1  |", "+----+"];
+    assert_batches_eq!(expected, &results);
 
     Ok(())
 }

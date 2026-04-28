@@ -510,76 +510,71 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
         //   - `metadata` — always needed (variant metadata dictionary)
         //   - `value` — always needed (fallback for non-shredded values)
         //   - `typed_value.<path...>` — the specific shredded field(s)
-        if let Some(func_expr) = node.downcast_ref::<ScalarFunctionExpr>() {
-            if is_variant_udf_name(func_expr.name()) {
-                if let Some(column) = func_expr
-                    .args()
-                    .first()
-                    .and_then(|a| a.downcast_ref::<Column>())
-                {
-                    let Ok(root_idx) = self.file_schema.index_of(column.name()) else {
-                        self.projected_columns = true;
-                        return Ok(TreeNodeRecursion::Jump);
-                    };
+        if let Some(func_expr) = node.downcast_ref::<ScalarFunctionExpr>()
+            && is_variant_udf_name(func_expr.name())
+            && let Some(column) = func_expr
+                .args()
+                .first()
+                .and_then(|a| a.downcast_ref::<Column>())
+        {
+            let Ok(root_idx) = self.file_schema.index_of(column.name()) else {
+                self.projected_columns = true;
+                return Ok(TreeNodeRecursion::Jump);
+            };
 
-                    // extract the variant path from the second argument.
-                    // it can be a string literal or a list of string literals.
-                    let variant_path: Option<Vec<String>> =
-                        func_expr.args().get(1).and_then(|arg| {
-                            let lit = arg.downcast_ref::<Literal>()?;
-                            match lit.value() {
-                                ScalarValue::Utf8(Some(s))
-                                | ScalarValue::Utf8View(Some(s))
-                                | ScalarValue::LargeUtf8(Some(s)) => {
-                                    Some(vec![s.to_string()])
-                                }
-                                ScalarValue::List(arr) if !arr.is_null(0) => {
-                                    let values = arr.value(0);
-                                    let strings =
-                                        values.as_any().downcast_ref::<StringArray>()?;
-                                    let path: Vec<String> = (0..strings.len())
-                                        .filter_map(|i| {
-                                            strings
-                                                .is_valid(i)
-                                                .then(|| strings.value(i).to_string())
-                                        })
-                                        .collect::<Vec<_>>();
-                                    Some(path)
-                                }
-                                _ => None,
-                            }
-                        });
-
-                    // record struct field accesses for the variant sub-fields:
-                    // metadata, value, and typed_value.<path>
-                    self.struct_field_accesses.push(StructFieldAccess {
-                        root_index: root_idx,
-                        field_path: vec!["metadata".to_string()],
-                    });
-                    self.struct_field_accesses.push(StructFieldAccess {
-                        root_index: root_idx,
-                        field_path: vec!["value".to_string()],
-                    });
-
-                    if let Some(path) = variant_path {
-                        // typed_value.<field1>.<field2>...
-                        let mut typed_value_path = vec!["typed_value".to_string()];
-                        typed_value_path.extend(path);
-                        self.struct_field_accesses.push(StructFieldAccess {
-                            root_index: root_idx,
-                            field_path: typed_value_path,
-                        });
-                    } else {
-                        // can't determine path statically — read entire typed_value
-                        self.struct_field_accesses.push(StructFieldAccess {
-                            root_index: root_idx,
-                            field_path: vec!["typed_value".to_string()],
-                        });
+            // extract the variant path from the second argument.
+            // it can be a string literal or a list of string literals.
+            let variant_path: Option<Vec<String>> =
+                func_expr.args().get(1).and_then(|arg| {
+                    let lit = arg.downcast_ref::<Literal>()?;
+                    match lit.value() {
+                        ScalarValue::Utf8(Some(s))
+                        | ScalarValue::Utf8View(Some(s))
+                        | ScalarValue::LargeUtf8(Some(s)) => {
+                            Some(vec![s.to_string()])
+                        }
+                        ScalarValue::List(arr) if !arr.is_null(0) => {
+                            let values = arr.value(0);
+                            let strings =
+                                values.as_any().downcast_ref::<StringArray>()?;
+                            let path = (0..strings.len())
+                                .filter(|&i| strings.is_valid(i))
+                                .map(|i| strings.value(i).to_string())
+                                .collect::<Vec<_>>();
+                            Some(path)
+                        }
+                        _ => None,
                     }
+                });
 
-                    return Ok(TreeNodeRecursion::Jump);
-                }
+            // record struct field accesses for the variant sub-fields:
+            // metadata, value, and typed_value.<path>
+            self.struct_field_accesses.push(StructFieldAccess {
+                root_index: root_idx,
+                field_path: vec!["metadata".to_string()],
+            });
+            self.struct_field_accesses.push(StructFieldAccess {
+                root_index: root_idx,
+                field_path: vec!["value".to_string()],
+            });
+
+            if let Some(path) = variant_path {
+                // typed_value.<field1>.<field2>...
+                let mut typed_value_path = vec!["typed_value".to_string()];
+                typed_value_path.extend(path);
+                self.struct_field_accesses.push(StructFieldAccess {
+                    root_index: root_idx,
+                    field_path: typed_value_path,
+                });
+            } else {
+                // can't determine path statically — read entire typed_value
+                self.struct_field_accesses.push(StructFieldAccess {
+                    root_index: root_idx,
+                    field_path: vec!["typed_value".to_string()],
+                });
             }
+
+            return Ok(TreeNodeRecursion::Jump);
         }
 
         if let Some(column) = node.downcast_ref::<Column>()

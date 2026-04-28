@@ -288,3 +288,22 @@ debug = false
 debug-assertions = false
 strip = "debuginfo"
 incremental = false
+
+[patch.crates-io]
+arrow = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+arrow-arith = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+arrow-array = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+arrow-avro = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+arrow-buffer = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+arrow-cast = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+arrow-csv = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+arrow-data = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+arrow-flight = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+arrow-ipc = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+arrow-json = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+arrow-ord = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+arrow-row = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+arrow-schema = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+arrow-select = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+arrow-string = { git = "https://github.com/apache/arrow-rs", branch = "main" }
+parquet = { git = "https://github.com/apache/arrow-rs", branch = "main" }

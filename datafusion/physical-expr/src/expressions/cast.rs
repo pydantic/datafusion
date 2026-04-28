@@ -346,14 +346,7 @@ pub fn cast_with_target_field(
         // via ColumnarValue::cast_to.
         can_cast_named_struct_types(&expr_type, cast_type)
     } else {
-        // check if cast is supported, with special handling for union types.
-        match &expr_type {
-            // union casting requires checking if any variant can cast to target.
-            Union(fields, _) => fields
-                .iter()
-                .any(|(_, f)| can_cast_types(f.data_type(), cast_type)),
-            _ => can_cast_types(&expr_type, cast_type),
-        }
+        can_cast_types(&expr_type, cast_type)
     };
 
     if !can_build_cast {
