@@ -123,12 +123,13 @@
 //! ```
 pub mod bytes;
 pub mod common;
-pub mod generated;
+pub mod convert;
 pub mod logical_plan;
 pub mod physical_plan;
 
+pub use convert::{FromProto, TryFromProto};
+
 pub mod protobuf {
-    pub use crate::generated::datafusion::*;
     pub use datafusion_proto_common::common::proto_error;
     pub use datafusion_proto_common::protobuf_common::{
         ArrowFormat, ArrowOptions, ArrowType, AvroFormat, AvroOptions, CsvFormat,
@@ -136,6 +137,7 @@ pub mod protobuf {
         ScalarValue, Schema,
     };
     pub use datafusion_proto_common::{FromProtoError, ToProtoError};
+    pub use datafusion_proto_models::protobuf::*;
 }
 
 #[cfg(doctest)]

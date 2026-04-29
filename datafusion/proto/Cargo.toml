@@ -36,7 +36,13 @@ name = "datafusion_proto"
 
 [features]
 default = ["parquet"]
-json = ["pbjson", "serde", "serde_json", "datafusion-proto-common/json"]
+json = [
+    "pbjson",
+    "serde",
+    "serde_json",
+    "datafusion-proto-common/json",
+    "datafusion-proto-models/json",
+]
 parquet = ["datafusion-datasource-parquet", "datafusion-common/parquet", "datafusion/parquet"]
 avro = ["datafusion-datasource-avro"]
 
@@ -63,6 +69,7 @@ datafusion-physical-expr = { workspace = true }
 datafusion-physical-expr-common = { workspace = true }
 datafusion-physical-plan = { workspace = true }
 datafusion-proto-common = { workspace = true }
+datafusion-proto-models = { workspace = true }
 object_store = { workspace = true }
 pbjson = { workspace = true, optional = true }
 prost = { workspace = true }
