@@ -478,11 +478,11 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
 
 /// Encode-side context for [`PhysicalExpr::to_proto`].
 ///
-/// Expression authors only ever see [`PhysicalExprEncodeCtx`]: a concrete
-/// struct with stable methods. Internally it dispatches to a
-/// [`PhysicalExprEncode`] implementor that lives in `datafusion-proto`,
-/// which is what lets `physical-expr-common` stay free of `datafusion-proto`
-/// as a dep.
+/// Expression authors only ever see [`proto_encode::PhysicalExprEncodeCtx`]:
+/// a concrete struct with stable methods. Internally it dispatches to a
+/// [`proto_encode::PhysicalExprEncode`] implementor that lives in
+/// `datafusion-proto`, which is what lets `physical-expr-common` stay free
+/// of `datafusion-proto` as a dep.
 ///
 /// More specialized helpers (e.g. encoding UDFs/UDAFs/UDWFs through the
 /// extension codec) can be added to the context as expressions migrate;
@@ -536,8 +536,9 @@ pub mod proto_encode {
 /// Decode-side counterpart to [`proto_encode`].
 ///
 /// Expression authors implement an associated `try_from_proto` on their
-/// concrete type and receive a [`PhysicalExprDecodeCtx`]; the central match
-/// in `datafusion-proto` dispatches `ExprType` variants to those constructors.
+/// concrete type and receive a [`proto_decode::PhysicalExprDecodeCtx`]; the
+/// central match in `datafusion-proto` dispatches `ExprType` variants to
+/// those constructors.
 ///
 /// As with the encode side, the public surface is a struct (not a `&dyn`
 /// trait) so future fields/helpers (registries for third-party expressions,
