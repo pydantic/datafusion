@@ -2379,6 +2379,7 @@ dependencies = [
  "criterion",
  "datafusion-common",
  "datafusion-expr-common",
+ "datafusion-proto-models",
  "hashbrown 0.17.0",
  "indexmap 2.14.0",
  "itertools 0.14.0",

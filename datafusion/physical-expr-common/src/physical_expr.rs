@@ -446,6 +446,65 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
     fn placement(&self) -> ExpressionPlacement {
         ExpressionPlacement::KeepInPlace
     }
+
+    /// Serialize this expression to a [`PhysicalExprNode`] proto message.
+    ///
+    /// Returning `Ok(None)` means "this expression does not know how to
+    /// serialize itself"; the caller (typically `datafusion-proto`) will fall
+    /// back to its existing codec / extension paths. This matches today's
+    /// behavior for expressions that aren't built into `datafusion-proto`.
+    ///
+    /// Returning `Ok(Some(node))` means the expression has serialized itself
+    /// fully; the caller should not try any further fallback path.
+    ///
+    /// Returning `Err(_)` means a real serialization failure (e.g. the
+    /// expression knows it should serialize but a child failed).
+    ///
+    /// The motivating use case is letting expressions with private state
+    /// (e.g. `DynamicFilterPhysicalExpr`'s `RwLock`-protected inner fields)
+    /// reach into their own internals for `to_proto`/`from_proto` without
+    /// having to expose `pub` accessors to `datafusion-proto`. See
+    /// <https://github.com/apache/datafusion/issues/21835>.
+    ///
+    /// [`PhysicalExprNode`]: datafusion_proto_models::protobuf::PhysicalExprNode
+    #[cfg(feature = "proto")]
+    fn to_proto(
+        &self,
+        _ctx: &dyn proto_encode::PhysicalExprEncoder,
+    ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalExprNode>> {
+        Ok(None)
+    }
+}
+
+/// Hook trait used by [`PhysicalExpr::to_proto`] to recurse into children
+/// without depending on `datafusion-proto` itself.
+///
+/// `datafusion-proto` provides the concrete implementation; expression authors
+/// only need to call methods on `&dyn PhysicalExprEncoder` from `to_proto`.
+///
+/// More specialized helpers (e.g. encoding UDFs/UDAFs/UDWFs through the
+/// extension codec) can be added here as expressions are migrated; today
+/// they're not required because the encoder forwards to the existing codec.
+#[cfg(feature = "proto")]
+pub mod proto_encode {
+    use std::sync::Arc;
+
+    use datafusion_common::Result;
+
+    use super::PhysicalExpr;
+
+    /// Encoder context handed to [`PhysicalExpr::to_proto`].
+    ///
+    /// Implementors (in `datafusion-proto`) wrap the existing
+    /// `PhysicalExtensionCodec` + `PhysicalProtoConverterExtension` plumbing.
+    pub trait PhysicalExprEncoder {
+        /// Encode a child expression. Routes through the proto converter so
+        /// dedup-aware encoding is preserved.
+        fn encode_child(
+            &self,
+            expr: &Arc<dyn PhysicalExpr>,
+        ) -> Result<datafusion_proto_models::protobuf::PhysicalExprNode>;
+    }
 }
 
 #[deprecated(
