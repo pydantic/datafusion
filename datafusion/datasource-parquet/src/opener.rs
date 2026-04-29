@@ -1363,23 +1363,6 @@ impl RowGroupsPrunedParquetOpen {
         let output_schema = Arc::clone(&prepared.output_schema);
         let files_ranges_pruned_statistics =
             prepared.file_metrics.files_ranges_pruned_statistics.clone();
-        // Coalescer is only useful when post-scan filtering will run —
-        // it has no effect on the `pushdown_filters=false` path (no
-        // post-scan filter to apply) and matches `FilterExec`'s
-        // own `LimitedBatchCoalescer` parameters so downstream batch
-        // sizes are comparable.
-        let post_scan_coalescer =
-            if prepared.pushdown_filters && prepared.predicate_conjuncts.is_some() {
-                Some(
-                    datafusion_physical_plan::coalesce::LimitedBatchCoalescer::new(
-                        Arc::clone(&output_schema),
-                        prepared.batch_size,
-                        None,
-                    ),
-                )
-            } else {
-                None
-            };
         let stream = futures::stream::unfold(
             AdaptiveParquetStream {
                 decoder,
@@ -1405,7 +1388,6 @@ impl RowGroupsPrunedParquetOpen {
                 predicate_cache_records,
                 baseline_metrics: prepared.baseline_metrics,
                 pushdown_filters: prepared.pushdown_filters,
-                post_scan_coalescer,
             },
             |state| async move { state.transition().await },
         )
@@ -1501,16 +1483,6 @@ struct AdaptiveParquetStream {
     /// Whether filter pushdown is enabled for this file. When `false`,
     /// `swap_strategy` is never called and `post_scan_filters` is empty.
     pushdown_filters: bool,
-    /// Coalesces post-scan-filtered batches before yielding downstream.
-    /// Mirrors `FilterExec`'s `LimitedBatchCoalescer` so that TopK / hash
-    /// joins downstream see batch sizes comparable to the
-    /// `pushdown_filters=false` (FilterExec-above) path. Without this,
-    /// inline post-scan filtering yields tiny batches (e.g. 1-100 rows
-    /// each) which delays TopK dynamic-filter convergence and weakens
-    /// file-stats pruning at the source. `None` when there are no
-    /// post-scan filters or when pushdown is disabled.
-    post_scan_coalescer:
-        Option<datafusion_physical_plan::coalesce::LimitedBatchCoalescer>,
 }
 
 impl AdaptiveParquetStream {
@@ -1524,15 +1496,6 @@ impl AdaptiveParquetStream {
     /// ownership across yield points under miri.
     async fn transition(mut self) -> Option<(Result<RecordBatch>, Self)> {
         loop {
-            // Step 0: drain any already-completed batch from the
-            // post-scan coalescer. Mirrors `FilterExec`'s pattern so
-            // small filtered batches accumulate into target-sized
-            // batches before being yielded downstream.
-            if let Some(ref mut coalescer) = self.post_scan_coalescer
-                && let Some(batch) = coalescer.next_completed_batch()
-            {
-                return Some((Ok(batch), self));
-            }
             // Step 1: ensure we have a reader for the current row group.
             if self.active_reader.is_none() {
                 // Re-evaluate filter placement at every row-group boundary.
@@ -1564,19 +1527,7 @@ impl AdaptiveParquetStream {
                             self.active_reader = Some(reader);
                             break;
                         }
-                        Ok(DecodeResult::Finished) => {
-                            // End of file — flush the coalescer so any
-                            // buffered rows are not dropped.
-                            if let Some(ref mut coalescer) = self.post_scan_coalescer {
-                                if let Err(e) = coalescer.finish() {
-                                    return Some((Err(e), self));
-                                }
-                                if let Some(batch) = coalescer.next_completed_batch() {
-                                    return Some((Ok(batch), self));
-                                }
-                            }
-                            return None;
-                        }
+                        Ok(DecodeResult::Finished) => return None,
                         Err(e) => return Some((Err(DataFusionError::from(e)), self)),
                     }
                 }
@@ -1625,35 +1576,10 @@ impl AdaptiveParquetStream {
                     continue;
                 }
                 Ok(b) => {
-                    let projected = match self.project_batch(&b) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            timer.stop();
-                            drop(timer);
-                            return Some((Err(e), self));
-                        }
-                    };
-                    if let Some(ref mut coalescer) = self.post_scan_coalescer {
-                        // Push the projected batch into the coalescer
-                        // and loop back. The next iteration's Step 0
-                        // will drain a completed batch when the buffer
-                        // crosses the target size.
-                        match coalescer.push_batch(projected) {
-                            Ok(_) => {
-                                timer.stop();
-                                drop(timer);
-                                continue;
-                            }
-                            Err(e) => {
-                                timer.stop();
-                                drop(timer);
-                                return Some((Err(e), self));
-                            }
-                        }
-                    }
+                    let result = self.project_batch(&b);
                     timer.stop();
                     drop(timer);
-                    return Some((Ok(projected), self));
+                    return Some((result, self));
                 }
                 Err(e) => {
                     timer.stop();
