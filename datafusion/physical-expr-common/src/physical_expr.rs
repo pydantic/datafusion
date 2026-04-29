@@ -470,40 +470,66 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
     #[cfg(feature = "proto")]
     fn to_proto(
         &self,
-        _ctx: &dyn proto_encode::PhysicalExprEncoder,
+        _ctx: &proto_encode::PhysicalExprEncodeCtx<'_>,
     ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalExprNode>> {
         Ok(None)
     }
 }
 
-/// Hook trait used by [`PhysicalExpr::to_proto`] to recurse into children
-/// without depending on `datafusion-proto` itself.
+/// Encode-side context for [`PhysicalExpr::to_proto`].
 ///
-/// `datafusion-proto` provides the concrete implementation; expression authors
-/// only need to call methods on `&dyn PhysicalExprEncoder` from `to_proto`.
+/// Expression authors only ever see [`PhysicalExprEncodeCtx`]: a concrete
+/// struct with stable methods. Internally it dispatches to a
+/// [`PhysicalExprEncode`] implementor that lives in `datafusion-proto`,
+/// which is what lets `physical-expr-common` stay free of `datafusion-proto`
+/// as a dep.
 ///
 /// More specialized helpers (e.g. encoding UDFs/UDAFs/UDWFs through the
-/// extension codec) can be added here as expressions are migrated; today
-/// they're not required because the encoder forwards to the existing codec.
+/// extension codec) can be added to the context as expressions migrate;
+/// today they're not required because the encoder forwards to the existing
+/// codec via the proto converter.
 #[cfg(feature = "proto")]
 pub mod proto_encode {
     use std::sync::Arc;
 
     use datafusion_common::Result;
+    use datafusion_proto_models::protobuf::PhysicalExprNode;
 
     use super::PhysicalExpr;
 
-    /// Encoder context handed to [`PhysicalExpr::to_proto`].
+    /// Encoder context handed to [`super::PhysicalExpr::to_proto`].
     ///
-    /// Implementors (in `datafusion-proto`) wrap the existing
-    /// `PhysicalExtensionCodec` + `PhysicalProtoConverterExtension` plumbing.
-    pub trait PhysicalExprEncoder {
-        /// Encode a child expression. Routes through the proto converter so
-        /// dedup-aware encoding is preserved.
-        fn encode_child(
+    /// Wraps an internal [`PhysicalExprEncode`] trait object so callers see a
+    /// stable concrete type while implementations can evolve in
+    /// `datafusion-proto`.
+    pub struct PhysicalExprEncodeCtx<'a> {
+        encoder: &'a dyn PhysicalExprEncode,
+    }
+
+    impl<'a> PhysicalExprEncodeCtx<'a> {
+        /// Construct a new encode context. Typically called by
+        /// `datafusion-proto`; expression authors receive `&PhysicalExprEncodeCtx`.
+        pub fn new(encoder: &'a dyn PhysicalExprEncode) -> Self {
+            Self { encoder }
+        }
+
+        /// Encode a child expression. Routes through the configured encoder
+        /// so dedup-aware encoding is preserved.
+        pub fn encode_child(
             &self,
             expr: &Arc<dyn PhysicalExpr>,
-        ) -> Result<datafusion_proto_models::protobuf::PhysicalExprNode>;
+        ) -> Result<PhysicalExprNode> {
+            self.encoder.encode(expr)
+        }
+    }
+
+    /// Internal dispatch trait. Implementors live in `datafusion-proto` and
+    /// wrap the existing `PhysicalExtensionCodec` +
+    /// `PhysicalProtoConverterExtension` plumbing. Expression authors should
+    /// use [`PhysicalExprEncodeCtx`] instead of calling this directly.
+    pub trait PhysicalExprEncode {
+        /// Encode an expression to a protobuf node.
+        fn encode(&self, expr: &Arc<dyn PhysicalExpr>) -> Result<PhysicalExprNode>;
     }
 }
 
