@@ -164,6 +164,23 @@ impl PhysicalExpr for Column {
     }
 }
 
+#[cfg(feature = "proto")]
+impl Column {
+    /// Reconstruct a [`Column`] from its protobuf representation.
+    ///
+    /// The decode context is currently unused, but is threaded through so
+    /// that future expressions with child sub-expressions can recurse via
+    /// [`PhysicalExprDecodeCtx::decode`].
+    ///
+    /// [`PhysicalExprDecodeCtx::decode`]: datafusion_physical_expr_common::physical_expr::proto_decode::PhysicalExprDecodeCtx::decode
+    pub fn try_from_proto(
+        node: &datafusion_proto_models::protobuf::PhysicalColumn,
+        _ctx: &datafusion_physical_expr_common::physical_expr::proto_decode::PhysicalExprDecodeCtx<'_>,
+    ) -> Result<Arc<Self>> {
+        Ok(Arc::new(Column::new(&node.name, node.index as usize)))
+    }
+}
+
 impl Column {
     fn bounds_check(&self, input_schema: &Schema) -> Result<()> {
         if self.index < input_schema.fields.len() {
