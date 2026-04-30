@@ -1895,6 +1895,7 @@ dependencies = [
  "datafusion-physical-expr-adapter",
  "datafusion-physical-expr-common",
  "datafusion-physical-plan",
+ "datafusion-proto-common",
  "datafusion-session",
  "flate2",
  "futures",

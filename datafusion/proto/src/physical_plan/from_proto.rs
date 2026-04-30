@@ -23,13 +23,11 @@ use arrow::array::RecordBatch;
 use arrow::compute::SortOptions;
 use arrow::datatypes::{Field, Schema};
 use arrow::ipc::reader::StreamReader;
-use chrono::{TimeZone, Utc};
 use datafusion_common::{DataFusionError, Result, internal_datafusion_err, not_impl_err};
+use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
-use datafusion_datasource::file_sink_config::FileSinkConfig;
-use datafusion_datasource::{FileRange, ListingTableUrl, PartitionedFile, TableSchema};
 use datafusion_datasource_csv::file_format::CsvSink;
 use datafusion_datasource_json::file_format::JsonSink;
 #[cfg(feature = "parquet")]
@@ -37,7 +35,6 @@ use datafusion_datasource_parquet::file_format::ParquetSink;
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::{FunctionRegistry, TaskContext};
 use datafusion_expr::WindowFunctionDefinition;
-use datafusion_expr::dml::InsertOp;
 use datafusion_expr::execution_props::SubqueryIndex;
 use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
 use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
@@ -50,8 +47,6 @@ use datafusion_physical_plan::joins::{HashExpr, SeededRandomState};
 use datafusion_physical_plan::windows::{create_window_expr, schema_add_window_field};
 use datafusion_physical_plan::{Partitioning, PhysicalExpr, WindowExpr};
 use datafusion_proto_common::common::proto_error;
-use object_store::ObjectMeta;
-use object_store::path::Path;
 
 use super::{
     DefaultPhysicalProtoConverter, PhysicalExtensionCodec, PhysicalPlanDecodeContext,
@@ -60,7 +55,7 @@ use super::{
 use crate::convert::{FromProto, TryFromProto};
 use crate::logical_plan::{self};
 use crate::protobuf::physical_expr_node::ExprType;
-use crate::{convert_required, convert_required_proto, protobuf};
+use crate::{convert_required, protobuf};
 
 impl FromProto<&protobuf::PhysicalColumn> for Column {
     fn from_proto(c: &protobuf::PhysicalColumn) -> Column {
@@ -645,7 +640,7 @@ pub fn parse_protobuf_file_scan_config(
     let file_groups = proto
         .file_groups
         .iter()
-        .map(FileGroup::try_from_proto)
+        .map(FileGroup::try_from)
         .collect::<Result<Vec<_>, _>>()?;
 
     let object_store_url = match proto.object_store_url.is_empty() {
@@ -714,65 +709,12 @@ pub fn parse_record_batches(buf: &[u8]) -> Result<Vec<RecordBatch>> {
     Ok(batches)
 }
 
-impl TryFromProto<&protobuf::PartitionedFile> for PartitionedFile {
-    type Error = DataFusionError;
-
-    fn try_from_proto(val: &protobuf::PartitionedFile) -> Result<Self, Self::Error> {
-        let mut pf = PartitionedFile::new_from_meta(ObjectMeta {
-            location: Path::parse(val.path.as_str())
-                .map_err(|e| proto_error(format!("Invalid object_store path: {e}")))?,
-            last_modified: Utc.timestamp_nanos(val.last_modified_ns as i64),
-            size: val.size,
-            e_tag: None,
-            version: None,
-        })
-        .with_partition_values(
-            val.partition_values
-                .iter()
-                .map(|v| v.try_into())
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        if let Some(range) = val.range.as_ref() {
-            let file_range = FileRange::try_from_proto(range)?;
-            pf = pf.with_range(file_range.start, file_range.end);
-        }
-        if let Some(proto_stats) = val.statistics.as_ref() {
-            pf = pf.with_statistics(Arc::new(proto_stats.try_into()?));
-        }
-        Ok(pf)
-    }
-}
-
-impl TryFromProto<&protobuf::FileRange> for FileRange {
-    type Error = DataFusionError;
-
-    fn try_from_proto(value: &protobuf::FileRange) -> Result<Self, Self::Error> {
-        Ok(FileRange {
-            start: value.start,
-            end: value.end,
-        })
-    }
-}
-
-impl TryFromProto<&protobuf::FileGroup> for FileGroup {
-    type Error = DataFusionError;
-
-    fn try_from_proto(val: &protobuf::FileGroup) -> Result<Self, Self::Error> {
-        let files = val
-            .files
-            .iter()
-            .map(PartitionedFile::try_from_proto)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(FileGroup::new(files))
-    }
-}
-
 impl TryFromProto<&protobuf::JsonSink> for JsonSink {
     type Error = DataFusionError;
 
     fn try_from_proto(value: &protobuf::JsonSink) -> Result<Self, Self::Error> {
         Ok(Self::new(
-            convert_required_proto!(FileSinkConfig, value.config)?,
+            convert_required!(value.config)?,
             convert_required!(value.writer_options)?,
         ))
     }
@@ -784,7 +726,7 @@ impl TryFromProto<&protobuf::ParquetSink> for ParquetSink {
 
     fn try_from_proto(value: &protobuf::ParquetSink) -> Result<Self, Self::Error> {
         Ok(Self::new(
-            convert_required_proto!(FileSinkConfig, value.config)?,
+            convert_required!(value.config)?,
             convert_required!(value.parquet_options)?,
         ))
     }
@@ -795,104 +737,8 @@ impl TryFromProto<&protobuf::CsvSink> for CsvSink {
 
     fn try_from_proto(value: &protobuf::CsvSink) -> Result<Self, Self::Error> {
         Ok(Self::new(
-            convert_required_proto!(FileSinkConfig, value.config)?,
+            convert_required!(value.config)?,
             convert_required!(value.writer_options)?,
         ))
-    }
-}
-
-impl TryFromProto<&protobuf::FileSinkConfig> for FileSinkConfig {
-    type Error = DataFusionError;
-
-    fn try_from_proto(conf: &protobuf::FileSinkConfig) -> Result<Self, Self::Error> {
-        let file_group = FileGroup::new(
-            conf.file_groups
-                .iter()
-                .map(PartitionedFile::try_from_proto)
-                .collect::<Result<Vec<_>>>()?,
-        );
-        let table_paths = conf
-            .table_paths
-            .iter()
-            .map(ListingTableUrl::parse)
-            .collect::<Result<Vec<_>>>()?;
-        let table_partition_cols = conf
-            .table_partition_cols
-            .iter()
-            .map(|protobuf::PartitionColumn { name, arrow_type }| {
-                let data_type = convert_required!(arrow_type)?;
-                Ok((name.clone(), data_type))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let insert_op = match conf.insert_op() {
-            protobuf::InsertOp::Append => InsertOp::Append,
-            protobuf::InsertOp::Overwrite => InsertOp::Overwrite,
-            protobuf::InsertOp::Replace => InsertOp::Replace,
-        };
-        let file_output_mode = match conf.file_output_mode() {
-            protobuf::FileOutputMode::Automatic => {
-                datafusion_datasource::file_sink_config::FileOutputMode::Automatic
-            }
-            protobuf::FileOutputMode::SingleFile => {
-                datafusion_datasource::file_sink_config::FileOutputMode::SingleFile
-            }
-            protobuf::FileOutputMode::Directory => {
-                datafusion_datasource::file_sink_config::FileOutputMode::Directory
-            }
-        };
-        Ok(Self {
-            original_url: String::default(),
-            object_store_url: ObjectStoreUrl::parse(&conf.object_store_url)?,
-            file_group,
-            table_paths,
-            output_schema: Arc::new(convert_required!(conf.output_schema)?),
-            table_partition_cols,
-            insert_op,
-            keep_partition_by_columns: conf.keep_partition_by_columns,
-            file_extension: conf.file_extension.clone(),
-            file_output_mode,
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-
-    #[test]
-    fn partitioned_file_path_roundtrip_percent_encoded() {
-        let path_str = "foo/foo%2Fbar/baz%252Fqux";
-        let pf = PartitionedFile::new_from_meta(ObjectMeta {
-            location: Path::parse(path_str).unwrap(),
-            last_modified: Utc.timestamp_nanos(1_000),
-            size: 42,
-            e_tag: None,
-            version: None,
-        });
-
-        let proto = protobuf::PartitionedFile::try_from_proto(&pf).unwrap();
-        assert_eq!(proto.path, path_str);
-
-        let pf2 = PartitionedFile::try_from_proto(&proto).unwrap();
-        assert_eq!(pf2.object_meta.location.as_ref(), path_str);
-        assert_eq!(pf2.object_meta.location, pf.object_meta.location);
-        assert_eq!(pf2.object_meta.size, pf.object_meta.size);
-        assert_eq!(pf2.object_meta.last_modified, pf.object_meta.last_modified);
-    }
-
-    #[test]
-    fn partitioned_file_from_proto_invalid_path() {
-        let proto = protobuf::PartitionedFile {
-            path: "foo//bar".to_string(),
-            size: 1,
-            last_modified_ns: 0,
-            partition_values: vec![],
-            range: None,
-            statistics: None,
-        };
-
-        let err = PartitionedFile::try_from_proto(&proto).unwrap_err();
-        assert!(err.to_string().contains("Invalid object_store path"));
     }
 }
