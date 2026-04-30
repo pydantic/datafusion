@@ -57,7 +57,7 @@ datafusion-datasource-csv = { workspace = true }
 datafusion-datasource-json = { workspace = true }
 datafusion-datasource-parquet = { workspace = true, optional = true }
 datafusion-execution = { workspace = true }
-datafusion-expr = { workspace = true }
+datafusion-expr = { workspace = true, features = ["proto"] }
 datafusion-functions-table = { workspace = true }
 datafusion-physical-expr = { workspace = true }
 datafusion-physical-expr-common = { workspace = true }

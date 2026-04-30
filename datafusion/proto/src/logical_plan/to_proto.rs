@@ -21,164 +21,20 @@
 
 use std::collections::HashMap;
 
-use datafusion_common::{NullEquality, TableReference, UnnestOptions};
-use datafusion_expr::WriteOp;
-use datafusion_expr::dml::InsertOp;
 use datafusion_expr::expr::{
     self, AggregateFunctionParams, Alias, Between, BinaryExpr, Cast, GroupingSet, InList,
-    Like, NullTreatment, Placeholder, ScalarFunction, Unnest,
+    Like, Placeholder, ScalarFunction, Unnest,
 };
 use datafusion_expr::logical_plan::Subquery;
-use datafusion_expr::{
-    Expr, JoinConstraint, JoinType, SortExpr, TryCast, WindowFrame, WindowFrameBound,
-    WindowFrameUnits, WindowFunctionDefinition, logical_plan::PlanType,
-    logical_plan::StringifiedPlan,
-};
+use datafusion_expr::{Expr, SortExpr, TryCast, WindowFunctionDefinition};
 
-use crate::protobuf::RecursionUnnestOption;
 use crate::protobuf::{
-    self, AnalyzedLogicalPlanType, CubeNode, EmptyMessage, GroupingSetNode,
-    LogicalExprList, OptimizedLogicalPlanType, OptimizedPhysicalPlanType,
-    PlaceholderNode, RollupNode, ToProtoError as Error,
-    plan_type::PlanTypeEnum::{
-        AnalyzedLogicalPlan, FinalAnalyzedLogicalPlan, FinalLogicalPlan,
-        FinalPhysicalPlan, FinalPhysicalPlanWithSchema, FinalPhysicalPlanWithStats,
-        InitialLogicalPlan, InitialPhysicalPlan, InitialPhysicalPlanWithSchema,
-        InitialPhysicalPlanWithStats, OptimizedLogicalPlan, OptimizedPhysicalPlan,
-        PhysicalPlanError,
-    },
+    self, CubeNode, GroupingSetNode, LogicalExprList, PlaceholderNode, RollupNode,
+    ToProtoError as Error,
 };
 
 use super::{AsLogicalPlan, LogicalExtensionCodec};
-use crate::convert::{FromProto, TryFromProto};
 use crate::protobuf::LogicalPlanNode;
-
-impl FromProto<&UnnestOptions> for protobuf::UnnestOptions {
-    fn from_proto(opts: &UnnestOptions) -> Self {
-        Self {
-            preserve_nulls: opts.preserve_nulls,
-            recursions: opts
-                .recursions
-                .iter()
-                .map(|r| RecursionUnnestOption {
-                    input_column: Some((&r.input_column).into()),
-                    output_column: Some((&r.output_column).into()),
-                    depth: r.depth as u32,
-                })
-                .collect(),
-        }
-    }
-}
-
-impl FromProto<&StringifiedPlan> for protobuf::StringifiedPlan {
-    fn from_proto(stringified_plan: &StringifiedPlan) -> Self {
-        Self {
-            plan_type: match stringified_plan.clone().plan_type {
-                PlanType::InitialLogicalPlan => Some(protobuf::PlanType {
-                    plan_type_enum: Some(InitialLogicalPlan(EmptyMessage {})),
-                }),
-                PlanType::AnalyzedLogicalPlan { analyzer_name } => {
-                    Some(protobuf::PlanType {
-                        plan_type_enum: Some(AnalyzedLogicalPlan(
-                            AnalyzedLogicalPlanType { analyzer_name },
-                        )),
-                    })
-                }
-                PlanType::FinalAnalyzedLogicalPlan => Some(protobuf::PlanType {
-                    plan_type_enum: Some(FinalAnalyzedLogicalPlan(EmptyMessage {})),
-                }),
-                PlanType::OptimizedLogicalPlan { optimizer_name } => {
-                    Some(protobuf::PlanType {
-                        plan_type_enum: Some(OptimizedLogicalPlan(
-                            OptimizedLogicalPlanType { optimizer_name },
-                        )),
-                    })
-                }
-                PlanType::FinalLogicalPlan => Some(protobuf::PlanType {
-                    plan_type_enum: Some(FinalLogicalPlan(EmptyMessage {})),
-                }),
-                PlanType::InitialPhysicalPlan => Some(protobuf::PlanType {
-                    plan_type_enum: Some(InitialPhysicalPlan(EmptyMessage {})),
-                }),
-                PlanType::OptimizedPhysicalPlan { optimizer_name } => {
-                    Some(protobuf::PlanType {
-                        plan_type_enum: Some(OptimizedPhysicalPlan(
-                            OptimizedPhysicalPlanType { optimizer_name },
-                        )),
-                    })
-                }
-                PlanType::FinalPhysicalPlan => Some(protobuf::PlanType {
-                    plan_type_enum: Some(FinalPhysicalPlan(EmptyMessage {})),
-                }),
-                PlanType::InitialPhysicalPlanWithStats => Some(protobuf::PlanType {
-                    plan_type_enum: Some(InitialPhysicalPlanWithStats(EmptyMessage {})),
-                }),
-                PlanType::InitialPhysicalPlanWithSchema => Some(protobuf::PlanType {
-                    plan_type_enum: Some(InitialPhysicalPlanWithSchema(EmptyMessage {})),
-                }),
-                PlanType::FinalPhysicalPlanWithStats => Some(protobuf::PlanType {
-                    plan_type_enum: Some(FinalPhysicalPlanWithStats(EmptyMessage {})),
-                }),
-                PlanType::FinalPhysicalPlanWithSchema => Some(protobuf::PlanType {
-                    plan_type_enum: Some(FinalPhysicalPlanWithSchema(EmptyMessage {})),
-                }),
-                PlanType::PhysicalPlanError => Some(protobuf::PlanType {
-                    plan_type_enum: Some(PhysicalPlanError(EmptyMessage {})),
-                }),
-            },
-            plan: stringified_plan.plan.to_string(),
-        }
-    }
-}
-
-impl FromProto<WindowFrameUnits> for protobuf::WindowFrameUnits {
-    fn from_proto(units: WindowFrameUnits) -> Self {
-        match units {
-            WindowFrameUnits::Rows => Self::Rows,
-            WindowFrameUnits::Range => Self::Range,
-            WindowFrameUnits::Groups => Self::Groups,
-        }
-    }
-}
-
-impl TryFromProto<&WindowFrameBound> for protobuf::WindowFrameBound {
-    type Error = Error;
-
-    fn try_from_proto(bound: &WindowFrameBound) -> Result<Self, Self::Error> {
-        Ok(match bound {
-            WindowFrameBound::CurrentRow => Self {
-                window_frame_bound_type: protobuf::WindowFrameBoundType::CurrentRow
-                    .into(),
-                bound_value: None,
-            },
-            WindowFrameBound::Preceding(v) => Self {
-                window_frame_bound_type: protobuf::WindowFrameBoundType::Preceding.into(),
-                bound_value: Some(v.try_into()?),
-            },
-            WindowFrameBound::Following(v) => Self {
-                window_frame_bound_type: protobuf::WindowFrameBoundType::Following.into(),
-                bound_value: Some(v.try_into()?),
-            },
-        })
-    }
-}
-
-impl TryFromProto<&WindowFrame> for protobuf::WindowFrame {
-    type Error = Error;
-
-    fn try_from_proto(window: &WindowFrame) -> Result<Self, Self::Error> {
-        Ok(Self {
-            window_frame_units: protobuf::WindowFrameUnits::from_proto(window.units)
-                .into(),
-            start_bound: Some(protobuf::WindowFrameBound::try_from_proto(
-                &window.start_bound,
-            )?),
-            end_bound: Some(protobuf::window_frame::EndBound::Bound(
-                protobuf::WindowFrameBound::try_from_proto(&window.end_bound)?,
-            )),
-        })
-    }
-}
 
 pub fn serialize_exprs<'a, I>(
     exprs: I,
@@ -343,7 +199,7 @@ pub fn serialize_expr(
             let partition_by = serialize_exprs(partition_by, codec)?;
             let order_by = serialize_sorts(order_by, codec)?;
 
-            let window_frame = Some(protobuf::WindowFrame::try_from_proto(window_frame)?);
+            let window_frame = Some(protobuf::WindowFrame::try_from(window_frame)?);
 
             let window_expr = protobuf::WindowExprNode {
                 exprs: serialize_exprs(args, codec)?,
@@ -357,7 +213,7 @@ pub fn serialize_expr(
                     None => None,
                 },
                 null_treatment: null_treatment
-                    .map(|nt| protobuf::NullTreatment::from_proto(nt).into()),
+                    .map(|nt| protobuf::NullTreatment::from(nt).into()),
                 fun_definition,
             };
             protobuf::LogicalExprNode {
@@ -390,7 +246,7 @@ pub fn serialize_expr(
                         order_by: serialize_sorts(order_by, codec)?,
                         fun_definition: (!buf.is_empty()).then_some(buf),
                         null_treatment: null_treatment
-                            .map(|nt| protobuf::NullTreatment::from_proto(nt).into()),
+                            .map(|nt| protobuf::NullTreatment::from(nt).into()),
                     },
                 ))),
             }
@@ -682,96 +538,4 @@ where
             })
         })
         .collect::<Result<Vec<_>, Error>>()
-}
-
-impl FromProto<TableReference> for protobuf::TableReference {
-    fn from_proto(t: TableReference) -> Self {
-        use protobuf::table_reference::TableReferenceEnum;
-        let table_reference_enum = match t {
-            TableReference::Bare { table } => {
-                TableReferenceEnum::Bare(protobuf::BareTableReference {
-                    table: table.to_string(),
-                })
-            }
-            TableReference::Partial { schema, table } => {
-                TableReferenceEnum::Partial(protobuf::PartialTableReference {
-                    schema: schema.to_string(),
-                    table: table.to_string(),
-                })
-            }
-            TableReference::Full {
-                catalog,
-                schema,
-                table,
-            } => TableReferenceEnum::Full(protobuf::FullTableReference {
-                catalog: catalog.to_string(),
-                schema: schema.to_string(),
-                table: table.to_string(),
-            }),
-        };
-
-        protobuf::TableReference {
-            table_reference_enum: Some(table_reference_enum),
-        }
-    }
-}
-
-impl FromProto<JoinType> for protobuf::JoinType {
-    fn from_proto(t: JoinType) -> Self {
-        match t {
-            JoinType::Inner => protobuf::JoinType::Inner,
-            JoinType::Left => protobuf::JoinType::Left,
-            JoinType::Right => protobuf::JoinType::Right,
-            JoinType::Full => protobuf::JoinType::Full,
-            JoinType::LeftSemi => protobuf::JoinType::Leftsemi,
-            JoinType::RightSemi => protobuf::JoinType::Rightsemi,
-            JoinType::LeftAnti => protobuf::JoinType::Leftanti,
-            JoinType::RightAnti => protobuf::JoinType::Rightanti,
-            JoinType::LeftMark => protobuf::JoinType::Leftmark,
-            JoinType::RightMark => protobuf::JoinType::Rightmark,
-        }
-    }
-}
-
-impl FromProto<JoinConstraint> for protobuf::JoinConstraint {
-    fn from_proto(t: JoinConstraint) -> Self {
-        match t {
-            JoinConstraint::On => protobuf::JoinConstraint::On,
-            JoinConstraint::Using => protobuf::JoinConstraint::Using,
-        }
-    }
-}
-
-impl FromProto<NullEquality> for protobuf::NullEquality {
-    fn from_proto(t: NullEquality) -> Self {
-        match t {
-            NullEquality::NullEqualsNothing => protobuf::NullEquality::NullEqualsNothing,
-            NullEquality::NullEqualsNull => protobuf::NullEquality::NullEqualsNull,
-        }
-    }
-}
-
-impl FromProto<&WriteOp> for protobuf::dml_node::Type {
-    fn from_proto(t: &WriteOp) -> Self {
-        match t {
-            WriteOp::Insert(InsertOp::Append) => protobuf::dml_node::Type::InsertAppend,
-            WriteOp::Insert(InsertOp::Overwrite) => {
-                protobuf::dml_node::Type::InsertOverwrite
-            }
-            WriteOp::Insert(InsertOp::Replace) => protobuf::dml_node::Type::InsertReplace,
-            WriteOp::Delete => protobuf::dml_node::Type::Delete,
-            WriteOp::Update => protobuf::dml_node::Type::Update,
-            WriteOp::Ctas => protobuf::dml_node::Type::Ctas,
-            WriteOp::Truncate => protobuf::dml_node::Type::Truncate,
-        }
-    }
-}
-
-impl FromProto<NullTreatment> for protobuf::NullTreatment {
-    fn from_proto(t: NullTreatment) -> Self {
-        match t {
-            NullTreatment::RespectNulls => protobuf::NullTreatment::RespectNulls,
-            NullTreatment::IgnoreNulls => protobuf::NullTreatment::IgnoreNulls,
-        }
-    }
 }

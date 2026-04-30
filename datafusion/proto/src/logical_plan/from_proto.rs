@@ -25,109 +25,21 @@ use datafusion_common::{
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::registry::FunctionRegistry;
-use datafusion_expr::dml::InsertOp;
+use datafusion_expr::ExprFunctionExt;
 use datafusion_expr::expr::{Alias, NullTreatment, Placeholder, Sort};
 use datafusion_expr::expr::{Unnest, WildcardOptions};
 use datafusion_expr::logical_plan::Subquery;
 use datafusion_expr::{
     Between, BinaryExpr, Case, Cast, Expr, GroupingSet,
     GroupingSet::GroupingSets,
-    Like, Operator, TryCast, WindowFrame, WindowFrameBound, WindowFrameUnits,
+    Like, Operator, TryCast, WindowFrame,
     expr::{self, InList, WindowFunction},
 };
-use datafusion_expr::{ExprFunctionExt, WriteOp};
 use datafusion_proto_common::{FromProtoError as Error, from_proto::FromOptionalField};
 
 use crate::protobuf::{self, CubeNode, GroupingSetNode, PlaceholderNode, RollupNode};
 
-use crate::convert::{FromProto, TryFromProto};
-
 use super::{AsLogicalPlan, LogicalExtensionCodec};
-
-impl FromProto<protobuf::WindowFrameUnits> for WindowFrameUnits {
-    fn from_proto(units: protobuf::WindowFrameUnits) -> Self {
-        match units {
-            protobuf::WindowFrameUnits::Rows => Self::Rows,
-            protobuf::WindowFrameUnits::Range => Self::Range,
-            protobuf::WindowFrameUnits::Groups => Self::Groups,
-        }
-    }
-}
-
-impl TryFromProto<protobuf::WindowFrame> for WindowFrame {
-    type Error = Error;
-
-    fn try_from_proto(window: protobuf::WindowFrame) -> Result<Self, Self::Error> {
-        let units = WindowFrameUnits::from_proto(
-            protobuf::WindowFrameUnits::try_from(window.window_frame_units).map_err(
-                |_| Error::unknown("WindowFrameUnits", window.window_frame_units),
-            )?,
-        );
-        let start_bound = WindowFrameBound::try_from_proto(
-            window
-                .start_bound
-                .ok_or_else(|| Error::required("start_bound"))?,
-        )?;
-        let end_bound = window
-            .end_bound
-            .map(|end_bound| match end_bound {
-                protobuf::window_frame::EndBound::Bound(end_bound) => {
-                    WindowFrameBound::try_from_proto(end_bound)
-                }
-            })
-            .transpose()?
-            .unwrap_or(WindowFrameBound::CurrentRow);
-        Ok(WindowFrame::new_bounds(units, start_bound, end_bound))
-    }
-}
-
-impl TryFromProto<protobuf::WindowFrameBound> for WindowFrameBound {
-    type Error = Error;
-
-    fn try_from_proto(bound: protobuf::WindowFrameBound) -> Result<Self, Self::Error> {
-        let bound_type =
-            protobuf::WindowFrameBoundType::try_from(bound.window_frame_bound_type)
-                .map_err(|_| {
-                    Error::unknown("WindowFrameBoundType", bound.window_frame_bound_type)
-                })?;
-        match bound_type {
-            protobuf::WindowFrameBoundType::CurrentRow => Ok(Self::CurrentRow),
-            protobuf::WindowFrameBoundType::Preceding => match bound.bound_value {
-                Some(x) => Ok(Self::Preceding(ScalarValue::try_from(&x)?)),
-                None => Ok(Self::Preceding(ScalarValue::UInt64(None))),
-            },
-            protobuf::WindowFrameBoundType::Following => match bound.bound_value {
-                Some(x) => Ok(Self::Following(ScalarValue::try_from(&x)?)),
-                None => Ok(Self::Following(ScalarValue::UInt64(None))),
-            },
-        }
-    }
-}
-
-impl FromProto<protobuf::dml_node::Type> for WriteOp {
-    fn from_proto(t: protobuf::dml_node::Type) -> Self {
-        match t {
-            protobuf::dml_node::Type::Update => WriteOp::Update,
-            protobuf::dml_node::Type::Delete => WriteOp::Delete,
-            protobuf::dml_node::Type::InsertAppend => WriteOp::Insert(InsertOp::Append),
-            protobuf::dml_node::Type::InsertOverwrite => {
-                WriteOp::Insert(InsertOp::Overwrite)
-            }
-            protobuf::dml_node::Type::InsertReplace => WriteOp::Insert(InsertOp::Replace),
-            protobuf::dml_node::Type::Ctas => WriteOp::Ctas,
-            protobuf::dml_node::Type::Truncate => WriteOp::Truncate,
-        }
-    }
-}
-
-impl FromProto<protobuf::NullTreatment> for NullTreatment {
-    fn from_proto(t: protobuf::NullTreatment) -> Self {
-        match t {
-            protobuf::NullTreatment::RespectNulls => NullTreatment::RespectNulls,
-            protobuf::NullTreatment::IgnoreNulls => NullTreatment::IgnoreNulls,
-        }
-    }
-}
 
 pub fn parse_expr(
     proto: &protobuf::LogicalExprNode,
@@ -177,7 +89,7 @@ pub fn parse_expr(
                 .window_frame
                 .as_ref()
                 .map::<Result<WindowFrame, _>, _>(|window_frame| {
-                    let window_frame = WindowFrame::try_from_proto(window_frame.clone())?;
+                    let window_frame = WindowFrame::try_from(window_frame.clone())?;
                     window_frame
                         .regularize_order_bys(&mut order_by)
                         .map(|_| window_frame)
@@ -195,7 +107,7 @@ pub fn parse_expr(
                             "Received a WindowExprNode message with unknown NullTreatment {null_treatment}",
                         ))
                     })?;
-                    Some(NullTreatment::from_proto(null_treatment))
+                    Some(NullTreatment::from(null_treatment))
                 }
                 None => None,
             };
@@ -485,7 +397,7 @@ pub fn parse_expr(
                             "Received an AggregateUdfExprNode message with unknown NullTreatment {null_treatment}",
                         ))
                     })?;
-                    Some(NullTreatment::from_proto(null_treatment))
+                    Some(NullTreatment::from(null_treatment))
                 }
                 None => None,
             };

@@ -152,7 +152,7 @@ pub fn parse_physical_window_expr(
     let window_frame = proto
         .window_frame
         .as_ref()
-        .map(|wf| datafusion_expr::WindowFrame::try_from_proto(wf.clone()))
+        .map(|wf| datafusion_expr::WindowFrame::try_from(wf.clone()))
         .transpose()
         .map_err(|e| internal_datafusion_err!("{e}"))?
         .ok_or_else(|| {

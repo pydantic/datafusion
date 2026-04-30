@@ -173,7 +173,7 @@ pub fn serialize_physical_window_expr(
         codec,
         proto_converter,
     )?;
-    let window_frame = protobuf::WindowFrame::try_from_proto(window_frame.as_ref())
+    let window_frame = protobuf::WindowFrame::try_from(window_frame.as_ref())
         .map_err(|e| internal_datafusion_err!("{e}"))?;
 
     Ok(protobuf::PhysicalWindowExprNode {
