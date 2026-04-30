@@ -2351,6 +2351,7 @@ dependencies = [
  "datafusion-functions",
  "datafusion-functions-aggregate-common",
  "datafusion-physical-expr-common",
+ "datafusion-proto-common",
  "half",
  "hashbrown 0.17.0",
  "indexmap 2.14.0",

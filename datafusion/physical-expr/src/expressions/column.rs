@@ -145,6 +145,23 @@ impl PhysicalExpr for Column {
     fn placement(&self) -> ExpressionPlacement {
         ExpressionPlacement::Column
     }
+
+    #[cfg(feature = "proto")]
+    fn to_proto(
+        &self,
+        _ctx: &dyn datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncoder,
+    ) -> Result<Option<datafusion_proto_common::protobuf::PhysicalExprNode>> {
+        use datafusion_proto_common::protobuf;
+        Ok(Some(protobuf::PhysicalExprNode {
+            expr_id: None,
+            expr_type: Some(protobuf::physical_expr_node::ExprType::Column(
+                protobuf::PhysicalColumn {
+                    name: self.name.clone(),
+                    index: self.index as u32,
+                },
+            )),
+        }))
+    }
 }
 
 impl Column {
