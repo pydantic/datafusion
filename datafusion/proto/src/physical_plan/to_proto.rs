@@ -239,6 +239,28 @@ pub fn serialize_physical_expr(
     )
 }
 
+/// Concrete [`PhysicalExprEncoder`] used to drive `PhysicalExpr::to_proto`.
+///
+/// Wraps the existing extension codec + converter pair so individual
+/// expressions can recurse into children without depending on
+/// `datafusion-proto` directly.
+struct TraitEncoder<'a> {
+    codec: &'a dyn PhysicalExtensionCodec,
+    proto_converter: &'a dyn PhysicalProtoConverterExtension,
+}
+
+impl datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncoder
+    for TraitEncoder<'_>
+{
+    fn encode_child(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+    ) -> Result<protobuf::PhysicalExprNode> {
+        self.proto_converter
+            .physical_expr_to_proto(expr, self.codec)
+    }
+}
+
 /// Serialize a `PhysicalExpr` to default protobuf representation.
 ///
 /// If required, a [`PhysicalExtensionCodec`] can be provided which can handle
@@ -253,6 +275,19 @@ pub fn serialize_physical_expr_with_converter(
     // Snapshot the expr in case it has dynamic predicate state so
     // it can be serialized
     let expr = snapshot_physical_expr(Arc::clone(value))?;
+
+    // Give the expression a chance to serialize itself first. Returning
+    // `Ok(Some(node))` lets expressions with private state (e.g.
+    // `DynamicFilterPhysicalExpr`) avoid exposing pub-for-proto accessors.
+    // `Ok(None)` falls through to the downcast chain below — that's the
+    // default for built-in expressions which haven't been migrated yet.
+    let encoder = TraitEncoder {
+        codec,
+        proto_converter,
+    };
+    if let Some(node) = expr.to_proto(&encoder)? {
+        return Ok(node);
+    }
 
     // HashTableLookupExpr is used for dynamic filter pushdown in hash joins.
     // It contains an Arc<dyn JoinHashMapType> (the build-side hash table) which
