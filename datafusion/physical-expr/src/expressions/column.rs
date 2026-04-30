@@ -149,7 +149,7 @@ impl PhysicalExpr for Column {
     #[cfg(feature = "proto")]
     fn to_proto(
         &self,
-        _ctx: &dyn datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncoder,
+        _ctx: &datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncodeCtx<'_>,
     ) -> Result<Option<datafusion_proto_common::protobuf::PhysicalExprNode>> {
         use datafusion_proto_common::protobuf;
         Ok(Some(protobuf::PhysicalExprNode {

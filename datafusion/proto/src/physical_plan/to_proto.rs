@@ -239,23 +239,24 @@ pub fn serialize_physical_expr(
     )
 }
 
-/// Concrete [`PhysicalExprEncoder`] used to drive `PhysicalExpr::to_proto`.
+/// Concrete [`PhysicalExprEncode`] driver used to back
+/// [`PhysicalExprEncodeCtx`] when expressions invoke `PhysicalExpr::to_proto`.
 ///
 /// Wraps the existing extension codec + converter pair so individual
 /// expressions can recurse into children without depending on
 /// `datafusion-proto` directly.
-struct TraitEncoder<'a> {
+///
+/// [`PhysicalExprEncode`]: datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncode
+/// [`PhysicalExprEncodeCtx`]: datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncodeCtx
+struct ConverterEncoder<'a> {
     codec: &'a dyn PhysicalExtensionCodec,
     proto_converter: &'a dyn PhysicalProtoConverterExtension,
 }
 
-impl datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncoder
-    for TraitEncoder<'_>
+impl datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncode
+    for ConverterEncoder<'_>
 {
-    fn encode_child(
-        &self,
-        expr: &Arc<dyn PhysicalExpr>,
-    ) -> Result<protobuf::PhysicalExprNode> {
+    fn encode(&self, expr: &Arc<dyn PhysicalExpr>) -> Result<protobuf::PhysicalExprNode> {
         self.proto_converter
             .physical_expr_to_proto(expr, self.codec)
     }
@@ -281,11 +282,12 @@ pub fn serialize_physical_expr_with_converter(
     // `DynamicFilterPhysicalExpr`) avoid exposing pub-for-proto accessors.
     // `Ok(None)` falls through to the downcast chain below — that's the
     // default for built-in expressions which haven't been migrated yet.
-    let encoder = TraitEncoder {
+    let encoder = ConverterEncoder {
         codec,
         proto_converter,
     };
-    if let Some(node) = expr.to_proto(&encoder)? {
+    let ctx = datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncodeCtx::new(&encoder);
+    if let Some(node) = expr.to_proto(&ctx)? {
         return Ok(node);
     }
 
