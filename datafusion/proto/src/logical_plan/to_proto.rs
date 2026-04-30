@@ -28,9 +28,10 @@ use datafusion_expr::expr::{
 use datafusion_expr::logical_plan::Subquery;
 use datafusion_expr::{Expr, SortExpr, TryCast, WindowFunctionDefinition};
 
+use datafusion_common::DataFusionError as Error;
+
 use crate::protobuf::{
     self, CubeNode, GroupingSetNode, LogicalExprList, PlaceholderNode, RollupNode,
-    ToProtoError as Error,
 };
 
 use super::{AsLogicalPlan, LogicalExtensionCodec};
@@ -253,7 +254,7 @@ pub fn serialize_expr(
         }
 
         Expr::ScalarVariable(_, _) => {
-            return Err(Error::General(
+            return Err(Error::Plan(
                 "Proto serialization error: Scalar Variable not supported".to_string(),
             ));
         }
@@ -451,7 +452,7 @@ pub fn serialize_expr(
         | Expr::Exists(_)
         | Expr::OuterReferenceColumn(_, _)
         | Expr::SetComparison(_) => {
-            return Err(Error::General(format!(
+            return Err(Error::Plan(format!(
                 "Proto serialization error: {expr} is not yet supported"
             )));
         }
@@ -494,7 +495,7 @@ pub fn serialize_expr(
             })),
         },
         Expr::HigherOrderFunction(_) | Expr::Lambda(_) | Expr::LambdaVariable(_) => {
-            return Err(Error::General(
+            return Err(Error::Plan(
                 "Proto serialization error: Lambda not implemented".to_string(),
             ));
         }
@@ -508,7 +509,7 @@ fn serialize_subquery(
     codec: &dyn LogicalExtensionCodec,
 ) -> Result<protobuf::SubqueryNode, Error> {
     let plan = LogicalPlanNode::try_from_logical_plan(&subquery.subquery, codec)
-        .map_err(|e| Error::General(e.to_string()))?;
+        .map_err(|e| Error::Plan(e.to_string()))?;
     let outer_ref_columns = serialize_exprs(&subquery.outer_ref_columns, codec)?;
     Ok(protobuf::SubqueryNode {
         subquery: Some(Box::new(plan)),

@@ -32,14 +32,15 @@ use crate::{
     },
 };
 
-use crate::protobuf::{ToProtoError, proto_error};
+use crate::protobuf::proto_error;
 use arrow::datatypes::{DataType, Field, Schema, SchemaBuilder, SchemaRef};
 use datafusion_catalog::cte_worktable::CteWorkTable;
 use datafusion_catalog::empty::EmptyTable;
 use datafusion_common::file_options::file_type::FileType;
 use datafusion_common::{
-    Result, TableReference, ToDFSchema, assert_or_internal_err, context,
-    internal_datafusion_err, internal_err, not_impl_err, plan_err,
+    DFSchema, DataFusionError, Result, TableReference, ToDFSchema,
+    assert_or_internal_err, context, internal_datafusion_err, internal_err, not_impl_err,
+    plan_err,
 };
 use datafusion_datasource::file_format::FileFormat;
 use datafusion_datasource::file_format::{
@@ -428,7 +429,6 @@ impl AsLogicalPlan for LogicalPlanNode {
                         .chunks_exact(n_cols)
                         .map(|r| from_proto::parse_exprs(r, ctx, extension_codec))
                         .collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| e.into())
                 }?;
 
                 LogicalPlanBuilder::values(values)?.build()
@@ -726,7 +726,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                         )?,
                         create_extern_table.location.clone(),
                         create_extern_table.file_type.clone(),
-                        pb_schema.try_into()?,
+                        Arc::new(DFSchema::try_from(&pb_schema)?),
                     )
                     .with_partition_cols(create_extern_table.table_partition_cols.clone())
                     .with_order_exprs(order_exprs)
@@ -772,7 +772,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     CreateCatalogSchema {
                         schema_name: create_catalog_schema.schema_name.clone(),
                         if_not_exists: create_catalog_schema.if_not_exists,
-                        schema: pb_schema.try_into()?,
+                        schema: Arc::new(DFSchema::try_from(&pb_schema)?),
                     },
                 )))
             }
@@ -787,7 +787,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     CreateCatalog {
                         catalog_name: create_catalog.catalog_name.clone(),
                         if_not_exists: create_catalog.if_not_exists,
-                        schema: pb_schema.try_into()?,
+                        schema: Arc::new(DFSchema::try_from(&pb_schema)?),
                     },
                 )))
             }
@@ -1506,7 +1506,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                             serialize_expr(r, extension_codec)?,
                         ))
                     })
-                    .collect::<Result<Vec<_>, ToProtoError>>()?
+                    .collect::<Result<Vec<_>, DataFusionError>>()?
                     .into_iter()
                     .unzip();
                 let join_type = protobuf::JoinType::from(join_type.to_owned());
@@ -1685,7 +1685,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                             name: Some(protobuf::TableReference::from(name.clone())),
                             location: location.clone(),
                             file_type: file_type.clone(),
-                            schema: Some(df_schema.try_into()?),
+                            schema: Some(df_schema.as_ref().try_into()?),
                             table_partition_cols: table_partition_cols.clone(),
                             if_not_exists: *if_not_exists,
                             or_replace: *or_replace,
@@ -1731,7 +1731,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     protobuf::CreateCatalogSchemaNode {
                         schema_name: schema_name.clone(),
                         if_not_exists: *if_not_exists,
-                        schema: Some(df_schema.try_into()?),
+                        schema: Some(df_schema.as_ref().try_into()?),
                     },
                 )),
             }),
@@ -1744,7 +1744,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     protobuf::CreateCatalogNode {
                         catalog_name: catalog_name.clone(),
                         if_not_exists: *if_not_exists,
-                        schema: Some(df_schema.try_into()?),
+                        schema: Some(df_schema.as_ref().try_into()?),
                     },
                 )),
             }),
@@ -1869,7 +1869,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                                 .iter()
                                 .map(|c| *c as u64)
                                 .collect(),
-                            schema: Some(schema.try_into()?),
+                            schema: Some(schema.as_ref().try_into()?),
                             options: Some(options.into()),
                         },
                     ))),
@@ -1893,7 +1893,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     protobuf::DropViewNode {
                         name: Some(name.clone().into()),
                         if_exists: *if_exists,
-                        schema: Some(schema.try_into()?),
+                        schema: Some(schema.as_ref().try_into()?),
                     },
                 )),
             }),

@@ -54,7 +54,7 @@ avro = ["datafusion-datasource-avro"]
 arrow = { workspace = true }
 datafusion-catalog = { workspace = true }
 datafusion-catalog-listing = { workspace = true }
-datafusion-common = { workspace = true }
+datafusion-common = { workspace = true, features = ["proto"] }
 datafusion-datasource = { workspace = true, features = ["proto"] }
 datafusion-datasource-arrow = { workspace = true }
 datafusion-datasource-avro = { workspace = true, optional = true }

@@ -18,9 +18,9 @@
 //! Conversions between `datafusion-proto-common` types and the `CsvSink`
 //! type. Enabled by the `proto` feature.
 
+use datafusion_common::proto::proto_error;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_datasource::file_sink_config::FileSink;
-use datafusion_proto_common::common::proto_error;
 use datafusion_proto_common::protobuf;
 
 use crate::file_format::CsvSink;

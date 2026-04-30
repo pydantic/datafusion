@@ -18,8 +18,7 @@
 //! Conversions between `datafusion-proto-common` types and `datafusion-expr`
 //! types. Enabled by the `proto` feature.
 
-use datafusion_common::ScalarValue;
-use datafusion_proto_common::FromProtoError as Error;
+use datafusion_common::{DataFusionError, ScalarValue, plan_datafusion_err};
 use datafusion_proto_common::protobuf;
 
 use crate::dml::InsertOp;
@@ -47,19 +46,23 @@ impl From<WindowFrameUnits> for protobuf::WindowFrameUnits {
 }
 
 impl TryFrom<protobuf::WindowFrame> for WindowFrame {
-    type Error = Error;
+    type Error = DataFusionError;
 
     fn try_from(window: protobuf::WindowFrame) -> Result<Self, Self::Error> {
         let units = WindowFrameUnits::from(
             protobuf::WindowFrameUnits::try_from(window.window_frame_units).map_err(
-                |_| Error::unknown("WindowFrameUnits", window.window_frame_units),
+                |_| {
+                    plan_datafusion_err!(
+                        "Unknown i32 value for WindowFrameUnits enum: {}",
+                        window.window_frame_units
+                    )
+                },
             )?,
         );
-        let start_bound = WindowFrameBound::try_from(
-            window
-                .start_bound
-                .ok_or_else(|| Error::required("start_bound"))?,
-        )?;
+        let start_bound =
+            WindowFrameBound::try_from(window.start_bound.ok_or_else(|| {
+                plan_datafusion_err!("Missing required field start_bound")
+            })?)?;
         let end_bound = window
             .end_bound
             .map(|end_bound| match end_bound {
@@ -74,7 +77,7 @@ impl TryFrom<protobuf::WindowFrame> for WindowFrame {
 }
 
 impl TryFrom<&WindowFrame> for protobuf::WindowFrame {
-    type Error = datafusion_proto_common::ToProtoError;
+    type Error = DataFusionError;
 
     fn try_from(window: &WindowFrame) -> Result<Self, Self::Error> {
         Ok(protobuf::WindowFrame {
@@ -88,13 +91,16 @@ impl TryFrom<&WindowFrame> for protobuf::WindowFrame {
 }
 
 impl TryFrom<protobuf::WindowFrameBound> for WindowFrameBound {
-    type Error = Error;
+    type Error = DataFusionError;
 
     fn try_from(bound: protobuf::WindowFrameBound) -> Result<Self, Self::Error> {
         let bound_type =
             protobuf::WindowFrameBoundType::try_from(bound.window_frame_bound_type)
                 .map_err(|_| {
-                    Error::unknown("WindowFrameBoundType", bound.window_frame_bound_type)
+                    plan_datafusion_err!(
+                        "Unknown i32 value for WindowFrameBoundType enum: {}",
+                        bound.window_frame_bound_type
+                    )
                 })?;
         match bound_type {
             protobuf::WindowFrameBoundType::CurrentRow => Ok(Self::CurrentRow),
@@ -111,7 +117,7 @@ impl TryFrom<protobuf::WindowFrameBound> for WindowFrameBound {
 }
 
 impl TryFrom<&WindowFrameBound> for protobuf::WindowFrameBound {
-    type Error = datafusion_proto_common::ToProtoError;
+    type Error = DataFusionError;
 
     fn try_from(bound: &WindowFrameBound) -> Result<Self, Self::Error> {
         Ok(match bound {

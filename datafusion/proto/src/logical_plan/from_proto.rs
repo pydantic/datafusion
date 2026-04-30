@@ -20,8 +20,8 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field};
 use datafusion_common::datatype::DataTypeExt;
 use datafusion_common::{
-    Result, ScalarValue, TableReference, exec_datafusion_err, internal_err,
-    plan_datafusion_err,
+    DataFusionError as Error, Result, ScalarValue, TableReference, exec_datafusion_err,
+    internal_err, plan_datafusion_err,
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::registry::FunctionRegistry;
@@ -35,7 +35,7 @@ use datafusion_expr::{
     Like, Operator, TryCast, WindowFrame,
     expr::{self, InList, WindowFunction},
 };
-use datafusion_proto_common::{FromProtoError as Error, from_proto::FromOptionalField};
+use datafusion_proto_common::from_proto::FromOptionalField;
 
 use crate::protobuf::{self, CubeNode, GroupingSetNode, PlaceholderNode, RollupNode};
 
@@ -51,7 +51,7 @@ pub fn parse_expr(
     let expr_type = proto
         .expr_type
         .as_ref()
-        .ok_or_else(|| Error::required("expr_type"))?;
+        .ok_or_else(|| plan_datafusion_err!("Missing required field expr_type"))?;
 
     match expr_type {
         ExprType::BinaryExpr(binary_expr) => {
@@ -79,10 +79,9 @@ pub fn parse_expr(
             Ok(Expr::Literal(scalar_value, None))
         }
         ExprType::WindowExpr(expr) => {
-            let window_function = expr
-                .window_function
-                .as_ref()
-                .ok_or_else(|| Error::required("window_function"))?;
+            let window_function = expr.window_function.as_ref().ok_or_else(|| {
+                plan_datafusion_err!("Missing required field window_function")
+            })?;
             let partition_by = parse_exprs(&expr.partition_by, ctx, codec)?;
             let mut order_by = parse_sorts(&expr.order_by, ctx, codec)?;
             let window_frame = expr
@@ -149,7 +148,7 @@ pub fn parse_expr(
                 builder = builder.filter(filter);
             }
 
-            builder.build().map_err(Error::DataFusionError)
+            builder.build()
         }
         ExprType::Alias(alias) => Ok(Expr::Alias(Alias::new(
             parse_required_expr(alias.expr.as_deref(), ctx, "expr", codec)?,
@@ -447,9 +446,11 @@ pub fn parse_expr(
         },
         ExprType::ScalarSubqueryExpr(sq) => {
             let subquery = parse_subquery(
-                sq.subquery
-                    .as_deref()
-                    .ok_or_else(|| Error::required("ScalarSubqueryExprNode.subquery"))?,
+                sq.subquery.as_deref().ok_or_else(|| {
+                    plan_datafusion_err!(
+                        "Missing required field ScalarSubqueryExprNode.subquery"
+                    )
+                })?,
                 ctx,
                 codec,
             )?;
@@ -463,10 +464,9 @@ fn parse_subquery(
     ctx: &TaskContext,
     codec: &dyn LogicalExtensionCodec,
 ) -> Result<Subquery, Error> {
-    let plan_node = proto
-        .subquery
-        .as_ref()
-        .ok_or_else(|| Error::required("SubqueryNode.subquery"))?;
+    let plan_node = proto.subquery.as_ref().ok_or_else(|| {
+        plan_datafusion_err!("Missing required field SubqueryNode.subquery")
+    })?;
     let plan = plan_node.try_into_logical_plan(ctx, codec)?;
     let outer_ref_columns = parse_exprs(&proto.outer_ref_columns, ctx, codec)?;
     Ok(Subquery {
@@ -587,10 +587,13 @@ fn parse_required_expr(
 ) -> Result<Expr, Error> {
     match p {
         Some(expr) => parse_expr(expr, ctx, codec),
-        None => Err(Error::required(field)),
+        None => Err(plan_datafusion_err!(
+            "Missing required field {}",
+            field.into()
+        )),
     }
 }
 
 fn proto_error<S: Into<String>>(message: S) -> Error {
-    Error::General(message.into())
+    Error::Plan(message.into())
 }

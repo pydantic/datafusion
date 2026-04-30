@@ -128,7 +128,7 @@ pub mod logical_plan;
 pub mod physical_plan;
 
 pub mod protobuf {
-    pub use datafusion_proto_common::common::proto_error;
+    pub use datafusion_common::proto::proto_error;
     pub use datafusion_proto_common::protobuf::*;
     pub use datafusion_proto_common::{FromProtoError, ToProtoError};
 }

@@ -21,9 +21,9 @@
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
+use datafusion_common::proto::proto_error;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::dml::InsertOp;
-use datafusion_proto_common::common::proto_error;
 use datafusion_proto_common::protobuf;
 use object_store::ObjectMeta;
 use object_store::path::Path;

@@ -23,6 +23,7 @@ use arrow::array::RecordBatch;
 use arrow::compute::SortOptions;
 use arrow::datatypes::{Field, Schema};
 use arrow::ipc::reader::StreamReader;
+use datafusion_common::proto::proto_error;
 use datafusion_common::{Result, internal_datafusion_err, not_impl_err};
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
@@ -42,7 +43,6 @@ use datafusion_physical_plan::expressions::{
 use datafusion_physical_plan::joins::{HashExpr, SeededRandomState};
 use datafusion_physical_plan::windows::{create_window_expr, schema_add_window_field};
 use datafusion_physical_plan::{Partitioning, PhysicalExpr, WindowExpr};
-use datafusion_proto_common::common::proto_error;
 
 use super::{
     DefaultPhysicalProtoConverter, PhysicalExtensionCodec, PhysicalPlanDecodeContext,

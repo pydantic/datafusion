@@ -42,7 +42,7 @@ name = "datafusion_expr"
 
 [features]
 default = ["sql"]
-proto = ["dep:datafusion-proto-common"]
+proto = ["dep:datafusion-proto-common", "datafusion-common/proto"]
 recursive_protection = ["dep:recursive"]
 sql = ["sqlparser"]
 
