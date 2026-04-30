@@ -26,16 +26,27 @@ pub use datafusion_physical_expr_common::serde::{
     DeserializeContext, PhysicalExprDeserialize, PhysicalExprRegistry,
 };
 
-use crate::expressions::Column;
+use crate::expressions::{Column, NotExpr};
 
-/// Returns a [`PhysicalExprRegistry`] with all of DataFusion's built-in
-/// physical expressions registered.
+/// Returns a [`PhysicalExprRegistry`] with the subset of DataFusion's
+/// built-in physical expressions that have been wired up to the new serde
+/// hook so far.
 ///
-/// Equivalent to `PhysicalExprRegistry::empty().with::<Column>()...`. Use
-/// [`PhysicalExprRegistry::with`] to layer additional custom expressions on
-/// top.
+/// Currently registered:
+///
+/// - [`Column`]
+/// - [`NotExpr`]
+///
+/// More built-ins will be added in follow-up PRs as their internal types
+/// (notably [`datafusion_common::ScalarValue`] and `arrow::DataType`) gain
+/// `serde::{Serialize, Deserialize}` impls.
+///
+/// Use [`PhysicalExprRegistry::with`] to layer additional custom expressions
+/// on top.
 pub fn default_registry() -> PhysicalExprRegistry {
-    PhysicalExprRegistry::empty().with::<Column>()
+    PhysicalExprRegistry::empty()
+        .with::<Column>()
+        .with::<NotExpr>()
 }
 
 #[cfg(test)]
@@ -45,19 +56,34 @@ mod tests {
     use super::*;
     use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
-    #[test]
-    fn column_json_round_trip() {
-        let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 3));
-
+    fn round_trip(expr: Arc<dyn PhysicalExpr>) {
         let json = serde_json::to_string(&expr).unwrap();
-        // {tag, data} envelope, with Column body { name, index }
-        assert!(json.contains("\"tag\":\"Column\""));
-        assert!(json.contains("\"name\":\"a\""));
-        assert!(json.contains("\"index\":3"));
-
         let registry = default_registry();
-        let back = registry.deserialize_json(&json).unwrap();
-        assert!(expr.dyn_eq(back.as_ref()));
+        let back = registry.deserialize_json(&json).unwrap_or_else(|e| {
+            panic!("deserialize failed for {json}: {e}");
+        });
+        assert!(
+            expr.dyn_eq(back.as_ref()),
+            "round-trip mismatch:\n  before: {expr}\n  after:  {back}\n  json:   {json}"
+        );
+    }
+
+    #[test]
+    fn column_round_trip() {
+        round_trip(Arc::new(Column::new("a", 3)));
+    }
+
+    #[test]
+    fn not_expr_round_trip() {
+        round_trip(Arc::new(NotExpr::new(Arc::new(Column::new("a", 0)))));
+    }
+
+    #[test]
+    fn nested_not_round_trip() {
+        // NOT(NOT(a))
+        let inner = NotExpr::new(Arc::new(Column::new("a", 0)));
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(NotExpr::new(Arc::new(inner)));
+        round_trip(expr);
     }
 
     #[test]
@@ -70,5 +96,25 @@ mod tests {
             msg.contains("no PhysicalExpr registered under tag"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn try_with_duplicate_tag_returns_err() {
+        let result = PhysicalExprRegistry::empty()
+            .with::<Column>()
+            .try_with::<Column>();
+        let err = match result {
+            Ok(_) => panic!("expected error on duplicate registration"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("duplicate registration"), "{err}");
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate registration")]
+    fn with_duplicate_tag_panics() {
+        let _ = PhysicalExprRegistry::empty()
+            .with::<Column>()
+            .with::<Column>();
     }
 }

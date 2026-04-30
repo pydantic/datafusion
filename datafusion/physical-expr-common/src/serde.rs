@@ -185,6 +185,42 @@ impl<'reg, 'de> DeserializeContext<'reg, 'de> {
         erased_serde::deserialize(&mut *self.de)
             .map_err(|e| exec_datafusion_err!("PhysicalExpr deserialize failed: {e}"))
     }
+
+    /// Deserialize the data body as a struct with a single
+    /// `Arc<dyn PhysicalExpr>` field named `field`. Helper for unary wrapper
+    /// expressions like `NotExpr`, `NegativeExpr`, `IsNullExpr`, etc.
+    pub fn deserialize_unary(
+        &mut self,
+        field: &'static str,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        struct V<'r> {
+            registry: &'r PhysicalExprRegistry,
+            field: &'static str,
+        }
+        impl<'de, 'r> Visitor<'de> for V<'r> {
+            type Value = Arc<dyn PhysicalExpr>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "a unary expression body {{{}}}", self.field)
+            }
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut child: Option<Arc<dyn PhysicalExpr>> = None;
+                while let Some(k) = map.next_key::<String>()? {
+                    if k == self.field {
+                        child = Some(map.next_value_seed(self.registry.expr_seed())?);
+                    } else {
+                        let _: serde::de::IgnoredAny = map.next_value()?;
+                    }
+                }
+                child.ok_or_else(|| A::Error::missing_field(self.field))
+            }
+        }
+        let registry = self.registry;
+        serde::Deserializer::deserialize_map(&mut *self.de, V { registry, field })
+            .map_err(|e| exec_datafusion_err!("unary expr deserialize failed: {e}"))
+    }
 }
 
 /// `DeserializeSeed` that reads a `{tag, data}` envelope and dispatches to the
@@ -307,22 +343,37 @@ impl PhysicalExprRegistry {
 
     /// Register the constructor for `T`.
     ///
-    /// Panics if a constructor was already registered under `T::TAG` — see
-    /// [`Self::contains_tag`] if you need to check ahead of time.
-    pub fn with<T: PhysicalExprDeserialize + 'static>(mut self) -> Self {
+    /// Panics if `T::TAG` is empty (the "not serializable" sentinel) or if a
+    /// constructor was already registered under `T::TAG`. Tag collisions
+    /// almost always indicate a programming error — two types claiming the
+    /// same identifier — so failing loudly during registry construction is
+    /// the safer default. Use [`Self::try_with`] if you need a fallible
+    /// version (e.g. when registering plugins discovered at runtime).
+    pub fn with<T: PhysicalExprDeserialize + 'static>(self) -> Self {
+        match self.try_with::<T>() {
+            Ok(reg) => reg,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Fallible version of [`Self::with`]. Returns the registry unchanged on
+    /// success, or a [`DataFusionError`] on tag collision / empty tag.
+    pub fn try_with<T: PhysicalExprDeserialize + 'static>(mut self) -> Result<Self> {
         let tag = T::TAG;
         if tag.is_empty() {
-            panic!(
-                "PhysicalExprDeserialize::TAG must not be empty (got empty for type registered with PhysicalExprRegistry::with)"
-            );
+            return Err(exec_datafusion_err!(
+                "PhysicalExprDeserialize::TAG must not be empty"
+            ));
         }
-        let prev = self.constructors.insert(tag, |ctx| {
+        if self.constructors.contains_key(tag) {
+            return Err(exec_datafusion_err!(
+                "PhysicalExprRegistry: duplicate registration for tag {tag:?}"
+            ));
+        }
+        self.constructors.insert(tag, |ctx| {
             T::deserialize(ctx).map(|v| Arc::new(v) as Arc<dyn PhysicalExpr>)
         });
-        if prev.is_some() {
-            panic!("PhysicalExprRegistry: duplicate registration for tag {tag:?}");
-        }
-        self
+        Ok(self)
     }
 
     /// Returns true if a constructor is registered for `tag`.
