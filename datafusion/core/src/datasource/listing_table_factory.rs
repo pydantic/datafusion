@@ -309,6 +309,10 @@ mod tests {
     #[tokio::test]
     async fn test_create_using_folder_with_compression() {
         let dir = tempfile::tempdir().unwrap();
+        // Schema inference now requires at least one file at the location.
+        // The file itself can be 0-byte — it will be filtered out before the
+        // format-specific inference runs, leaving an empty inferred schema.
+        fs::File::create_new(dir.path().join("placeholder.csv.gz")).unwrap();
 
         let factory = ListingTableFactory::new();
         let context = SessionContext::new();
@@ -351,6 +355,9 @@ mod tests {
     #[tokio::test]
     async fn test_create_using_folder_without_compression() {
         let dir = tempfile::tempdir().unwrap();
+        // See `test_create_using_folder_with_compression` — a placeholder file
+        // is required so schema inference does not error on an empty location.
+        fs::File::create_new(dir.path().join("placeholder.csv")).unwrap();
 
         let factory = ListingTableFactory::new();
         let context = SessionContext::new();
@@ -387,6 +394,8 @@ mod tests {
         let mut path = PathBuf::from(dir.path());
         path.extend(["odd.v1", "odd.v2"]);
         fs::create_dir_all(&path).unwrap();
+        // Placeholder so schema inference does not error on an empty location.
+        fs::File::create_new(path.join("placeholder.parquet")).unwrap();
 
         let factory = ListingTableFactory::new();
         let context = SessionContext::new();
