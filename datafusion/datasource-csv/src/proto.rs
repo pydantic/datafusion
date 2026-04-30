@@ -55,3 +55,41 @@ impl TryFrom<&CsvSink> for protobuf::CsvSink {
         })
     }
 }
+
+impl From<&crate::file_format::CsvFormatFactory> for protobuf::CsvOptions {
+    fn from(factory: &crate::file_format::CsvFormatFactory) -> Self {
+        let Some(options) = &factory.options else {
+            return protobuf::CsvOptions::default();
+        };
+        protobuf::CsvOptions {
+            has_header: options.has_header.map_or(vec![], |v| vec![v as u8]),
+            delimiter: vec![options.delimiter],
+            quote: vec![options.quote],
+            terminator: options.terminator.map_or(vec![], |v| vec![v]),
+            escape: options.escape.map_or(vec![], |v| vec![v]),
+            double_quote: options.double_quote.map_or(vec![], |v| vec![v as u8]),
+            compression: options.compression as i32,
+            schema_infer_max_rec: options.schema_infer_max_rec.map(|v| v as u64),
+            date_format: options.date_format.clone().unwrap_or_default(),
+            datetime_format: options.datetime_format.clone().unwrap_or_default(),
+            timestamp_format: options.timestamp_format.clone().unwrap_or_default(),
+            timestamp_tz_format: options.timestamp_tz_format.clone().unwrap_or_default(),
+            time_format: options.time_format.clone().unwrap_or_default(),
+            null_value: options.null_value.clone().unwrap_or_default(),
+            null_regex: options.null_regex.clone().unwrap_or_default(),
+            comment: options.comment.map_or(vec![], |v| vec![v]),
+            newlines_in_values: options
+                .newlines_in_values
+                .map_or(vec![], |v| vec![v as u8]),
+            truncated_rows: options.truncated_rows.map_or(vec![], |v| vec![v as u8]),
+            compression_level: options.compression_level,
+            quote_style: options.quote_style as i32,
+            ignore_leading_whitespace: options
+                .ignore_leading_whitespace
+                .map_or(vec![], |v| vec![v as u8]),
+            ignore_trailing_whitespace: options
+                .ignore_trailing_whitespace
+                .map_or(vec![], |v| vec![v as u8]),
+        }
+    }
+}

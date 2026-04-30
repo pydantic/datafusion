@@ -1006,8 +1006,8 @@ impl TryFrom<&protobuf::CsvOptions> for CsvOptions {
     ) -> datafusion_common::Result<Self, Self::Error> {
         Ok(CsvOptions {
             has_header: proto_opts.has_header.first().map(|h| *h != 0),
-            delimiter: proto_opts.delimiter[0],
-            quote: proto_opts.quote[0],
+            delimiter: proto_opts.delimiter.first().copied().unwrap_or(b','),
+            quote: proto_opts.quote.first().copied().unwrap_or(b'"'),
             terminator: proto_opts.terminator.first().copied(),
             escape: proto_opts.escape.first().copied(),
             double_quote: proto_opts.double_quote.first().map(|h| *h != 0),
@@ -1208,6 +1208,11 @@ impl TryFrom<&protobuf::TableParquetOptions> for TableParquetOptions {
                 .unwrap()
                 .unwrap(),
             column_specific_options,
+            key_value_metadata: value
+                .key_value_metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), Some(v.clone())))
+                .collect(),
             ..Default::default()
         };
         Ok(opts)

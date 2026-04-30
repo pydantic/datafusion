@@ -55,3 +55,17 @@ impl TryFrom<&JsonSink> for protobuf::JsonSink {
         })
     }
 }
+
+impl From<&crate::file_format::JsonFormatFactory> for protobuf::JsonOptions {
+    fn from(factory: &crate::file_format::JsonFormatFactory) -> Self {
+        let Some(options) = &factory.options else {
+            return protobuf::JsonOptions::default();
+        };
+        protobuf::JsonOptions {
+            compression: options.compression as i32,
+            schema_infer_max_rec: options.schema_infer_max_rec.map(|v| v as u64),
+            compression_level: options.compression_level,
+            newline_delimited: Some(options.newline_delimited),
+        }
+    }
+}
