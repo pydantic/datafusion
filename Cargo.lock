@@ -2346,6 +2346,7 @@ dependencies = [
  "datafusion-functions",
  "datafusion-functions-aggregate-common",
  "datafusion-physical-expr-common",
+ "erased-serde",
  "half",
  "hashbrown 0.17.0",
  "indexmap 2.14.0",
@@ -2356,6 +2357,8 @@ dependencies = [
  "rand 0.9.4",
  "recursive",
  "rstest",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

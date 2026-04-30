@@ -45,19 +45,23 @@
 //! dispatch on the tag to call the right constructor. Implementers opt in
 //! by implementing [`PhysicalExprDeserialize`].
 //!
-//! The deserialization path is currently JSON-only — the trait method takes a
-//! [`serde_json::Value`] for the body. A future revision will replace that
-//! with a streaming, format-agnostic API; the current shape is enough to
-//! cover JSON-based debugging and tests.
+//! Decoding is format-agnostic: the trait method receives a
+//! [`DeserializeContext`] holding `&mut dyn erased_serde::Deserializer<'de>`
+//! plus the registry. Convenience entry points like
+//! [`PhysicalExprRegistry::deserialize_json`] wrap a concrete serde
+//! `Deserializer` for callers; other formats can be added by writing a
+//! similar wrapper.
 //!
 //! Wire stability across DataFusion versions is **not** a goal of this layer.
 //! Use the proto crate for stable cross-version wire formats.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 use datafusion_common::{Result, exec_datafusion_err};
 use serde::Serialize;
+use serde::de::{Deserialize, DeserializeSeed, Error as DeError, MapAccess, Visitor};
 use serde::ser::{Error as _, SerializeStruct, Serializer};
 
 use crate::physical_expr::PhysicalExpr;
@@ -99,9 +103,10 @@ impl Serialize for NotSerializable {
 /// Trait implemented by expressions that opt in to deserialization.
 ///
 /// Each implementer pairs a stable string tag (`TAG`) with a constructor
-/// (`deserialize`) that rebuilds the expression from a JSON body. The tag
-/// must be globally unique and must agree with what the type returns from
-/// [`PhysicalExpr::serde_tag`] — the convention is to use `TAG` for both:
+/// (`deserialize`) that rebuilds the expression from a serde
+/// [`Deserializer`]. The tag must be globally unique and must agree with
+/// what the type returns from [`PhysicalExpr::serde_tag`] — the convention
+/// is to use `TAG` for both:
 ///
 /// ```ignore
 /// impl PhysicalExpr for MyExpr {
@@ -110,44 +115,184 @@ impl Serialize for NotSerializable {
 /// }
 /// ```
 ///
-/// Trait-object children (`Arc<dyn PhysicalExpr>`) are deserialized by
-/// recursing back through the registry — see [`PhysicalExprRegistry::deserialize_value`].
+/// # Implementing for leaf expressions (no trait-object children)
+///
+/// Derive `serde::Deserialize` on the type and call `ctx.deserialize::<Self>()`:
+///
+/// ```ignore
+/// fn deserialize(ctx: &mut DeserializeContext<'_, '_>) -> Result<Self> {
+///     ctx.deserialize::<Self>()
+/// }
+/// ```
+///
+/// # Implementing for expressions with trait-object children
+///
+/// `Arc<dyn PhysicalExpr>` is not directly `Deserialize` — child expressions
+/// need to recurse through the registry. Use [`DeserializeContext::expr_seed`]
+/// inside a hand-written `Visitor`:
+///
+/// ```ignore
+/// struct V<'r> { registry: &'r PhysicalExprRegistry }
+/// impl<'de, 'r> Visitor<'de> for V<'r> {
+///     type Value = MyExpr;
+///     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<MyExpr, A::Error> {
+///         let mut child = None;
+///         while let Some(k) = map.next_key::<String>()? {
+///             match k.as_str() {
+///                 "child" => child = Some(map.next_value_seed(self.registry.expr_seed())?),
+///                 _ => { let _: serde::de::IgnoredAny = map.next_value()?; }
+///             }
+///         }
+///         Ok(MyExpr { child: child.ok_or_else(|| Error::missing_field("child"))? })
+///     }
+/// }
+/// ctx.deserializer().deserialize_map(V { registry: ctx.registry() })
+/// ```
 pub trait PhysicalExprDeserialize: PhysicalExpr + Sized {
     /// Stable identifier for this expression in serialized form.
     const TAG: &'static str;
 
     /// Rebuild `Self` from the body of an envelope.
-    ///
-    /// `data` is the value of the `"data"` field of the `{tag, data}`
-    /// envelope. For expressions with no trait-object children, the typical
-    /// implementation is `serde_json::from_value(data).map_err(...)`.
-    /// Expressions with children should deserialize the children's bodies as
-    /// `serde_json::Value` and recurse via `ctx.registry().deserialize_value`.
-    fn deserialize(ctx: &DeserializeContext<'_>, data: serde_json::Value)
-    -> Result<Self>;
+    fn deserialize(ctx: &mut DeserializeContext<'_, '_>) -> Result<Self>;
 }
 
-/// Context passed to [`PhysicalExprDeserialize::deserialize`]. Carries the
-/// registry so implementers can recursively deserialize child expressions.
-pub struct DeserializeContext<'reg> {
+/// Context passed to [`PhysicalExprDeserialize::deserialize`].
+///
+/// Holds the registry (so child expressions can recurse via
+/// [`PhysicalExprRegistry::expr_seed`]) and a type-erased deserializer
+/// pointing at the expression's data body.
+pub struct DeserializeContext<'reg, 'de> {
     registry: &'reg PhysicalExprRegistry,
+    de: &'reg mut dyn erased_serde::Deserializer<'de>,
 }
 
-impl<'reg> DeserializeContext<'reg> {
+impl<'reg, 'de> DeserializeContext<'reg, 'de> {
+    /// Returns the registry, primarily to access [`PhysicalExprRegistry::expr_seed`]
+    /// when deserializing trait-object children.
     pub fn registry(&self) -> &'reg PhysicalExprRegistry {
         self.registry
     }
+
+    /// Direct access to the erased deserializer. Use this when implementing a
+    /// custom `Visitor` for an expression with trait-object children.
+    pub fn deserializer(&mut self) -> &mut dyn erased_serde::Deserializer<'de> {
+        &mut *self.de
+    }
+
+    /// Deserialize the data body as `T`. Convenience for leaf expressions
+    /// whose body is `T: serde::Deserialize`.
+    pub fn deserialize<T: Deserialize<'de>>(&mut self) -> Result<T> {
+        erased_serde::deserialize(&mut *self.de)
+            .map_err(|e| exec_datafusion_err!("PhysicalExpr deserialize failed: {e}"))
+    }
 }
 
-type Constructor =
-    fn(&DeserializeContext<'_>, serde_json::Value) -> Result<Arc<dyn PhysicalExpr>>;
+/// `DeserializeSeed` that reads a `{tag, data}` envelope and dispatches to the
+/// registered constructor for `tag`. Use via [`PhysicalExprRegistry::expr_seed`]
+/// inside `next_value_seed` / `next_element_seed` calls.
+pub struct ExprSeed<'reg> {
+    registry: &'reg PhysicalExprRegistry,
+}
+
+impl<'de, 'reg> DeserializeSeed<'de> for ExprSeed<'reg> {
+    type Value = Arc<dyn PhysicalExpr>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(EnvelopeVisitor {
+            registry: self.registry,
+        })
+    }
+}
+
+struct EnvelopeVisitor<'reg> {
+    registry: &'reg PhysicalExprRegistry,
+}
+
+impl<'de, 'reg> Visitor<'de> for EnvelopeVisitor<'reg> {
+    type Value = Arc<dyn PhysicalExpr>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a {tag, data} PhysicalExpr envelope")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        // Tag must come first — that's how we serialize, and reading it first
+        // lets us dispatch the data field to the correct constructor without
+        // buffering.
+        let tag_key: String = map
+            .next_key()?
+            .ok_or_else(|| A::Error::missing_field("tag"))?;
+        if tag_key != "tag" {
+            return Err(A::Error::custom(format!(
+                "expected `tag` as first key in PhysicalExpr envelope, got {tag_key:?}"
+            )));
+        }
+        let tag: String = map.next_value()?;
+
+        let constructor =
+            *self
+                .registry
+                .constructors
+                .get(tag.as_str())
+                .ok_or_else(|| {
+                    A::Error::custom(format!(
+                        "no PhysicalExpr registered under tag {tag:?}"
+                    ))
+                })?;
+
+        let data_key: String = map
+            .next_key()?
+            .ok_or_else(|| A::Error::missing_field("data"))?;
+        if data_key != "data" {
+            return Err(A::Error::custom(format!(
+                "expected `data` after `tag` in PhysicalExpr envelope, got {data_key:?}"
+            )));
+        }
+
+        map.next_value_seed(DataSeed {
+            registry: self.registry,
+            constructor,
+        })
+    }
+}
+
+struct DataSeed<'reg> {
+    registry: &'reg PhysicalExprRegistry,
+    constructor: Constructor,
+}
+
+impl<'de, 'reg> DeserializeSeed<'de> for DataSeed<'reg> {
+    type Value = Arc<dyn PhysicalExpr>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        let mut erased = <dyn erased_serde::Deserializer<'de>>::erase(deserializer);
+        let mut ctx = DeserializeContext {
+            registry: self.registry,
+            de: &mut erased,
+        };
+        (self.constructor)(&mut ctx).map_err(D::Error::custom)
+    }
+}
+
+type Constructor = for<'reg, 'de> fn(
+    &mut DeserializeContext<'reg, 'de>,
+) -> Result<Arc<dyn PhysicalExpr>>;
 
 /// Registry mapping serialization tags to constructors.
 ///
 /// Built up with [`PhysicalExprRegistry::empty`] and
 /// [`PhysicalExprRegistry::with`] in builder style. The `physical-expr` crate
-/// provides a `PhysicalExprRegistry::new()` that returns a registry
-/// pre-populated with all of DataFusion's built-in expressions.
+/// provides a `default_registry()` that returns a registry pre-populated with
+/// all of DataFusion's built-in expressions.
 pub struct PhysicalExprRegistry {
     constructors: HashMap<&'static str, Constructor>,
 }
@@ -171,8 +316,8 @@ impl PhysicalExprRegistry {
                 "PhysicalExprDeserialize::TAG must not be empty (got empty for type registered with PhysicalExprRegistry::with)"
             );
         }
-        let prev = self.constructors.insert(tag, |ctx, data| {
-            T::deserialize(ctx, data).map(|v| Arc::new(v) as Arc<dyn PhysicalExpr>)
+        let prev = self.constructors.insert(tag, |ctx| {
+            T::deserialize(ctx).map(|v| Arc::new(v) as Arc<dyn PhysicalExpr>)
         });
         if prev.is_some() {
             panic!("PhysicalExprRegistry: duplicate registration for tag {tag:?}");
@@ -185,60 +330,35 @@ impl PhysicalExprRegistry {
         self.constructors.contains_key(tag)
     }
 
-    /// Decode a JSON-serialized expression.
-    ///
-    /// `s` must be a `{tag, data}` envelope produced by serializing an
-    /// `Arc<dyn PhysicalExpr>` (or `dyn PhysicalExpr`) through this crate's
-    /// [`Serialize`] impl.
-    pub fn deserialize_json(&self, s: &str) -> Result<Arc<dyn PhysicalExpr>> {
-        let value: serde_json::Value = serde_json::from_str(s).map_err(|e| {
-            exec_datafusion_err!("failed to parse PhysicalExpr JSON: {e}")
-        })?;
-        self.deserialize_value(value)
+    /// Returns a `DeserializeSeed` that reads a `{tag, data}` envelope and
+    /// produces an `Arc<dyn PhysicalExpr>`. Use this inside a custom
+    /// `Visitor` to deserialize trait-object children of an expression.
+    pub fn expr_seed(&self) -> ExprSeed<'_> {
+        ExprSeed { registry: self }
     }
 
-    /// Decode an already-parsed JSON value as an expression. Used both at the
-    /// top level and recursively for child expressions.
-    pub fn deserialize_value(
+    /// Decode an expression from any serde [`Deserializer`].
+    ///
+    /// This is the format-agnostic entry point. Convenience methods like
+    /// [`Self::deserialize_json`] wrap this for specific formats.
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         &self,
-        value: serde_json::Value,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        let mut obj = match value {
-            serde_json::Value::Object(o) => o,
-            other => {
-                return Err(exec_datafusion_err!(
-                    "expected PhysicalExpr envelope object, got {other}"
-                ));
-            }
-        };
+        deserializer: D,
+    ) -> std::result::Result<Arc<dyn PhysicalExpr>, D::Error> {
+        self.expr_seed().deserialize(deserializer)
+    }
 
-        let tag = match obj.remove("tag") {
-            Some(serde_json::Value::String(s)) => s,
-            Some(other) => {
-                return Err(exec_datafusion_err!(
-                    "PhysicalExpr envelope `tag` must be a string, got {other}"
-                ));
-            }
-            None => {
-                return Err(exec_datafusion_err!(
-                    "PhysicalExpr envelope missing `tag` field"
-                ));
-            }
-        };
-        let data = obj.remove("data").ok_or_else(|| {
-            exec_datafusion_err!("PhysicalExpr envelope missing `data` field")
+    /// Decode a JSON-serialized expression. Convenience wrapper around
+    /// [`Self::deserialize`] with a `serde_json` deserializer.
+    pub fn deserialize_json(&self, s: &str) -> Result<Arc<dyn PhysicalExpr>> {
+        let mut de = serde_json::Deserializer::from_str(s);
+        let expr = self
+            .deserialize(&mut de)
+            .map_err(|e| exec_datafusion_err!("PhysicalExpr JSON decode failed: {e}"))?;
+        de.end().map_err(|e| {
+            exec_datafusion_err!("PhysicalExpr JSON had trailing data: {e}")
         })?;
-
-        let constructor = *self.constructors.get(tag.as_str()).ok_or_else(|| {
-            exec_datafusion_err!(
-                "no PhysicalExpr registered under tag {:?}; registered tags: {:?}",
-                tag,
-                self.constructors.keys().copied().collect::<Vec<_>>()
-            )
-        })?;
-
-        let ctx = DeserializeContext { registry: self };
-        constructor(&ctx, data)
+        Ok(expr)
     }
 }
 
