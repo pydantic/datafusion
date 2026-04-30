@@ -100,9 +100,19 @@ pub mod generated;
 pub mod to_proto;
 
 pub use from_proto::Error as FromProtoError;
-pub use generated::datafusion_proto_common as protobuf_common;
-pub use generated::datafusion_proto_common::*;
+pub use generated::common_pkg as protobuf_common;
+pub use generated::common_pkg::*;
 pub use to_proto::Error as ToProtoError;
+
+/// All DataFusion protobuf model types (both `package datafusion` and
+/// `package datafusion_common`) re-exported from a single flat namespace.
+///
+/// This is the canonical location for these prost-generated types.
+/// `datafusion-proto` re-exports it as `datafusion_proto::protobuf`.
+pub mod protobuf {
+    pub use crate::generated::common_pkg::*;
+    pub use crate::generated::datafusion::*;
+}
 
 #[cfg(doctest)]
 doc_comment::doctest!("../README.md", readme_example_test);

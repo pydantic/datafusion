@@ -3114,14 +3114,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gen"
-version = "0.1.0"
-dependencies = [
- "pbjson-build 0.9.0",
- "prost-build",
-]
-
-[[package]]
 name = "gen-common"
 version = "0.1.0"
 dependencies = [
