@@ -20,8 +20,8 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field};
 use datafusion_common::datatype::DataTypeExt;
 use datafusion_common::{
-    NullEquality, RecursionUnnestOption, Result, ScalarValue, TableReference,
-    UnnestOptions, exec_datafusion_err, internal_err, plan_datafusion_err,
+    Result, ScalarValue, TableReference, exec_datafusion_err, internal_err,
+    plan_datafusion_err,
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::registry::FunctionRegistry;
@@ -32,48 +32,17 @@ use datafusion_expr::logical_plan::Subquery;
 use datafusion_expr::{
     Between, BinaryExpr, Case, Cast, Expr, GroupingSet,
     GroupingSet::GroupingSets,
-    JoinConstraint, JoinType, Like, Operator, TryCast, WindowFrame, WindowFrameBound,
-    WindowFrameUnits,
+    Like, Operator, TryCast, WindowFrame, WindowFrameBound, WindowFrameUnits,
     expr::{self, InList, WindowFunction},
-    logical_plan::{PlanType, StringifiedPlan},
 };
 use datafusion_expr::{ExprFunctionExt, WriteOp};
 use datafusion_proto_common::{FromProtoError as Error, from_proto::FromOptionalField};
 
-use crate::protobuf::plan_type::PlanTypeEnum::{
-    FinalPhysicalPlanWithSchema, InitialPhysicalPlanWithSchema,
-};
-use crate::protobuf::{
-    self, AnalyzedLogicalPlanType, CubeNode, GroupingSetNode, OptimizedLogicalPlanType,
-    OptimizedPhysicalPlanType, PlaceholderNode, RollupNode,
-    plan_type::PlanTypeEnum::{
-        AnalyzedLogicalPlan, FinalAnalyzedLogicalPlan, FinalLogicalPlan,
-        FinalPhysicalPlan, FinalPhysicalPlanWithStats, InitialLogicalPlan,
-        InitialPhysicalPlan, InitialPhysicalPlanWithStats, OptimizedLogicalPlan,
-        OptimizedPhysicalPlan, PhysicalPlanError,
-    },
-};
+use crate::protobuf::{self, CubeNode, GroupingSetNode, PlaceholderNode, RollupNode};
 
 use crate::convert::{FromProto, TryFromProto};
 
 use super::{AsLogicalPlan, LogicalExtensionCodec};
-
-impl FromProto<&protobuf::UnnestOptions> for UnnestOptions {
-    fn from_proto(opts: &protobuf::UnnestOptions) -> Self {
-        Self {
-            preserve_nulls: opts.preserve_nulls,
-            recursions: opts
-                .recursions
-                .iter()
-                .map(|r| RecursionUnnestOption {
-                    input_column: r.input_column.as_ref().unwrap().into(),
-                    output_column: r.output_column.as_ref().unwrap().into(),
-                    depth: r.depth as usize,
-                })
-                .collect::<Vec<_>>(),
-        }
-    }
-}
 
 impl FromProto<protobuf::WindowFrameUnits> for WindowFrameUnits {
     fn from_proto(units: protobuf::WindowFrameUnits) -> Self {
@@ -81,75 +50,6 @@ impl FromProto<protobuf::WindowFrameUnits> for WindowFrameUnits {
             protobuf::WindowFrameUnits::Rows => Self::Rows,
             protobuf::WindowFrameUnits::Range => Self::Range,
             protobuf::WindowFrameUnits::Groups => Self::Groups,
-        }
-    }
-}
-
-impl TryFromProto<protobuf::TableReference> for TableReference {
-    type Error = Error;
-
-    fn try_from_proto(value: protobuf::TableReference) -> Result<Self, Self::Error> {
-        use protobuf::table_reference::TableReferenceEnum;
-        let table_reference_enum = value
-            .table_reference_enum
-            .ok_or_else(|| Error::required("table_reference_enum"))?;
-
-        match table_reference_enum {
-            TableReferenceEnum::Bare(protobuf::BareTableReference { table }) => {
-                Ok(TableReference::bare(table))
-            }
-            TableReferenceEnum::Partial(protobuf::PartialTableReference {
-                schema,
-                table,
-            }) => Ok(TableReference::partial(schema, table)),
-            TableReferenceEnum::Full(protobuf::FullTableReference {
-                catalog,
-                schema,
-                table,
-            }) => Ok(TableReference::full(catalog, schema, table)),
-        }
-    }
-}
-
-impl FromProto<&protobuf::StringifiedPlan> for StringifiedPlan {
-    fn from_proto(stringified_plan: &protobuf::StringifiedPlan) -> Self {
-        Self {
-            plan_type: match stringified_plan
-                .plan_type
-                .as_ref()
-                .and_then(|pt| pt.plan_type_enum.as_ref())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Cannot create protobuf::StringifiedPlan from {stringified_plan:?}"
-                    )
-                }) {
-                InitialLogicalPlan(_) => PlanType::InitialLogicalPlan,
-                AnalyzedLogicalPlan(AnalyzedLogicalPlanType { analyzer_name }) => {
-                    PlanType::AnalyzedLogicalPlan {
-                        analyzer_name:analyzer_name.clone()
-                    }
-                }
-                FinalAnalyzedLogicalPlan(_) => PlanType::FinalAnalyzedLogicalPlan,
-                OptimizedLogicalPlan(OptimizedLogicalPlanType { optimizer_name }) => {
-                    PlanType::OptimizedLogicalPlan {
-                        optimizer_name: optimizer_name.clone(),
-                    }
-                }
-                FinalLogicalPlan(_) => PlanType::FinalLogicalPlan,
-                InitialPhysicalPlan(_) => PlanType::InitialPhysicalPlan,
-                InitialPhysicalPlanWithStats(_) => PlanType::InitialPhysicalPlanWithStats,
-                InitialPhysicalPlanWithSchema(_) => PlanType::InitialPhysicalPlanWithSchema,
-                OptimizedPhysicalPlan(OptimizedPhysicalPlanType { optimizer_name }) => {
-                    PlanType::OptimizedPhysicalPlan {
-                        optimizer_name: optimizer_name.clone(),
-                    }
-                }
-                FinalPhysicalPlan(_) => PlanType::FinalPhysicalPlan,
-                FinalPhysicalPlanWithStats(_) => PlanType::FinalPhysicalPlanWithStats,
-                FinalPhysicalPlanWithSchema(_) => PlanType::FinalPhysicalPlanWithSchema,
-                PhysicalPlanError(_) => PlanType::PhysicalPlanError,
-            },
-            plan: Arc::new(stringified_plan.plan.clone()),
         }
     }
 }
@@ -200,41 +100,6 @@ impl TryFromProto<protobuf::WindowFrameBound> for WindowFrameBound {
                 Some(x) => Ok(Self::Following(ScalarValue::try_from(&x)?)),
                 None => Ok(Self::Following(ScalarValue::UInt64(None))),
             },
-        }
-    }
-}
-
-impl FromProto<protobuf::JoinType> for JoinType {
-    fn from_proto(t: protobuf::JoinType) -> Self {
-        match t {
-            protobuf::JoinType::Inner => JoinType::Inner,
-            protobuf::JoinType::Left => JoinType::Left,
-            protobuf::JoinType::Right => JoinType::Right,
-            protobuf::JoinType::Full => JoinType::Full,
-            protobuf::JoinType::Leftsemi => JoinType::LeftSemi,
-            protobuf::JoinType::Rightsemi => JoinType::RightSemi,
-            protobuf::JoinType::Leftanti => JoinType::LeftAnti,
-            protobuf::JoinType::Rightanti => JoinType::RightAnti,
-            protobuf::JoinType::Leftmark => JoinType::LeftMark,
-            protobuf::JoinType::Rightmark => JoinType::RightMark,
-        }
-    }
-}
-
-impl FromProto<protobuf::JoinConstraint> for JoinConstraint {
-    fn from_proto(t: protobuf::JoinConstraint) -> Self {
-        match t {
-            protobuf::JoinConstraint::On => JoinConstraint::On,
-            protobuf::JoinConstraint::Using => JoinConstraint::Using,
-        }
-    }
-}
-
-impl FromProto<protobuf::NullEquality> for NullEquality {
-    fn from_proto(t: protobuf::NullEquality) -> Self {
-        match t {
-            protobuf::NullEquality::NullEqualsNothing => NullEquality::NullEqualsNothing,
-            protobuf::NullEquality::NullEqualsNull => NullEquality::NullEqualsNull,
         }
     }
 }
@@ -379,7 +244,7 @@ pub fn parse_expr(
             alias
                 .relation
                 .first()
-                .map(|r| TableReference::try_from_proto(r.clone()))
+                .map(|r| TableReference::try_from(r.clone()))
                 .transpose()?,
             alias.alias.clone(),
         ))),
@@ -581,7 +446,7 @@ pub fn parse_expr(
         ExprType::Wildcard(protobuf::Wildcard { qualifier }) => {
             let qualifier = qualifier
                 .to_owned()
-                .map(TableReference::try_from_proto)
+                .map(TableReference::try_from)
                 .transpose()?;
             #[expect(deprecated)]
             Ok(Expr::Wildcard {

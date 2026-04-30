@@ -1230,6 +1230,157 @@ impl TryFrom<&protobuf::JsonOptions> for JsonOptions {
     }
 }
 
+// Conversion impls for `package datafusion_common` enum types whose target
+// types live in `datafusion-common`. These are foreign-foreign in
+// datafusion-proto, but here both sides — proto and Rust — sit on at least
+// one local side, so the orphan rule is satisfied.
+
+impl From<protobuf::JoinType> for datafusion_common::JoinType {
+    fn from(t: protobuf::JoinType) -> Self {
+        use datafusion_common::JoinType;
+        match t {
+            protobuf::JoinType::Inner => JoinType::Inner,
+            protobuf::JoinType::Left => JoinType::Left,
+            protobuf::JoinType::Right => JoinType::Right,
+            protobuf::JoinType::Full => JoinType::Full,
+            protobuf::JoinType::Leftsemi => JoinType::LeftSemi,
+            protobuf::JoinType::Rightsemi => JoinType::RightSemi,
+            protobuf::JoinType::Leftanti => JoinType::LeftAnti,
+            protobuf::JoinType::Rightanti => JoinType::RightAnti,
+            protobuf::JoinType::Leftmark => JoinType::LeftMark,
+            protobuf::JoinType::Rightmark => JoinType::RightMark,
+        }
+    }
+}
+
+impl From<protobuf::JoinConstraint> for datafusion_common::JoinConstraint {
+    fn from(t: protobuf::JoinConstraint) -> Self {
+        use datafusion_common::JoinConstraint;
+        match t {
+            protobuf::JoinConstraint::On => JoinConstraint::On,
+            protobuf::JoinConstraint::Using => JoinConstraint::Using,
+        }
+    }
+}
+
+impl From<protobuf::NullEquality> for datafusion_common::NullEquality {
+    fn from(t: protobuf::NullEquality) -> Self {
+        use datafusion_common::NullEquality;
+        match t {
+            protobuf::NullEquality::NullEqualsNothing => NullEquality::NullEqualsNothing,
+            protobuf::NullEquality::NullEqualsNull => NullEquality::NullEqualsNull,
+        }
+    }
+}
+
+// Conversion impls for `package datafusion` types whose targets live in
+// `datafusion-common`. These reference proto types under their full path
+// because the local `protobuf` alias only covers the common package.
+
+impl From<&crate::generated::datafusion::UnnestOptions>
+    for datafusion_common::UnnestOptions
+{
+    fn from(opts: &crate::generated::datafusion::UnnestOptions) -> Self {
+        Self {
+            preserve_nulls: opts.preserve_nulls,
+            recursions: opts
+                .recursions
+                .iter()
+                .map(|r| datafusion_common::RecursionUnnestOption {
+                    input_column: r.input_column.as_ref().unwrap().into(),
+                    output_column: r.output_column.as_ref().unwrap().into(),
+                    depth: r.depth as usize,
+                })
+                .collect::<Vec<_>>(),
+        }
+    }
+}
+
+impl TryFrom<crate::generated::datafusion::TableReference> for TableReference {
+    type Error = Error;
+
+    fn try_from(
+        value: crate::generated::datafusion::TableReference,
+    ) -> datafusion_common::Result<Self, Self::Error> {
+        use crate::generated::datafusion::table_reference::TableReferenceEnum;
+        let table_reference_enum = value
+            .table_reference_enum
+            .ok_or_else(|| Error::required("table_reference_enum"))?;
+
+        match table_reference_enum {
+            TableReferenceEnum::Bare(
+                crate::generated::datafusion::BareTableReference { table },
+            ) => Ok(TableReference::bare(table)),
+            TableReferenceEnum::Partial(
+                crate::generated::datafusion::PartialTableReference { schema, table },
+            ) => Ok(TableReference::partial(schema, table)),
+            TableReferenceEnum::Full(
+                crate::generated::datafusion::FullTableReference {
+                    catalog,
+                    schema,
+                    table,
+                },
+            ) => Ok(TableReference::full(catalog, schema, table)),
+        }
+    }
+}
+
+impl From<&crate::generated::datafusion::StringifiedPlan>
+    for datafusion_common::display::StringifiedPlan
+{
+    fn from(stringified_plan: &crate::generated::datafusion::StringifiedPlan) -> Self {
+        use crate::generated::datafusion::plan_type::PlanTypeEnum::{
+            AnalyzedLogicalPlan, FinalAnalyzedLogicalPlan, FinalLogicalPlan,
+            FinalPhysicalPlan, FinalPhysicalPlanWithSchema, FinalPhysicalPlanWithStats,
+            InitialLogicalPlan, InitialPhysicalPlan, InitialPhysicalPlanWithSchema,
+            InitialPhysicalPlanWithStats, OptimizedLogicalPlan, OptimizedPhysicalPlan,
+            PhysicalPlanError,
+        };
+        use crate::generated::datafusion::{
+            AnalyzedLogicalPlanType, OptimizedLogicalPlanType, OptimizedPhysicalPlanType,
+        };
+        use datafusion_common::display::PlanType;
+        Self {
+            plan_type: match stringified_plan
+                .plan_type
+                .as_ref()
+                .and_then(|pt| pt.plan_type_enum.as_ref())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Cannot create protobuf::StringifiedPlan from {stringified_plan:?}"
+                    )
+                }) {
+                InitialLogicalPlan(_) => PlanType::InitialLogicalPlan,
+                AnalyzedLogicalPlan(AnalyzedLogicalPlanType { analyzer_name }) => {
+                    PlanType::AnalyzedLogicalPlan {
+                        analyzer_name: analyzer_name.clone(),
+                    }
+                }
+                FinalAnalyzedLogicalPlan(_) => PlanType::FinalAnalyzedLogicalPlan,
+                OptimizedLogicalPlan(OptimizedLogicalPlanType { optimizer_name }) => {
+                    PlanType::OptimizedLogicalPlan {
+                        optimizer_name: optimizer_name.clone(),
+                    }
+                }
+                FinalLogicalPlan(_) => PlanType::FinalLogicalPlan,
+                InitialPhysicalPlan(_) => PlanType::InitialPhysicalPlan,
+                InitialPhysicalPlanWithStats(_) => PlanType::InitialPhysicalPlanWithStats,
+                InitialPhysicalPlanWithSchema(_) => PlanType::InitialPhysicalPlanWithSchema,
+                OptimizedPhysicalPlan(OptimizedPhysicalPlanType { optimizer_name }) => {
+                    PlanType::OptimizedPhysicalPlan {
+                        optimizer_name: optimizer_name.clone(),
+                    }
+                }
+                FinalPhysicalPlan(_) => PlanType::FinalPhysicalPlan,
+                FinalPhysicalPlanWithStats(_) => PlanType::FinalPhysicalPlanWithStats,
+                FinalPhysicalPlanWithSchema(_) => PlanType::FinalPhysicalPlanWithSchema,
+                PhysicalPlanError(_) => PlanType::PhysicalPlanError,
+            },
+            plan: Arc::new(stringified_plan.plan.clone()),
+        }
+    }
+}
+
 pub fn parse_i32_to_time_unit(value: &i32) -> datafusion_common::Result<TimeUnit, Error> {
     protobuf::TimeUnit::try_from(*value)
         .map(|t| t.into())

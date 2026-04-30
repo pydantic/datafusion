@@ -1067,6 +1067,171 @@ impl TryFrom<&JsonOptions> for protobuf::JsonOptions {
     }
 }
 
+// Conversion impls for `package datafusion_common` enum types whose source
+// types live in `datafusion-common`.
+
+impl From<datafusion_common::JoinType> for protobuf::JoinType {
+    fn from(t: datafusion_common::JoinType) -> Self {
+        use datafusion_common::JoinType;
+        match t {
+            JoinType::Inner => Self::Inner,
+            JoinType::Left => Self::Left,
+            JoinType::Right => Self::Right,
+            JoinType::Full => Self::Full,
+            JoinType::LeftSemi => Self::Leftsemi,
+            JoinType::RightSemi => Self::Rightsemi,
+            JoinType::LeftAnti => Self::Leftanti,
+            JoinType::RightAnti => Self::Rightanti,
+            JoinType::LeftMark => Self::Leftmark,
+            JoinType::RightMark => Self::Rightmark,
+        }
+    }
+}
+
+impl From<datafusion_common::JoinConstraint> for protobuf::JoinConstraint {
+    fn from(t: datafusion_common::JoinConstraint) -> Self {
+        use datafusion_common::JoinConstraint;
+        match t {
+            JoinConstraint::On => Self::On,
+            JoinConstraint::Using => Self::Using,
+        }
+    }
+}
+
+impl From<datafusion_common::NullEquality> for protobuf::NullEquality {
+    fn from(t: datafusion_common::NullEquality) -> Self {
+        use datafusion_common::NullEquality;
+        match t {
+            NullEquality::NullEqualsNothing => Self::NullEqualsNothing,
+            NullEquality::NullEqualsNull => Self::NullEqualsNull,
+        }
+    }
+}
+
+// Conversion impls for `package datafusion` types.
+
+impl From<&datafusion_common::UnnestOptions>
+    for crate::generated::datafusion::UnnestOptions
+{
+    fn from(opts: &datafusion_common::UnnestOptions) -> Self {
+        Self {
+            preserve_nulls: opts.preserve_nulls,
+            recursions: opts
+                .recursions
+                .iter()
+                .map(|r| crate::generated::datafusion::RecursionUnnestOption {
+                    input_column: Some((&r.input_column).into()),
+                    output_column: Some((&r.output_column).into()),
+                    depth: r.depth as u32,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<datafusion_common::TableReference>
+    for crate::generated::datafusion::TableReference
+{
+    fn from(t: datafusion_common::TableReference) -> Self {
+        use crate::generated::datafusion::table_reference::TableReferenceEnum;
+        use crate::generated::datafusion::{
+            BareTableReference, FullTableReference, PartialTableReference,
+            TableReference as ProtoTableReference,
+        };
+        let table_reference_enum = match t {
+            datafusion_common::TableReference::Bare { table } => {
+                TableReferenceEnum::Bare(BareTableReference {
+                    table: table.to_string(),
+                })
+            }
+            datafusion_common::TableReference::Partial { schema, table } => {
+                TableReferenceEnum::Partial(PartialTableReference {
+                    schema: schema.to_string(),
+                    table: table.to_string(),
+                })
+            }
+            datafusion_common::TableReference::Full {
+                catalog,
+                schema,
+                table,
+            } => TableReferenceEnum::Full(FullTableReference {
+                catalog: catalog.to_string(),
+                schema: schema.to_string(),
+                table: table.to_string(),
+            }),
+        };
+        ProtoTableReference {
+            table_reference_enum: Some(table_reference_enum),
+        }
+    }
+}
+
+impl From<&datafusion_common::display::StringifiedPlan>
+    for crate::generated::datafusion::StringifiedPlan
+{
+    fn from(stringified_plan: &datafusion_common::display::StringifiedPlan) -> Self {
+        use crate::EmptyMessage;
+        use crate::generated::datafusion::plan_type::PlanTypeEnum;
+        use crate::generated::datafusion::{
+            AnalyzedLogicalPlanType, OptimizedLogicalPlanType, OptimizedPhysicalPlanType,
+            PlanType,
+        };
+        use datafusion_common::display::PlanType as DfPlanType;
+        Self {
+            plan_type: Some(PlanType {
+                plan_type_enum: Some(match &stringified_plan.plan_type {
+                    DfPlanType::InitialLogicalPlan => {
+                        PlanTypeEnum::InitialLogicalPlan(EmptyMessage {})
+                    }
+                    DfPlanType::AnalyzedLogicalPlan { analyzer_name } => {
+                        PlanTypeEnum::AnalyzedLogicalPlan(AnalyzedLogicalPlanType {
+                            analyzer_name: analyzer_name.clone(),
+                        })
+                    }
+                    DfPlanType::FinalAnalyzedLogicalPlan => {
+                        PlanTypeEnum::FinalAnalyzedLogicalPlan(EmptyMessage {})
+                    }
+                    DfPlanType::OptimizedLogicalPlan { optimizer_name } => {
+                        PlanTypeEnum::OptimizedLogicalPlan(OptimizedLogicalPlanType {
+                            optimizer_name: optimizer_name.clone(),
+                        })
+                    }
+                    DfPlanType::FinalLogicalPlan => {
+                        PlanTypeEnum::FinalLogicalPlan(EmptyMessage {})
+                    }
+                    DfPlanType::InitialPhysicalPlan => {
+                        PlanTypeEnum::InitialPhysicalPlan(EmptyMessage {})
+                    }
+                    DfPlanType::InitialPhysicalPlanWithStats => {
+                        PlanTypeEnum::InitialPhysicalPlanWithStats(EmptyMessage {})
+                    }
+                    DfPlanType::InitialPhysicalPlanWithSchema => {
+                        PlanTypeEnum::InitialPhysicalPlanWithSchema(EmptyMessage {})
+                    }
+                    DfPlanType::OptimizedPhysicalPlan { optimizer_name } => {
+                        PlanTypeEnum::OptimizedPhysicalPlan(OptimizedPhysicalPlanType {
+                            optimizer_name: optimizer_name.clone(),
+                        })
+                    }
+                    DfPlanType::FinalPhysicalPlan => {
+                        PlanTypeEnum::FinalPhysicalPlan(EmptyMessage {})
+                    }
+                    DfPlanType::FinalPhysicalPlanWithStats => {
+                        PlanTypeEnum::FinalPhysicalPlanWithStats(EmptyMessage {})
+                    }
+                    DfPlanType::FinalPhysicalPlanWithSchema => {
+                        PlanTypeEnum::FinalPhysicalPlanWithSchema(EmptyMessage {})
+                    }
+                    DfPlanType::PhysicalPlanError => {
+                        PlanTypeEnum::PhysicalPlanError(EmptyMessage {})
+                    }
+                }),
+            }),
+            plan: stringified_plan.plan.to_string(),
+        }
+    }
+}
+
 /// Creates a scalar protobuf value from an optional value (T), and
 /// encoding None as the appropriate datatype
 fn create_proto_scalar<I, T: FnOnce(&I) -> protobuf::scalar_value::Value>(

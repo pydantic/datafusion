@@ -213,7 +213,7 @@ pub fn serialize_expr(
                 expr: Some(Box::new(serialize_expr(expr.as_ref(), codec)?)),
                 relation: relation
                     .to_owned()
-                    .map(|r| vec![protobuf::TableReference::from_proto(r)])
+                    .map(|r| vec![r.into()])
                     .unwrap_or(vec![]),
                 alias: name.to_owned(),
                 metadata: metadata
@@ -581,9 +581,7 @@ pub fn serialize_expr(
         #[expect(deprecated)]
         Expr::Wildcard { qualifier, .. } => protobuf::LogicalExprNode {
             expr_type: Some(ExprType::Wildcard(protobuf::Wildcard {
-                qualifier: qualifier
-                    .to_owned()
-                    .map(protobuf::TableReference::from_proto),
+                qualifier: qualifier.to_owned().map(protobuf::TableReference::from),
             })),
         },
         Expr::ScalarSubquery(subquery) => protobuf::LogicalExprNode {

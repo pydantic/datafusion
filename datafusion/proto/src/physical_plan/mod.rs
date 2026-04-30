@@ -99,7 +99,7 @@ use prost::bytes::BufMut;
 use self::from_proto::parse_protobuf_partitioning;
 use self::to_proto::serialize_partitioning;
 use crate::common::{byte_to_string, str_to_byte};
-use crate::convert::{FromProto, TryFromProto};
+use crate::convert::TryFromProto;
 use crate::convert_required;
 use crate::physical_plan::from_proto::{
     parse_physical_expr_with_converter, parse_physical_sort_expr,
@@ -672,7 +672,7 @@ pub trait PhysicalPlanNodeExt: Sized {
             explain
                 .stringified_plans
                 .iter()
-                .map(StringifiedPlan::from_proto)
+                .map(StringifiedPlan::from)
                 .collect(),
             explain.verbose,
         )))
@@ -1424,10 +1424,10 @@ pub trait PhysicalPlanNodeExt: Sized {
             right,
             on,
             filter,
-            &JoinType::from_proto(join_type),
+            &JoinType::from(join_type),
             projection,
             partition_mode,
-            NullEquality::from_proto(null_equality),
+            NullEquality::from(null_equality),
             hashjoin.null_aware,
         )?))
     }
@@ -1548,8 +1548,8 @@ pub trait PhysicalPlanNodeExt: Sized {
             right,
             on,
             filter,
-            &JoinType::from_proto(join_type),
-            NullEquality::from_proto(null_equality),
+            &JoinType::from(join_type),
+            NullEquality::from(null_equality),
             left_sort_exprs,
             right_sort_exprs,
             partition_mode,
@@ -1811,7 +1811,7 @@ pub trait PhysicalPlanNodeExt: Sized {
             left,
             right,
             filter,
-            &JoinType::from_proto(join_type),
+            &JoinType::from(join_type),
             projection,
         )?))
     }
@@ -1984,7 +1984,7 @@ pub trait PhysicalPlanNodeExt: Sized {
             unnest
                 .options
                 .as_ref()
-                .map(datafusion_common::UnnestOptions::from_proto)
+                .map(datafusion_common::UnnestOptions::from)
                 .ok_or_else(|| proto_error("Missing required field in protobuf"))?,
         )?))
     }
@@ -2097,9 +2097,9 @@ pub trait PhysicalPlanNodeExt: Sized {
             right,
             on,
             filter,
-            JoinType::from_proto(join_type),
+            JoinType::from(join_type),
             sort_options,
-            NullEquality::from_proto(null_equality),
+            NullEquality::from(null_equality),
         )?))
     }
 
@@ -2280,7 +2280,7 @@ pub trait PhysicalPlanNodeExt: Sized {
                     stringified_plans: exec
                         .stringified_plans()
                         .iter()
-                        .map(protobuf::StringifiedPlan::from_proto)
+                        .map(protobuf::StringifiedPlan::from)
                         .collect(),
                     verbose: exec.verbose(),
                 },
@@ -2450,8 +2450,8 @@ pub trait PhysicalPlanNodeExt: Sized {
                 })
             })
             .collect::<Result<_>>()?;
-        let join_type = protobuf::JoinType::from_proto(exec.join_type().to_owned());
-        let null_equality = protobuf::NullEquality::from_proto(exec.null_equality());
+        let join_type = protobuf::JoinType::from(exec.join_type().to_owned());
+        let null_equality = protobuf::NullEquality::from(exec.null_equality());
         let filter = exec
             .filter()
             .as_ref()
@@ -2530,8 +2530,8 @@ pub trait PhysicalPlanNodeExt: Sized {
                 })
             })
             .collect::<Result<_>>()?;
-        let join_type = protobuf::JoinType::from_proto(exec.join_type().to_owned());
-        let null_equality = protobuf::NullEquality::from_proto(exec.null_equality());
+        let join_type = protobuf::JoinType::from(exec.join_type().to_owned());
+        let null_equality = protobuf::NullEquality::from(exec.null_equality());
         let filter = exec
             .filter()
             .as_ref()
@@ -2651,8 +2651,8 @@ pub trait PhysicalPlanNodeExt: Sized {
                 })
             })
             .collect::<Result<_>>()?;
-        let join_type = protobuf::JoinType::from_proto(exec.join_type().to_owned());
-        let null_equality = protobuf::NullEquality::from_proto(exec.null_equality());
+        let join_type = protobuf::JoinType::from(exec.join_type().to_owned());
+        let null_equality = protobuf::NullEquality::from(exec.null_equality());
         let filter = exec
             .filter()
             .as_ref()
@@ -3233,7 +3233,7 @@ pub trait PhysicalPlanNodeExt: Sized {
             proto_converter,
         )?;
 
-        let join_type = protobuf::JoinType::from_proto(exec.join_type().to_owned());
+        let join_type = protobuf::JoinType::from(exec.join_type().to_owned());
         let filter = exec
             .filter()
             .as_ref()
@@ -3469,7 +3469,7 @@ pub trait PhysicalPlanNodeExt: Sized {
                         .iter()
                         .map(|c| *c as _)
                         .collect(),
-                    options: Some(protobuf::UnnestOptions::from_proto(exec.options())),
+                    options: Some(exec.options().into()),
                 },
             ))),
         })
