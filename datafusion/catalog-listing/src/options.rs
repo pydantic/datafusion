@@ -263,7 +263,12 @@ impl ListingOptions {
     /// Infer the schema of the files at the given path on the provided object store.
     ///
     /// If the table_path contains one or more files (i.e. it is a directory /
-    /// prefix of files) their schema is merged by calling [`FileFormat::infer_schema`]
+    /// prefix of files) their schema is merged by calling [`FileFormat::infer_schema`].
+    ///
+    /// Returns a `Plan` error if no files are found at `table_path`, since an
+    /// inferred schema with zero columns produces confusing errors at query time.
+    /// Callers that need to support empty locations must declare an explicit
+    /// schema instead of relying on inference.
     ///
     /// Note: The inferred schema does not include any partitioning columns.
     ///
@@ -282,6 +287,15 @@ impl ListingOptions {
             .try_filter(|object_meta| future::ready(object_meta.size > 0))
             .try_collect()
             .await?;
+
+        if files.is_empty() {
+            return plan_err!(
+                "No files found at {}. \
+                 Cannot infer schema from an empty location; either add data files \
+                 or declare an explicit schema for the table.",
+                table_path
+            );
+        }
 
         let schema = self.format.infer_schema(state, &store, &files).await?;
 
