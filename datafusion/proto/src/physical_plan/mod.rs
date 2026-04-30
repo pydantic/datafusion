@@ -99,7 +99,6 @@ use prost::bytes::BufMut;
 use self::from_proto::parse_protobuf_partitioning;
 use self::to_proto::serialize_partitioning;
 use crate::common::{byte_to_string, str_to_byte};
-use crate::convert::TryFromProto;
 use crate::convert_required;
 use crate::physical_plan::from_proto::{
     parse_physical_expr_with_converter, parse_physical_sort_expr,
@@ -1852,7 +1851,7 @@ pub trait PhysicalPlanNodeExt: Sized {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let input = into_physical_plan(&sink.input, ctx, proto_converter)?;
 
-        let data_sink = JsonSink::try_from_proto(
+        let data_sink = JsonSink::try_from(
             sink.sink
                 .as_ref()
                 .ok_or_else(|| proto_error("Missing required field in protobuf"))?,
@@ -1889,7 +1888,7 @@ pub trait PhysicalPlanNodeExt: Sized {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let input = into_physical_plan(&sink.input, ctx, proto_converter)?;
 
-        let data_sink = CsvSink::try_from_proto(
+        let data_sink = CsvSink::try_from(
             sink.sink
                 .as_ref()
                 .ok_or_else(|| proto_error("Missing required field in protobuf"))?,
@@ -1929,7 +1928,7 @@ pub trait PhysicalPlanNodeExt: Sized {
         {
             let input = into_physical_plan(&sink.input, ctx, proto_converter)?;
 
-            let data_sink = ParquetSink::try_from_proto(
+            let data_sink = ParquetSink::try_from(
                 sink.sink
                     .as_ref()
                     .ok_or_else(|| proto_error("Missing required field in protobuf"))?,
@@ -3401,7 +3400,7 @@ pub trait PhysicalPlanNodeExt: Sized {
                 physical_plan_type: Some(PhysicalPlanType::JsonSink(Box::new(
                     protobuf::JsonSinkExecNode {
                         input: Some(Box::new(input)),
-                        sink: Some(protobuf::JsonSink::try_from_proto(sink)?),
+                        sink: Some(protobuf::JsonSink::try_from(sink)?),
                         sink_schema: Some(exec.schema().as_ref().try_into()?),
                         sort_order,
                     },
@@ -3414,7 +3413,7 @@ pub trait PhysicalPlanNodeExt: Sized {
                 physical_plan_type: Some(PhysicalPlanType::CsvSink(Box::new(
                     protobuf::CsvSinkExecNode {
                         input: Some(Box::new(input)),
-                        sink: Some(protobuf::CsvSink::try_from_proto(sink)?),
+                        sink: Some(protobuf::CsvSink::try_from(sink)?),
                         sink_schema: Some(exec.schema().as_ref().try_into()?),
                         sort_order,
                     },
@@ -3428,7 +3427,7 @@ pub trait PhysicalPlanNodeExt: Sized {
                 physical_plan_type: Some(PhysicalPlanType::ParquetSink(Box::new(
                     protobuf::ParquetSinkExecNode {
                         input: Some(Box::new(input)),
-                        sink: Some(protobuf::ParquetSink::try_from_proto(sink)?),
+                        sink: Some(protobuf::ParquetSink::try_from(sink)?),
                         sink_schema: Some(exec.schema().as_ref().try_into()?),
                         sort_order,
                     },

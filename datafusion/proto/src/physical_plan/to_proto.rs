@@ -24,11 +24,6 @@ use datafusion_common::{
     DataFusionError, Result, internal_datafusion_err, internal_err, not_impl_err,
 };
 use datafusion_datasource::file_scan_config::FileScanConfig;
-use datafusion_datasource::file_sink_config::FileSink;
-use datafusion_datasource_csv::file_format::CsvSink;
-use datafusion_datasource_json::file_format::JsonSink;
-#[cfg(feature = "parquet")]
-use datafusion_datasource_parquet::file_format::ParquetSink;
 use datafusion_expr::WindowFrame;
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
@@ -48,7 +43,6 @@ use super::{
     DefaultPhysicalProtoConverter, PhysicalExtensionCodec,
     PhysicalProtoConverterExtension,
 };
-use crate::convert::TryFromProto;
 use crate::protobuf::{
     self, PhysicalSortExprNode, PhysicalSortExprNodeCollection,
     physical_aggregate_expr_node, physical_window_expr_node,
@@ -707,38 +701,4 @@ pub fn serialize_record_batches(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     }
     writer.finish()?;
     Ok(buf)
-}
-
-impl TryFromProto<&JsonSink> for protobuf::JsonSink {
-    type Error = DataFusionError;
-
-    fn try_from_proto(value: &JsonSink) -> Result<Self, Self::Error> {
-        Ok(Self {
-            config: Some(protobuf::FileSinkConfig::try_from(value.config())?),
-            writer_options: Some(value.writer_options().try_into()?),
-        })
-    }
-}
-
-impl TryFromProto<&CsvSink> for protobuf::CsvSink {
-    type Error = DataFusionError;
-
-    fn try_from_proto(value: &CsvSink) -> Result<Self, Self::Error> {
-        Ok(Self {
-            config: Some(protobuf::FileSinkConfig::try_from(value.config())?),
-            writer_options: Some(value.writer_options().try_into()?),
-        })
-    }
-}
-
-#[cfg(feature = "parquet")]
-impl TryFromProto<&ParquetSink> for protobuf::ParquetSink {
-    type Error = DataFusionError;
-
-    fn try_from_proto(value: &ParquetSink) -> Result<Self, Self::Error> {
-        Ok(Self {
-            config: Some(protobuf::FileSinkConfig::try_from(value.config())?),
-            parquet_options: Some(value.parquet_options().try_into()?),
-        })
-    }
 }

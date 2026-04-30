@@ -23,15 +23,11 @@ use arrow::array::RecordBatch;
 use arrow::compute::SortOptions;
 use arrow::datatypes::{Field, Schema};
 use arrow::ipc::reader::StreamReader;
-use datafusion_common::{DataFusionError, Result, internal_datafusion_err, not_impl_err};
+use datafusion_common::{Result, internal_datafusion_err, not_impl_err};
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
-use datafusion_datasource_csv::file_format::CsvSink;
-use datafusion_datasource_json::file_format::JsonSink;
-#[cfg(feature = "parquet")]
-use datafusion_datasource_parquet::file_format::ParquetSink;
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::{FunctionRegistry, TaskContext};
 use datafusion_expr::WindowFunctionDefinition;
@@ -52,7 +48,7 @@ use super::{
     DefaultPhysicalProtoConverter, PhysicalExtensionCodec, PhysicalPlanDecodeContext,
     PhysicalProtoConverterExtension,
 };
-use crate::convert::{FromProto, TryFromProto};
+use crate::convert::FromProto;
 use crate::logical_plan::{self};
 use crate::protobuf::physical_expr_node::ExprType;
 use crate::{convert_required, protobuf};
@@ -707,38 +703,4 @@ pub fn parse_record_batches(buf: &[u8]) -> Result<Vec<RecordBatch>> {
         batches.push(batch?);
     }
     Ok(batches)
-}
-
-impl TryFromProto<&protobuf::JsonSink> for JsonSink {
-    type Error = DataFusionError;
-
-    fn try_from_proto(value: &protobuf::JsonSink) -> Result<Self, Self::Error> {
-        Ok(Self::new(
-            convert_required!(value.config)?,
-            convert_required!(value.writer_options)?,
-        ))
-    }
-}
-
-#[cfg(feature = "parquet")]
-impl TryFromProto<&protobuf::ParquetSink> for ParquetSink {
-    type Error = DataFusionError;
-
-    fn try_from_proto(value: &protobuf::ParquetSink) -> Result<Self, Self::Error> {
-        Ok(Self::new(
-            convert_required!(value.config)?,
-            convert_required!(value.parquet_options)?,
-        ))
-    }
-}
-
-impl TryFromProto<&protobuf::CsvSink> for CsvSink {
-    type Error = DataFusionError;
-
-    fn try_from_proto(value: &protobuf::CsvSink) -> Result<Self, Self::Error> {
-        Ok(Self::new(
-            convert_required!(value.config)?,
-            convert_required!(value.writer_options)?,
-        ))
-    }
 }
