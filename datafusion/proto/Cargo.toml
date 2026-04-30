@@ -37,6 +37,12 @@ name = "datafusion_proto"
 [features]
 default = ["parquet"]
 json = ["serde_json", "datafusion-proto-common/json"]
+# Back-compat alias: pbjson used to be an optional dep auto-creating a `pbjson`
+# feature. After the proto-common extraction, datafusion-proto no longer has a
+# direct pbjson dep; the JSON serde plumbing forwards through proto-common.
+# Keep `pbjson` as a feature alias for `json` so downstream `features = ["pbjson"]`
+# continues to work.
+pbjson = ["json"]
 parquet = ["datafusion-datasource-parquet", "datafusion-common/parquet", "datafusion/parquet"]
 avro = ["datafusion-datasource-avro"]
 

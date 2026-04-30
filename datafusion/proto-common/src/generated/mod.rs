@@ -38,6 +38,11 @@ pub mod common_pkg {
 pub mod datafusion {
     include!("datafusion.rs");
 
+    // Re-export the `datafusion_common` package types from inside `mod datafusion`
+    // so historical paths like `datafusion_proto::generated::datafusion::JoinType`
+    // (which used to be embedded duplicates of the common types) keep resolving.
+    pub use super::common_pkg::*;
+
     #[cfg(feature = "json")]
     include!("datafusion.serde.rs");
 }
