@@ -48,16 +48,9 @@ use super::{
     DefaultPhysicalProtoConverter, PhysicalExtensionCodec, PhysicalPlanDecodeContext,
     PhysicalProtoConverterExtension,
 };
-use crate::convert::FromProto;
 use crate::logical_plan::{self};
 use crate::protobuf::physical_expr_node::ExprType;
 use crate::{convert_required, protobuf};
-
-impl FromProto<&protobuf::PhysicalColumn> for Column {
-    fn from_proto(c: &protobuf::PhysicalColumn) -> Column {
-        Column::new(&c.name, c.index as usize)
-    }
-}
 
 /// Parses a physical sort expression from a protobuf.
 ///
@@ -256,10 +249,7 @@ pub fn parse_physical_expr_with_converter(
         .ok_or_else(|| proto_error("Unexpected empty physical expression"))?;
 
     let pexpr: Arc<dyn PhysicalExpr> = match expr_type {
-        ExprType::Column(c) => {
-            let pcol = Column::from_proto(c);
-            Arc::new(pcol)
-        }
+        ExprType::Column(c) => Arc::new(Column::new(&c.name, c.index as usize)),
         ExprType::UnknownColumn(c) => Arc::new(UnKnownColumn::new(&c.name)),
         ExprType::Literal(scalar) => Arc::new(Literal::new(scalar.try_into()?)),
         ExprType::BinaryExpr(binary_expr) => {

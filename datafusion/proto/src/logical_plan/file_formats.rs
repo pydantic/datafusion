@@ -18,7 +18,6 @@
 use std::sync::Arc;
 
 use super::LogicalExtensionCodec;
-use crate::convert::FromProto;
 use crate::protobuf::{
     CsvOptions as CsvOptionsProto, CsvQuoteStyle as CsvQuoteStyleProto,
     JsonOptions as JsonOptionsProto,
@@ -34,6 +33,16 @@ use datafusion_datasource_csv::file_format::CsvFormatFactory;
 use datafusion_datasource_json::file_format::JsonFormatFactory;
 use datafusion_execution::TaskContext;
 use prost::Message;
+
+/// File-local helper trait used to organize the FormatFactory <-> Options
+/// conversions below. Both source and target types are foreign to this crate
+/// for the file-format pairs (e.g. `CsvFormatFactory` is in
+/// `datafusion-datasource-csv` and `CsvOptionsProto` is in
+/// `datafusion-proto-common`), so the orphan rule forbids a standard `From`
+/// impl here. Kept private — public callers should not depend on it.
+trait FromProto<T>: Sized {
+    fn from_proto(value: T) -> Self;
+}
 
 #[derive(Debug)]
 pub struct CsvLogicalExtensionCodec;
