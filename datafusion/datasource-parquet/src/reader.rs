@@ -22,17 +22,15 @@ use crate::ParquetFileMetrics;
 use crate::metadata::DFParquetMetadata;
 use bytes::Bytes;
 use datafusion_datasource::PartitionedFile;
-use datafusion_execution::cache::cache_manager::FileMetadata;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use object_store::ObjectStore;
-use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use crate::metadata::CachedParquetMetaData;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
 use parquet::file::metadata::ParquetMetaData;
-use std::any::Any;
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
@@ -319,6 +317,94 @@ impl AsyncFileReader for CachedParquetFileReader {
         }
         .boxed()
     }
+
+    fn get_arrow_reader_metadata<'a>(
+        &'a mut self,
+        options: ArrowReaderOptions,
+    ) -> BoxFuture<'a, parquet::errors::Result<ArrowReaderMetadata>> {
+        let object_meta = self.partitioned_file.object_meta.clone();
+        let metadata_cache = Arc::clone(&self.metadata_cache);
+
+        async move {
+            // Only the "no special options" case can use the cached arrow
+            // schema/field-levels view; other configurations need a fresh
+            // walk of the parquet schema.
+            let can_use_cache = options.supplied_schema().is_none()
+                && !options.skip_arrow_metadata()
+                && options.virtual_columns().is_empty();
+
+            #[cfg(feature = "parquet_encryption")]
+            let file_decryption_properties = options
+                .file_decryption_properties()
+                .map(Arc::clone);
+            #[cfg(not(feature = "parquet_encryption"))]
+            let file_decryption_properties = None;
+
+            // Fast path: cache hit, default options. Look up the wrapper
+            // entry directly so we can also reuse its cached arrow schema.
+            if can_use_cache
+                && let Some(cached) = metadata_cache.get(&object_meta.location)
+                && cached.is_valid_for(&object_meta)
+                && let Some(cached_parquet) = cached
+                    .file_metadata
+                    .as_any()
+                    .downcast_ref::<CachedParquetMetaData>()
+            {
+                let view = cached_parquet.arrow_view().map_err(|e| {
+                    parquet::errors::ParquetError::General(format!(
+                        "Failed to build arrow view for {}: {e}",
+                        object_meta.location,
+                    ))
+                })?;
+                return Ok(ArrowReaderMetadata::from_field_levels(
+                    Arc::clone(cached_parquet.parquet_metadata()),
+                    Arc::clone(&view.schema),
+                    view.field_levels.clone(),
+                ));
+            }
+
+            // Slow path: fall back to fetching metadata then constructing
+            // the arrow reader metadata from scratch.
+            let metadata = DFParquetMetadata::new(&self.store, &object_meta)
+                .with_decryption_properties(file_decryption_properties)
+                .with_file_metadata_cache(Some(Arc::clone(&metadata_cache)))
+                .with_metadata_size_hint(self.metadata_size_hint)
+                .fetch_metadata()
+                .await
+                .map_err(|e| {
+                    parquet::errors::ParquetError::General(format!(
+                        "Failed to fetch metadata for file {}: {e}",
+                        object_meta.location,
+                    ))
+                })?;
+
+            // The fetch above just (re)cached the metadata, so try the
+            // cache lookup once more now that we know the entry is fresh.
+            if can_use_cache
+                && let Some(cached) = metadata_cache.get(&object_meta.location)
+                && cached.is_valid_for(&object_meta)
+                && let Some(cached_parquet) = cached
+                    .file_metadata
+                    .as_any()
+                    .downcast_ref::<CachedParquetMetaData>()
+            {
+                let view = cached_parquet.arrow_view().map_err(|e| {
+                    parquet::errors::ParquetError::General(format!(
+                        "Failed to build arrow view for {}: {e}",
+                        object_meta.location,
+                    ))
+                })?;
+                return Ok(ArrowReaderMetadata::from_field_levels(
+                    metadata,
+                    Arc::clone(&view.schema),
+                    view.field_levels.clone(),
+                ));
+            }
+
+            ArrowReaderMetadata::try_new(metadata, options)
+        }
+        .boxed()
+    }
 }
 
 impl Drop for CachedParquetFileReader {
@@ -333,31 +419,4 @@ impl Drop for CachedParquetFileReader {
     }
 }
 
-/// Wrapper to implement [`FileMetadata`] for [`ParquetMetaData`].
-pub struct CachedParquetMetaData(Arc<ParquetMetaData>);
-
-impl CachedParquetMetaData {
-    pub fn new(metadata: Arc<ParquetMetaData>) -> Self {
-        Self(metadata)
-    }
-
-    pub fn parquet_metadata(&self) -> &Arc<ParquetMetaData> {
-        &self.0
-    }
-}
-
-impl FileMetadata for CachedParquetMetaData {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn memory_size(&self) -> usize {
-        self.0.memory_size()
-    }
-
-    fn extra_info(&self) -> HashMap<String, String> {
-        let page_index =
-            self.0.column_index().is_some() && self.0.offset_index().is_some();
-        HashMap::from([("page_index".to_owned(), page_index.to_string())])
-    }
-}
+// CachedParquetMetaData is defined in crate::metadata; we reuse it here.
