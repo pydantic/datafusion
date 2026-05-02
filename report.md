@@ -129,13 +129,20 @@ In the warm-cache profile this showed up as:
 
 ## Measured impact (Q04, profiling build)
 
+End-of-pass numbers:
+
 | Scenario | Before | After | Δ |
 |---|---|---|---|
 | narrow, hot | ~25 ms | ~25 ms | (control) |
-| wide @50M cache, **cold** | ~1010 ms | ~700 ms | **−31%** |
-| wide @50M cache, hot | ~108 ms | ~92 ms | −15% |
-| wide @2G cache, **cold** | ~830 ms | ~560 ms | **−33%** |
-| wide @2G cache, hot | ~47 ms | ~42 ms | −11% |
+| wide @50M cache, **cold** | ~1010 ms | ~615 ms | **−39%** |
+| wide @50M cache, hot | ~108 ms | ~87 ms | −19% |
+| wide @2G cache, **cold** | ~830 ms | ~510 ms | **−39%** |
+| wide @2G cache, hot | ~47 ms | ~38 ms | **−19%** |
+| wide @50M, `collect_statistics=false` cold | ~1010 ms | **~257 ms** | **−75%** |
+
+The last row is the same code as the row above it — only the
+`datafusion.execution.collect_statistics` setting differs. See the
+"Major finding" section below.
 
 In the warm-cache profile after the fixes:
 - `ArrowReaderMetadata::try_new` 4.6% → **1.3%**
