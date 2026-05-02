@@ -282,6 +282,41 @@ queries supply the same schema (same Arc), which is the common case
 across all files in a single ListingTable scan with `force_view_types`
 on.
 
+### Major finding: `collect_statistics=true` is the cold-path tax
+
+The default `datafusion.execution.collect_statistics = true` causes
+per-file metadata + statistics inference to happen eagerly during
+`list_files_for_scan` (which the first query triggers). For
+1024-col × 256-file dataset on Q04:
+
+| `collect_statistics` | cold | hot |
+|---|---|---|
+| `true` (default) | 655 ms | 86 ms |
+| `false` | **253 ms** | 75 ms |
+
+That's a **−61% cold improvement** for free. The per-file work hidden
+behind this knob is `fetch_metadata` + `statistics_from_parquet_metadata`
+× 256 files (parallel up to `meta_fetch_concurrency = 32`). For Q04
+the result is then unused — `files_ranges_pruned_statistics = 267 →
+267` (none pruned), so the inferred per-file stats don't actually help
+the query.
+
+For workloads that *do* benefit from file-level pruning (large
+time-range filters, partition-style data), turning it off would hurt.
+The right structural fix is one of:
+
+- Make `Statistics::column_statistics` lazy — compute per column on
+  first access. Then the optimizer only pays for the columns it
+  actually inspects.
+- Compute stats only for columns the optimizer is statically known to
+  inspect (predicate columns + sort columns), not all `N` columns.
+- Pre-fetch metadata in the background so the user's first query
+  doesn't see the latency.
+
+For now I am noting this as a documented knob — anyone running on cold
+paths against wide schemas should set it false and accept the loss of
+file-level pruning, or accept the cold tax.
+
 ### Open / next
 
 - For COLD specifically, the dominant per-file CPU is the parquet
