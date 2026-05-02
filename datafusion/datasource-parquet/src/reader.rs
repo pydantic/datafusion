@@ -340,8 +340,10 @@ impl AsyncFileReader for CachedParquetFileReader {
             #[cfg(not(feature = "parquet_encryption"))]
             let file_decryption_properties = None;
 
-            // Fast path: cache hit, default options. Look up the wrapper
-            // entry directly so we can also reuse its cached arrow schema.
+            // Fast path: cache hit, default options. The cached
+            // CachedParquetMetaData also memoises the built
+            // ArrowReaderMetadata, so a hit is just an Arc clone of the
+            // schema + field-levels (no per-leaf walk).
             if can_use_cache
                 && let Some(cached) = metadata_cache.get(&object_meta.location)
                 && cached.is_valid_for(&object_meta)
@@ -350,17 +352,13 @@ impl AsyncFileReader for CachedParquetFileReader {
                     .as_any()
                     .downcast_ref::<CachedParquetMetaData>()
             {
-                let view = cached_parquet.arrow_view().map_err(|e| {
+                let arm = cached_parquet.arrow_reader_metadata().map_err(|e| {
                     parquet::errors::ParquetError::General(format!(
-                        "Failed to build arrow view for {}: {e}",
+                        "Failed to build arrow reader metadata for {}: {e}",
                         object_meta.location,
                     ))
                 })?;
-                return Ok(ArrowReaderMetadata::from_field_levels(
-                    Arc::clone(cached_parquet.parquet_metadata()),
-                    Arc::clone(&view.schema),
-                    view.field_levels.clone(),
-                ));
+                return Ok(arm.clone());
             }
 
             // Slow path: fall back to fetching metadata then constructing
@@ -388,17 +386,13 @@ impl AsyncFileReader for CachedParquetFileReader {
                     .as_any()
                     .downcast_ref::<CachedParquetMetaData>()
             {
-                let view = cached_parquet.arrow_view().map_err(|e| {
+                let arm = cached_parquet.arrow_reader_metadata().map_err(|e| {
                     parquet::errors::ParquetError::General(format!(
-                        "Failed to build arrow view for {}: {e}",
+                        "Failed to build arrow reader metadata for {}: {e}",
                         object_meta.location,
                     ))
                 })?;
-                return Ok(ArrowReaderMetadata::from_field_levels(
-                    metadata,
-                    Arc::clone(&view.schema),
-                    view.field_levels.clone(),
-                ));
+                return Ok(arm.clone());
             }
 
             ArrowReaderMetadata::try_new(metadata, options)

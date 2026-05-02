@@ -39,9 +39,10 @@ use datafusion_physical_plan::Accumulator;
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore};
 use parquet::DecodeResult;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::arrow::{
-    FieldLevels, ProjectionMask, parquet_column, parquet_to_arrow_schema,
+    ProjectionMask, parquet_column, parquet_to_arrow_schema,
     parquet_to_arrow_schema_and_field_levels,
 };
 use parquet::file::metadata::{
@@ -696,43 +697,73 @@ fn has_any_exact_match(
 /// Wrapper to implement [`FileMetadata`] for [`ParquetMetaData`].
 pub struct CachedParquetMetaData {
     metadata: Arc<ParquetMetaData>,
-    /// Lazily-computed arrow [`Schema`] and [`FieldLevels`] derived from
-    /// `metadata.file_metadata().schema_descr()` and the embedded arrow
-    /// schema metadata (if any). This conversion walks every leaf in the
-    /// parquet schema, which is `O(N_columns)` work per file. Caching it
-    /// across reader builds (e.g. across queries that touch the same file)
-    /// makes the cost a one-shot rather than per-query.
-    arrow_view: OnceLock<CachedArrowView>,
-}
-
-/// Cached arrow schema view of a [`ParquetMetaData`]. See
-/// [`CachedParquetMetaData::arrow_view`].
-pub struct CachedArrowView {
-    pub schema: SchemaRef,
-    pub field_levels: FieldLevels,
+    /// Lazily-built [`ArrowReaderMetadata`] for this file. Constructing
+    /// this walks every leaf in the parquet schema (the "field-levels"
+    /// step), which is `O(N_columns)` work per file. Caching it lets
+    /// subsequent reader builds for the same file just `Clone` the result
+    /// (an `Arc` bump for the parquet metadata, the arrow schema, and the
+    /// dremel-level info) instead of redoing the walk.
+    arrow_reader_metadata: OnceLock<ArrowReaderMetadata>,
+    /// Single-slot cache for [`ArrowReaderMetadata`] built with a supplied
+    /// schema (e.g. after `apply_file_schema_type_coercions` or
+    /// `coerce_int96_to_resolution` produced one). Keyed by the supplied
+    /// schema's `Arc` pointer — different supplied schemas miss and
+    /// overwrite the slot. In typical workloads (one query touches every
+    /// file with the same coerced table schema) every file pays this rebuild
+    /// at most once per session.
+    coerced_arm: std::sync::Mutex<Option<(usize, ArrowReaderMetadata)>>,
 }
 
 impl CachedParquetMetaData {
     pub fn new(metadata: Arc<ParquetMetaData>) -> Self {
         Self {
             metadata,
-            arrow_view: OnceLock::new(),
+            arrow_reader_metadata: OnceLock::new(),
+            coerced_arm: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Get-or-build an [`ArrowReaderMetadata`] whose arrow schema is
+    /// `supplied_schema`. The result is memoised in a single-slot cache
+    /// keyed by `Arc::as_ptr(&supplied_schema)` — repeat calls with the
+    /// same schema (the common case: every file in a query coerces to the
+    /// same table schema) return a cheap [`ArrowReaderMetadata::clone`]
+    /// instead of re-walking the parquet schema.
+    pub fn coerced_arrow_reader_metadata(
+        &self,
+        supplied_schema: SchemaRef,
+        options: ArrowReaderOptions,
+    ) -> Result<ArrowReaderMetadata> {
+        let key = Arc::as_ptr(&supplied_schema) as usize;
+        {
+            let guard = self.coerced_arm.lock().unwrap();
+            if let Some((cached_key, cached)) = guard.as_ref() {
+                if *cached_key == key {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+        let arm = ArrowReaderMetadata::try_new(
+            Arc::clone(&self.metadata),
+            options.with_schema(Arc::clone(&supplied_schema)),
+        )?;
+        let mut guard = self.coerced_arm.lock().unwrap();
+        *guard = Some((key, arm.clone()));
+        Ok(arm)
     }
 
     pub fn parquet_metadata(&self) -> &Arc<ParquetMetaData> {
         &self.metadata
     }
 
-    /// Return the cached arrow schema view, building it on first use.
+    /// Return the cached [`ArrowReaderMetadata`] for this file, building it
+    /// on first use.
     ///
-    /// The returned [`FieldLevels`] is `Clone`, so the caller can use it
-    /// to build an [`ArrowReaderMetadata`] via
-    /// [`ArrowReaderMetadata::from_field_levels`] without redoing the
-    /// per-leaf walk through the parquet schema.
-    pub fn arrow_view(&self) -> Result<&CachedArrowView> {
-        // OnceLock has no get_or_try_init in stable; emulate it.
-        if let Some(v) = self.arrow_view.get() {
+    /// `ArrowReaderMetadata` stores its schema and field-levels behind
+    /// `Arc`s, so [`ArrowReaderMetadata::clone`] is cheap and is what
+    /// callers should use to consume the cached value.
+    pub fn arrow_reader_metadata(&self) -> Result<&ArrowReaderMetadata> {
+        if let Some(v) = self.arrow_reader_metadata.get() {
             return Ok(v);
         }
         let file_meta = self.metadata.file_metadata();
@@ -741,13 +772,14 @@ impl CachedParquetMetaData {
             ProjectionMask::all(),
             file_meta.key_value_metadata(),
         )?;
-        let view = CachedArrowView {
-            schema: Arc::new(schema),
-            field_levels: levels,
-        };
-        // Race: if another thread also computed it, that one wins.
-        let _ = self.arrow_view.set(view);
-        Ok(self.arrow_view.get().expect("just set"))
+        let arm = ArrowReaderMetadata::from_field_levels(
+            Arc::clone(&self.metadata),
+            Arc::new(schema),
+            levels,
+        );
+        // Race: if another thread also computed it, theirs wins.
+        let _ = self.arrow_reader_metadata.set(arm);
+        Ok(self.arrow_reader_metadata.get().expect("just set"))
     }
 }
 

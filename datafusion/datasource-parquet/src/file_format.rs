@@ -661,6 +661,14 @@ pub fn apply_file_schema_type_coercions(
         .map(|f| (f.name(), f.data_type()))
         .collect();
 
+    // Track whether any field actually got transformed. The early-return
+    // above only knows that *some* table field has a string-ish type — not
+    // that any file field will actually change. Without this, wide schemas
+    // where the file already matches the table return `Some(<identical
+    // schema>)` and force the caller to rebuild `ArrowReaderMetadata` (an
+    // O(N_columns) walk) for nothing.
+    let mut any_changed = false;
+
     let transformed_fields: Vec<Arc<Field>> = file_schema
         .fields()
         .iter()
@@ -676,6 +684,7 @@ pub fn apply_file_schema_type_coercions(
                         &DataType::Utf8,
                         DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
                     ) => {
+                        any_changed = true;
                         return field_with_new_type(field, DataType::Utf8);
                     }
                     // table schema uses large string type, coerce the file schema to use large string type
@@ -683,6 +692,7 @@ pub fn apply_file_schema_type_coercions(
                         &DataType::LargeUtf8,
                         DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
                     ) => {
+                        any_changed = true;
                         return field_with_new_type(field, DataType::LargeUtf8);
                     }
                     // table schema uses string view type, coerce the file schema to use view type
@@ -690,13 +700,16 @@ pub fn apply_file_schema_type_coercions(
                         &DataType::Utf8View,
                         DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
                     ) => {
+                        any_changed = true;
                         return field_with_new_type(field, DataType::Utf8View);
                     }
                     // Handle view type conversions
                     (&DataType::Utf8View, DataType::Utf8 | DataType::LargeUtf8) => {
+                        any_changed = true;
                         return field_with_new_type(field, DataType::Utf8View);
                     }
                     (&DataType::BinaryView, DataType::Binary | DataType::LargeBinary) => {
+                        any_changed = true;
                         return field_with_new_type(field, DataType::BinaryView);
                     }
                     _ => {}
@@ -707,6 +720,10 @@ pub fn apply_file_schema_type_coercions(
             Arc::clone(field)
         })
         .collect();
+
+    if !any_changed {
+        return None;
+    }
 
     Some(Schema::new_with_metadata(
         transformed_fields,
