@@ -32,7 +32,8 @@ use arrow::datatypes::{DataType, Field, FieldRef, Fields};
 
 use datafusion_common::cast::as_list_array;
 use datafusion_common::utils::{
-    SingleRowListArrayBuilder, compare_rows, get_row_at_idx, take_function_args,
+    SingleRowListArrayBuilder, compare_rows, get_row_at_idx, list_inner_field_from,
+    take_function_args,
 };
 use datafusion_common::{Result, ScalarValue, assert_eq_or_internal_err, exec_err};
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
@@ -111,13 +112,26 @@ impl AggregateUDFImpl for ArrayAgg {
         ))))
     }
 
+    fn return_field(&self, arg_fields: &[FieldRef]) -> Result<FieldRef> {
+        // Preserve the input field's metadata on the list's inner field so
+        // Arrow extension types (`ARROW:extension:*`) round-trip through
+        // `array_agg`.
+        let inner = list_inner_field_from(&arg_fields[0]);
+        Ok(Arc::new(Field::new(
+            self.name(),
+            DataType::List(inner),
+            self.is_nullable(),
+        )))
+    }
+
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+        let inner = list_inner_field_from(&args.input_fields[0]);
+
         if args.is_distinct {
             return Ok(vec![
-                Field::new_list(
+                Field::new(
                     format_state_name(args.name, "distinct_array_agg"),
-                    // See COMMENTS.md to understand why nullable is set to true
-                    Field::new_list_field(args.input_fields[0].data_type().clone(), true),
+                    DataType::List(inner),
                     true,
                 )
                 .into(),
@@ -125,10 +139,9 @@ impl AggregateUDFImpl for ArrayAgg {
         }
 
         let mut fields = vec![
-            Field::new_list(
+            Field::new(
                 format_state_name(args.name, "array_agg"),
-                // See COMMENTS.md to understand why nullable is set to true
-                Field::new_list_field(args.input_fields[0].data_type().clone(), true),
+                DataType::List(inner),
                 true,
             )
             .into(),
@@ -167,7 +180,6 @@ impl AggregateUDFImpl for ArrayAgg {
 
     fn accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
         let field = &acc_args.expr_fields[0];
-        let data_type = field.data_type();
         let ignore_nulls = acc_args.ignore_nulls && field.is_nullable();
 
         if acc_args.is_distinct {
@@ -195,17 +207,14 @@ impl AggregateUDFImpl for ArrayAgg {
                 }
             };
             return Ok(Box::new(DistinctArrayAggAccumulator::try_new(
-                data_type,
+                field,
                 sort_option,
                 ignore_nulls,
             )?));
         }
 
         let Some(ordering) = LexOrdering::new(acc_args.order_bys.to_vec()) else {
-            return Ok(Box::new(ArrayAggAccumulator::try_new(
-                data_type,
-                ignore_nulls,
-            )?));
+            return Ok(Box::new(ArrayAggAccumulator::try_new(field, ignore_nulls)?));
         };
 
         let ordering_dtypes = ordering
@@ -214,7 +223,7 @@ impl AggregateUDFImpl for ArrayAgg {
             .collect::<Result<Vec<_>>>()?;
 
         OrderSensitiveArrayAggAccumulator::try_new(
-            data_type,
+            field,
             &ordering_dtypes,
             ordering,
             self.is_input_pre_ordered,
@@ -237,10 +246,9 @@ impl AggregateUDFImpl for ArrayAgg {
         args: AccumulatorArgs,
     ) -> Result<Box<dyn GroupsAccumulator>> {
         let field = &args.expr_fields[0];
-        let data_type = field.data_type().clone();
         let ignore_nulls = args.ignore_nulls && field.is_nullable();
         Ok(Box::new(ArrayAggGroupsAccumulator::new(
-            data_type,
+            field,
             ignore_nulls,
         )))
     }
@@ -257,16 +265,20 @@ impl AggregateUDFImpl for ArrayAgg {
 #[derive(Debug)]
 pub struct ArrayAggAccumulator {
     values: Vec<ArrayRef>,
-    datatype: DataType,
+    /// Source field for the aggregated values. Carries data type and metadata
+    /// so the resulting `List`'s inner field preserves the input's metadata.
+    value_field: FieldRef,
     ignore_nulls: bool,
 }
 
 impl ArrayAggAccumulator {
-    /// new array_agg accumulator based on given item data type
-    pub fn try_new(datatype: &DataType, ignore_nulls: bool) -> Result<Self> {
+    /// New `array_agg` accumulator based on the given item field. Use
+    /// `value_field`'s data type and metadata when constructing the output
+    /// list.
+    pub fn try_new(value_field: &FieldRef, ignore_nulls: bool) -> Result<Self> {
         Ok(Self {
             values: vec![],
-            datatype: datatype.clone(),
+            value_field: Arc::clone(value_field),
             ignore_nulls,
         })
     }
@@ -399,12 +411,15 @@ impl Accumulator for ArrayAggAccumulator {
             self.values.iter().map(|a| a.as_ref()).collect();
 
         if element_arrays.is_empty() {
-            return Ok(ScalarValue::new_null_list(self.datatype.clone(), true, 1));
+            return Ok(empty_list_scalar(&self.value_field));
         }
 
         let concated_array = arrow::compute::concat(&element_arrays)?;
 
-        Ok(SingleRowListArrayBuilder::new(concated_array).build_list_scalar())
+        let inner = list_inner_field_from(&self.value_field);
+        Ok(SingleRowListArrayBuilder::new(concated_array)
+            .with_field(&inner)
+            .build_list_scalar())
     }
 
     fn size(&self) -> usize {
@@ -426,14 +441,16 @@ impl Accumulator for ArrayAggAccumulator {
                 // accumulator might not own any data.
                 .map(|arr| arr.to_data().get_slice_memory_size().unwrap_or_default())
                 .sum::<usize>()
-            + self.datatype.size()
-            - size_of_val(&self.datatype)
+            + self.value_field.data_type().size()
+            - size_of_val(self.value_field.data_type())
     }
 }
 
 #[derive(Debug)]
 struct ArrayAggGroupsAccumulator {
-    datatype: DataType,
+    /// Source field for the aggregated values; preserves metadata on the
+    /// list's inner field.
+    value_field: FieldRef,
     ignore_nulls: bool,
     /// Source arrays — input arrays (from update_batch) or list backing
     /// arrays (from merge_batch).
@@ -445,9 +462,9 @@ struct ArrayAggGroupsAccumulator {
 }
 
 impl ArrayAggGroupsAccumulator {
-    fn new(datatype: DataType, ignore_nulls: bool) -> Self {
+    fn new(value_field: &FieldRef, ignore_nulls: bool) -> Self {
         Self {
-            datatype,
+            value_field: Arc::clone(value_field),
             ignore_nulls,
             batches: Vec::new(),
             batch_entries: Vec::new(),
@@ -634,7 +651,7 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
         // Step 3: Scatter entries into group order using the counting sort. The
         // batch index is implicit from the outer loop position.
         let flat_values = if total_rows == 0 {
-            new_empty_array(&self.datatype)
+            new_empty_array(self.value_field.data_type())
         } else {
             let mut interleave_indices = vec![(0usize, 0usize); total_rows];
             for (batch_idx, entries) in self.batch_entries.iter().enumerate() {
@@ -660,7 +677,7 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
         }
 
         let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
-        let field = Arc::new(Field::new_list_field(self.datatype.clone(), true));
+        let field = list_inner_field_from(&self.value_field);
         let result = ListArray::new(field, offsets, flat_values, nulls_builder.finish());
 
         Ok(Arc::new(result))
@@ -731,7 +748,7 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
             filter_nulls
         };
 
-        let field = Arc::new(Field::new_list_field(self.datatype.clone(), true));
+        let field = list_inner_field_from(&self.value_field);
         let list_array = ListArray::new(field, offsets, Arc::clone(input), nulls);
 
         Ok(vec![Arc::new(list_array)])
@@ -759,20 +776,22 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
 #[derive(Debug)]
 pub struct DistinctArrayAggAccumulator {
     values: HashSet<ScalarValue>,
-    datatype: DataType,
+    /// Source field for the aggregated values; preserves metadata on the
+    /// list's inner field.
+    value_field: FieldRef,
     sort_options: Option<SortOptions>,
     ignore_nulls: bool,
 }
 
 impl DistinctArrayAggAccumulator {
     pub fn try_new(
-        datatype: &DataType,
+        value_field: &FieldRef,
         sort_options: Option<SortOptions>,
         ignore_nulls: bool,
     ) -> Result<Self> {
         Ok(Self {
             values: HashSet::new(),
-            datatype: datatype.clone(),
+            value_field: Arc::clone(value_field),
             sort_options,
             ignore_nulls,
         })
@@ -826,7 +845,7 @@ impl Accumulator for DistinctArrayAggAccumulator {
     fn evaluate(&mut self) -> Result<ScalarValue> {
         let mut values: Vec<ScalarValue> = self.values.iter().cloned().collect();
         if values.is_empty() {
-            return Ok(ScalarValue::new_null_list(self.datatype.clone(), true, 1));
+            return Ok(empty_list_scalar(&self.value_field));
         }
 
         if let Some(opts) = self.sort_options {
@@ -856,15 +875,14 @@ impl Accumulator for DistinctArrayAggAccumulator {
             delayed_cmp_err?;
         };
 
-        let arr = ScalarValue::new_list(&values, &self.datatype, true);
-        Ok(ScalarValue::List(arr))
+        values_to_list_scalar(&values, &self.value_field, true)
     }
 
     fn size(&self) -> usize {
         size_of_val(self) + ScalarValue::size_of_hashset(&self.values)
             - size_of_val(&self.values)
-            + self.datatype.size()
-            - size_of_val(&self.datatype)
+            + self.value_field.data_type().size()
+            - size_of_val(self.value_field.data_type())
             - size_of_val(&self.sort_options)
             + size_of::<Option<SortOptions>>()
     }
@@ -882,9 +900,11 @@ pub(crate) struct OrderSensitiveArrayAggAccumulator {
     /// different partitions. For detailed information how merging is done, see
     /// [`merge_ordered_arrays`].
     ordering_values: Vec<Vec<ScalarValue>>,
-    /// Stores datatypes of expressions inside values and ordering requirement
-    /// expressions.
-    datatypes: Vec<DataType>,
+    /// Source field for the aggregated values; preserves metadata on the
+    /// resulting list's inner field.
+    value_field: FieldRef,
+    /// Datatypes of the ordering requirement expressions.
+    ordering_dtypes: Vec<DataType>,
     /// Stores the ordering requirement of the `Accumulator`.
     ordering_req: LexOrdering,
     /// Whether the input is known to be pre-ordered
@@ -897,21 +917,20 @@ pub(crate) struct OrderSensitiveArrayAggAccumulator {
 
 impl OrderSensitiveArrayAggAccumulator {
     /// Create a new order-sensitive ARRAY_AGG accumulator based on the given
-    /// item data type.
+    /// item field.
     pub fn try_new(
-        datatype: &DataType,
+        value_field: &FieldRef,
         ordering_dtypes: &[DataType],
         ordering_req: LexOrdering,
         is_input_pre_ordered: bool,
         reverse: bool,
         ignore_nulls: bool,
     ) -> Result<Self> {
-        let mut datatypes = vec![datatype.clone()];
-        datatypes.extend(ordering_dtypes.iter().cloned());
         Ok(Self {
             values: vec![],
             ordering_values: vec![],
-            datatypes,
+            value_field: Arc::clone(value_field),
+            ordering_dtypes: ordering_dtypes.to_vec(),
             ordering_req,
             is_input_pre_ordered,
             reverse,
@@ -942,7 +961,7 @@ impl OrderSensitiveArrayAggAccumulator {
     }
 
     fn evaluate_orderings(&self) -> Result<ScalarValue> {
-        let fields = ordering_fields(&self.ordering_req, &self.datatypes[1..]);
+        let fields = ordering_fields(&self.ordering_req, &self.ordering_dtypes);
 
         let column_wise_ordering_values = if self.ordering_values.is_empty() {
             fields
@@ -1095,24 +1114,15 @@ impl Accumulator for OrderSensitiveArrayAggAccumulator {
         }
 
         if self.values.is_empty() {
-            return Ok(ScalarValue::new_null_list(
-                self.datatypes[0].clone(),
-                true,
-                1,
-            ));
+            return Ok(empty_list_scalar(&self.value_field));
         }
 
-        let values = self.values.clone();
-        let array = if self.reverse {
-            ScalarValue::new_list_from_iter(
-                values.into_iter().rev(),
-                &self.datatypes[0],
-                true,
-            )
+        let values: Vec<ScalarValue> = if self.reverse {
+            self.values.iter().rev().cloned().collect()
         } else {
-            ScalarValue::new_list_from_iter(values.into_iter(), &self.datatypes[0], true)
+            self.values.clone()
         };
-        Ok(ScalarValue::List(array))
+        values_to_list_scalar(&values, &self.value_field, true)
     }
 
     fn size(&self) -> usize {
@@ -1125,9 +1135,11 @@ impl Accumulator for OrderSensitiveArrayAggAccumulator {
             total += ScalarValue::size_of_vec(row) - size_of_val(row);
         }
 
-        // Add size of the `self.datatypes`
-        total += size_of::<DataType>() * self.datatypes.capacity();
-        for dtype in &self.datatypes {
+        // Add size of the value field's data type and the ordering datatypes.
+        total += self.value_field.data_type().size()
+            - size_of_val(self.value_field.data_type());
+        total += size_of::<DataType>() * self.ordering_dtypes.capacity();
+        for dtype in &self.ordering_dtypes {
             total += dtype.size() - size_of_val(dtype);
         }
 
@@ -1136,6 +1148,36 @@ impl Accumulator for OrderSensitiveArrayAggAccumulator {
         // TODO: Calculate size of each `PhysicalSortExpr` more accurately.
         total
     }
+}
+
+/// Build a single-element `ScalarValue::List` containing one null entry
+/// whose inner field carries `value_field`'s data type and metadata.
+fn empty_list_scalar(value_field: &FieldRef) -> ScalarValue {
+    let inner = list_inner_field_from(value_field);
+    let data_type = DataType::List(inner);
+    ScalarValue::List(Arc::new(ListArray::from(
+        arrow::array::ArrayData::new_null(&data_type, 1),
+    )))
+}
+
+/// Build a single-element `ScalarValue::List` from a slice of `ScalarValue`s,
+/// preserving `value_field`'s data type and metadata on the resulting list's
+/// inner field.
+fn values_to_list_scalar(
+    values: &[ScalarValue],
+    value_field: &FieldRef,
+    nullable: bool,
+) -> Result<ScalarValue> {
+    let arr = if values.is_empty() {
+        new_empty_array(value_field.data_type())
+    } else {
+        ScalarValue::iter_to_array(values.iter().cloned())?
+    };
+    let inner = list_inner_field_from(value_field);
+    Ok(SingleRowListArrayBuilder::new(arr)
+        .with_field(&inner)
+        .with_nullable(nullable)
+        .build_list_scalar())
 }
 
 #[cfg(test)]
@@ -1147,6 +1189,31 @@ mod tests {
     use datafusion_common::internal_err;
     use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_expr::expressions::Column;
+
+    fn int32_field() -> FieldRef {
+        Arc::new(Field::new("c", DataType::Int32, true))
+    }
+
+    /// Regression test for #21982: `array_agg` must propagate the input
+    /// field's metadata onto the resulting list's inner field.
+    #[test]
+    fn array_agg_preserves_inner_field_metadata() -> Result<()> {
+        let metadata = std::collections::HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "arrow.uuid".to_string(),
+        )]);
+        let input: FieldRef =
+            Arc::new(Field::new("c", DataType::Int64, true).with_metadata(metadata));
+        let rf = ArrayAgg::default().return_field(&[Arc::clone(&input)])?;
+        let DataType::List(inner) = rf.data_type() else {
+            panic!("expected List return type");
+        };
+        assert_eq!(
+            inner.metadata().get("ARROW:extension:name"),
+            Some(&"arrow.uuid".to_string())
+        );
+        Ok(())
+    }
 
     #[test]
     fn no_duplicates_no_distinct() -> Result<()> {
@@ -1415,7 +1482,7 @@ mod tests {
         acc2.update_batch(&[data(["b", "c", "a"])])?;
         acc1 = merge(acc1, acc2)?;
 
-        assert_eq!(acc1.size(), 266);
+        assert_eq!(acc1.size(), 250);
 
         Ok(())
     }
@@ -1433,7 +1500,7 @@ mod tests {
         acc1 = merge(acc1, acc2)?;
 
         // without compaction, the size is 16660
-        assert_eq!(acc1.size(), 1660);
+        assert_eq!(acc1.size(), 1644);
 
         Ok(())
     }
@@ -1451,7 +1518,7 @@ mod tests {
         ])])?;
 
         // without compaction, the size is 17112
-        assert_eq!(acc.size(), 2224);
+        assert_eq!(acc.size(), 2160);
 
         Ok(())
     }
@@ -1601,7 +1668,7 @@ mod tests {
 
     #[test]
     fn groups_accumulator_multiple_batches() -> Result<()> {
-        let mut acc = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let mut acc = ArrayAggGroupsAccumulator::new(&int32_field(), false);
 
         // First batch
         let values: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
@@ -1620,7 +1687,7 @@ mod tests {
 
     #[test]
     fn groups_accumulator_emit_first() -> Result<()> {
-        let mut acc = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let mut acc = ArrayAggGroupsAccumulator::new(&int32_field(), false);
 
         let values: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30]));
         acc.update_batch(&[values], &[0, 1, 2], None, 3)?;
@@ -1645,7 +1712,7 @@ mod tests {
         // both groups. After emitting group 0, batch 0 should be
         // dropped entirely and batch 1 should be compacted to the
         // retained row(s).
-        let mut acc = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let mut acc = ArrayAggGroupsAccumulator::new(&int32_field(), false);
 
         let batch0: ArrayRef = Arc::new(Int32Array::from(vec![10, 20]));
         acc.update_batch(&[batch0], &[0, 0], None, 2)?;
@@ -1683,7 +1750,7 @@ mod tests {
 
     #[test]
     fn groups_accumulator_emit_first_compacts_mixed_batches() -> Result<()> {
-        let mut acc = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let mut acc = ArrayAggGroupsAccumulator::new(&int32_field(), false);
 
         let batch: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30, 40]));
         acc.update_batch(&[batch], &[0, 1, 0, 1], None, 2)?;
@@ -1711,7 +1778,7 @@ mod tests {
 
     #[test]
     fn groups_accumulator_emit_all_releases_capacity() -> Result<()> {
-        let mut acc = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let mut acc = ArrayAggGroupsAccumulator::new(&int32_field(), false);
 
         let batch: ArrayRef = Arc::new(Int32Array::from_iter_values(0..64));
         acc.update_batch(
@@ -1734,7 +1801,7 @@ mod tests {
     #[test]
     fn groups_accumulator_null_groups() -> Result<()> {
         // Groups that never receive values should produce null
-        let mut acc = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let mut acc = ArrayAggGroupsAccumulator::new(&int32_field(), false);
 
         let values: ArrayRef = Arc::new(Int32Array::from(vec![1]));
         // Only group 0 gets a value, groups 1 and 2 are empty
@@ -1748,7 +1815,7 @@ mod tests {
 
     #[test]
     fn groups_accumulator_ignore_nulls() -> Result<()> {
-        let mut acc = ArrayAggGroupsAccumulator::new(DataType::Int32, true);
+        let mut acc = ArrayAggGroupsAccumulator::new(&int32_field(), true);
 
         let values: ArrayRef =
             Arc::new(Int32Array::from(vec![Some(1), None, Some(3), None]));
@@ -1765,7 +1832,7 @@ mod tests {
 
     #[test]
     fn groups_accumulator_opt_filter() -> Result<()> {
-        let mut acc = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let mut acc = ArrayAggGroupsAccumulator::new(&int32_field(), false);
 
         let values: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
         // Use a mix of false and null to filter out rows — both should
@@ -1784,12 +1851,12 @@ mod tests {
     fn groups_accumulator_state_merge_roundtrip() -> Result<()> {
         // Accumulator 1: update_batch, then merge, then update_batch again.
         // Verifies that values appear in chronological insertion order.
-        let mut acc1 = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let mut acc1 = ArrayAggGroupsAccumulator::new(&int32_field(), false);
         let values: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
         acc1.update_batch(&[values], &[0, 1], None, 2)?;
 
         // Accumulator 2
-        let mut acc2 = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let mut acc2 = ArrayAggGroupsAccumulator::new(&int32_field(), false);
         let values: ArrayRef = Arc::new(Int32Array::from(vec![3, 4]));
         acc2.update_batch(&[values], &[0, 1], None, 2)?;
 
@@ -1813,7 +1880,7 @@ mod tests {
 
     #[test]
     fn groups_accumulator_convert_to_state() -> Result<()> {
-        let acc = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let acc = ArrayAggGroupsAccumulator::new(&int32_field(), false);
 
         let values: ArrayRef = Arc::new(Int32Array::from(vec![Some(10), None, Some(30)]));
         let state = acc.convert_to_state(&[values], None)?;
@@ -1834,7 +1901,7 @@ mod tests {
 
     #[test]
     fn groups_accumulator_convert_to_state_with_filter() -> Result<()> {
-        let acc = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let acc = ArrayAggGroupsAccumulator::new(&int32_field(), false);
 
         let values: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30]));
         let filter = BooleanArray::from(vec![true, false, true]);
@@ -1857,13 +1924,13 @@ mod tests {
     fn groups_accumulator_convert_to_state_merge_preserves_nulls() -> Result<()> {
         // Verifies that null values survive the convert_to_state -> merge_batch
         // round-trip when ignore_nulls is false (default null handling).
-        let acc = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let acc = ArrayAggGroupsAccumulator::new(&int32_field(), false);
 
         let values: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
         let state = acc.convert_to_state(&[values], None)?;
 
         // Feed state into a new accumulator via merge_batch
-        let mut acc2 = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let mut acc2 = ArrayAggGroupsAccumulator::new(&int32_field(), false);
         acc2.merge_batch(&state, &[0, 0, 1], None, 2)?;
 
         // Group 0 received rows 0 ([1]) and 1 ([NULL]) → [1, NULL]
@@ -1879,7 +1946,7 @@ mod tests {
     fn groups_accumulator_convert_to_state_merge_ignore_nulls() -> Result<()> {
         // Verifies that null values are dropped in the convert_to_state ->
         // merge_batch round-trip when ignore_nulls is true.
-        let acc = ArrayAggGroupsAccumulator::new(DataType::Int32, true);
+        let acc = ArrayAggGroupsAccumulator::new(&int32_field(), true);
 
         let values: ArrayRef =
             Arc::new(Int32Array::from(vec![Some(1), None, Some(3), None]));
@@ -1893,7 +1960,7 @@ mod tests {
         assert!(list.is_null(3));
 
         // Feed state into a new accumulator via merge_batch
-        let mut acc2 = ArrayAggGroupsAccumulator::new(DataType::Int32, true);
+        let mut acc2 = ArrayAggGroupsAccumulator::new(&int32_field(), true);
         acc2.merge_batch(&state, &[0, 0, 1, 1], None, 2)?;
 
         // Group 0: received [1] and null (skipped) → [1]
@@ -1907,7 +1974,7 @@ mod tests {
 
     #[test]
     fn groups_accumulator_all_groups_empty() -> Result<()> {
-        let mut acc = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let mut acc = ArrayAggGroupsAccumulator::new(&int32_field(), false);
 
         // Create groups but don't add any values (all filtered out)
         let values: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
@@ -1924,7 +1991,7 @@ mod tests {
     fn groups_accumulator_ignore_nulls_all_null_group() -> Result<()> {
         // When ignore_nulls is true and a group receives only nulls,
         // it should produce a null output
-        let mut acc = ArrayAggGroupsAccumulator::new(DataType::Int32, true);
+        let mut acc = ArrayAggGroupsAccumulator::new(&int32_field(), true);
 
         let values: ArrayRef = Arc::new(Int32Array::from(vec![None, Some(1), None]));
         acc.update_batch(&[values], &[0, 1, 0], None, 2)?;
