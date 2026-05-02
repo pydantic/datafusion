@@ -169,3 +169,138 @@ queries that only reference a handful of columns this is the next
 target — a "reduced" arrow schema containing only referenced columns,
 and per-(physical_file_schema, predicate) caches for the predicate
 machinery, would push it toward O(num_columns_referenced).
+
+---
+
+## Research log
+
+Things tried after the initial round, in chronological order. Numbers
+quoted are wide @50M / wide @2G / cold first-query, in milliseconds, on
+the 1024-col × 256-file dataset and Q04. Baseline before any of this
+work was 1010 / 832 / cold-first-query.
+
+### Cache-size sweep (validates the thrashing thesis)
+
+Default `metadata_cache_limit = 50MB`, wide metadata is ~1.5 MB/file ×
+256 ≈ 400 MB. Sweep at hot (5 reps after the cold one):
+
+| limit | cold | hot median |
+|---|---|---|
+| 0 (disabled) | 705 | 100 |
+| 10M | 707 | 85 |
+| **50M (default)** | 716 | **136** ← worst |
+| 100M | 702 | 95 |
+| 200M | 698 | 120 |
+| 300M | 654 | 110 |
+| 400M | 591 | 55 |
+| 500M | 623 | 52 |
+| 1G | 669 | 80 |
+| 4G | 648 | 63 |
+
+The default lands in the worst regime: *enough* fits that threads
+contend on the cache mutex, but not enough to stop re-parsing. With
+the cache flat-out disabled it's actually faster than at 50M because
+the lock contention disappears. Implication: tuning the default cache
+or shrinking what's cached is the largest single lever. (See "skip
+page index" below.)
+
+### Microbench: try_new vs cached clone vs apply_coercions noop
+
+Added `wide_schema_microbench`. Findings:
+
+- `ArrowReaderMetadata::try_new` is ~190ns/col linear — at 1024 cols,
+  ~190 µs per file. Across 256 files / 12 threads ≈ 4 ms wall per query
+  spent purely rebuilding the arrow view.
+- The cached clone path (after this branch's changes) is **~4 ns flat**,
+  independent of column count. ~43000× faster at 1024 cols.
+- `apply_file_schema_type_coercions` no-op walk is ~10 ns/col linear
+  even when nothing actually changes — that's why the next change made
+  it return `None` when no field was actually coerced (the early-return
+  was insufficient because the table having any Utf8 field would cause
+  the function to walk all file fields).
+- `PruningPredicate::try_new` on a 1-column predicate is ~2-3 µs and
+  does **not** scale with schema width — it's predicate-driven and the
+  schema is only consulted for the few columns the predicate names.
+  Good news: this part is already where we want it.
+- `StatisticsConverter::try_new` 4.9 ns vs `from_arrow_field` 3.5 ns —
+  ~30% per call, called 1024×/file in the old `statistics_from_parquet_metadata`,
+  so a few µs per file in absolute savings. Small in this micro view but
+  the bigger win was the surrounding O(N²) → O(N) restructure.
+
+### Dead end: `apply_file_schema_type_coercions` early-return
+
+Changed the function to do the "any view/string?" check in a quick
+first pass and only build the 1024-entry HashMap if we *might* coerce.
+Then made it return `None` when no field was actually transformed (the
+function was returning `Some(<identical schema>)` when the table had
+e.g. a Utf8 column but the file already matched).
+
+**Tested impact**: ~zero on Q04. Reason: with `schema_force_view_types =
+true` (the default since #X), the inferred table schema has Utf8View
+and every Utf8 field in the parquet file *does* get coerced — so
+`any_changed` is `true` and the function returns `Some(...)` anyway.
+The function does still get cheaper for cases where the file already
+matches the view-typed table, but Q04 isn't one of those. Keeping the
+change because it's a strict win for callers where it does fire.
+
+### Dead end: skip page index in cache (cold improved, warm regressed)
+
+Hypothesis: wide-schema metadata is dominated by page-index payload;
+loading it eagerly bloats the cache and pays I/O & decode that's wasted
+when the query doesn't need page-level pruning. So change
+`fetch_metadata` to use `PageIndexPolicy::Skip`.
+
+**Result**: cold improved meaningfully (700 → 578 ms wide @50M; 560 →
+498 ms wide @2G — both ~12-17%). Warm regressed badly (42 → 60 ms wide
+@2G — about +40%) because for queries that **do** need page-level
+pruning (ours does), the opener's `load_page_index` then re-reads the
+page index from disk every query and never updates the cache, so
+subsequent queries pay the load again.
+
+Reverted. The right fix is to also update the cache after
+`load_page_index` — defer the page-index decode to first use, but still
+amortise it across queries. That's a bigger surgery and didn't fit this
+pass. Recorded as future work.
+
+### Dead end (so far): `apply_file_schema_type_coercions` return-`None`-on-noop
+
+Mostly subsumed by the above. The "any actually changed" tracking is
+still present (cleaner), but on Q04 with default `force_view_types`
+it doesn't trigger.
+
+### Win: post-coercion `ArrowReaderMetadata` cache slot
+
+The opener does `try_new` again after `apply_file_schema_type_coercions`
+and after `coerce_int96_to_resolution` to rebuild field-levels with the
+new schema. With wide schemas this is **~190 µs per file** of
+recomputing parquet → arrow field-levels with a hint. Added a
+single-slot `coerced_arm: Mutex<Option<(usize_supplied_schema_ptr,
+ArrowReaderMetadata)>>` to `CachedParquetMetaData` and routed the
+opener's coercion rebuilds through `AsyncFileReader::get_arrow_reader_metadata`
+(by making `prepare_filters` async). Hits when subsequent files /
+queries supply the same schema (same Arc), which is the common case
+across all files in a single ListingTable scan with `force_view_types`
+on.
+
+### Open / next
+
+- For COLD specifically, the dominant per-file CPU is the parquet
+  thrift footer decode (~5% of total samples = ~25 ms across the run
+  for our wide bench) plus building the arrow view (~3-5%). The decode
+  is hard to shrink without a parquet-format change. The arrow view
+  could be O(num_columns_referenced) if `parquet_to_arrow_field_levels`
+  was called with a `ProjectionMask` for just the columns the query
+  reads — but currently the metadata cache stores the full view because
+  it's shared across queries with different projections. Splitting
+  full-view-vs-projected-view is the next thing to try.
+- The `infer_stats_and_ordering` path is still per-file per-query and
+  computes statistics for **all** 1024 columns even though the query
+  uses 4. Making `Statistics::column_statistics` lazy (compute per
+  column on first access) would cut this directly.
+- `Schema::index_of` and `Fields::find` are O(N) linear scans in arrow.
+  Profile shows them at ~0.5% combined for Q04 — tiny in this benchmark
+  but they're called from every PruningPredicate construction and their
+  callers in DataFusion already take pains to avoid them in hot loops.
+  Adding a lazy name → index hashmap to `Fields` would future-proof
+  any code that lookups by name without thinking about it. Not done in
+  this pass because the immediate impact is small.

@@ -28,6 +28,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use object_store::ObjectStore;
 use crate::metadata::CachedParquetMetaData;
+use arrow::datatypes::SchemaRef;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
 use parquet::file::metadata::ParquetMetaData;
@@ -326,12 +327,13 @@ impl AsyncFileReader for CachedParquetFileReader {
         let metadata_cache = Arc::clone(&self.metadata_cache);
 
         async move {
-            // Only the "no special options" case can use the cached arrow
-            // schema/field-levels view; other configurations need a fresh
-            // walk of the parquet schema.
-            let can_use_cache = options.supplied_schema().is_none()
-                && !options.skip_arrow_metadata()
-                && options.virtual_columns().is_empty();
+            // We can serve from cache when no embedded-schema-skip and no
+            // virtual columns are requested. A `supplied_schema` is OK —
+            // the wrapper has a separate cache slot for post-coercion
+            // builds keyed by the supplied schema's Arc identity.
+            let can_use_cache =
+                !options.skip_arrow_metadata() && options.virtual_columns().is_empty();
+            let supplied = options.supplied_schema().cloned();
 
             #[cfg(feature = "parquet_encryption")]
             let file_decryption_properties = options
@@ -340,29 +342,54 @@ impl AsyncFileReader for CachedParquetFileReader {
             #[cfg(not(feature = "parquet_encryption"))]
             let file_decryption_properties = None;
 
-            // Fast path: cache hit, default options. The cached
-            // CachedParquetMetaData also memoises the built
-            // ArrowReaderMetadata, so a hit is just an Arc clone of the
-            // schema + field-levels (no per-leaf walk).
-            if can_use_cache
-                && let Some(cached) = metadata_cache.get(&object_meta.location)
-                && cached.is_valid_for(&object_meta)
-                && let Some(cached_parquet) = cached
+            let try_serve_from_cache = |options: ArrowReaderOptions,
+                                        supplied: Option<SchemaRef>|
+             -> parquet::errors::Result<Option<ArrowReaderMetadata>> {
+                if !can_use_cache {
+                    return Ok(None);
+                }
+                let Some(cached) = metadata_cache.get(&object_meta.location) else {
+                    return Ok(None);
+                };
+                if !cached.is_valid_for(&object_meta) {
+                    return Ok(None);
+                }
+                let Some(cached_parquet) = cached
                     .file_metadata
                     .as_any()
                     .downcast_ref::<CachedParquetMetaData>()
-            {
-                let arm = cached_parquet.arrow_reader_metadata().map_err(|e| {
-                    parquet::errors::ParquetError::General(format!(
-                        "Failed to build arrow reader metadata for {}: {e}",
-                        object_meta.location,
-                    ))
-                })?;
-                return Ok(arm.clone());
+                else {
+                    return Ok(None);
+                };
+                let arm = if let Some(schema) = supplied {
+                    cached_parquet
+                        .coerced_arrow_reader_metadata(schema, options)
+                        .map_err(|e| {
+                            parquet::errors::ParquetError::General(format!(
+                                "Failed to build coerced arrow reader metadata for {}: {e}",
+                                object_meta.location,
+                            ))
+                        })?
+                } else {
+                    cached_parquet
+                        .arrow_reader_metadata()
+                        .map_err(|e| {
+                            parquet::errors::ParquetError::General(format!(
+                                "Failed to build arrow reader metadata for {}: {e}",
+                                object_meta.location,
+                            ))
+                        })?
+                        .clone()
+                };
+                Ok(Some(arm))
+            };
+
+            // Fast path: cache hit (already-fetched metadata).
+            if let Some(arm) = try_serve_from_cache(options.clone(), supplied.clone())? {
+                return Ok(arm);
             }
 
-            // Slow path: fall back to fetching metadata then constructing
-            // the arrow reader metadata from scratch.
+            // Slow path: fetch + cache the metadata, then retry.
             let metadata = DFParquetMetadata::new(&self.store, &object_meta)
                 .with_decryption_properties(file_decryption_properties)
                 .with_file_metadata_cache(Some(Arc::clone(&metadata_cache)))
@@ -375,24 +402,8 @@ impl AsyncFileReader for CachedParquetFileReader {
                         object_meta.location,
                     ))
                 })?;
-
-            // The fetch above just (re)cached the metadata, so try the
-            // cache lookup once more now that we know the entry is fresh.
-            if can_use_cache
-                && let Some(cached) = metadata_cache.get(&object_meta.location)
-                && cached.is_valid_for(&object_meta)
-                && let Some(cached_parquet) = cached
-                    .file_metadata
-                    .as_any()
-                    .downcast_ref::<CachedParquetMetaData>()
-            {
-                let arm = cached_parquet.arrow_reader_metadata().map_err(|e| {
-                    parquet::errors::ParquetError::General(format!(
-                        "Failed to build arrow reader metadata for {}: {e}",
-                        object_meta.location,
-                    ))
-                })?;
-                return Ok(arm.clone());
+            if let Some(arm) = try_serve_from_cache(options.clone(), supplied)? {
+                return Ok(arm);
             }
 
             ArrowReaderMetadata::try_new(metadata, options)
