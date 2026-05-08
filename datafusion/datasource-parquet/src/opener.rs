@@ -331,6 +331,12 @@ struct FiltersPreparedParquetOpen {
 struct RowGroupsPrunedParquetOpen {
     prepared: FiltersPreparedParquetOpen,
     row_groups: RowGroupAccessPlanFilter,
+    /// Per-conjunct row-group pruning rates surfaced as a side-effect of
+    /// `prune_by_statistics_with_per_conjunct_stats`.  Threaded into the
+    /// adaptive scheduler's `pruning_rates` map alongside the
+    /// page-pruning rates so the initial-placement prior gets the
+    /// strongest available signal per FilterId.
+    row_group_per_conjunct: Vec<datafusion_pruning::PerConjunctPruneStats>,
 }
 
 /// State of [`ParquetOpenState`]
@@ -875,12 +881,31 @@ impl MetadataLoadedParquetOpen {
         // the adaptive selectivity tracker.
         let combined_predicate = prepared.combined_predicate();
 
-        // Build predicates for this specific file
-        let pruning_predicate = build_pruning_predicates(
-            combined_predicate.as_ref(),
-            &physical_file_schema,
-            &prepared.predicate_creation_errors,
-        );
+        // Build predicates for this specific file. When we have
+        // FilterId-tagged conjuncts available, use the tagged
+        // constructor so the row-group pruning pass surfaces
+        // per-FilterId pruning rates as a side-effect of the same
+        // iteration that produces the row-group prune decision (see
+        // `PruningPredicate::prune_per_conjunct`). Otherwise fall back
+        // to the existing combined-predicate path.
+        let pruning_predicate = if let Some(conjuncts) =
+            prepared.predicate_conjuncts.as_ref()
+            && !conjuncts.is_empty()
+        {
+            match PruningPredicate::try_new_tagged_conjuncts(
+                conjuncts.as_slice(),
+                Arc::clone(&physical_file_schema),
+            ) {
+                Ok(p) if !p.always_true() => Some(Arc::new(p)),
+                _ => None,
+            }
+        } else {
+            build_pruning_predicates(
+                combined_predicate.as_ref(),
+                &physical_file_schema,
+                &prepared.predicate_creation_errors,
+            )
+        };
 
         // Only build page pruning predicate if page index is enabled.
         // Prefer the *tagged* constructor when we have FilterId-tagged
@@ -963,15 +988,17 @@ impl FiltersPreparedParquetOpen {
         }
 
         // If there is a predicate that can be evaluated against the metadata
+        let mut row_group_per_conjunct: Vec<datafusion_pruning::PerConjunctPruneStats> = Vec::new();
         if let Some(predicate) = self.pruning_predicate.as_ref().map(|p| p.as_ref()) {
             if prepared.enable_row_group_stats_pruning {
-                row_groups.prune_by_statistics(
-                    &prepared.physical_file_schema,
-                    loaded.reader_metadata.parquet_schema(),
-                    rg_metadata,
-                    predicate,
-                    &prepared.file_metrics,
-                );
+                row_group_per_conjunct = row_groups
+                    .prune_by_statistics_with_per_conjunct_stats(
+                        &prepared.physical_file_schema,
+                        loaded.reader_metadata.parquet_schema(),
+                        rg_metadata,
+                        predicate,
+                        &prepared.file_metrics,
+                    );
             } else {
                 // Update metrics: statistics unavailable, so all row groups are
                 // matched (not pruned)
@@ -1005,6 +1032,7 @@ impl FiltersPreparedParquetOpen {
         Ok(RowGroupsPrunedParquetOpen {
             prepared: self,
             row_groups,
+            row_group_per_conjunct,
         })
     }
 }
@@ -1129,6 +1157,7 @@ impl RowGroupsPrunedParquetOpen {
         let RowGroupsPrunedParquetOpen {
             prepared,
             mut row_groups,
+            row_group_per_conjunct,
         } = self;
         let FiltersPreparedParquetOpen {
             loaded,
@@ -1175,12 +1204,34 @@ impl RowGroupsPrunedParquetOpen {
             row_groups.prune_by_limit(limit, rg_metadata, &prepared.file_metrics);
         }
 
-        // Page index pruning: side-effect captures per-FilterId rate.
+        // Initial-placement prior map: per-FilterId pruning rates fed
+        // to `partition_filters` so it can decide row-level vs
+        // post-scan based on real selectivity stats from the prunings
+        // the opener already ran.
+        //
+        // Two sources, both side-effects of work that happens regardless
+        // of this experiment:
+        //   1. Row-group min/max pruning
+        //      (see `prune_by_statistics_with_per_conjunct_stats`).
+        //   2. Page-index pruning (see
+        //      `prune_plan_with_per_conjunct_stats`). Page-level is
+        //      strictly finer-grained; when both produce a rate for
+        //      the same FilterId, the page-level rate wins (it's
+        //      written second).
         let mut access_plan = row_groups.build();
         let mut page_pruning_rates: HashMap<
             crate::selectivity::FilterId,
             f64,
         > = HashMap::new();
+        // Source 1: row-group rates
+        for stats in &row_group_per_conjunct {
+            if let Some(tag) = stats.tag
+                && let Some(rate) = stats.pruning_rate()
+            {
+                page_pruning_rates.insert(tag, rate);
+            }
+        }
+        // Source 2: page-index rates (override row-group when both are present)
         if prepared.enable_page_index
             && !access_plan.is_empty()
             && let Some(page_pruning_predicate) = page_pruning_predicate.as_ref()

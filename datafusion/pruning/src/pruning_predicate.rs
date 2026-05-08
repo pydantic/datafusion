@@ -375,6 +375,51 @@ pub struct PruningPredicate {
     ///
     /// See [`PruningPredicate::literal_guarantees`] for more details.
     literal_guarantees: Vec<LiteralGuarantee>,
+    /// Optional per-conjunct sub-predicates, populated when the
+    /// constructor splits a top-level AND into separate
+    /// `PruningPredicate`s.  When present, [`Self::prune_per_conjunct`]
+    /// evaluates each sub-predicate to produce per-conjunct pruning
+    /// rates; ordinary [`Self::prune`] is unchanged.
+    ///
+    /// Only the leaves are populated — the sub-predicates themselves
+    /// have `sub_predicates: None`.
+    sub_predicates: Option<Vec<TaggedSubPredicate>>,
+}
+
+/// A per-conjunct sub-predicate paired with an optional caller tag
+/// (typically a `FilterId` chosen by the caller).  Lives behind
+/// [`PruningPredicate::sub_predicates`].
+#[derive(Debug, Clone)]
+struct TaggedSubPredicate {
+    /// Caller tag (`None` when constructed without tagging).
+    tag: Option<usize>,
+    /// The per-conjunct PruningPredicate.
+    predicate: PruningPredicate,
+}
+
+/// Result of [`PruningPredicate::prune_per_conjunct`] for one
+/// sub-predicate.
+#[derive(Debug, Clone, Default)]
+pub struct PerConjunctPruneStats {
+    /// Caller tag (e.g. `FilterId`), `None` when constructed via
+    /// [`PruningPredicate::try_new`] without tagging.
+    pub tag: Option<usize>,
+    /// Number of containers (row groups) the sub-predicate was
+    /// evaluated against.
+    pub containers_seen: usize,
+    /// Number of containers this sub-predicate alone would prune.
+    pub containers_pruned: usize,
+}
+
+impl PerConjunctPruneStats {
+    /// Pruning rate for this conjunct, or `None` when no containers
+    /// were evaluated.
+    pub fn pruning_rate(&self) -> Option<f64> {
+        if self.containers_seen == 0 {
+            return None;
+        }
+        Some(self.containers_pruned as f64 / self.containers_seen as f64)
+    }
 }
 
 /// Build a pruning predicate from an optional predicate expression.
@@ -499,7 +544,67 @@ impl PruningPredicate {
             required_columns,
             orig_expr: expr,
             literal_guarantees,
+            sub_predicates: None,
         })
+    }
+
+    /// Like [`Self::try_new`] but takes already-split top-level
+    /// conjuncts each carrying a caller tag (typically a `FilterId`).
+    /// Builds one [`PruningPredicate`] per conjunct as a leaf
+    /// sub-predicate, then a top-level wrapper whose `predicate_expr`
+    /// is the AND of all the leaves so [`Self::prune`] still produces
+    /// the combined result. The leaves' tags are preserved for
+    /// [`Self::prune_per_conjunct`].
+    ///
+    /// Conjuncts whose individual `try_new` would error or return
+    /// always-true are silently skipped (their tags do not appear in
+    /// the per-conjunct output). If every conjunct is dropped this
+    /// function returns the same `Err` shape `try_new` would on the
+    /// AND'd input.
+    pub fn try_new_tagged_conjuncts(
+        tagged: &[(usize, Arc<dyn PhysicalExpr>)],
+        schema: SchemaRef,
+    ) -> Result<Self> {
+        // Build per-conjunct PruningPredicates (each is a leaf — i.e.
+        // its own `sub_predicates` is `None`).
+        let mut sub_predicates: Vec<TaggedSubPredicate> = Vec::new();
+        for (tag, expr) in tagged {
+            match Self::try_new(Arc::clone(expr), Arc::clone(&schema)) {
+                Ok(p) if !p.always_true() => {
+                    sub_predicates.push(TaggedSubPredicate {
+                        tag: Some(*tag),
+                        predicate: p,
+                    });
+                }
+                Ok(_) => {
+                    // always-true: skip; leaves the tag unrepresented.
+                    continue;
+                }
+                Err(e) => {
+                    debug!(
+                        "try_new_tagged_conjuncts: skipping conjunct {tag}: {e}"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // Combined predicate: AND of all per-conjunct expressions, run
+        // through the same builder that `try_new` uses so the existing
+        // `prune()` semantics are preserved.
+        let combined_expr: Arc<dyn PhysicalExpr> = if tagged.is_empty() {
+            Arc::new(phys_expr::Literal::new(ScalarValue::from(true)))
+        } else {
+            // Conjunction of all original (untransformed) conjuncts.
+            let exprs: Vec<Arc<dyn PhysicalExpr>> =
+                tagged.iter().map(|(_, e)| Arc::clone(e)).collect();
+            datafusion_physical_expr::conjunction(exprs)
+        };
+        let mut wrapper = Self::try_new(combined_expr, schema)?;
+        if !sub_predicates.is_empty() {
+            wrapper.sub_predicates = Some(sub_predicates);
+        }
+        Ok(wrapper)
     }
 
     /// For each set of statistics, evaluates the pruning predicate
@@ -566,6 +671,52 @@ impl PruningPredicate {
         builder.combine_value(self.predicate_expr.evaluate(&statistics_batch)?);
 
         Ok(builder.build())
+    }
+
+    /// Like [`Self::prune`] but also returns per-conjunct pruning
+    /// stats when this predicate was constructed via
+    /// [`Self::try_new_tagged_conjuncts`]. The `Vec<bool>` is the same
+    /// AND'd result `prune` would return; the per-conjunct stats are
+    /// computed by evaluating each leaf sub-predicate against the same
+    /// `statistics` and counting pruned/seen containers.
+    ///
+    /// Returns `(prune_result, vec![])` for predicates constructed via
+    /// the plain [`Self::try_new`] (no sub-predicates available).
+    pub fn prune_per_conjunct<S: PruningStatistics + ?Sized>(
+        &self,
+        statistics: &S,
+    ) -> Result<(Vec<bool>, Vec<PerConjunctPruneStats>)> {
+        let combined = self.prune(statistics)?;
+        let Some(sub_predicates) = &self.sub_predicates else {
+            return Ok((combined, Vec::new()));
+        };
+
+        let total_containers = statistics.num_containers();
+        let mut per_conjunct: Vec<PerConjunctPruneStats> =
+            Vec::with_capacity(sub_predicates.len());
+        for sub in sub_predicates {
+            let kept = sub.predicate.prune(statistics)?;
+            let containers_seen = kept.len();
+            let containers_pruned =
+                containers_seen - kept.iter().filter(|b| **b).count();
+            // Sanity: every sub-predicate evaluates against the same
+            // statistics shape, so `kept.len() == total_containers`.
+            // If the implementation drift breaks that, fall back to
+            // skipping this conjunct rather than panicking.
+            if containers_seen != total_containers {
+                debug!(
+                    "prune_per_conjunct: sub-predicate seen={} expected={}, skipping conjunct",
+                    containers_seen, total_containers
+                );
+                continue;
+            }
+            per_conjunct.push(PerConjunctPruneStats {
+                tag: sub.tag,
+                containers_seen,
+                containers_pruned,
+            });
+        }
+        Ok((combined, per_conjunct))
     }
 
     /// Return a reference to the input schema
