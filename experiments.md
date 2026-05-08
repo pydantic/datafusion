@@ -395,3 +395,116 @@ exp/all-combined         exp7    full real merge: partition_filters +
                                  Preserves morselization wins; Q64
                                  unfixed (sub-RG required).
 ```
+
+---
+
+## Round 3 — chasing Q64 inside the morsel flow
+
+After round 2 left Q64 unfixed in `exp/all-combined`, I tried four
+hypotheses that would each have been a quick win. None landed.
+
+### Hypothesis A: placeholder dynamic filters dominate
+
+Theory: Q64's `OptionalFilterPhysicalExpr` hash-join filters start as
+`lit(true)` placeholders, get installed in the row filter, and pay
+per-row eval cost on every row group before the build side finalises.
+Force them to PostScan unconditionally on first encounter (when
+`snapshot_generation == 0`) → never installed at row level.
+
+Branch: `exp/optional-postscan` (commit `02f791d10`).
+
+Result: **Q64 still 23 s.** So Q64's slow path is **not** the
+placeholder filters.
+
+### Hypothesis B: any filter at row level is the problem
+
+Theory: setting `filter_pushdown_min_bytes_per_sec = INFINITY` makes
+`partition_filters` short-circuit to "all post-scan", so the row
+filter is empty on every chunk.
+
+Test: env var `DATAFUSION_EXECUTION_PARQUET_FILTER_PUSHDOWN_MIN_BYTES_PER_SEC=inf`
+(also tried `1e30`).
+
+Result: **Q64 still 24 s.** So the slow path is **not** about row
+filter placement at all — Q64 stays slow even with the row filter
+empty.
+
+### Hypothesis C: stream-side post-scan filter with wider stream schema
+
+Theory: my round-2 integration only applied stream-side post-scan
+filtering for filters whose columns are all in the user projection.
+For OOP-column filters it re-added them to the row filter. So expand
+the projection mask to include post-scan-filter columns; then ALL
+demoted filters can run stream-side.
+
+Branch: `exp/optional-postscan` + commit `a9f0106f0` (since reverted
+in `befa82605`).
+
+Result: **Q64 worse — 24 s with default config.** Why: the wider
+mask reads extra columns the user projection wouldn't otherwise
+touch. Q64's filter columns include join keys (heavy ints/strings)
+not in the SELECT list. The extra decode cost more than offsets any
+post-scan-filter savings. **Wrong architecture.**
+
+### Hypothesis D: morsel + pushdown=true is structurally bad on Q64
+
+Sanity check: `pushdown_filters=false` on the same branch.
+
+Result: **Q64 = 486 ms.** Same as `main_off`. So #21766 +
+`pushdown=true` is structurally slow on Q64 regardless of any
+adaptive scheduling logic on top. The adaptive layer can't fix what's
+upstream in #21766's morselization itself.
+
+### Conclusion
+
+Q64's regression on the morselized flow is **not** addressable by
+the adaptive scheduler alone. The path forward must be one of:
+
+1. **Sub-row-group adaptation in arrow-rs** — gives the adaptive
+   scheduler swap points within the chunk's single row group.
+   Whether it fixes Q64 depends on whether the regression is a "no
+   swap points to adapt at" issue or something deeper.
+
+2. **Upstream fix in #21766** — if the regression is from how
+   morselization decomposes the work (chunk-rebuild overhead,
+   donor/stealer task overhead), that needs investigation in the
+   morsel codepath itself.
+
+3. **Restrict morselization to multi-row-group files** — if Q64's
+   TPC-DS files are 1-row-group-per-file, donating those 1-RG
+   chunks might be net-negative. A "only donate when the file has
+   ≥ K row groups" check would let files with morselization-friendly
+   layouts benefit while leaving the rest on the original flow.
+
+I lean toward (3) as the easiest test — if `K = 2` recovers Q64
+while preserving TPC-H Q7-Q9 wins, that's the real unblocker. But
+that's a #21766 design change, out of scope here.
+
+### Branches at end of overnight session
+
+```
+exp/baseline                       PR tip
+exp/page-pruning-prior   exp1      cherry-pickable
+exp/latency-aware-z      exp2      cherry-pickable
+exp/pp-plus-laz          exp3      ★ recommend landing
+exp/rg-morsels-clean     exp4      pure #21766
+exp/all-combined         exp7      real merge — Q64 unfixable here
+exp/optional-postscan    exp11     placeholder→postscan (no Q64 win),
+                                   wider-schema commit reverted
+```
+
+### Final scorecard
+
+For **`exp/pp-plus-laz`** (the recommended landing), against `main_off`:
+
+| Workload | exp3 vs main_off |
+|---|---:|
+| ClickBench (no-lat) | **0.81×** ✓ (18 % faster) |
+| ClickBench (lat) | 1.02× ≈ tied |
+| TPC-DS (no-lat) | 1.07× (slight loss) |
+| TPC-DS (lat) | **1.03×** ≈ tied (was 1.15×) |
+| TPC-H (no-lat) | 1.21× (was 1.45×) |
+| TPC-H (lat) | **1.01×** ≈ tied |
+
+**No cell is worse than 1.21× of `main_off`, and four out of six
+are ≤ 1.03×.** Cleanest multi-workload result of the night.
