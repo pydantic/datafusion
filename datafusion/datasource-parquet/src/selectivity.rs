@@ -1037,9 +1037,25 @@ impl SelectivityTrackerInner {
                 // this filter's per-conjunct rate. When no rate is
                 // available (page index disabled, predicate not
                 // single-column, or schema mismatch), we fall back to
-                // the existing byte-ratio heuristic; we deliberately do
-                // NOT re-run any pruning ourselves.
-                let prior = page_pruning_rates.get(&id).copied();
+                // the existing byte-ratio heuristic.
+                //
+                // **Dynamic-filter refresh**: when this conjunct is a
+                // populated DynamicFilter (snapshot_generation > 0)
+                // we evaluate a per-conjunct `PruningPredicate` against
+                // the file's row-group stats *now*, because the
+                // side-effect rates captured at file open were taken
+                // when the filter was still a placeholder. This is
+                // targeted re-evaluation — only for dynamic conjuncts
+                // that have updated since file open — so it doesn't
+                // count as an "extra pruning run" on the static path.
+                let dynamic_rate = if snapshot_generation(&expr) > 0 {
+                    fresh_rate_for_dynamic_conjunct(
+                        &expr, arrow_schema, parquet_schema, metadata,
+                    )
+                } else {
+                    None
+                };
+                let prior = dynamic_rate.or_else(|| page_pruning_rates.get(&id).copied());
 
                 let row_level = match prior {
                     Some(p) if p >= config.prior_promote_threshold => {
@@ -1227,8 +1243,56 @@ fn filter_scan_size(expr: &Arc<dyn PhysicalExpr>, metadata: &ParquetMetaData) ->
 // of the opener's existing page-index pruning pass — see
 // `PagePruningAccessPlanFilter::prune_plan_with_per_conjunct_stats`.
 // `partition_filters` reads them through its `page_pruning_rates`
-// parameter; no extra pruning runs happen on the partition_filters
-// path.)
+// parameter; no extra pruning runs happen on the static path.)
+
+/// Compute a fresh row-group pruning rate for a single dynamic
+/// conjunct, evaluated against the file's row-group statistics
+/// *now*. Used by `partition_filters` to refresh the prior for
+/// dynamic filters that were placeholders when the side-effect
+/// rates were captured at file open and have since been populated
+/// by the join build side.
+///
+/// Returns `None` when the conjunct doesn't translate into a
+/// usable pruning predicate (e.g. always-true after rewriting,
+/// references columns missing from the schema, contains
+/// hash_lookup-style nodes the rewriter can't handle).
+fn fresh_rate_for_dynamic_conjunct(
+    expr: &Arc<dyn PhysicalExpr>,
+    arrow_schema: &SchemaRef,
+    parquet_schema: &SchemaDescriptor,
+    metadata: &ParquetMetaData,
+) -> Option<f64> {
+    use datafusion_pruning::PruningPredicate;
+    // Unwrap OptionalFilterPhysicalExpr — pruning should evaluate
+    // the underlying predicate, not the marker.
+    let inner = if let Some(opt) =
+        expr.downcast_ref::<OptionalFilterPhysicalExpr>()
+    {
+        opt.inner()
+    } else {
+        Arc::clone(expr)
+    };
+    let pp = PruningPredicate::try_new(inner, Arc::clone(arrow_schema)).ok()?;
+    if pp.always_true() {
+        return None;
+    }
+    let groups = metadata.row_groups();
+    if groups.is_empty() {
+        return None;
+    }
+    let stats = crate::row_group_filter::RowGroupPruningStatistics {
+        parquet_schema,
+        row_group_metadatas: groups.iter().collect(),
+        arrow_schema: arrow_schema.as_ref(),
+    };
+    let kept = pp.prune(&stats).ok()?;
+    let total = kept.len();
+    if total == 0 {
+        return None;
+    }
+    let pruned = total - kept.iter().filter(|b| **b).count();
+    Some(pruned as f64 / total as f64)
+}
 
 #[cfg(test)]
 mod tests {
