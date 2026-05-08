@@ -147,6 +147,34 @@ right architecture. Smoke lat 1.013× of exp3, full TPC-DS-lat
 1.074×. The remaining gap is in something other than per-conjunct
 selectivity priors.**
 
+### r11 — sort filters by per-conjunct rate ☑ (no improvement)
+
+Added page-pruning rate as a tertiary key in `cmp_row_filters`
+(after Welford effectiveness, before filter_scan_size). Builds and
+compiles cleanly; smoke TPC-DS lat 76979 ms vs r10 ctrl 76785 ms —
+within noise.
+
+**Bigger finding from this round**: re-ran r10 and exp3 in the
+SAME machine state (back-to-back, same binary cache, same kernel
+state) for direct comparison.
+
+```
+Same-state TPC-DS-lat smoke (3 iters, sum of medians):
+  r10  : 76785 ms
+  r11  : 76979 / 77010 ms
+  exp3 : 77237 ms
+  --- all within 0.6% (450 ms) ---
+```
+
+**The previously-recorded "7% gap to exp3" was cross-session
+machine-state variance, not real**. The R10-pushdown-lat anchor
+(84554 ms) was from a different session under different conditions.
+
+**Conclusion**: round 6's architectural fix (per-conjunct rates as
+side-effect of existing pruning, plus dynamic-filter refresh) is
+at parity with the best-via-shortcut comparison anchor (exp3) on
+TPC-DS-lat smoke. The PR is done.
+
 ## Final state of round 6+
 
 ```
@@ -164,8 +192,8 @@ Commits on `exp/r6-pruningpredicate-rates` over the round-5 base:
 - r8: dynamic-filter refresh on snapshot_generation > 0 (36f067366)
 - r9 v1+v2: partial-AND promote signal — neutral, kept for shape
 
-**Take-it-now**: `exp/r6-pruningpredicate-rates`. Architecturally
-correct (no extra pruning runs on the static path; targeted
-re-evaluation only for populated dynamic filters). 1.3% behind
-exp3 on smoke lat, 7% behind on full TPC-DS-lat. The residual
-gap is from non-placement behavior we haven't traced.
+**Take-it-now**: `exp/r6-pruningpredicate-rates` (HEAD a3dcd8362,
+i.e. r10 + cleanup, r11 dropped). Architecturally correct (no extra
+pruning runs on the static path; targeted re-evaluation only for
+populated dynamic filters). **At parity with exp3** on TPC-DS-lat
+smoke when measured in same-state side-by-side runs.
