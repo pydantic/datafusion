@@ -22,9 +22,11 @@
 //! `ParquetOpener::open`, and [`FilterId`] for stable filter identification.
 
 use arrow::array::BooleanArray;
+use arrow::datatypes::SchemaRef;
 use log::debug;
 use parking_lot::{Mutex, RwLock};
 use parquet::file::metadata::ParquetMetaData;
+use parquet::schema::types::SchemaDescriptor;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +35,7 @@ use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr_common::physical_expr::{
     OptionalFilterPhysicalExpr, PhysicalExpr, snapshot_generation,
 };
+use datafusion_pruning::PruningPredicate;
 
 /// Window size for the per-batch scatter analysis fed to
 /// [`count_skippable_bytes`]. Approximates a parquet data page so that
@@ -274,6 +277,16 @@ pub struct TrackerConfig {
     /// Set to <= 0.0 to disable confidence intervals and promote/demote based on point estimates alone (not recommended).
     /// Set to INFINITY to disable promotion entirely (overrides `min_bytes_per_sec`).
     pub confidence_z: f64,
+    /// Initial-placement prior threshold: if per-conjunct row-group
+    /// statistics pruning prunes ≥ this fraction of the file's row
+    /// groups, place the filter at row-level on first encounter. Set
+    /// to >1.0 to disable the prior. Default 0.5.
+    pub prior_promote_threshold: f64,
+    /// Initial-placement prior threshold: if per-conjunct row-group
+    /// statistics pruning prunes ≤ this fraction of the file's row
+    /// groups, place the filter at post-scan on first encounter. Set
+    /// to <0.0 to disable the prior. Default 0.05.
+    pub prior_demote_threshold: f64,
 }
 
 impl TrackerConfig {
@@ -282,6 +295,8 @@ impl TrackerConfig {
             min_bytes_per_sec: f64::INFINITY,
             byte_ratio_threshold: 0.20,
             confidence_z: 2.0,
+            prior_promote_threshold: 0.5,
+            prior_demote_threshold: 0.05,
         }
     }
 
@@ -297,6 +312,16 @@ impl TrackerConfig {
 
     pub fn with_confidence_z(mut self, v: f64) -> Self {
         self.confidence_z = v;
+        self
+    }
+
+    pub fn with_prior_promote_threshold(mut self, v: f64) -> Self {
+        self.prior_promote_threshold = v;
+        self
+    }
+
+    pub fn with_prior_demote_threshold(mut self, v: f64) -> Self {
+        self.prior_demote_threshold = v;
         self
     }
 
@@ -593,6 +618,8 @@ impl SelectivityTracker {
         projection_columns: &std::collections::HashSet<usize>,
         projection_scan_size: usize,
         metadata: &ParquetMetaData,
+        arrow_schema: &SchemaRef,
+        parquet_schema: &SchemaDescriptor,
     ) -> PartitionedFilters {
         // Phase 1: inner.lock() + filter_stats.read() → all decision logic
         let mut guard = self.inner.lock();
@@ -602,6 +629,8 @@ impl SelectivityTracker {
             projection_columns,
             projection_scan_size,
             metadata,
+            arrow_schema,
+            parquet_schema,
             &self.config,
             &stats_map,
         );
@@ -630,6 +659,37 @@ impl SelectivityTracker {
         }
 
         result.partitioned
+    }
+
+    /// Test-only convenience that derives `arrow_schema` / `parquet_schema`
+    /// from the parquet metadata and forwards to the public
+    /// [`Self::partition_filters`]. Lets test code keep its existing call
+    /// sites without threading two more arguments through every test.
+    #[cfg(test)]
+    pub fn partition_filters_for_test(
+        &self,
+        filters: Vec<(FilterId, Arc<dyn PhysicalExpr>)>,
+        projection_columns: &std::collections::HashSet<usize>,
+        projection_scan_size: usize,
+        metadata: &ParquetMetaData,
+    ) -> PartitionedFilters {
+        let parquet_schema =
+            metadata.file_metadata().schema_descr_ptr();
+        let arrow_schema: SchemaRef = match parquet::arrow::parquet_to_arrow_schema(
+            parquet_schema.as_ref(),
+            None,
+        ) {
+            Ok(s) => Arc::new(s),
+            Err(_) => Arc::new(arrow::datatypes::Schema::empty()),
+        };
+        self.partition_filters(
+            filters,
+            projection_columns,
+            projection_scan_size,
+            metadata,
+            &arrow_schema,
+            parquet_schema.as_ref(),
+        )
     }
 
     /// Test helper: ensure a stats entry exists for the given filter ID.
@@ -780,6 +840,8 @@ impl SelectivityTrackerInner {
         projection_columns: &std::collections::HashSet<usize>,
         projection_scan_size: usize,
         metadata: &ParquetMetaData,
+        arrow_schema: &SchemaRef,
+        parquet_schema: &SchemaDescriptor,
         config: &TrackerConfig,
         stats_map: &HashMap<FilterId, Mutex<SelectivityStats>>,
     ) -> PartitionResult {
@@ -898,19 +960,50 @@ impl SelectivityTrackerInner {
                     new_optional_flags.push((id, is_optional_filter(&expr)));
                 }
 
-                let row_level =
-                    extra_bytes > 0 && byte_ratio <= config.byte_ratio_threshold;
+                // Selectivity prior from row-group statistics pruning.
+                // If the per-conjunct PruningPredicate prunes a high
+                // fraction of row groups in this file, treat that as
+                // strong evidence the filter is selective and start at
+                // RowFilter — even if byte_ratio would have said
+                // PostScan. Conversely, if it prunes essentially nothing,
+                // start at PostScan even if byte_ratio is small.
+                let prior = pruning_rate_for_filter(
+                    &expr,
+                    arrow_schema,
+                    parquet_schema,
+                    metadata,
+                );
+
+                let row_level = match prior {
+                    Some(p) if p >= config.prior_promote_threshold => {
+                        debug!(
+                            "FilterId {id}: New filter → Row filter via prior (pruned_rate={p:.3} >= {}) — {expr}",
+                            config.prior_promote_threshold
+                        );
+                        true
+                    }
+                    Some(p) if p <= config.prior_demote_threshold => {
+                        debug!(
+                            "FilterId {id}: New filter → Post-scan via prior (pruned_rate={p:.3} <= {}) — {expr}",
+                            config.prior_demote_threshold
+                        );
+                        false
+                    }
+                    _ => {
+                        let r = extra_bytes > 0
+                            && byte_ratio <= config.byte_ratio_threshold;
+                        debug!(
+                            "FilterId {id}: New filter → {} via byte_ratio (byte_ratio={byte_ratio:.4}, extra_bytes={extra_bytes}, prior={prior:?}) — {expr}",
+                            if r { "Row filter" } else { "Post-scan" }
+                        );
+                        r
+                    }
+                };
+
                 if row_level {
-                    debug!(
-                        "FilterId {id}: New filter → Row filter (byte_ratio {byte_ratio:.4} <= {}, extra_bytes={extra_bytes}) — {expr}",
-                        config.byte_ratio_threshold
-                    );
                     self.filter_states.insert(id, FilterState::RowFilter);
                     row_filters.push((id, expr));
                 } else {
-                    debug!(
-                        "FilterId {id}: New filter → Post-scan (byte_ratio {byte_ratio:.4}, extra_bytes={extra_bytes}) — {expr}",
-                    );
                     self.filter_states.insert(id, FilterState::PostScan);
                     post_scan_filters.push((id, expr));
                 }
@@ -1063,6 +1156,95 @@ fn filter_scan_size(expr: &Arc<dyn PhysicalExpr>, metadata: &ParquetMetaData) ->
     crate::row_filter::total_compressed_bytes(&columns, metadata)
 }
 
+/// Selectivity prior: fraction of row groups in `metadata` that this
+/// filter alone would prune via min/max statistics. Returns `None`
+/// when the prior cannot be trusted, specifically when:
+///
+/// - the expression cannot be turned into a `PruningPredicate`
+///   (always-true after rewriting, or references columns not in the
+///   schema), or
+/// - the file has no min/max statistics for the filter's columns —
+///   in that case `PruningPredicate::prune` would return "all match"
+///   indistinguishably from a genuinely non-selective filter.
+///
+/// This is the "page-pruning prior" from `report.md` §7.2.b — used
+/// at initial placement so we can place row-level on filters that
+/// stats can prove are selective, and post-scan on filters stats
+/// can prove aren't, without waiting for runtime samples.
+fn pruning_rate_for_filter(
+    expr: &Arc<dyn PhysicalExpr>,
+    arrow_schema: &SchemaRef,
+    parquet_schema: &SchemaDescriptor,
+    metadata: &ParquetMetaData,
+) -> Option<f64> {
+    let pruning = build_per_conjunct_pruning_predicate(expr, arrow_schema)?;
+    let groups = metadata.row_groups();
+    if groups.is_empty() {
+        return None;
+    }
+
+    // Bail if no row-group has min/max statistics for the columns this
+    // filter references. Without stats, `PruningPredicate::prune`
+    // returns "match" for every row group — which would look identical
+    // to a filter that's genuinely non-selective and force a spurious
+    // PostScan placement.
+    let referenced_columns: std::collections::HashSet<usize> =
+        collect_columns(expr).iter().map(|c| c.index()).collect();
+    if referenced_columns.is_empty() {
+        return None;
+    }
+    let any_stats = groups.iter().any(|rg| {
+        referenced_columns.iter().any(|&col_idx| {
+            rg.columns()
+                .get(col_idx)
+                .map(|c| c.statistics().is_some())
+                .unwrap_or(false)
+        })
+    });
+    if !any_stats {
+        return None;
+    }
+
+    let stats = crate::row_group_filter::RowGroupPruningStatistics {
+        parquet_schema,
+        row_group_metadatas: groups.iter().collect(),
+        arrow_schema: arrow_schema.as_ref(),
+    };
+    let kept = match pruning.prune(&stats) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    let total = kept.len();
+    if total == 0 {
+        return None;
+    }
+    let pruned = total - kept.iter().filter(|b| **b).count();
+    Some(pruned as f64 / total as f64)
+}
+
+fn build_per_conjunct_pruning_predicate(
+    expr: &Arc<dyn PhysicalExpr>,
+    arrow_schema: &SchemaRef,
+) -> Option<Arc<PruningPredicate>> {
+    // Match `datafusion_pruning::build_pruning_predicate` (cf.
+    // pruning/src/pruning_predicate.rs:385) but without bumping the
+    // `predicate_creation_errors` counter — initial placement is best
+    // effort, an unbuildable predicate just falls back to byte-ratio.
+    let predicate = if let Some(opt) =
+        expr.downcast_ref::<OptionalFilterPhysicalExpr>()
+    {
+        // Unwrap optional wrappers — the prior should be over the
+        // underlying predicate, not the marker.
+        opt.inner()
+    } else {
+        Arc::clone(expr)
+    };
+    match PruningPredicate::try_new(predicate, Arc::clone(arrow_schema)) {
+        Ok(p) if !p.always_true() => Some(Arc::new(p)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1146,9 +1328,7 @@ mod tests {
                 .with_fields(fields)
                 .build()
                 .unwrap();
-            Arc::new(parquet::schema::types::SchemaDescriptor::new(Arc::new(
-                schema,
-            )))
+            Arc::new(SchemaDescriptor::new(Arc::new(schema)))
         }
     }
 
@@ -1386,7 +1566,7 @@ mod tests {
             let expr = col_expr("a", 0);
             let filters = vec![(1, expr)];
 
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -1413,7 +1593,7 @@ mod tests {
             let expr = col_expr("a", 0);
             let filters = vec![(1, expr)];
 
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -1439,7 +1619,7 @@ mod tests {
             let expr = col_expr("a", 0);
             let filters = vec![(1, expr)];
 
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -1461,7 +1641,7 @@ mod tests {
             let expr = col_expr("a", 0);
             let filters = vec![(1, expr)];
 
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -1481,7 +1661,7 @@ mod tests {
             let expr = col_expr("a", 0);
             let filters = vec![(1, expr)];
 
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -1506,7 +1686,7 @@ mod tests {
             let filters = vec![(1, expr.clone())];
 
             // First partition: goes to PostScan (high byte ratio)
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -1521,7 +1701,7 @@ mod tests {
             }
 
             // Second partition: should be promoted to RowFilter
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -1544,7 +1724,7 @@ mod tests {
             let filters = vec![(1, expr.clone())];
 
             // First partition: goes to RowFilter (low byte ratio)
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -1559,7 +1739,7 @@ mod tests {
             }
 
             // Second partition: should be demoted to PostScan
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -1582,7 +1762,7 @@ mod tests {
             let filters = vec![(1, expr.clone())];
 
             // Start as RowFilter
-            tracker.partition_filters(
+            tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -1594,7 +1774,7 @@ mod tests {
             tracker.update(1, 100, 100, 100_000, 1000);
 
             // Demote
-            tracker.partition_filters(
+            tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -1622,7 +1802,7 @@ mod tests {
             let filters = vec![(1, expr.clone())];
 
             // Start as PostScan
-            tracker.partition_filters(
+            tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -1636,7 +1816,7 @@ mod tests {
             }
 
             // Promote
-            tracker.partition_filters(
+            tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -1664,7 +1844,7 @@ mod tests {
             let filters = vec![(1, expr.clone())];
 
             // Start as PostScan
-            tracker.partition_filters(
+            tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -1677,7 +1857,7 @@ mod tests {
             }
 
             // Next partition: should stay as PostScan (not dropped because not optional)
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -1706,7 +1886,7 @@ mod tests {
                 .insert(1, FilterState::Dropped);
 
             // On next partition, dropped filters should not reappear
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -1735,7 +1915,7 @@ mod tests {
             ];
 
             // Partition should process all filters
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -1750,7 +1930,7 @@ mod tests {
             tracker.update(2, 1, 100, 1_000_000, 100);
             tracker.update(3, 40, 100, 1_000_000, 100);
 
-            let result2 = tracker.partition_filters(
+            let result2 = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -1776,7 +1956,7 @@ mod tests {
             ];
 
             // First partition - no stats yet
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -1787,7 +1967,7 @@ mod tests {
             assert!(result.row_filters.len() + result.post_scan.len() > 0);
 
             // Filters should be consistent on repeated calls
-            let result2 = tracker.partition_filters(
+            let result2 = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -1812,7 +1992,7 @@ mod tests {
             ];
 
             // First partition
-            let result1 = tracker.partition_filters(
+            let result1 = tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -1825,7 +2005,7 @@ mod tests {
             tracker.update(3, 60, 100, 1_000_000, 100);
 
             // Second partition with partial stats
-            let result2 = tracker.partition_filters(
+            let result2 = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -1845,13 +2025,13 @@ mod tests {
                 (3, col_expr("a", 2)),
             ];
 
-            let result1 = tracker.partition_filters(
+            let result1 = tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
                 &metadata,
             );
-            let result2 = tracker.partition_filters(
+            let result2 = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -1883,7 +2063,7 @@ mod tests {
             let expr1 = col_expr("a", 0);
             let filters1 = vec![(1, expr1)];
 
-            tracker.partition_filters(
+            tracker.partition_filters_for_test(
                 filters1,
                 &std::collections::HashSet::new(),
                 1000,
@@ -1989,7 +2169,7 @@ mod tests {
             // First partition: goes to RowFilter
             let expr = col_expr("a", 0);
             let filters = vec![(1, expr)];
-            tracker.partition_filters(
+            tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -2099,7 +2279,7 @@ mod tests {
             let filters = vec![(1, expr.clone())];
 
             // Step 1: Initial placement (PostScan)
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -2114,7 +2294,7 @@ mod tests {
             }
 
             // Step 3: Promotion should occur
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -2124,7 +2304,7 @@ mod tests {
             assert_eq!(result.post_scan.len(), 0);
 
             // Step 4: Continue to partition without additional updates
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -2147,7 +2327,7 @@ mod tests {
             let filters = vec![(1, expr.clone())];
 
             // Step 1: Initial placement (RowFilter)
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -2162,7 +2342,7 @@ mod tests {
             }
 
             // Step 3: Demotion should occur
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -2172,7 +2352,7 @@ mod tests {
             assert_eq!(result.post_scan.len(), 1);
 
             // Step 4: Continue to partition without additional updates
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -2194,7 +2374,7 @@ mod tests {
             let filters = vec![(1, col_expr("a", 0)), (2, col_expr("a", 1))];
 
             // Initial partition: both go to PostScan (500/1000 = 0.5 > 0.4)
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -2213,7 +2393,7 @@ mod tests {
             }
 
             // Next partition: Filter 1 promoted, Filter 2 stays PostScan
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -2231,7 +2411,7 @@ mod tests {
             let metadata = create_test_metadata(vec![(100, vec![1000])]);
             let filters = vec![];
 
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -2250,7 +2430,7 @@ mod tests {
             let expr = col_expr("a", 0);
             let filters = vec![(1, expr)];
 
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,
@@ -2274,7 +2454,7 @@ mod tests {
             let filters = vec![(1, expr.clone())];
 
             // Start as RowFilter
-            tracker.partition_filters(
+            tracker.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 1000,
@@ -2287,7 +2467,7 @@ mod tests {
             }
 
             // Should demote due to CI upper bound being 0
-            let result = tracker.partition_filters(
+            let result = tracker.partition_filters_for_test(
                 filters,
                 &std::collections::HashSet::new(),
                 1000,

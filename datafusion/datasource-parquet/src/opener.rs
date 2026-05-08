@@ -1160,6 +1160,8 @@ impl RowGroupsPrunedParquetOpen {
                 &projection_columns,
                 projection_compressed_bytes,
                 file_metadata.as_ref(),
+                &prepared.physical_file_schema,
+                reader_metadata.parquet_schema(),
             );
             (partitioned.row_filters, partitioned.post_scan)
         } else {
@@ -1369,6 +1371,7 @@ impl RowGroupsPrunedParquetOpen {
                 reader: prepared.async_file_reader,
                 active_reader: None,
                 file_metadata: Arc::clone(&file_metadata),
+                parquet_schema: file_metadata.file_metadata().schema_descr_ptr(),
                 physical_file_schema: Arc::clone(&prepared.physical_file_schema),
                 stream_schema: Arc::clone(&stream_schema),
                 file_metrics: prepared.file_metrics.clone(),
@@ -1441,6 +1444,9 @@ struct AdaptiveParquetStream {
     /// Parquet metadata for the file. Used by the tracker to size filter
     /// vs projection bytes when re-partitioning.
     file_metadata: Arc<ParquetMetaData>,
+    /// Parquet `SchemaDescriptor`, used by the page-pruning prior in the
+    /// tracker to construct `RowGroupPruningStatistics`.
+    parquet_schema: Arc<parquet::schema::types::SchemaDescriptor>,
     /// Schema used for filter expressions before rebase.
     physical_file_schema: SchemaRef,
     /// Wide schema the decoder yields — including post-scan-filter columns
@@ -1607,6 +1613,8 @@ impl AdaptiveParquetStream {
             &self.projection_columns,
             self.projection_compressed_bytes,
             self.file_metadata.as_ref(),
+            &self.physical_file_schema,
+            self.parquet_schema.as_ref(),
         );
         let new_ids: std::collections::BTreeSet<crate::selectivity::FilterId> =
             partitioned.row_filters.iter().map(|(id, _)| *id).collect();

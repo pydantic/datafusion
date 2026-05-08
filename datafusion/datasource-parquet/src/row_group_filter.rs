@@ -578,10 +578,10 @@ impl PruningStatistics for BloomFilterStatistics {
 }
 
 /// Wraps a slice of [`RowGroupMetaData`] in a way that implements [`PruningStatistics`]
-struct RowGroupPruningStatistics<'a> {
-    parquet_schema: &'a SchemaDescriptor,
-    row_group_metadatas: Vec<&'a RowGroupMetaData>,
-    arrow_schema: &'a Schema,
+pub(crate) struct RowGroupPruningStatistics<'a> {
+    pub(crate) parquet_schema: &'a SchemaDescriptor,
+    pub(crate) row_group_metadatas: Vec<&'a RowGroupMetaData>,
+    pub(crate) arrow_schema: &'a Schema,
 }
 
 impl<'a> RowGroupPruningStatistics<'a> {
