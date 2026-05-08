@@ -1295,16 +1295,19 @@ fn fresh_rate_for_dynamic_conjunct(
         return Some(pruned as f64 / total as f64);
     }
 
-    // Second try (the AND-with-hash-lookup case): split the inner
-    // conjunct into AND parts, build a PruningPredicate from each
-    // part that the rewriter can handle, take the *max* pruning
-    // rate. The max is correct as a *promote* signal — if any
-    // sub-conjunct prunes a high fraction, the whole AND prunes at
-    // least that much. We deliberately do NOT use this as a demote
-    // signal (a low max could be because the unhandled sub-conjuncts
-    // are doing the actual filtering, e.g. the hash_lookup in
-    // `range_lo <= col <= range_hi AND hash_lookup`).
-    let parts = datafusion_physical_expr::split_conjunction(&inner);
+    // Second try (the AND-with-hash-lookup case): snapshot the
+    // dynamic filter to materialize its current inner expression,
+    // then split the AND inside. `split_conjunction` doesn't descend
+    // into DynamicFilterPhysicalExpr wrappers, so without this step
+    // the split would return `[dynamic_filter]` and miss the
+    // prunable parts inside. We take the *max* pruning rate across
+    // sub-parts as a *promote* signal — if any sub-conjunct prunes
+    // a high fraction, the whole AND prunes at least that much. We
+    // deliberately do NOT use this as a demote signal.
+    let snapshot_result = datafusion_physical_expr_common::physical_expr
+        ::snapshot_physical_expr_opt(Arc::clone(&inner)).ok()?;
+    let snapshotted = snapshot_result.data;
+    let parts = datafusion_physical_expr::split_conjunction(&snapshotted);
     if parts.len() < 2 {
         return None;
     }
