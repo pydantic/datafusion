@@ -75,22 +75,42 @@ single-conjunct PruningPredicates (they always return always_true);
 those conjuncts have NO row-group rate either way, so r6 doesn't
 improve them.
 
-### r7 (next) — bloom-filter per-conjunct rates
+### r7 — bloom-filter per-conjunct rates ☑
 
-**Hypothesis**: opener.rs runs bloom-filter pruning after stats
-pruning. Bloom filters can rule out specific value sets (e.g.
-`col = 'X'` where X is not in the bloom filter for any row group).
-For string-equality / IN predicates, bloom filter pruning is the
-strongest signal stats pruning can produce. We're not capturing
-per-conjunct bloom-filter rates yet.
+Added `prune_by_bloom_filters_with_per_conjunct_stats`; merged into
+`row_group_per_conjunct` taking max rate per FilterId.
 
-If exp3's TPC-DS-lat win includes filters where bloom-filter
-pruning was effective per-conjunct, surfacing those rates should
-close more of the gap.
+**Result**: smoke lat 1.033× of exp3 (was 1.040× r6, 1.048× perconj).
+Modest 0.7% improvement. Concrete wins under lat: ClickBench Q42
+411→350, Q40 437→385, Q21 4557→4410. TPC-DS full-lat: 85 772 ms
+(8.7% behind exp3, was 11.3% perconj, 9.5% r6).
+
+Diminishing returns: each iteration shaves ~0.7-1.5% off the gap.
+
+### r8 (next) — refresh rates on snapshot_generation change
+
+**Hypothesis** (strongest remaining gap source): exp3's
+per-conjunct re-eval runs at EVERY `maybe_swap_strategy` call
+(every row-group boundary). When a dynamic filter (placeholder
+at file open) gets populated by the join build mid-stream,
+exp3's next call evaluates the now-populated conjunct against
+stats and gets a fresh rate. Our cached `page_pruning_rates` is
+fixed at file open — placeholder rates stay None forever.
+
+This explains TPC-DS Q25/Q26/Q50 where dynamic filters mature
+mid-stream and exp3 wins.
 
 **Plan**:
-1. ☐ Look at `prune_by_bloom_filters` in row_group_filter.rs
-2. ☐ Add per-conjunct variant
-3. ☐ Wire into `page_pruning_rates` (now misnamed; should be
-     `pruning_rates` since it covers stats + page + bloom)
-4. ☐ Smoke vs r6 baseline
+1. ☐ Track snapshot_generation per FilterId in tracker
+2. ☐ In maybe_swap_strategy, detect generation changes
+3. ☐ For changed FilterIds, build a fresh per-conjunct
+     PruningPredicate against the current snapshot and evaluate
+     against the file's row-group stats
+4. ☐ Update page_pruning_rates entry for that FilterId
+5. ☐ Smoke + full TPC-DS-lat to verify gap closure
+
+**Honest cost note**: this IS extra work per maybe_swap_strategy
+call (typically per row group boundary). For dynamic conjuncts
+only — typically 2-3 per file. Each is microseconds. Not a "new
+pruning run" in the sense of fetching new bytes; just re-evaluating
+predicates against stats already in memory.
