@@ -551,16 +551,14 @@ impl PruningPredicate {
     /// Like [`Self::try_new`] but takes already-split top-level
     /// conjuncts each carrying a caller tag (typically a `FilterId`).
     /// Builds one [`PruningPredicate`] per conjunct as a leaf
-    /// sub-predicate, then a top-level wrapper whose `predicate_expr`
-    /// is the AND of all the leaves so [`Self::prune`] still produces
-    /// the combined result. The leaves' tags are preserved for
-    /// [`Self::prune_per_conjunct`].
+    /// sub-predicate. The wrapper itself is a marker holding the
+    /// leaves; calls to [`Self::prune`] AND the leaves' results,
+    /// avoiding a redundant combined-predicate construction.
+    /// [`Self::prune_per_conjunct`] also reads from the same leaves.
     ///
     /// Conjuncts whose individual `try_new` would error or return
     /// always-true are silently skipped (their tags do not appear in
-    /// the per-conjunct output). If every conjunct is dropped this
-    /// function returns the same `Err` shape `try_new` would on the
-    /// AND'd input.
+    /// the per-conjunct output).
     pub fn try_new_tagged_conjuncts(
         tagged: &[(usize, Arc<dyn PhysicalExpr>)],
         schema: SchemaRef,
@@ -589,21 +587,30 @@ impl PruningPredicate {
             }
         }
 
-        // Combined predicate: AND of all per-conjunct expressions, run
-        // through the same builder that `try_new` uses so the existing
-        // `prune()` semantics are preserved.
-        let combined_expr: Arc<dyn PhysicalExpr> = if tagged.is_empty() {
-            Arc::new(phys_expr::Literal::new(ScalarValue::from(true)))
+        // Build a marker wrapper. Its own `predicate_expr` is a
+        // literal `true` placeholder; `prune` is special-cased below
+        // to AND the leaves' results when `sub_predicates` is set.
+        let placeholder_expr: Arc<dyn PhysicalExpr> =
+            Arc::new(phys_expr::Literal::new(ScalarValue::from(true)));
+        let combined_orig: Arc<dyn PhysicalExpr> = if tagged.is_empty() {
+            Arc::clone(&placeholder_expr)
         } else {
-            // Conjunction of all original (untransformed) conjuncts.
-            let exprs: Vec<Arc<dyn PhysicalExpr>> =
-                tagged.iter().map(|(_, e)| Arc::clone(e)).collect();
-            datafusion_physical_expr::conjunction(exprs)
+            datafusion_physical_expr::conjunction(
+                tagged.iter().map(|(_, e)| Arc::clone(e)).collect::<Vec<_>>(),
+            )
         };
-        let mut wrapper = Self::try_new(combined_expr, schema)?;
-        if !sub_predicates.is_empty() {
-            wrapper.sub_predicates = Some(sub_predicates);
-        }
+        let wrapper = Self {
+            schema,
+            predicate_expr: placeholder_expr,
+            required_columns: RequiredColumns::new(),
+            orig_expr: combined_orig,
+            literal_guarantees: Vec::new(),
+            sub_predicates: if sub_predicates.is_empty() {
+                None
+            } else {
+                Some(sub_predicates)
+            },
+        };
         Ok(wrapper)
     }
 
@@ -625,6 +632,22 @@ impl PruningPredicate {
         &self,
         statistics: &S,
     ) -> Result<Vec<bool>> {
+        // If we're a tagged-conjunct wrapper (no own predicate_expr,
+        // just leaf sub_predicates), AND the leaves' results.
+        if let Some(sub_predicates) = &self.sub_predicates {
+            let n = statistics.num_containers();
+            let mut combined = vec![true; n];
+            for sub in sub_predicates {
+                let leaf = sub.predicate.prune(statistics)?;
+                for (i, val) in leaf.iter().enumerate() {
+                    if i < combined.len() {
+                        combined[i] = combined[i] && *val;
+                    }
+                }
+            }
+            return Ok(combined);
+        }
+
         let mut builder = BoolVecBuilder::new(statistics.num_containers());
 
         // Try to prove the predicate can't be true for the containers based on
@@ -750,6 +773,13 @@ impl PruningPredicate {
     ///
     /// This can happen when a predicate is simplified to a constant `true`
     pub fn always_true(&self) -> bool {
+        // A tagged-conjunct wrapper is never always-true unless every
+        // leaf is (which can't happen — always-true leaves are dropped
+        // at construction). So when sub_predicates is Some and
+        // non-empty, return false.
+        if let Some(subs) = &self.sub_predicates {
+            return subs.is_empty();
+        }
         is_always_true(&self.predicate_expr) && self.literal_guarantees.is_empty()
     }
 
