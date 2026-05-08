@@ -87,30 +87,45 @@ Modest 0.7% improvement. Concrete wins under lat: ClickBench Q42
 
 Diminishing returns: each iteration shaves ~0.7-1.5% off the gap.
 
-### r8 (next) — refresh rates on snapshot_generation change
+### r8 — refresh rates for populated dynamic filters ☑
 
-**Hypothesis** (strongest remaining gap source): exp3's
-per-conjunct re-eval runs at EVERY `maybe_swap_strategy` call
-(every row-group boundary). When a dynamic filter (placeholder
-at file open) gets populated by the join build mid-stream,
-exp3's next call evaluates the now-populated conjunct against
-stats and gets a fresh rate. Our cached `page_pruning_rates` is
-fixed at file open — placeholder rates stay None forever.
+Implemented `fresh_rate_for_dynamic_conjunct` and called it from
+`partition_filters` only when `snapshot_generation(&expr) > 0`.
+Static filters use the side-effect rates from existing pruning;
+dynamic filters with current values get a targeted re-eval.
 
-This explains TPC-DS Q25/Q26/Q50 where dynamic filters mature
-mid-stream and exp3 wins.
+**Results**:
+- smoke lat: **1.013× of exp3** (was r7 1.033×, r6 1.040×, perconj 1.048×) — close to parity
+- full TPC-DS lat: **1.074× of exp3** (was 1.087× r7, 1.095× r6, 1.113× perconj) — half the original gap closed
 
-**Plan**:
-1. ☐ Track snapshot_generation per FilterId in tracker
-2. ☐ In maybe_swap_strategy, detect generation changes
-3. ☐ For changed FilterIds, build a fresh per-conjunct
-     PruningPredicate against the current snapshot and evaluate
-     against the file's row-group stats
-4. ☐ Update page_pruning_rates entry for that FilterId
-5. ☐ Smoke + full TPC-DS-lat to verify gap closure
+Per-query wins vs exp3 on smoke lat: Q34 0.74×, Q64 0.90×, Q17/Q18 0.97×.
+Still behind: Q25 1.20×, Q26 1.18×, Q37 1.30×.
 
-**Honest cost note**: this IS extra work per maybe_swap_strategy
-call (typically per row group boundary). For dynamic conjuncts
-only — typically 2-3 per file. Each is microseconds. Not a "new
-pruning run" in the sense of fetching new bytes; just re-evaluating
-predicates against stats already in memory.
+**Diagnosis of the residual TPC-DS Q25/Q26 gap**: dynamic filters in
+these queries have shape
+`col >= lo AND col <= hi AND hash_lookup(...)`. The `hash_lookup`
+makes `PruningPredicate::try_new` return always-true (rewriter
+can't handle CASE-with-hash). So `fresh_rate_for_dynamic_conjunct`
+returns None for these — they fall to byte_ratio just like in r7
+or earlier.
+
+exp3 also can't prune these (same rewriter), so its win on Q25/Q26
+must come from a different mechanism — possibly the order in which
+filters get demoted, or how mid-stream `maybe_swap_strategy` cascades
+state. Not investigated further this round.
+
+### r9 (deferred) — extract prunable-part of AND-with-hash-lookup
+
+**Hypothesis**: split the AND inside a populated dynamic filter,
+build a PruningPredicate from only the range / equality parts,
+ignoring the hash_lookup. Pruning rate from the range alone gives
+a *lower bound* on the dynamic filter's selectivity (since the
+hash_lookup further narrows it).
+
+**Risk**: range-alone is often unselective (broad min/max from the
+build side), so the rate could be ~0 → push to PostScan, losing
+the hash_lookup's row-level benefit. Need to think about whether
+this is the right semantic.
+
+**Status**: deferred. The smoke gap is already 1.3%, full TPC-DS-lat
+is 7.4%. Diminishing returns. r8 is a reasonable stopping point.
