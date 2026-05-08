@@ -1223,94 +1223,12 @@ fn filter_scan_size(expr: &Arc<dyn PhysicalExpr>, metadata: &ParquetMetaData) ->
     crate::row_filter::total_compressed_bytes(&columns, metadata)
 }
 
-/// Selectivity prior: fraction of row groups in `metadata` that this
-/// filter alone would prune via min/max statistics. Returns `None`
-/// when the prior cannot be trusted, specifically when:
-///
-/// - the expression cannot be turned into a `PruningPredicate`
-///   (always-true after rewriting, or references columns not in the
-///   schema), or
-/// - the file has no min/max statistics for the filter's columns —
-///   in that case `PruningPredicate::prune` would return "all match"
-///   indistinguishably from a genuinely non-selective filter.
-///
-/// This is the "page-pruning prior" from `report.md` §7.2.b — used
-/// at initial placement so we can place row-level on filters that
-/// stats can prove are selective, and post-scan on filters stats
-/// can prove aren't, without waiting for runtime samples.
-fn pruning_rate_for_filter(
-    expr: &Arc<dyn PhysicalExpr>,
-    arrow_schema: &SchemaRef,
-    parquet_schema: &SchemaDescriptor,
-    metadata: &ParquetMetaData,
-) -> Option<f64> {
-    let pruning = build_per_conjunct_pruning_predicate(expr, arrow_schema)?;
-    let groups = metadata.row_groups();
-    if groups.is_empty() {
-        return None;
-    }
-
-    // Bail if no row-group has min/max statistics for the columns this
-    // filter references. Without stats, `PruningPredicate::prune`
-    // returns "match" for every row group — which would look identical
-    // to a filter that's genuinely non-selective and force a spurious
-    // PostScan placement.
-    let referenced_columns: std::collections::HashSet<usize> =
-        collect_columns(expr).iter().map(|c| c.index()).collect();
-    if referenced_columns.is_empty() {
-        return None;
-    }
-    let any_stats = groups.iter().any(|rg| {
-        referenced_columns.iter().any(|&col_idx| {
-            rg.columns()
-                .get(col_idx)
-                .map(|c| c.statistics().is_some())
-                .unwrap_or(false)
-        })
-    });
-    if !any_stats {
-        return None;
-    }
-
-    let stats = crate::row_group_filter::RowGroupPruningStatistics {
-        parquet_schema,
-        row_group_metadatas: groups.iter().collect(),
-        arrow_schema: arrow_schema.as_ref(),
-    };
-    let kept = match pruning.prune(&stats) {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
-    let total = kept.len();
-    if total == 0 {
-        return None;
-    }
-    let pruned = total - kept.iter().filter(|b| **b).count();
-    Some(pruned as f64 / total as f64)
-}
-
-fn build_per_conjunct_pruning_predicate(
-    expr: &Arc<dyn PhysicalExpr>,
-    arrow_schema: &SchemaRef,
-) -> Option<Arc<PruningPredicate>> {
-    // Match `datafusion_pruning::build_pruning_predicate` (cf.
-    // pruning/src/pruning_predicate.rs:385) but without bumping the
-    // `predicate_creation_errors` counter — initial placement is best
-    // effort, an unbuildable predicate just falls back to byte-ratio.
-    let predicate = if let Some(opt) =
-        expr.downcast_ref::<OptionalFilterPhysicalExpr>()
-    {
-        // Unwrap optional wrappers — the prior should be over the
-        // underlying predicate, not the marker.
-        opt.inner()
-    } else {
-        Arc::clone(expr)
-    };
-    match PruningPredicate::try_new(predicate, Arc::clone(arrow_schema)) {
-        Ok(p) if !p.always_true() => Some(Arc::new(p)),
-        _ => None,
-    }
-}
+// (Per-conjunct page-pruning rates are now extracted as a side-effect
+// of the opener's existing page-index pruning pass — see
+// `PagePruningAccessPlanFilter::prune_plan_with_per_conjunct_stats`.
+// `partition_filters` reads them through its `page_pruning_rates`
+// parameter; no extra pruning runs happen on the partition_filters
+// path.)
 
 #[cfg(test)]
 mod tests {
