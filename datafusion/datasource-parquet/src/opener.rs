@@ -1140,11 +1140,39 @@ impl BloomFiltersLoadedParquetOpen {
             && self.prepared.prepared.loaded.prepared.enable_bloom_filter
             && !self.prepared.row_groups.is_empty()
         {
-            self.prepared.row_groups.prune_by_bloom_filters(
-                predicate,
-                &self.prepared.prepared.loaded.prepared.file_metrics,
-                &self.row_group_bloom_filters,
-            );
+            // Capture per-conjunct bloom-filter rates; merge into the
+            // RowGroupsPrunedParquetOpen accumulator alongside the
+            // row-group-stats rates.  Bloom filters often catch
+            // string-equality / IN predicates that min/max stats miss.
+            let bloom_per_conjunct = self
+                .prepared
+                .row_groups
+                .prune_by_bloom_filters_with_per_conjunct_stats(
+                    predicate,
+                    &self.prepared.prepared.loaded.prepared.file_metrics,
+                    &self.row_group_bloom_filters,
+                );
+            // Merge into the row_group_per_conjunct accumulator. For
+            // each FilterId, keep the strongest signal (max
+            // pruning_rate) seen across the two sources.
+            for bloom in bloom_per_conjunct {
+                if let Some(rate) = bloom.pruning_rate() {
+                    if let Some(existing) = self
+                        .prepared
+                        .row_group_per_conjunct
+                        .iter_mut()
+                        .find(|s| s.tag == bloom.tag)
+                    {
+                        let existing_rate = existing.pruning_rate().unwrap_or(0.0);
+                        if rate > existing_rate {
+                            existing.containers_seen = bloom.containers_seen;
+                            existing.containers_pruned = bloom.containers_pruned;
+                        }
+                    } else {
+                        self.prepared.row_group_per_conjunct.push(bloom);
+                    }
+                }
+            }
         }
 
         self.prepared
