@@ -35,7 +35,6 @@ use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr_common::physical_expr::{
     OptionalFilterPhysicalExpr, PhysicalExpr, snapshot_generation,
 };
-use datafusion_pruning::PruningPredicate;
 
 /// Window size for the per-batch scatter analysis fed to
 /// [`count_skippable_bytes`]. Approximates a parquet data page so that
