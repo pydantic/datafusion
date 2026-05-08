@@ -508,3 +508,98 @@ For **`exp/pp-plus-laz`** (the recommended landing), against `main_off`:
 
 **No cell is worse than 1.21× of `main_off`, and four out of six
 are ≤ 1.03×.** Cleanest multi-workload result of the night.
+
+---
+
+## Round 4 — page-pruning prior tried and rejected
+
+User push: page stats subsume row-group stats; prefer page-level
+when available, fall back to row-group only when page index isn't
+loaded; ideally don't run any "extra pruning pass" — extract from
+the prunings the opener already does.
+
+**Implemented** (branch `exp/page-pruning-prior-v2`, commit
+`7188f3959`): `pruning_rate_for_filter` first checks for
+`column_index() + offset_index()`; if present, builds a per-conjunct
+`PagePruningAccessPlanFilter`, runs `prune_plan_with_page_index`
+against an `all-row-groups-selected` `ParquetAccessPlan`, walks the
+result to compute `pruned_rows / total_rows`. Falls back to
+row-group min/max only when the page index is genuinely absent.
+
+**Result**: aggregate **+18 % vs exp3** on smoke (no-lat).
+
+```
+no-lat smoke (3 iter, 18 queries):
+  baseline (PR)  : 3 723 ms
+  exp3           : 3 549 ms  (0.95×, the recommendation)
+  page-prior     : 4 200 ms  (1.13× of baseline, 1.18× of exp3 — clear loss)
+
+Concrete regressions vs exp3:
+  TPC-DS Q26      :  55 →  105 ms (1.91×)  ← exp3's win is GONE
+  TPC-H Q5        :  56 →   97 ms (1.73×)
+  ClickBench Q11  :  64 →   96 ms (1.51×)
+  ClickBench Q21  : 622 →  857 ms (1.38×)
+  TPC-H Q9        : 110 →  146 ms (1.32×)
+  TPC-H Q18       :  63 →   89 ms (1.41×)
+  ClickBench Q23  : 152 →  177 ms (1.17×)
+```
+
+**Two failure modes**, in order:
+
+1. **The page-pruning evaluation is itself an "extra pruning run"
+   in the cost sense.** Building a per-conjunct
+   `PagePruningAccessPlanFilter` and calling `prune_plan_with_page_index`
+   walks the page index for every page in every row group. For files
+   with many small pages × many conjuncts × hundreds of files
+   (ClickBench partitioned), the per-file overhead dominates the
+   benefit. This is exactly the cost concern flagged.
+
+2. **Removing the row-group fallback lost exp3's Q26-style win.**
+   exp3's row-group prior caught "stats are present but the filter
+   isn't selective" via the `any_stats` guard → forced PostScan
+   placement immediately. Page-prior often returns `None` for the
+   same filter (page index says "all pages might match" → no
+   signal); with the row-group fallback gated on "page index NOT
+   loaded" the byte-ratio path kicks in instead, placing at
+   row-level. The runtime tracker would eventually demote, but in a
+   3-iteration smoke (and probably a real query running once) the
+   convergence doesn't happen in time.
+
+### What a proper version would need
+
+The user's actual architecture — "extract from the prunings that
+already happened" — would require:
+
+a. `PruningPredicate::prune` (in `datafusion-pruning`) instrumented
+   to surface per-conjunct pass/fail rates as a side effect. Today
+   it only returns the combined boolean per row group. Per-conjunct
+   rates exist in the implementation (it splits internally) but
+   aren't exposed.
+
+b. Same for `PagePruningAccessPlanFilter::prune_plan_with_page_index`.
+
+c. The opener captures both per-conjunct rates after each pruning
+   pass and threads them through to `partition_filters` as a
+   `Map<FilterId, f64>`.
+
+d. The prior reads from this map; if a filter has no entry, falls
+   back to byte-ratio.
+
+This is ~200-300 LOC across `datafusion-pruning` and `datafusion-
+datasource-parquet`, plus an API addition to `PruningPredicate`.
+**Not done tonight; documented as a follow-up.**
+
+The simpler version — coarser file-level pruning rate applied to all
+new conjuncts — was considered and rejected: it would lose
+per-conjunct precision (e.g. Q26 has a mix of selective and
+non-selective conjuncts; one file-level rate can't drive both
+correctly).
+
+### Verdict
+
+`exp/pp-plus-laz` (exp3) **stays the recommended landing target**.
+The page-pruning prior is a real follow-up but needs the proper
+"extract from existing prunings" implementation, not the
+"re-evaluate per conjunct" shortcut. Branch
+`exp/page-pruning-prior-v2` is preserved as a reference for what
+*not* to do, with this writeup as context.
