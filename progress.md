@@ -201,12 +201,16 @@ side-by-side runs:
 
 ```
 TPC-DS-lat smoke (3 iters, sum of medians):
-  r10  : 76785 ms   (within 0.6% of exp3)
+  r10  : 76785 ms   (within 0.6% of exp3 — slightly faster)
   exp3 : 77237 ms
 
 ClickBench-lat smoke (3 iters, --pushdown):
-  r10  : 89434 ms   (within 0.9% of exp3)
+  r10  : 89434 ms   (within 0.9% of exp3 — slightly slower)
   exp3 : 88654 ms
+
+TPC-H-lat smoke (3 iters, sf1):
+  r10  : 23373 ms   (1.5% faster than exp3)
+  exp3 : 23721 ms
 ```
 
 ClickBench top regressions vs exp3 are individual queries (Q32,
