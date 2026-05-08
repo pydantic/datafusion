@@ -29,7 +29,7 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr_common::physical_expr::{
@@ -287,6 +287,14 @@ pub struct TrackerConfig {
     /// groups, place the filter at post-scan on first encounter. Set
     /// to <0.0 to disable the prior. Default 0.05.
     pub prior_demote_threshold: f64,
+    /// Per-fetch latency baseline in milliseconds — at this average
+    /// per-fetch RTT the tracker uses the unmodified `confidence_z`.
+    /// Above this, `confidence_z` is shrunk proportionally so the
+    /// tracker becomes more aggressive about state changes when
+    /// per-request cost is high. 0.0 disables. Default 5.0.
+    pub latency_z_baseline_ms: f64,
+    /// Maximum scale factor for the latency-aware z shrink. Default 8.0.
+    pub latency_z_max_scale: f64,
 }
 
 impl TrackerConfig {
@@ -297,6 +305,8 @@ impl TrackerConfig {
             confidence_z: 2.0,
             prior_promote_threshold: 0.5,
             prior_demote_threshold: 0.05,
+            latency_z_baseline_ms: 5.0,
+            latency_z_max_scale: 8.0,
         }
     }
 
@@ -325,12 +335,24 @@ impl TrackerConfig {
         self
     }
 
+    pub fn with_latency_z_baseline_ms(mut self, v: f64) -> Self {
+        self.latency_z_baseline_ms = v;
+        self
+    }
+
+    pub fn with_latency_z_max_scale(mut self, v: f64) -> Self {
+        self.latency_z_max_scale = v;
+        self
+    }
+
     pub fn build(self) -> SelectivityTracker {
         SelectivityTracker {
             config: self,
             filter_stats: RwLock::new(HashMap::new()),
             skip_flags: RwLock::new(HashMap::new()),
             inner: Mutex::new(SelectivityTrackerInner::new()),
+            total_fetch_ns: AtomicU64::new(0),
+            total_fetches: AtomicU64::new(0),
         }
     }
 }
@@ -452,6 +474,11 @@ pub struct SelectivityTracker {
     /// Each inner `Mutex<SelectivityStats>` protects a single filter's
     /// counters, so concurrent `update()` calls on *different* filters
     /// proceed in parallel with zero contention.
+    /// Cumulative wall time spent inside `AsyncFileReader::get_byte_ranges`
+    /// across all openers using this tracker.
+    total_fetch_ns: AtomicU64,
+    /// Number of byte-range fetches recorded.
+    total_fetches: AtomicU64,
     filter_stats: RwLock<HashMap<FilterId, Mutex<SelectivityStats>>>,
     /// Per-filter "skip" flags — when set, the corresponding filter is
     /// treated as a no-op by both the row-filter
@@ -494,6 +521,40 @@ impl SelectivityTracker {
     /// Create a new tracker with default settings (feature disabled).
     pub fn new() -> Self {
         TrackerConfig::new().build()
+    }
+
+    /// Record one batch of `get_byte_ranges` activity (latency-aware z input).
+    pub fn record_fetch(&self, ranges: usize, elapsed_ns: u64) {
+        if ranges == 0 || elapsed_ns == 0 {
+            return;
+        }
+        self.total_fetch_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.total_fetches
+            .fetch_add(ranges as u64, Ordering::Relaxed);
+    }
+
+    fn avg_fetch_ms(&self) -> f64 {
+        let fetches = self.total_fetches.load(Ordering::Relaxed);
+        if fetches == 0 {
+            return 0.0;
+        }
+        let ns = self.total_fetch_ns.load(Ordering::Relaxed) as f64;
+        ns / fetches as f64 / 1_000_000.0
+    }
+
+    fn effective_z(&self) -> f64 {
+        let z = self.config.confidence_z;
+        if self.config.latency_z_baseline_ms <= 0.0 {
+            return z;
+        }
+        let avg = self.avg_fetch_ms();
+        if avg <= self.config.latency_z_baseline_ms {
+            return z;
+        }
+        let factor = (avg / self.config.latency_z_baseline_ms)
+            .clamp(1.0, self.config.latency_z_max_scale);
+        z / factor
     }
 
     /// Update stats for a filter after processing a batch.
@@ -550,7 +611,8 @@ impl SelectivityTracker {
         if !self.config.min_bytes_per_sec.is_finite() {
             return;
         }
-        let Some(ub) = stats.confidence_upper_bound(self.config.confidence_z) else {
+        let z = self.effective_z();
+        let Some(ub) = stats.confidence_upper_bound(z) else {
             return;
         };
         if ub >= self.config.min_bytes_per_sec {
@@ -622,6 +684,7 @@ impl SelectivityTracker {
         parquet_schema: &SchemaDescriptor,
     ) -> PartitionedFilters {
         // Phase 1: inner.lock() + filter_stats.read() → all decision logic
+        let z_eff = self.effective_z();
         let mut guard = self.inner.lock();
         let stats_map = self.filter_stats.read();
         let result = guard.partition_filters(
@@ -632,6 +695,7 @@ impl SelectivityTracker {
             arrow_schema,
             parquet_schema,
             &self.config,
+            z_eff,
             &stats_map,
         );
         drop(stats_map);
@@ -843,6 +907,7 @@ impl SelectivityTrackerInner {
         arrow_schema: &SchemaRef,
         parquet_schema: &SchemaDescriptor,
         config: &TrackerConfig,
+        z_eff: f64,
         stats_map: &HashMap<FilterId, Mutex<SelectivityStats>>,
     ) -> PartitionResult {
         let mut new_optional_flags: Vec<(FilterId, bool)> = Vec::new();
@@ -900,7 +965,8 @@ impl SelectivityTrackerInner {
         let mut row_filters: Vec<(FilterId, Arc<dyn PhysicalExpr>)> = Vec::new();
         let mut post_scan_filters: Vec<(FilterId, Arc<dyn PhysicalExpr>)> = Vec::new();
 
-        let confidence_z = config.confidence_z;
+        // Use the latency-aware effective z (clamped to <= config.confidence_z).
+        let confidence_z = z_eff;
         for (id, expr) in filters {
             let state = self.filter_states.get(&id).copied();
 

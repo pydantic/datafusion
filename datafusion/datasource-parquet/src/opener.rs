@@ -1514,8 +1514,12 @@ impl AdaptiveParquetStream {
                 loop {
                     match self.decoder.try_next_reader() {
                         Ok(DecodeResult::NeedsData(ranges)) => {
+                            let n_ranges = ranges.len();
+                            let started = std::time::Instant::now();
                             match self.reader.get_byte_ranges(ranges.clone()).await {
                                 Ok(data) => {
+                                    let elapsed = started.elapsed().as_nanos() as u64;
+                                    self.tracker.record_fetch(n_ranges, elapsed);
                                     if let Err(e) = self.decoder.push_ranges(ranges, data)
                                     {
                                         return Some((
