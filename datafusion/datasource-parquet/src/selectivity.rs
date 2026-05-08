@@ -1272,10 +1272,6 @@ fn fresh_rate_for_dynamic_conjunct(
     } else {
         Arc::clone(expr)
     };
-    let pp = PruningPredicate::try_new(inner, Arc::clone(arrow_schema)).ok()?;
-    if pp.always_true() {
-        return None;
-    }
     let groups = metadata.row_groups();
     if groups.is_empty() {
         return None;
@@ -1285,13 +1281,57 @@ fn fresh_rate_for_dynamic_conjunct(
         row_group_metadatas: groups.iter().collect(),
         arrow_schema: arrow_schema.as_ref(),
     };
-    let kept = pp.prune(&stats).ok()?;
-    let total = kept.len();
-    if total == 0 {
+
+    // First try: build a PruningPredicate from the whole conjunct.
+    if let Ok(pp) = PruningPredicate::try_new(
+        Arc::clone(&inner),
+        Arc::clone(arrow_schema),
+    ) && !pp.always_true()
+        && let Ok(kept) = pp.prune(&stats)
+        && !kept.is_empty()
+    {
+        let total = kept.len();
+        let pruned = total - kept.iter().filter(|b| **b).count();
+        return Some(pruned as f64 / total as f64);
+    }
+
+    // Second try (the AND-with-hash-lookup case): split the inner
+    // conjunct into AND parts, build a PruningPredicate from each
+    // part that the rewriter can handle, take the *max* pruning
+    // rate. The max is correct as a *promote* signal — if any
+    // sub-conjunct prunes a high fraction, the whole AND prunes at
+    // least that much. We deliberately do NOT use this as a demote
+    // signal (a low max could be because the unhandled sub-conjuncts
+    // are doing the actual filtering, e.g. the hash_lookup in
+    // `range_lo <= col <= range_hi AND hash_lookup`).
+    let parts = datafusion_physical_expr::split_conjunction(&inner);
+    if parts.len() < 2 {
         return None;
     }
-    let pruned = total - kept.iter().filter(|b| **b).count();
-    Some(pruned as f64 / total as f64)
+    let mut max_rate: Option<f64> = None;
+    for part in parts {
+        let Ok(pp) =
+            PruningPredicate::try_new(Arc::clone(part), Arc::clone(arrow_schema))
+        else {
+            continue;
+        };
+        if pp.always_true() {
+            continue;
+        }
+        let Ok(kept) = pp.prune(&stats) else { continue };
+        if kept.is_empty() {
+            continue;
+        }
+        let total = kept.len();
+        let pruned = total - kept.iter().filter(|b| **b).count();
+        let rate = pruned as f64 / total as f64;
+        max_rate = Some(max_rate.map_or(rate, |m| m.max(rate)));
+    }
+    // Promote-only semantics: only return when the partial-AND rate
+    // is high enough to be a confident promote signal. Below that we
+    // return None and let the standard prior / byte-ratio fallback
+    // run, which won't be misled by an undercounted rate.
+    max_rate.filter(|&r| r >= 0.5)
 }
 
 #[cfg(test)]
