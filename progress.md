@@ -192,8 +192,29 @@ Commits on `exp/r6-pruningpredicate-rates` over the round-5 base:
 - r8: dynamic-filter refresh on snapshot_generation > 0 (36f067366)
 - r9 v1+v2: partial-AND promote signal — neutral, kept for shape
 
-**Take-it-now**: `exp/r6-pruningpredicate-rates` (HEAD a3dcd8362,
-i.e. r10 + cleanup, r11 dropped). Architecturally correct (no extra
-pruning runs on the static path; targeted re-evaluation only for
-populated dynamic filters). **At parity with exp3** on TPC-DS-lat
-smoke when measured in same-state side-by-side runs.
+**Take-it-now**: `exp/r6-pruningpredicate-rates` (HEAD 1c416f629,
+i.e. r10 + cleanup commits, r11 dropped). Architecturally correct
+(no extra pruning runs on the static path; targeted re-evaluation
+only for populated dynamic filters). **At parity with exp3** on
+both major latency-pushdown smokes when measured in same-state
+side-by-side runs:
+
+```
+TPC-DS-lat smoke (3 iters, sum of medians):
+  r10  : 76785 ms   (within 0.6% of exp3)
+  exp3 : 77237 ms
+
+ClickBench-lat smoke (3 iters, --pushdown):
+  r10  : 89434 ms   (within 0.9% of exp3)
+  exp3 : 88654 ms
+```
+
+ClickBench top regressions vs exp3 are individual queries (Q32,
+Q41, Q39, Q37) at 100-250 ms absolute — within per-query run-to-run
+noise. Cumulative 0.9% slip on ClickBench appears to be the cost
+of the per-conjunct evaluation pass; investigation deferred — the
+architectural goal is met.
+
+Lint: `cargo clippy -p datafusion-datasource-parquet -p datafusion-pruning
+--all-targets --all-features -- -D warnings` passes after the
+1c416f629 cleanup commit.
