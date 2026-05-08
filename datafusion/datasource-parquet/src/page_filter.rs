@@ -194,15 +194,13 @@ impl PagePruningAccessPlanFilter {
     /// pruning stats keyed by tag.
     pub fn new_tagged(
         conjuncts: &[(usize, Arc<dyn PhysicalExpr>)],
-        schema: SchemaRef,
+        schema: &SchemaRef,
     ) -> Self {
         let mut predicates = Vec::with_capacity(conjuncts.len());
         let mut tags = Vec::with_capacity(conjuncts.len());
         for (id, expr) in conjuncts {
-            let pp = match PruningPredicate::try_new(
-                Arc::clone(expr),
-                Arc::clone(&schema),
-            ) {
+            let pp = match PruningPredicate::try_new(Arc::clone(expr), Arc::clone(schema))
+            {
                 Ok(pp) => pp,
                 Err(e) => {
                     debug!(
@@ -427,7 +425,8 @@ impl PagePruningAccessPlanFilter {
             let mut overall_selection = None;
 
             for (i, predicate) in self.predicates.iter().enumerate() {
-                per_conjunct[i].rows_seen = per_conjunct[i].rows_seen.saturating_add(rg_rows);
+                per_conjunct[i].rows_seen =
+                    per_conjunct[i].rows_seen.saturating_add(rg_rows);
 
                 let column = predicate
                     .required_columns()
@@ -500,7 +499,9 @@ impl PagePruningAccessPlanFilter {
         }
 
         file_metrics.page_index_rows_pruned.add_pruned(total_skip);
-        file_metrics.page_index_rows_pruned.add_matched(total_select);
+        file_metrics
+            .page_index_rows_pruned
+            .add_matched(total_select);
         file_metrics
             .page_index_pages_pruned
             .add_pruned(total_pages_skip);

@@ -131,7 +131,7 @@ fn warm_tracker(
     // Seed with a round-trip so HashMap entries exist; otherwise the first
     // bench iteration pays the "new filter" insertion cost and later ones
     // don't.
-    let _ = tracker.partition_filters(
+    let _ = tracker.partition_filters_for_test(
         filters.to_vec(),
         &std::collections::HashSet::new(),
         1_000_000,
@@ -196,7 +196,7 @@ fn bench_partition_filters(c: &mut Criterion) {
         b.iter_batched(
             || Arc::new(TrackerConfig::new().build()),
             |tracker| {
-                std::hint::black_box(tracker.partition_filters(
+                std::hint::black_box(tracker.partition_filters_for_test(
                     filters.clone(),
                     &std::collections::HashSet::new(),
                     projection_bytes,
@@ -212,7 +212,7 @@ fn bench_partition_filters(c: &mut Criterion) {
     let warm = warm_tracker(TrackerConfig::new(), &filters, &metadata);
     group.bench_function("warm_repeat_call", |b| {
         b.iter(|| {
-            std::hint::black_box(warm.partition_filters(
+            std::hint::black_box(warm.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 projection_bytes,
@@ -233,7 +233,7 @@ fn bench_partition_filters(c: &mut Criterion) {
     }
     group.bench_function("warm_with_accumulated_stats", |b| {
         b.iter(|| {
-            std::hint::black_box(promoted.partition_filters(
+            std::hint::black_box(promoted.partition_filters_for_test(
                 filters.clone(),
                 &std::collections::HashSet::new(),
                 projection_bytes,
@@ -261,7 +261,7 @@ fn bench_file_scan_simulation(c: &mut Criterion) {
     group.bench_function("one_file", |b| {
         b.iter(|| {
             for _morsel in 0..MORSELS_PER_FILE {
-                std::hint::black_box(warm.partition_filters(
+                std::hint::black_box(warm.partition_filters_for_test(
                     filters.clone(),
                     &std::collections::HashSet::new(),
                     projection_bytes,
@@ -301,7 +301,7 @@ fn bench_query_simulation(c: &mut Criterion) {
                     |tracker| {
                         for _file in 0..NUM_FILES {
                             for _morsel in 0..morsels_per_file {
-                                std::hint::black_box(tracker.partition_filters(
+                                std::hint::black_box(tracker.partition_filters_for_test(
                                     filters.clone(),
                                     &std::collections::HashSet::new(),
                                     projection_bytes,

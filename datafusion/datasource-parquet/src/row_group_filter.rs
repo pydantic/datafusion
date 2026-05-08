@@ -296,8 +296,7 @@ impl RowGroupAccessPlanFilter {
             arrow_schema,
         };
 
-        let mut per_conjunct: Vec<datafusion_pruning::PerConjunctPruneStats> =
-            Vec::new();
+        let mut per_conjunct: Vec<datafusion_pruning::PerConjunctPruneStats> = Vec::new();
 
         // try to prune the row groups in a single call (now also captures
         // per-conjunct rates when the predicate was built with
@@ -403,27 +402,14 @@ impl RowGroupAccessPlanFilter {
     ///
     /// Updates this set with row groups that should not be scanned.
     /// `row_group_bloom_filters[idx]` contains the bloom filters for the
-    /// parquet row group at index `idx`.
+    /// parquet row group at index `idx`. Surfaces per-conjunct
+    /// bloom-filter pruning stats aggregated across row groups,
+    /// populated when the predicate was built via
+    /// `PruningPredicate::try_new_tagged_conjuncts`. Empty `Vec` on the
+    /// untagged path.
     ///
     /// # Panics
     /// if `row_group_bloom_filters` does not have the same number of row groups as this set
-    pub(crate) fn prune_by_bloom_filters(
-        &mut self,
-        predicate: &PruningPredicate,
-        metrics: &ParquetFileMetrics,
-        row_group_bloom_filters: &[BloomFilterStatistics],
-    ) {
-        self.prune_by_bloom_filters_with_per_conjunct_stats(
-            predicate,
-            metrics,
-            row_group_bloom_filters,
-        );
-    }
-
-    /// Variant that surfaces per-conjunct bloom-filter pruning stats
-    /// aggregated across row groups, populated when the predicate was
-    /// built via `PruningPredicate::try_new_tagged_conjuncts`. Empty
-    /// `Vec` on the untagged path.
     pub(crate) fn prune_by_bloom_filters_with_per_conjunct_stats(
         &mut self,
         predicate: &PruningPredicate,
@@ -481,7 +467,7 @@ impl RowGroupAccessPlanFilter {
         }
 
         tags.into_iter()
-            .zip(seen.into_iter().zip(pruned.into_iter()))
+            .zip(seen.into_iter().zip(pruned))
             .map(|(tag, (s, p))| datafusion_pruning::PerConjunctPruneStats {
                 tag,
                 containers_seen: s,
@@ -1899,7 +1885,7 @@ mod tests {
             }
             row_group_bloom_filters[idx] = BloomFilterStatistics { column_sbbf };
         }
-        pruned_row_groups.prune_by_bloom_filters(
+        pruned_row_groups.prune_by_bloom_filters_with_per_conjunct_stats(
             pruning_predicate,
             &file_metrics,
             &row_group_bloom_filters,

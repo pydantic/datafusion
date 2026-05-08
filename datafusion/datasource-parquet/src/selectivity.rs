@@ -527,8 +527,7 @@ impl SelectivityTracker {
         if ranges == 0 || elapsed_ns == 0 {
             return;
         }
-        self.total_fetch_ns
-            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.total_fetch_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
         self.total_fetches
             .fetch_add(ranges as u64, Ordering::Relaxed);
     }
@@ -673,6 +672,7 @@ impl SelectivityTracker {
     ///    to insert per-filter `Mutex` entries so that future `update()` calls
     ///    can find them.
     #[doc(hidden)]
+    #[expect(clippy::too_many_arguments)]
     pub fn partition_filters(
         &self,
         filters: Vec<(FilterId, Arc<dyn PhysicalExpr>)>,
@@ -730,7 +730,7 @@ impl SelectivityTracker {
     /// from the parquet metadata and forwards to the public
     /// [`Self::partition_filters`]. Lets test code keep its existing call
     /// sites without threading two more arguments through every test.
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn partition_filters_for_test(
         &self,
         filters: Vec<(FilterId, Arc<dyn PhysicalExpr>)>,
@@ -738,8 +738,7 @@ impl SelectivityTracker {
         projection_scan_size: usize,
         metadata: &ParquetMetaData,
     ) -> PartitionedFilters {
-        let parquet_schema =
-            metadata.file_metadata().schema_descr_ptr();
+        let parquet_schema = metadata.file_metadata().schema_descr_ptr();
         let arrow_schema: SchemaRef = match parquet::arrow::parquet_to_arrow_schema(
             parquet_schema.as_ref(),
             None,
@@ -900,6 +899,7 @@ impl SelectivityTrackerInner {
     }
 
     /// Partition filters into collecting / promoted / post-scan buckets.
+    #[expect(clippy::too_many_arguments)]
     fn partition_filters(
         &mut self,
         filters: Vec<(FilterId, Arc<dyn PhysicalExpr>)>,
@@ -1049,7 +1049,10 @@ impl SelectivityTrackerInner {
                 // count as an "extra pruning run" on the static path.
                 let dynamic_rate = if snapshot_generation(&expr) > 0 {
                     fresh_rate_for_dynamic_conjunct(
-                        &expr, arrow_schema, parquet_schema, metadata,
+                        &expr,
+                        arrow_schema,
+                        parquet_schema,
+                        metadata,
                     )
                 } else {
                     None
@@ -1072,8 +1075,8 @@ impl SelectivityTrackerInner {
                         false
                     }
                     _ => {
-                        let r = extra_bytes > 0
-                            && byte_ratio <= config.byte_ratio_threshold;
+                        let r =
+                            extra_bytes > 0 && byte_ratio <= config.byte_ratio_threshold;
                         debug!(
                             "FilterId {id}: New filter → {} via byte_ratio (byte_ratio={byte_ratio:.4}, extra_bytes={extra_bytes}, prior={prior:?}) — {expr}",
                             if r { "Row filter" } else { "Post-scan" }
@@ -1264,9 +1267,7 @@ fn fresh_rate_for_dynamic_conjunct(
     use datafusion_pruning::PruningPredicate;
     // Unwrap OptionalFilterPhysicalExpr — pruning should evaluate
     // the underlying predicate, not the marker.
-    let inner = if let Some(opt) =
-        expr.downcast_ref::<OptionalFilterPhysicalExpr>()
-    {
+    let inner = if let Some(opt) = expr.downcast_ref::<OptionalFilterPhysicalExpr>() {
         opt.inner()
     } else {
         Arc::clone(expr)
@@ -1282,10 +1283,9 @@ fn fresh_rate_for_dynamic_conjunct(
     };
 
     // First try: build a PruningPredicate from the whole conjunct.
-    if let Ok(pp) = PruningPredicate::try_new(
-        Arc::clone(&inner),
-        Arc::clone(arrow_schema),
-    ) && !pp.always_true()
+    if let Ok(pp) =
+        PruningPredicate::try_new(Arc::clone(&inner), Arc::clone(arrow_schema))
+        && !pp.always_true()
         && let Ok(kept) = pp.prune(&stats)
         && !kept.is_empty()
     {
@@ -1303,8 +1303,11 @@ fn fresh_rate_for_dynamic_conjunct(
     // sub-parts as a *promote* signal — if any sub-conjunct prunes
     // a high fraction, the whole AND prunes at least that much. We
     // deliberately do NOT use this as a demote signal.
-    let snapshot_result = datafusion_physical_expr_common::physical_expr
-        ::snapshot_physical_expr_opt(Arc::clone(&inner)).ok()?;
+    let snapshot_result =
+        datafusion_physical_expr_common::physical_expr::snapshot_physical_expr_opt(
+            Arc::clone(&inner),
+        )
+        .ok()?;
     let snapshotted = snapshot_result.data;
     let parts = datafusion_physical_expr::split_conjunction(&snapshotted);
     if parts.len() < 2 {

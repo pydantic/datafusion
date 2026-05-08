@@ -579,9 +579,7 @@ impl PruningPredicate {
                     continue;
                 }
                 Err(e) => {
-                    debug!(
-                        "try_new_tagged_conjuncts: skipping conjunct {tag}: {e}"
-                    );
+                    debug!("try_new_tagged_conjuncts: skipping conjunct {tag}: {e}");
                     continue;
                 }
             }
@@ -596,7 +594,10 @@ impl PruningPredicate {
             Arc::clone(&placeholder_expr)
         } else {
             datafusion_physical_expr::conjunction(
-                tagged.iter().map(|(_, e)| Arc::clone(e)).collect::<Vec<_>>(),
+                tagged
+                    .iter()
+                    .map(|(_, e)| Arc::clone(e))
+                    .collect::<Vec<_>>(),
             )
         };
         let wrapper = Self {
@@ -720,16 +721,14 @@ impl PruningPredicate {
         for sub in sub_predicates {
             let kept = sub.predicate.prune(statistics)?;
             let containers_seen = kept.len();
-            let containers_pruned =
-                containers_seen - kept.iter().filter(|b| **b).count();
+            let containers_pruned = containers_seen - kept.iter().filter(|b| **b).count();
             // Sanity: every sub-predicate evaluates against the same
             // statistics shape, so `kept.len() == total_containers`.
             // If the implementation drift breaks that, fall back to
             // skipping this conjunct rather than panicking.
             if containers_seen != total_containers {
                 debug!(
-                    "prune_per_conjunct: sub-predicate seen={} expected={}, skipping conjunct",
-                    containers_seen, total_containers
+                    "prune_per_conjunct: sub-predicate seen={containers_seen} expected={total_containers}, skipping conjunct"
                 );
                 continue;
             }

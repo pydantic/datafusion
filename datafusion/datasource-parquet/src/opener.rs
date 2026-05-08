@@ -920,12 +920,13 @@ impl MetadataLoadedParquetOpen {
             {
                 let p = Arc::new(PagePruningAccessPlanFilter::new_tagged(
                     conjuncts.as_slice(),
-                    Arc::clone(&physical_file_schema),
+                    &physical_file_schema,
                 ));
                 (p.filter_number() > 0).then_some(p)
             } else {
                 combined_predicate.as_ref().and_then(|predicate| {
-                    let p = build_page_pruning_predicate(predicate, &physical_file_schema);
+                    let p =
+                        build_page_pruning_predicate(predicate, &physical_file_schema);
                     (p.filter_number() > 0).then_some(p)
                 })
             }
@@ -988,7 +989,8 @@ impl FiltersPreparedParquetOpen {
         }
 
         // If there is a predicate that can be evaluated against the metadata
-        let mut row_group_per_conjunct: Vec<datafusion_pruning::PerConjunctPruneStats> = Vec::new();
+        let mut row_group_per_conjunct: Vec<datafusion_pruning::PerConjunctPruneStats> =
+            Vec::new();
         if let Some(predicate) = self.pruning_predicate.as_ref().map(|p| p.as_ref()) {
             if prepared.enable_row_group_stats_pruning {
                 row_group_per_conjunct = row_groups
@@ -1247,10 +1249,8 @@ impl RowGroupsPrunedParquetOpen {
         //      the same FilterId, the page-level rate wins (it's
         //      written second).
         let mut access_plan = row_groups.build();
-        let mut page_pruning_rates: HashMap<
-            crate::selectivity::FilterId,
-            f64,
-        > = HashMap::new();
+        let mut page_pruning_rates: HashMap<crate::selectivity::FilterId, f64> =
+            HashMap::new();
         // Source 1: row-group rates
         for stats in &row_group_per_conjunct {
             if let Some(tag) = stats.tag
@@ -1636,7 +1636,7 @@ impl AdaptiveParquetStream {
                     match self.decoder.try_next_reader() {
                         Ok(DecodeResult::NeedsData(ranges)) => {
                             let n_ranges = ranges.len();
-                            let started = std::time::Instant::now();
+                            let started = datafusion_common::instant::Instant::now();
                             match self.reader.get_byte_ranges(ranges.clone()).await {
                                 Ok(data) => {
                                     let elapsed = started.elapsed().as_nanos() as u64;
