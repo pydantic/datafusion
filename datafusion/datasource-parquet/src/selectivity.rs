@@ -682,6 +682,7 @@ impl SelectivityTracker {
         metadata: &ParquetMetaData,
         arrow_schema: &SchemaRef,
         parquet_schema: &SchemaDescriptor,
+        page_pruning_rates: &HashMap<FilterId, f64>,
     ) -> PartitionedFilters {
         // Phase 1: inner.lock() + filter_stats.read() → all decision logic
         let z_eff = self.effective_z();
@@ -696,6 +697,7 @@ impl SelectivityTracker {
             parquet_schema,
             &self.config,
             z_eff,
+            page_pruning_rates,
             &stats_map,
         );
         drop(stats_map);
@@ -753,6 +755,7 @@ impl SelectivityTracker {
             metadata,
             &arrow_schema,
             parquet_schema.as_ref(),
+            &HashMap::new(),
         )
     }
 
@@ -908,6 +911,7 @@ impl SelectivityTrackerInner {
         parquet_schema: &SchemaDescriptor,
         config: &TrackerConfig,
         z_eff: f64,
+        page_pruning_rates: &HashMap<FilterId, f64>,
         stats_map: &HashMap<FilterId, Mutex<SelectivityStats>>,
     ) -> PartitionResult {
         let mut new_optional_flags: Vec<(FilterId, bool)> = Vec::new();
@@ -1026,31 +1030,28 @@ impl SelectivityTrackerInner {
                     new_optional_flags.push((id, is_optional_filter(&expr)));
                 }
 
-                // Selectivity prior from row-group statistics pruning.
-                // If the per-conjunct PruningPredicate prunes a high
-                // fraction of row groups in this file, treat that as
-                // strong evidence the filter is selective and start at
-                // RowFilter — even if byte_ratio would have said
-                // PostScan. Conversely, if it prunes essentially nothing,
-                // start at PostScan even if byte_ratio is small.
-                let prior = pruning_rate_for_filter(
-                    &expr,
-                    arrow_schema,
-                    parquet_schema,
-                    metadata,
-                );
+                // Selectivity prior from page-index pruning that the
+                // opener already ran on this file (see
+                // `PagePruningAccessPlanFilter::prune_plan_with_per_conjunct_stats`).
+                // No extra pruning work is done here — we just look up
+                // this filter's per-conjunct rate. When no rate is
+                // available (page index disabled, predicate not
+                // single-column, or schema mismatch), we fall back to
+                // the existing byte-ratio heuristic; we deliberately do
+                // NOT re-run any pruning ourselves.
+                let prior = page_pruning_rates.get(&id).copied();
 
                 let row_level = match prior {
                     Some(p) if p >= config.prior_promote_threshold => {
                         debug!(
-                            "FilterId {id}: New filter → Row filter via prior (pruned_rate={p:.3} >= {}) — {expr}",
+                            "FilterId {id}: New filter → Row filter via page-prior (pruned_rate={p:.3} >= {}) — {expr}",
                             config.prior_promote_threshold
                         );
                         true
                     }
                     Some(p) if p <= config.prior_demote_threshold => {
                         debug!(
-                            "FilterId {id}: New filter → Post-scan via prior (pruned_rate={p:.3} <= {}) — {expr}",
+                            "FilterId {id}: New filter → Post-scan via page-prior (pruned_rate={p:.3} <= {}) — {expr}",
                             config.prior_demote_threshold
                         );
                         false
