@@ -1433,11 +1433,11 @@ mod tests {
         fn test_effectiveness_basic_calculation() {
             let mut stats = SelectivityStats::default();
 
-            // 100 rows total, 50 rows pruned (matched 50), 1 sec eval time, 10000 bytes seen
-            // bytes_per_row = 10000 / 100 = 100
-            // bytes_saved = 50 * 100 = 5000
-            // effectiveness = 5000 * 1e9 / 1e9 = 5000
-            stats.update(50, 100, 1_000_000_000, 10_000);
+            // skippable_bytes is now caller-computed (= rows_pruned *
+            // bytes_per_row in the simple case), so passing 5000 directly
+            // models the same scenario the old test described:
+            // "100 rows total, 50 pruned, 100 bytes/row → 5000 saved".
+            stats.update(50, 100, 1_000_000_000, 5_000);
 
             let eff = stats.effectiveness().unwrap();
             assert!((eff - 5000.0).abs() < 0.1);
@@ -1461,17 +1461,22 @@ mod tests {
 
         #[test]
         fn test_effectiveness_zero_bytes_seen() {
+            // A batch with zero skippable_bytes is a legitimate sample
+            // ("filter ran, late-mat had nothing to save") — Welford
+            // records it as eff=0 rather than discarding it, so the
+            // demotion path can see "CPU spent, no payoff."
             let mut stats = SelectivityStats::default();
             stats.update(50, 100, 1_000_000_000, 0);
 
-            assert_eq!(stats.effectiveness(), None);
+            assert_eq!(stats.effectiveness(), Some(0.0));
         }
 
         #[test]
         fn test_effectiveness_all_rows_matched() {
             let mut stats = SelectivityStats::default();
-            // All rows matched (no pruning)
-            stats.update(100, 100, 1_000_000_000, 10_000);
+            // All rows matched (no pruning) — caller computes
+            // skippable_bytes = rows_pruned * bytes_per_row = 0.
+            stats.update(100, 100, 1_000_000_000, 0);
 
             let eff = stats.effectiveness().unwrap();
             assert_eq!(eff, 0.0);
@@ -1508,11 +1513,11 @@ mod tests {
         fn test_welford_variance_calculation() {
             let mut stats = SelectivityStats::default();
 
-            // Add samples that will produce effectiveness values of ~100, ~200, ~300
-            // These are constructed to give those exact effectiveness values
-            stats.update(50, 100, 1_000_000_000, 10_000); // eff ≈ 5000
-            stats.update(40, 100, 1_000_000_000, 10_000); // eff ≈ 6000
-            stats.update(30, 100, 1_000_000_000, 10_000); // eff ≈ 7000
+            // Add samples that produce effectiveness values 5000, 6000, 7000
+            // (caller-computed skippable_bytes is the lever now).
+            stats.update(50, 100, 1_000_000_000, 5_000); // eff = 5000
+            stats.update(40, 100, 1_000_000_000, 6_000); // eff = 6000
+            stats.update(30, 100, 1_000_000_000, 7_000); // eff = 7000
 
             // We should have 3 samples
             assert_eq!(stats.sample_count, 3);
@@ -1827,9 +1832,10 @@ mod tests {
             assert_eq!(result.row_filters.len(), 1);
             assert_eq!(result.post_scan.len(), 0);
 
-            // Feed low effectiveness stats
+            // Feed low effectiveness stats — all rows matched, no rows
+            // pruned, so caller-computed skippable_bytes is 0.
             for _ in 0..5 {
-                tracker.update(1, 100, 100, 100_000, 1000); // all rows matched, no pruning
+                tracker.update(1, 100, 100, 100_000, 0);
             }
 
             // Second partition: should be demoted to PostScan
@@ -1863,9 +1869,9 @@ mod tests {
                 &metadata,
             );
 
-            // Add stats
-            tracker.update(1, 100, 100, 100_000, 1000);
-            tracker.update(1, 100, 100, 100_000, 1000);
+            // Add stats — no pruning, so skippable_bytes = 0
+            tracker.update(1, 100, 100, 100_000, 0);
+            tracker.update(1, 100, 100, 100_000, 0);
 
             // Demote
             tracker.partition_filters_for_test(
@@ -1945,9 +1951,9 @@ mod tests {
                 &metadata,
             );
 
-            // Feed poor effectiveness stats
+            // Feed poor effectiveness stats — no pruning, no skippable_bytes
             for _ in 0..5 {
-                tracker.update(1, 100, 100, 100_000, 1000); // no pruning
+                tracker.update(1, 100, 100, 100_000, 0);
             }
 
             // Next partition: should stay as PostScan (not dropped because not optional)
@@ -2430,9 +2436,10 @@ mod tests {
             assert_eq!(result.row_filters.len(), 1);
             assert_eq!(result.post_scan.len(), 0);
 
-            // Step 2: Accumulate low effectiveness stats
+            // Step 2: Accumulate low effectiveness stats — no pruning,
+            // so skippable_bytes = 0
             for _ in 0..5 {
-                tracker.update(1, 100, 100, 100_000, 1000); // no pruning
+                tracker.update(1, 100, 100, 100_000, 0);
             }
 
             // Step 3: Demotion should occur
@@ -2476,14 +2483,15 @@ mod tests {
             );
             assert_eq!(result.post_scan.len(), 2);
 
-            // Filter 1: high effectiveness (promote)
+            // Filter 1: high effectiveness — 99/100 rows pruned out of
+            // 500 batch bytes ≈ 495 skippable bytes
             for _ in 0..3 {
-                tracker.update(1, 1, 100, 100_000, 500);
+                tracker.update(1, 1, 100, 100_000, 495);
             }
 
-            // Filter 2: low effectiveness (stay PostScan)
+            // Filter 2: low effectiveness — no rows pruned, so 0 skippable
             for _ in 0..3 {
-                tracker.update(2, 100, 100, 100_000, 500);
+                tracker.update(2, 100, 100, 100_000, 0);
             }
 
             // Next partition: Filter 1 promoted, Filter 2 stays PostScan
@@ -2555,9 +2563,10 @@ mod tests {
                 &metadata,
             );
 
-            // All rows match (zero effectiveness)
+            // All rows match (zero effectiveness) — no rows pruned, so
+            // skippable_bytes = 0
             for _ in 0..5 {
-                tracker.update(1, 100, 100, 100_000, 100);
+                tracker.update(1, 100, 100, 100_000, 0);
             }
 
             // Should demote due to CI upper bound being 0
