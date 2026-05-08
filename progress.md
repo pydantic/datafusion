@@ -218,3 +218,12 @@ architectural goal is met.
 Lint: `cargo clippy -p datafusion-datasource-parquet -p datafusion-pruning
 --all-targets --all-features -- -D warnings` passes after the
 1c416f629 cleanup commit.
+
+Tests: 9736ec97e fixed 10 selectivity tests that had been failing
+since `97c62a684 feat(parquet): scatter-aware bytes-saved metric`
+(four commits before round 6 began). The bytes-saved metric was
+refactored so callers pre-compute `skippable_bytes`; tests still
+called `update()` with the old "raw batch_bytes" arg semantics.
+
+  cargo test -p datafusion-datasource-parquet --lib  → 143 / 0
+  cargo test -p datafusion-pruning            --lib  →  82 / 0
