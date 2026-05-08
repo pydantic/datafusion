@@ -114,18 +114,58 @@ must come from a different mechanism — possibly the order in which
 filters get demoted, or how mid-stream `maybe_swap_strategy` cascades
 state. Not investigated further this round.
 
-### r9 (deferred) — extract prunable-part of AND-with-hash-lookup
+### r9 — partial-AND prior with promote-only semantics ☑ (no improvement)
 
-**Hypothesis**: split the AND inside a populated dynamic filter,
-build a PruningPredicate from only the range / equality parts,
-ignoring the hash_lookup. Pruning rate from the range alone gives
-a *lower bound* on the dynamic filter's selectivity (since the
-hash_lookup further narrows it).
+Tried two variants:
+- **r9 v1**: split inner conjunct via `split_conjunction`, build
+  PruningPredicate per part, take max rate ≥ 0.5 as promote signal.
+  No effect — split_conjunction doesn't descend through
+  DynamicFilterPhysicalExpr wrappers.
+- **r9 v2**: snapshot the dynamic filter first via
+  `snapshot_physical_expr_opt`, then split. Compiled cleanly,
+  matched r8 numbers exactly (84 765 vs 84 783 on full TPC-DS-lat,
+  Q25/Q26 still 1.29×/1.34× behind exp3).
 
-**Risk**: range-alone is often unselective (broad min/max from the
-build side), so the rate could be ~0 → push to PostScan, losing
-the hash_lookup's row-level benefit. Need to think about whether
-this is the right semantic.
+**Diagnosis from trace**:
+The dynamic filters in Q26 ARE getting demoted correctly via
+page-prior (`cs_promo_sk >= 1 AND <= 300 AND hash_lookup` →
+pruned_rate=0.000 → PostScan). Same placement as exp3 should
+produce. So the residual TPC-DS-lat gap is **not from initial
+placement decisions**.
 
-**Status**: deferred. The smoke gap is already 1.3%, full TPC-DS-lat
-is 7.4%. Diminishing returns. r8 is a reasonable stopping point.
+Possibilities for the residual ~7% gap on full TPC-DS-lat:
+- Mid-stream behavior (`maybe_swap_strategy` cascading state
+  differently)
+- Order of post-scan filters within a stream
+- How runtime tracker stats interact with new placements over time
+- Something in the bloom-filter or page-index pruning iteration
+  that exp3's flow exercises slightly differently
+
+These would need deep investigation per-query traces with
+EXPLAIN ANALYZE on both binaries. **Stopping point: r8 is the
+right architecture. Smoke lat 1.013× of exp3, full TPC-DS-lat
+1.074×. The remaining gap is in something other than per-conjunct
+selectivity priors.**
+
+## Final state of round 6+
+
+```
+exp/baseline                      9a1705088 (PR tip)
+exp/per-conjunct-rates            r5 — page-only side-effect prior
+exp/r6-pruningpredicate-rates     ★ r6+r7+r8+r9 stack — final
+                                    architecture (page + row-group +
+                                    bloom-filter rates as side-effect,
+                                    plus dynamic-filter refresh)
+```
+
+Commits on `exp/r6-pruningpredicate-rates` over the round-5 base:
+- r6: PruningPredicate per-conjunct rates (3192689a6)
+- r7: bloom-filter per-conjunct rates (26b0eb944)
+- r8: dynamic-filter refresh on snapshot_generation > 0 (36f067366)
+- r9 v1+v2: partial-AND promote signal — neutral, kept for shape
+
+**Take-it-now**: `exp/r6-pruningpredicate-rates`. Architecturally
+correct (no extra pruning runs on the static path; targeted
+re-evaluation only for populated dynamic filters). 1.3% behind
+exp3 on smoke lat, 7% behind on full TPC-DS-lat. The residual
+gap is from non-placement behavior we haven't traced.
