@@ -213,6 +213,20 @@ TPC-H-lat smoke (3 iters, sf1):
   exp3 : 23721 ms
 ```
 
+Memory's success criterion ("branch+pushdown must never be slower
+than main+no-pushdown") verified on the no-latency variants too,
+same machine state, sequential solo runs:
+
+```
+TPC-DS no-lat (3 iters, sf1):
+  r10  (with adaptive scheduler) : 16683 ms  (1.7% faster)
+  main (no pushdown)             : 16971 ms
+
+ClickBench no-lat (3 iters, partitioned):
+  r10  (--pushdown)              : 18304 ms  (19.7% faster)
+  main (no pushdown)             : 22811 ms
+```
+
 ClickBench top regressions vs exp3 are individual queries (Q32,
 Q41, Q39, Q37) at 100-250 ms absolute — within per-query run-to-run
 noise. Cumulative 0.9% slip on ClickBench appears to be the cost
