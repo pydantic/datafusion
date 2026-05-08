@@ -277,3 +277,121 @@ In order of bang/buck:
    `pause`/`resume_with` to `ParquetPushDecoder`. Significant
    arrow-rs surface area; probably worth a separate follow-up arrow-rs
    PR after #21766 lands.
+
+---
+
+## Round 2 — pushed all-combined further
+
+After round 1, three more changes landed on `exp/all-combined`
+trying to get Q64 to win in the morselization flow:
+
+| commit (on `exp/all-combined`) | what it does |
+|---|---|
+| `b206f5495` (allv3) | Adds `AdaptiveState` to `PushDecoderStreamState`; `transition()` calls `maybe_swap_strategy` at every row-group boundary inside the morsel stream. Drop-only semantics still in effect (mandatory demotes get re-added to row-level). |
+| `96deb5bc2` (allv3.5) | Exposes 4 new `ParquetOptions` knobs: `filter_prior_promote_threshold`, `filter_prior_demote_threshold`, `filter_latency_z_baseline_ms`, `filter_latency_z_max_scale`. So everything is tunable per query via env vars without rebuilding. |
+| `44b394277` (allv4) | Stream-level post-scan filtering. When a mandatory demote's columns are entirely in the user projection, the filter is rebased against the stream schema and applied per-batch before the projector. Out-of-projection-column demotes still re-add to row-level. |
+
+### Combined-flow smoke totals across the four variants
+
+**no-lat (sum-of-medians, 18-query subset):**
+
+| variant | total ms | vs baseline | Q64 |
+|---|---:|---:|---:|
+| baseline (PR) | 3 723 | 1.000× | 675 |
+| exp4 (#21766 only) | 22 876 | 6.145× | 20 560 ✗ |
+| allv2 (theirs adaptive) | 22 498 | 6.043× | 20 604 ✗ |
+| allv3 (+ mid-stream swap) | 21 490 | 5.772× | 19 512 ✗ |
+| **allv4** (+ post-scan filter) | 21 766 | 5.846× | **19 705 ✗** |
+
+**lat:**
+
+| variant | total ms | vs baseline | Q64 |
+|---|---:|---:|---:|
+| baseline (PR-lat) | 26 731 | 1.000× | 2 390 |
+| exp4-lat | 56 521 | 2.114× | 23 023 ✗ |
+| allv2-lat | 57 315 | 2.144× | 23 481 ✗ |
+| allv3-lat | 57 737 | 2.160× | 24 291 ✗ |
+| **allv4-lat** | 56 436 | 2.111× | **22 796 ✗** |
+
+### Why Q64 still doesn't win
+
+After enabling: per-conjunct adaptive partitioning at file open
+(allv2), mid-stream `swap_strategy` at every row-group boundary
+(allv3), AND stream-level post-scan filtering for in-projection
+demotes (allv4) — Q64 remains pegged at main_on's ~30× regression.
+
+Best diagnosis: with #21766's morselization, **each
+`PushDecoderStream` processes one row group only** (the donated
+chunk). The mid-stream re-evaluation inside a stream has nothing
+past the first row group to adapt to. The shared `SelectivityTracker`
+still accumulates stats across chunks, but for Q64-shaped TPC-DS
+data the file layout limits how much cross-chunk learning can
+happen before all the work is done.
+
+To actually fix Q64 in the combined flow you need one of:
+
+a. **Sub-RG adaptation** (report.md §7.1) — multiple swap points
+   inside a single row group give the adaptive scheduler room to
+   adapt even when the chunk is one row group long. **This is now
+   the binding constraint and the highest-impact open work.**
+b. **PostScan-by-default for placeholder dynamic filters** — make
+   `OptionalFilterPhysicalExpr` whose inner expression is `lit(true)`
+   start at PostScan unconditionally, sidestepping the warmup
+   problem. Cheap follow-up to the page-pruning prior.
+c. **Multi-row-group morsel chunks** for files that have many row
+   groups but only a few partitions — would mean each stream sees
+   multiple row groups and the existing mid-stream swap would fire.
+   Architectural change to #21766.
+
+### Final per-workload scorecard
+
+For **exp3** (clean, no morselization), against `main_off`:
+
+| Workload | exp3 vs main_off |
+|---|---:|
+| ClickBench (no-lat) | **0.81×** ✓ |
+| ClickBench (lat) | 1.02× ≈ |
+| TPC-DS (no-lat) | 1.07× |
+| TPC-DS (lat) | **1.03×** ≈ |
+| TPC-H (no-lat) | 1.21× (down from PR's 1.45×) |
+| TPC-H (lat) | **1.01×** ≈ |
+
+For **allv4** (real merge, morsels + adaptive + mid-stream swap +
+post-scan filter), against the original PR:
+
+| query | win/loss |
+|---|---|
+| TPC-DS Q24 | **0.13×** ✓ (massive — morselization win) |
+| TPC-DS Q25 | 0.45× ✓ |
+| TPC-H Q5-Q9, Q18 | 0.79-0.93× ✓ (morselization + adaptive) |
+| ClickBench Q23 | 0.64× ✓ |
+| TPC-DS Q64 | **29× ✗** (morselization re-introduces, sub-RG needed) |
+| ClickBench Q11 | 1.45× ✗ |
+
+### Bottom line
+
+**`exp/pp-plus-laz` (exp3) is still the take-it-now landing target.**
+It composes cleanly on top of #11, has clean wins on every workload-
+config except TPC-DS no-lat (+1%), and ~150 LOC of well-isolated
+change.
+
+**`exp/all-combined` (allv4) is plumbing-complete** for the real
+merge — partition_filters runs, mid-stream swap fires, post-scan
+filtering is wired, env knobs are exposed. Q64 specifically needs
+sub-RG adaptation to escape the 1-RG-per-chunk constraint imposed
+by #21766's morselization. That's a follow-up arrow-rs change.
+
+Updated branch list:
+
+```
+exp/baseline                     PR tip (your starting point)
+exp/page-pruning-prior   exp1    cherry-pickable
+exp/latency-aware-z      exp2    cherry-pickable
+exp/pp-plus-laz          exp3    1+2 — best clean win, recommend landing
+exp/rg-morsels-clean     exp4    pure #21766, no adaptive
+exp/all-combined         exp7    full real merge: partition_filters +
+                                 mid-stream swap_strategy + per-batch
+                                 post-scan filter + 4 env knobs.
+                                 Preserves morselization wins; Q64
+                                 unfixed (sub-RG required).
+```
