@@ -511,6 +511,124 @@ are ≤ 1.03×.** Cleanest multi-workload result of the night.
 
 ---
 
+## Round 5 — proper architecture: per-conjunct rates as side-effect
+
+User pushback (and feedback memory): page-pruning prior should
+extract from existing pruning runs, not do per-conjunct re-evaluation.
+Round 4's implementation re-ran page pruning per conjunct per file,
+which was an "extra pruning run" by the cost-aware definition. This
+round does it properly.
+
+**Implemented** (branch `exp/per-conjunct-rates`):
+
+1. **`PagePruningAccessPlanFilter`** gets an optional `tags: Option<Vec<usize>>`
+   field and a `new_tagged(conjuncts: &[(usize, Arc<dyn PhysicalExpr>)],
+   schema)` constructor that takes pre-split tagged conjuncts. Tags
+   survive the filter_map that drops always-true / multi-column
+   predicates.
+2. **New `prune_plan_with_per_conjunct_stats`** method runs the same
+   per-row-group / per-predicate iteration as `prune_plan_with_page_index`
+   but also tracks `Vec<PerConjunctPageStats>` (rows_seen,
+   rows_skipped, optional tag) — surfaced as a side effect of the
+   pruning iteration the opener was going to run anyway. **No extra
+   pruning passes.**
+3. **Opener `build_stream`** now:
+   - Builds the page filter via `new_tagged` when `predicate_conjuncts`
+     is set;
+   - Reorders so `prune_by_limit` + `prune_plan_with_per_conjunct_stats`
+     run **before** the initial `partition_filters` call, so per-FilterId
+     rates are available as the prior on the very first placement
+     decision;
+   - Captures rates into `HashMap<FilterId, f64>`, threads into
+     `AdaptiveParquetStream` as `page_pruning_rates`, passes on every
+     `partition_filters` call (initial + mid-stream swap).
+4. **`SelectivityTracker::partition_filters`** takes a new
+   `page_pruning_rates: &HashMap<FilterId, f64>` parameter; the prior
+   reads from this map. Falls back to byte-ratio when no rate is
+   available (page index disabled, multi-column predicate, schema
+   mismatch). The old per-conjunct re-evaluation helpers
+   (`pruning_rate_for_filter`, `build_per_conjunct_pruning_predicate`)
+   are deleted.
+
+### Results
+
+```
+Workload                   main_off      PR_on    exp3_on    perconj   perc/PR  perc/exp3
+ClickBench (no-lat)           21020      17190      17130      17839     1.04x     1.041x
+TPC-DS (no-lat)               17003      18056      18260      18226     1.01x     0.998x  ← MATCHES EXP3
+TPC-H (no-lat)                  780       1128        941        990     0.88x     1.052x
+ClickBench (lat)              86562      89044      88482      89330     1.00x     1.010x
+TPC-DS (lat)                  76418      88026      78910      87813     1.00x     1.113x  ← worst gap
+TPC-H (lat)                   23723      24684      23956      24195     0.98x     1.010x
+```
+
+### What this confirms
+
+- **The architecture works on data with page indexes.** TPC-DS no-lat:
+  perconj matches exp3 exactly (0.998×). The `RUST_LOG` trace on
+  `tpcds Q26` shows the prior firing correctly:
+  ```
+  page-prior (pruned_rate=0.726 >= 0.5) — d_year@6 = 1998        → row-level
+  page-prior (pruned_rate=0.000 <= 0.05) — cd_gender@1 = F         → post-scan
+  page-prior (pruned_rate=0.000 <= 0.05) — cd_marital_status@2 = W → post-scan
+  ```
+
+- **`hits_partitioned` doesn't have page indexes.** `column_index_present=false`
+  / `offset_index_present=false` for every file. So perconj never
+  fires on ClickBench — falls back to byte-ratio per the design.
+  exp3's row-group re-eval was finding wins there that perconj
+  doesn't get, hence the 4 % slow-down.
+
+- **Latency: TPC-DS perconj loses 11 % vs exp3.** exp3's row-group
+  re-eval caught lat-sensitive demotes that page-prior alone misses
+  (cases where the row-group min/max can rule out a filter but page
+  index would just say "all pages might match → no signal"). Under
+  latency this 11 % is real; on no-lat it's noise (perconj actually
+  beats exp3 by 0.2 % there).
+
+### Trade-off summary
+
+| | exp3 (re-eval) | perconj (side-effect) |
+|---|---|---|
+| Architecture | "Extra pruning run" per-file per-conjunct | Reads from existing pruning iteration |
+| TPC-DS no-lat | 1.07× of main_off | 1.07× (matches) |
+| TPC-DS lat | 1.03× of main_off ✓ | 1.15× (loses exp3's lat win) |
+| ClickBench no-lat | 0.81× of main_off ✓ | 0.85× |
+| Code surface | One file (`selectivity.rs`) | Three files; new public-ish API on `PagePruningAccessPlanFilter` |
+
+### Two options to land
+
+The user has explicitly preferred the architecturally correct version.
+On that basis: **`exp/per-conjunct-rates` is the right thing to land**,
+even with the 5 % aggregate cost vs exp3. To recover exp3's TPC-DS-lat
+edge under the proper architecture, the follow-up is to also surface
+per-conjunct rates from the row-group `PruningPredicate::prune` pass —
+that's a `datafusion-pruning` API addition (`PruningPredicate` doesn't
+naturally split internally, so it needs a per-sub-expression
+evaluator). Out of scope tonight.
+
+If the lat performance gap matters more than architectural cleanliness
+in the short term, **`exp/pp-plus-laz` (exp3) is the take-it-now
+option** — same code surface as the existing PR, ~150 LOC.
+
+### Branch state at end of round 5
+
+```
+exp/baseline                      PR tip
+exp/page-pruning-prior   exp1     cherry-pickable (row-group prior, re-eval)
+exp/latency-aware-z      exp2     cherry-pickable
+exp/pp-plus-laz          exp3     1+2 — best perf numbers via re-eval
+exp/rg-morsels-clean     exp4     pure #21766
+exp/all-combined         exp7     real merge — Q64 unfixable
+exp/optional-postscan    exp11    placeholder→postscan dead end
+exp/page-pruning-prior-v2 r4      page re-eval, rejected
+exp/per-conjunct-rates   r5       ★ proper architecture (page-prior as
+                                  side-effect of opener's existing
+                                  pruning, no extra runs)
+```
+
+---
+
 ## Round 4 — page-pruning prior tried and rejected
 
 User push: page stats subsume row-group stats; prefer page-level
