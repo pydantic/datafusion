@@ -22,7 +22,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 RESULTS = ROOT / "benchmarks" / "results"
 OUT = Path(__file__).parent / "img"
 OUT.mkdir(exist_ok=True, parents=True)
@@ -40,7 +40,8 @@ def load(p):
     return {q["query"]: med(q["iterations"]) for q in d["queries"]}
 
 
-# Color palette: pushdown=off subdued, pushdown=on (regression) red-tinted, PR brand-blue
+# Color palette: main (subdued grey), main+pushdown (regression red),
+# the change branch (brand blue).
 C_OFF = "#7a8b99"
 C_ON = "#d4504e"
 C_PR = "#2e86c1"
@@ -73,9 +74,9 @@ def trio_bar(ax, labels, off, on, pr, ylabel="time (ms)"):
 
     x = np.arange(len(labels))
     w = 0.27
-    b1 = ax.bar(x - w, off, width=w, label="main pushdown=off", color=C_OFF)
-    b2 = ax.bar(x,     on,  width=w, label="main pushdown=on",  color=C_ON)
-    b3 = ax.bar(x + w, pr,  width=w, label="PR pushdown=on",    color=C_PR)
+    b1 = ax.bar(x - w, off, width=w, label="main",           color=C_OFF)
+    b2 = ax.bar(x,     on,  width=w, label="main + pushdown", color=C_ON)
+    b3 = ax.bar(x + w, pr,  width=w, label="change",          color=C_PR)
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.set_ylabel(ylabel)
@@ -126,7 +127,7 @@ def render_pair(off_path, on_path, pr_path, query_name, query_label,
 print("ClickBench SSD →", render_pair(
     "MAIN-nopushdown/clickbench_partitioned.json",
     "MAIN-pushdown/clickbench_partitioned.json",
-    "PR-pushdown/clickbench_partitioned.json",
+    "R6-STACK-pushdown/clickbench_partitioned.json",
     query_name="Query 23",
     query_label="Q23 (URL LIKE '%google%')",
     total_label="Total (43 q, sum of medians)",
@@ -136,7 +137,7 @@ print("ClickBench SSD →", render_pair(
 print("TPC-DS SSD    →", render_pair(
     "MAIN-nopushdown/tpcds_sf1.json",
     "MAIN-pushdown/tpcds_sf1.json",
-    "PR-pushdown/tpcds_sf1.json",
+    "R6-STACK-pushdown/tpcds_sf1.json",
     query_name="Query 64",
     query_label="Q64",
     total_label="Total (99 q, sum of medians)",
@@ -146,9 +147,9 @@ print("TPC-DS SSD    →", render_pair(
 print("TPC-H SSD     →", render_pair(
     "MAIN-nopushdown/tpch_sf1.json",
     "MAIN-pushdown/tpch_sf1.json",
-    "PR-pushdown/tpch_sf1.json",
+    "R6-STACK-pushdown/tpch_sf1.json",
     query_name="Query 9",
-    query_label="Q9 (worst loss)",
+    query_label="Q9",
     total_label="Total (22 q, sum of medians)",
     out_name="tpch_nolat.png",
 ))
@@ -156,9 +157,9 @@ print("TPC-H SSD     →", render_pair(
 print("TPC-H S3      →", render_pair(
     "MAIN-nopushdown-lat/tpch_sf1.json",
     "MAIN-pushdown-lat/tpch_sf1.json",
-    "PR-pushdown-lat/tpch_sf1.json",
+    "R6-STACK-pushdown-lat/tpch_sf1.json",
     query_name="Query 9",
-    query_label="Q9 (was 3.1× loss on SSD)",
+    query_label="Q9",
     total_label="Total (22 q, sum of medians)",
     out_name="tpch_lat.png",
 ))

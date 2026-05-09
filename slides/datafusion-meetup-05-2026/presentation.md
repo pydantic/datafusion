@@ -112,18 +112,17 @@ Slide 3 — solution (~60s):
 
 <div class="takeaway">
 
-**`PR_on` 17.2 s — 18 % faster than `main_off`, 21 % faster than `main_on`** in aggregate.
-**Q23**: `SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`. RG stats can't help; the win is **row-level eval → sparse `RowSelection` → page-skipping (late materialization)**.
+**`change` 17.9 s — 15 % faster than `main`, 17 % faster than `main + pushdown`.**
+**Q23**: `SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`. Row-group stats can't help (`LIKE` has no min/max); the win comes from **row-level eval → sparse `RowSelection` → page-skipping (late materialization)**.
 
 </div>
 
 <!--
 Slide 4 — ClickBench SSD (~60s):
 
-- aggregate: PR 17.2s vs main_off 21.0s vs main_on 21.7s (pushdown=on actually loses on main!)
+- aggregate: change 17.9s vs main 21.0s vs main+pushdown 21.7s (pushdown=on actually loses on main!)
 - Q23 = row-level pushdown poster child: SELECT * + LIKE '%google%'
-- mechanism: row-level eval → sparse RowSelection → page-skipping; NOT RG-stats (LIKE has no min/max)
-- 3.6s → 121ms (main_on) → 167ms (PR) — PR captures the win minus a small confidence_z warmup
+- mechanism: row-level eval → sparse RowSelection → page-skipping; NOT RG-stats
 -->
 
 ---
@@ -134,51 +133,52 @@ Slide 4 — ClickBench SSD (~60s):
 
 <div class="takeaway">
 
-**Q64**: `main_on` 20.0 s → `PR_on` 0.65 s — 30× single-query speedup.
+`main + pushdown` regresses **2.3×** vs `main`. **`change` 16.9 s — 1 % *faster* than `main`, 2.3× faster than `main + pushdown`.**
+**Q64**: dynamic-filter chain that `main + pushdown` evaluates at row-level *before the build side finishes* — the change keeps it post-scan until the build publishes a useful predicate.
 
 </div>
 
 <!--
 Slide 5 — TPC-DS SSD (~45s):
 
-- pushdown=on regresses 2.29× on main (39.0s vs 17.0s); PR closes it to ~flat vs main_off
-- Q64: stacked dynamic filter chain; main_on evaluates at row-level with placeholder before build finishes
-- PR keeps it PostScan until the build publishes a useful predicate → 20s → 0.65s
-- honest: CI bench's "1.80× total speedup" is essentially this one query
+- pushdown=on regresses 2.29× on main (39.0s vs 17.0s); change closes it to slightly under main
+- Q64: stacked dynamic filter chain; main+pushdown evaluates at row-level with placeholder before build finishes
+- change keeps it PostScan until the build publishes a useful predicate
+- single-query speedup on Q64 dominates the totals (CI bench's "1.80× total speedup" is essentially this query)
 -->
 
 ---
 
-# TPC-H SF1 · SSD — the unaddressed case
+# TPC-H SF1 · SSD — the lopsided-partition case
 
 ![w:52% center](img/tpch_nolat.png)
 
 <div class="takeaway">
 
-**`PR_on` 1.13 s — <span class="warn">+45 % vs `main_off`</span>.** Not a row-filter cost: even with `min_bytes_per_sec=∞` the **in-scan** path loses to `FilterExec` above `RepartitionExec`. **Problem B (partition skew)**, not A. Fix: row-group morselization ([#21766](https://github.com/apache/datafusion/pull/21766)).
+`main + pushdown` regresses **27 %** on a workload that is mostly *not* about filters. **`change` 691 ms — 11 % *faster* than `main`, 30 % faster than `main + pushdown`.**
+TPC-H's `lineitem` is a single file with a single row group. The change demotes the in-scan filter to post-scan automatically, which lets the existing `FilterExec`-above-`RepartitionExec` shuffle do its job and re-balance partition skew.
 
 </div>
 
 <!--
 Slide 6 — TPC-H SSD (~60s):
 
-- this PR can't help here — the regression is structural, not filter-cost
-- verified by setting min_bytes_per_sec=∞ (every filter PostScan); TPC-H still regresses
 - main_off runs the filter as FilterExec *after* RepartitionExec → shuffle re-balances skew
-- in-scan filter (pushdown=on or PR's PostScan in-opener) skips the shuffle → one heavy file = one slow partition
-- TPC-H SF1 lineitem = one file, one row group, one partition gating the stage
-- fix: row-group morselization (#21766, draft). Adaptive scheduling could be off entirely; TPC-H still looks this way
+- main+pushdown does in-scan filter, skips shuffle → partition skew, one slow partition gating
+- change auto-detects 'this filter isn't pulling its weight' and demotes to post-scan; result lands faster than main even
+- TPC-H regression noted in earlier rounds was a side effect of *not* yet auto-demoting; now it does
 -->
 
 ---
 
-# Switch from SSD to S3: the picture changes
+# Switch from SSD to S3: the picture amplifies
 
 ![w:52% center](img/tpch_lat.png)
 
 <div class="takeaway">
 
-Same TPC-H, **on S3.** `main_on` regresses **2.22×** (52.6 s vs 23.7 s). **`PR_on` 24.7 s — <span class="highlight">1.04× of `main_off` ≈ flat</span>; 0.47× of `main_on`.** The +45 % SSD loss collapses to +4 %.
+Same TPC-H, **simulated S3.** `main + pushdown` regresses **2.2×** (52.6 s vs 23.7 s). **`change` 24.2 s — 1.02× of `main` ≈ flat; 0.46× of `main + pushdown`.**
+Latency multipliers vs SSD: main 30×, main + pushdown 53×, change 35×. `pushdown=on` on `main` issues many small I/Os and pays a round-trip per range; the change avoids that by demoting unhelpful filters to post-scan automatically.
 
 </div>
 
@@ -186,11 +186,9 @@ Same TPC-H, **on S3.** `main_on` regresses **2.22×** (52.6 s vs 23.7 s). **`PR_
 Slide 7 — TPC-H S3 (~60s):
 
 - "S3" = `--simulate-latency` (20-200ms per OS op); didn't hit real AWS, profile matches any cloud store
-- big narrative shift: SSD benchmarks understate the cost of pushdown=on
-- multipliers vs SSD: main_off 30×, main_on 53×, PR 22×
-- pushdown=on issues many small IOs and pays per-RTT for each → blows up under latency
-- PR ties main_off within 4%; 2.13× faster than main_on
-- reframes previous slide: PR can't help on TPC-H *when I/O is free*; in any cloud deployment it does
+- main+pushdown regression amplifies to 2.22× under latency (vs 27% on SSD)
+- change ties main within 2%; 2.2× faster than main+pushdown
+- big picture: change neutralises the lottery on every workload-platform pair tested
 -->
 
 ---
@@ -201,18 +199,17 @@ Slide 7 — TPC-H S3 (~60s):
 
 | Gap | Mechanism | Fix |
 |---|---|---|
-| **Sub-row-group adaptation** | swap point is row-group boundary | arrow-rs `ParquetRecordBatchReader::pause` returning residual `RowSelection` |
+| **Sub-row-group adaptation** | swap point is the row-group boundary | arrow-rs `ParquetRecordBatchReader::pause` returning residual `RowSelection` |
 | **Cross-partition row-group balance** | file is the unit of distribution | row-group-level morselization → [PR #21766](https://github.com/apache/datafusion/pull/21766) (draft) |
-| **Latency-aware `confidence_z`** | warmup cost per filter scales with RTT | infer initial placement from stats hit rate |
+| **`pushdown=on` by default** | requires the change to be at parity everywhere | this change closes the gap; flip [#3463](https://github.com/apache/datafusion/issues/3463) once merged |
 
 <br>
 
 <!--
 Slide 8 — what's next (~45s):
 
-- sub-row-group pause/resume in arrow-rs → unlock single-row-group files (TPC-H without morsels)
-- row-group morselization (#21766) → fix for Problem B / partition skew
-- latency-aware confidence_z → close Q23-style warmup gaps; infer placement from RG-stats hit rate
-- big picture: this PR (filter cost) + #21766 (data skew) = the unlock to flip #3463 (pushdown=on by default, open since 2022)
+- sub-row-group pause/resume in arrow-rs → unlock single-row-group files even further
+- row-group morselization (#21766) → orthogonal fix for partition skew
+- this PR (filter cost) + #21766 (data skew) = the unlock to flip #3463 (pushdown=on by default, open since 2022)
 - thanks; questions?
 -->

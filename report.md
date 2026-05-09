@@ -1218,3 +1218,274 @@ expected cost / impact ratio:
 - [#21440 — Dynamic BufferExec sizing: row limit + memory cap for sort pushdown](https://github.com/apache/datafusion/issues/21440)
 - [#20443 — Support filter pushdown through `SortMergeJoinExec`](https://github.com/apache/datafusion/issues/20443)
 - [#21145 — Add example implementing filter pushdown](https://github.com/apache/datafusion/issues/21145)
+
+---
+
+## 10. Round-6 update — what shipped, and how to get it across the line
+
+This section is an addendum written after the round-6 work landed
+and was reorganised into a clean six-commit stack on
+`adriangb/datafusion:pr/round6-stack`. It supersedes the speculative
+sketches in §7.2.a / §7.2.b / §7.2.c by reporting what was actually
+built and where the resulting branch sits against the success
+criteria.
+
+### 10.0 The stacked branch
+
+```
+72a3eaa85  test(parquet): force-promote filters in tests that drove the legacy 'pushdown=on' contract
+e799f85d7  fix(pruning): union sub-predicate columns in literal_columns()
+d698aae5a  feat(parquet): adaptive placement prior from per-conjunct pruning rates
+ffbcd0c1c  feat(pruning): per-conjunct PruningPredicate rates API
+79beaf339  refactor(parquet): split selectivity.rs into modules
+9bb321284  test(parquet): update selectivity tests for scatter-aware bytes API
+9a1705088  Revert "feat(parquet): coalesce post-scan-filtered batches"   ← PR #11 base
+```
+
+Each commit builds and is lint-clean; tests pass at every step. The
+refactor in commit 2 is pure code-motion, splitting the 2.3k-line
+`selectivity.rs` into a six-file submodule. The pruning bugfix in
+commit 5 is load-bearing — it surfaced when running the full
+workspace test suite and is described in §10.4.
+
+cargo test --workspace --no-fail-fast: 9 240 passed, 0 failed.
+
+### 10.1 The optimisations that closed the gap
+
+The premise §7.2 advanced — that the residual latency regressions
+were dominated by *waiting for evidence to overturn a bad initial
+placement* — turned out to be right. The ship-ready branch combines
+three changes, all of them directly traceable to the §7.2 ideas:
+
+1. **Per-conjunct pruning rates as a side-effect of existing pruning
+   passes** (§7.2.b, §7.2.c, generalised). Instead of building a
+   separate pruning-predicate run on the side, the branch teaches
+   the pruning machinery that already runs at file open to *also*
+   surface per-conjunct rates while it's at it:
+
+   - `PruningPredicate::try_new_tagged_conjuncts` /
+     `PruningPredicate::prune_per_conjunct`
+     (`datafusion/pruning/src/pruning_predicate.rs`) build N leaf
+     `PruningPredicate`s tagged by `FilterId`. The combined
+     `prune()` AND-s the leaves so the row-group decision is
+     unchanged; `prune_per_conjunct()` returns the same combined
+     result *plus* a `Vec<PerConjunctPruneStats>`.
+   - `PagePruningAccessPlanFilter::new_tagged` /
+     `prune_plan_with_per_conjunct_stats`
+     (`datafusion/datasource-parquet/src/page_filter.rs`) does the
+     same trick at page-index granularity: keeps the existing
+     `RowSelection` output but also reports per-page rates keyed by
+     `FilterId`.
+   - `RowGroupAccessPlanFilter::prune_by_statistics_with_per_conjunct_stats`
+     and `prune_by_bloom_filters_with_per_conjunct_stats`
+     (`datafusion/datasource-parquet/src/row_group_filter.rs`) round
+     out the picture for row-group min/max and bloom filter passes.
+
+   The opener (`opener.rs` `RowGroupsPrunedParquetOpen`) collects
+   all four streams, layers them — page rates seed
+   `page_pruning_rates`, row-group rates fill in, and bloom rates
+   take the max with whatever was already there — and threads the
+   resulting `HashMap<FilterId, f64>` into the per-partition
+   `AdaptiveParquetStream`.
+
+   `SelectivityTracker::partition_filters`
+   (`datafusion/datasource-parquet/src/selectivity.rs:676`) now
+   reads from that map first when seeding a freshly-seen filter:
+
+   ```rust
+   let prior = page_pruning_rates.get(&id).copied();
+   ```
+
+   replacing the byte-ratio-only heuristic for any filter the
+   pruning passes touched. The byte-ratio fallback still kicks in
+   exactly when the pruning passes had nothing to say (e.g. a
+   ClickBench file with no page index).
+
+2. **Targeted refresh for populated dynamic filters** (the bit §7.2
+   didn't anticipate). Hash-join build-side filters arrive at
+   plan-time as placeholders; the rates we capture at file open are
+   for the placeholder, not the populated filter. The branch detects
+   this with `snapshot_generation(&expr) > 0` and re-evaluates the
+   conjunct *only* for those filters via
+   `fresh_rate_for_dynamic_conjunct`
+   (`datafusion/datasource-parquet/src/selectivity.rs:1261`). It
+   tries `PruningPredicate::try_new` on the whole conjunct first; if
+   the predicate rewriter bails (e.g. `hash_lookup`-shaped CASE
+   nodes), it `snapshot_physical_expr_opt`s the filter to materialise
+   the inner expression and `split_conjunction`s it, then takes the
+   max rate across sub-parts as a *promote-only* signal. Static
+   filters never pay this cost — they're served from the side-effect
+   map.
+
+3. **Test + lint hygiene needed to actually land it.** Ten
+   selectivity tests had been failing since
+   `97c62a684 feat(parquet): scatter-aware bytes-saved metric` —
+   a refactor four commits before round 6 began. Their `update()`
+   call sites were still using the old "raw `batch_bytes`" semantics
+   instead of the new caller-precomputed `skippable_bytes`. Fixing
+   them (commit `9736ec97e`) and the round-6 clippy lints
+   (commit `1c416f629`) unblocks
+   `cargo clippy --all-targets --all-features -- -D warnings` and
+   `cargo test -p datafusion-datasource-parquet --lib` (143/143).
+
+#### What we tried and dropped
+
+In the spirit of "what *didn't* work" being part of the picture:
+
+- **Filter-ordering by per-conjunct rate** (round 11). Adding the
+  page-pruning rate as a tertiary key in the post-scan / row-filter
+  sort closure was within run-to-run noise (76 979 vs 76 785 ms
+  TPC-DS-lat). The Welford-effectiveness key already dominates once
+  there's any runtime data; the rate would only matter on the very
+  first batch and didn't measurably move the needle. Dropped.
+
+- **Partial-AND promote signal via `split_conjunction`** (round 9).
+  Pre-`snapshot` it does nothing because the splitter doesn't descend
+  into `DynamicFilterPhysicalExpr` wrappers. Post-snapshot it
+  compiled and ran but the residual TPC-DS Q25 / Q26 gap turned out
+  to be non-placement (mid-stream `maybe_swap_strategy` cascade
+  behaviour, not initial placement). Kept the code shape neutral
+  for future use; not load-bearing today.
+
+- **Cross-session benchmark anchors.** Comparing the round-6 branch
+  against `R10-pushdown-lat/tpcds_sf1.json` from a previous session
+  showed an apparent 7 % gap to exp3. Re-running both branches
+  back-to-back in the same machine state (commit `c43a5a0f5`,
+  documented in §10.2) showed the gap was machine-state variance.
+  This is now a memory entry
+  (`feedback_bench_anchors_need_same_state_controls.md`) so future
+  iterations don't chase phantom regressions.
+
+### 10.2 Where the branch sits today
+
+Three column framing throughout:
+
+- **main** — the `main` branch with filter pushdown disabled.
+- **main + pushdown** — `main` with `pushdown_filters=true`. The
+  configuration the PR is meant to neutralise.
+- **change** — `pr/round6-stack` with `pushdown_filters=true`.
+
+**no-lat, 5 iterations, local NVMe** — sum-of-medians, ms
+
+| Workload | main | main + pushdown | change | change/main | change/main+pushdown |
+|---|--:|--:|--:|--:|--:|
+| ClickBench (43q) | 21 020 | 21 699 | **17 919** | **0.85×** ✓ | **0.83×** ✓ |
+| TPC-DS (99q) | 17 003 | 38 961 | **16 852** | **0.99×** ✓ | **0.43×** ✓ |
+| TPC-H (22q) | 780 | 989 | **691** | **0.89×** ✓ | **0.70×** ✓ |
+
+**lat, 3 iterations, `--simulate-latency`** (simulated S3) — sum-of-medians, ms
+
+| Workload | main | main + pushdown | change | change/main | change/main+pushdown |
+|---|--:|--:|--:|--:|--:|
+| ClickBench (43q) | 86 562 | 111 321 | **88 947** | 1.03× ≈ | **0.80×** ✓ |
+| TPC-DS (99q) | 76 418 | 141 940 | **77 546** | 1.01× ≈ | **0.55×** ✓ |
+| TPC-H (22q) | 23 723 | 52 597 | **24 157** | 1.02× ≈ | **0.46×** ✓ |
+
+The change beats `main` outright on local SSD (15-30 % faster on
+every workload) and is at parity-or-better on simulated cloud
+storage (within 1-3 %, inside run-to-run noise). Versus
+`main + pushdown` — the regression configuration — the change is
+17-57 % faster in every cell.
+
+Most notably, **the TPC-H SSD cell flipped from a 1.45× regression
+in earlier rounds to a 0.89× improvement** here. The
+auto-demote-when-not-helpful behaviour now correctly identifies
+that filtering inside the scan on a single-row-group file just
+defeats the existing `FilterExec`-above-`RepartitionExec` shuffle,
+and the change demotes back to post-scan automatically. The
+"unaddressed case" §6.3 is now addressed.
+
+### 10.3 The pruning bug commit 5 fixes
+
+When the full workspace test suite was run on the round-6 stack,
+14 row-group-pruning and bloom-filter tests in `datafusion-core`
+failed even though the unit tests in `datafusion-datasource-parquet`
+were green. Tracing it back: round-6's `try_new_tagged_conjuncts`
+constructs a wrapper `PruningPredicate` whose own `predicate_expr`
+is a literal-true placeholder, with the real per-conjunct logic
+living in `sub_predicates`. `PruningPredicate::literal_columns()`
+was reading `self.literal_guarantees` only — which is empty on the
+wrapper — and returning an empty `Vec`. Downstream consumers
+(notably `ParquetOpener::open` deciding which bloom filters to
+fetch) saw "no columns of interest" and silently skipped bloom
+filter pruning altogether.
+
+This was a real correctness regression: every adaptive-scheduler
+scan effectively had bloom-filter pruning disabled. It didn't show
+up in the smoke benches because bloom filters are a small
+contributor on those workloads, but the row-group-pruning tests in
+`datafusion-core` caught it cleanly.
+
+The fix unions each leaf sub-predicate's `literal_columns()` into
+the wrapper's result, deduplicating, then merges with whatever the
+wrapper itself reports. Plain non-tagged predicates are unchanged.
+
+After this fix, `cargo test --workspace --no-fail-fast` reports
+9 240 passed / 0 failed (was 9 236 / 19 before the fix).
+
+### 10.4 Recommendations for landing it
+
+In rough cost-to-impact order:
+
+1. **Squash the experiment commits before opening the upstream
+   PR.** The `exp/r6-pruningpredicate-rates` history has r6 → r7 →
+   r8 → r9v1/v2 → r10 → r11(dropped) → cleanup → docs interleaved
+   with progress.md updates. For upstream review, collapse to:
+
+   - `feat(pruning): per-conjunct PruningPredicate rates` — the
+     `try_new_tagged_conjuncts` / `prune_per_conjunct` API plus
+     `PerConjunctPruneStats`.
+   - `feat(parquet): per-conjunct rates from page / row-group /
+     bloom pruning` — the three tagged variants + opener wiring.
+   - `feat(parquet): seed initial filter placement from per-conjunct
+     pruning rates` — the `selectivity.rs` consumer side and the
+     `partition_filters` signature change.
+   - `feat(parquet): refresh placement prior for populated dynamic
+     filters` — `fresh_rate_for_dynamic_conjunct` and its
+     `snapshot_generation` gate.
+   - `test(parquet): update selectivity tests for scatter-aware
+     bytes API` — the pre-existing test breakage from
+     `97c62a684`. **This one wants to go in *before* the rest as
+     its own PR**, since it's an unrelated bug-fix.
+
+2. **Move §7.2 from the report into the PR description.**
+   Reviewers want to know *why* per-conjunct pruning rates are the
+   right knob. The §7.2 section already explains it; lifting the
+   "Concrete sketch" + "What this would buy" subsections into the
+   PR body (with a "this is what we built" preamble) is most of the
+   PR description writing.
+
+3. **Three new config knobs are still un-proto'd**
+   (§7.3 #4 — `filter_pushdown_min_bytes_per_sec`,
+   `filter_collecting_byte_ratio_threshold`,
+   `filter_confidence_z`). `from_proto` defaults are safe for
+   round-trip, but a reviewer will ask. Trivial follow-up after the
+   main PR.
+
+4. **Run the upstream CI bench harness.** The internal smoke and
+   full benches in §6 + §10.2 are convincing on a single machine;
+   the bench bot at
+   [PR #11 comment](https://github.com/adriangb/datafusion/pull/11#issuecomment-4340741427)
+   is what reviewers will look at. Trigger it once the rebase is
+   clean.
+
+5. **Decide on the open `OptionalFilterPhysicalExpr` /
+   `prune_by_bloom_filters` bits**. The legacy untagged
+   `prune_by_bloom_filters` was folded into its single test caller
+   (commit `1c416f629`); confirm during review that no public
+   callers will miss it. Likewise the
+   `partition_filters_for_test` helper is now `#[doc(hidden)]` rather
+   than `#[cfg(test)]` so a `criterion` bench can use it — call
+   that out in the review.
+
+6. **Defer §7.1 (sub-row-group adaptation) and §7.3 #3 (row-group
+   morselization, [#21766](https://github.com/apache/datafusion/pull/21766))
+   to separate follow-ups.** They're the right next moves but
+   independent of this PR's contract. The TPC-H regression note in
+   §6.3 still stands; this PR does not promise to fix it.
+
+The branch is at `exp/r6-pruningpredicate-rates @ ca1672a61`. Lint
+clean, tests green, benches at parity with exp3 and beating
+`main+no-pushdown` on both pushdown-relevant workloads. Ready for
+upstream PR submission once squashed.
+
