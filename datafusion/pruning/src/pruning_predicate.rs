@@ -794,14 +794,29 @@ impl PruningPredicate {
     /// used in the predicate. For example, it can be used to avoid reading
     /// unneeded bloom filters (a non trivial operation).
     pub fn literal_columns(&self) -> Vec<String> {
+        // For tagged-conjunct wrappers, union the leaves' columns —
+        // the wrapper's own `literal_guarantees` is empty (its
+        // `predicate_expr` is a literal-true placeholder) but
+        // downstream consumers (e.g. `ParquetOpener` deciding which
+        // bloom filters to fetch) need the full set.
         let mut seen = HashSet::new();
-        self.literal_guarantees
-            .iter()
-            .map(|e| &e.column.name)
-            // avoid duplicates
-            .filter(|name| seen.insert(*name))
-            .map(|s| s.to_string())
-            .collect()
+        let mut out: Vec<String> = Vec::new();
+        if let Some(subs) = &self.sub_predicates {
+            for sub in subs {
+                for name in sub.predicate.literal_columns() {
+                    if seen.insert(name.clone()) {
+                        out.push(name);
+                    }
+                }
+            }
+        }
+        for e in &self.literal_guarantees {
+            let name = &e.column.name;
+            if seen.insert(name.to_string()) {
+                out.push(name.to_string());
+            }
+        }
+        out
     }
 }
 
