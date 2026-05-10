@@ -278,8 +278,7 @@ img[alt~=&quot;center&quot;] { display: block; margin: 0 auto; }
 <h1 id="tpc-h-sf1--ssd--the-single-row-group-case">TPC-H SF1 · SSD — the single-row-group case</h1>
 <p><img src="img/tpch_nolat.png" alt="center" /></p>
 <div class="takeaway">
-<p><code>main + pushdown</code> regresses <strong>27 %</strong> on a workload that is mostly <em>not</em> about filters. <strong><code>change</code> 691 ms — 11 % <em>faster</em> than <code>main</code>, 30 % faster than <code>main + pushdown</code>.</strong><br />
-TPC-H's <code>lineitem</code> is a single file with a single row group, so the picks have to be right on file open. The pruning-rate prior promotes the filters that benefit — Q18's <code>l_quantity IN (subquery)</code> dynamic filter lands at <strong>0.59× of <code>main</code></strong> (46 of the 89 ms total delta), and Q1/Q3/Q19 contribute smaller page-skipping wins on selective predicates.</p>
+<p><strong><code>change</code> 691 ms — 11 % <em>faster</em> than <code>main</code>, 30 % faster than <code>main + pushdown</code>.</strong> TPC-H's <code>lineitem</code> is one file of one row group, so the picks have to be right on file open. The pruning-rate prior promotes the filters that benefit: <strong>Q18</strong>'s <code>l_quantity IN (subquery)</code> dynamic filter lands at <strong>0.59× of <code>main</code></strong> (46 of the 89 ms total delta); Q1/Q3/Q19 contribute smaller page-skipping wins.</p>
 </div>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="7" data-paginate="true" data-theme="default" data-style="section {

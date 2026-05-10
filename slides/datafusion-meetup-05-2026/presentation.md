@@ -157,8 +157,7 @@ Slide 5 — TPC-DS SSD (~45s):
 
 <div class="takeaway">
 
-`main + pushdown` regresses **27 %** on a workload that is mostly *not* about filters. **`change` 691 ms — 11 % *faster* than `main`, 30 % faster than `main + pushdown`.**
-TPC-H's `lineitem` is a single file with a single row group, so the picks have to be right on file open. The pruning-rate prior promotes the filters that benefit — Q18's `l_quantity IN (subquery)` dynamic filter lands at **0.59× of `main`** (46 of the 89 ms total delta), and Q1/Q3/Q19 contribute smaller page-skipping wins on selective predicates.
+**`change` 691 ms — 11 % *faster* than `main`, 30 % faster than `main + pushdown`.** TPC-H's `lineitem` is one file of one row group, so the picks have to be right on file open. The pruning-rate prior promotes the filters that benefit: **Q18**'s `l_quantity IN (subquery)` dynamic filter lands at **0.59× of `main`** (46 of the 89 ms total delta); Q1/Q3/Q19 contribute smaller page-skipping wins.
 
 </div>
 

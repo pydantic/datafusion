@@ -148,8 +148,8 @@ print("TPC-H SSD     →", render_pair(
     "MAIN-nopushdown/tpch_sf1.json",
     "MAIN-pushdown/tpch_sf1.json",
     "R6-STACK-pushdown/tpch_sf1.json",
-    query_name="Query 9",
-    query_label="Q9",
+    query_name="Query 18",
+    query_label="Q18 (dyn. filter)",
     total_label="Total (22 q, sum of medians)",
     out_name="tpch_nolat.png",
 ))
