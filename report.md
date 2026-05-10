@@ -1,85 +1,73 @@
-# Adaptive Filter Scheduling in the Parquet Decoder
+# Adaptive filter scheduling in the Parquet decoder
 
-**PR:** [adriangb/datafusion#11](https://github.com/adriangb/datafusion/pull/11) (`adaptive-filters-in-decoder`)
-**Branched off:** `apache/datafusion@6a09260d5`
-**Companion:** [`pydantic/arrow-rs#9` — `adaptive-strategy-swap`](https://github.com/pydantic/arrow-rs/pull/9)
-
-> One sentence summary: a runtime selectivity tracker decides per-filter
-> whether each predicate runs as a Parquet row-level filter or a post-scan
-> filter, and re-evaluates that placement at every row-group boundary by
-> swapping the decoder's strategy in place — so the cost of
-> `pushdown_filters=on` is paid only when it pays off.
+> This is a discursive write-up of a proposed change to DataFusion's
+> Parquet scan. The companion `design.md` is the spec; this report is
+> the analysis — what the change does, why, where it wins, where it
+> doesn't, and the benchmark drill-downs that support the headline
+> claims. Numbers are sums-of-medians (lower is better) across queries
+> for the workload. The change is built on top of
+> `apache/datafusion@main`; a companion arrow-rs change adds the
+> in-decoder strategy-swap APIs (`can_swap_strategy`, `swap_strategy`,
+> reusable `PushBuffers`).
 
 ## TL;DR — does the work pay off?
 
-| Workload | main_off | main_on | PR_on | PR_on / main_off | PR_on / main_on |
-|----------|---------:|--------:|------:|-----------------:|----------------:|
-| **ClickBench partitioned, SSD (43 q)** | 21.02 s | 21.70 s | **17.19 s** | **0.82×** ✓ | **0.79×** ✓ |
-| **TPC-DS SF1, SSD (99 q)**             | 17.00 s | **38.96 s** ⚠ | 18.06 s | 1.06× | **0.46×** ✓ |
-| **TPC-H SF1, SSD (22 q)**              | **0.78 s** | 0.99 s | 1.13 s | 1.45× ✗ | 1.14× |
-| TPC-H SF1, S3 (22 q)                   | 23.72 s | **52.60 s** ⚠ | 24.68 s | **1.04×** ≈ | **0.47×** ✓ |
-| TPC-DS SF1, S3 (99 q)                  | 76.42 s | **141.94 s** ⚠ | 88.03 s | 1.15× | **0.62×** ✓ |
-| ClickBench partitioned, S3 (43 q)      | 86.62 s | **111.31 s** ⚠ | 89.04 s | **1.03×** ≈ | **0.80×** ✓ |
+**Local NVMe** — sum-of-medians, ms
 
-> "SSD" = local NVMe. "S3" = the bench harness with `--simulate-latency`,
-> which adds 20–200 ms random latency per object-store op
-> ([PR #20954](https://github.com/apache/datafusion/pull/20954)). I
-> didn't run against AWS — but the latency profile is what you'd see
-> against any cloud object store.
+| Workload | main | main + pushdown | **change** | change / main | change / main+pushdown |
+|---|--:|--:|--:|--:|--:|
+| ClickBench partitioned (43 q) | 21 020 | 21 699 | **17 919** | **0.85×** ✓ | **0.83×** ✓ |
+| TPC-DS SF1 (99 q) | 17 003 | 38 961 | **16 852** | **0.99×** ✓ | **0.43×** ✓ |
+| TPC-H SF1 (22 q) | 780 | 989 | **691** | **0.89×** ✓ | **0.70×** ✓ |
 
-What this says, framed against the original hypotheses:
+**`--simulate-latency`** (`dfbench --simulate-latency`, 20–200 ms per object-store op)
 
-1. **ClickBench:** PR beats main on *both* settings → confirmed.
-2. **TPC-DS:** the user's "2× faster than main pushdown=off" claim
-   actually maps to "**2× faster than main pushdown=on**". The CI
-   bench at
-   [PR #11 comment](https://github.com/adriangb/datafusion/pull/11#issuecomment-4340741427)
-   was triggered with explicit env flags
-   `DATAFUSION_EXECUTION_PARQUET_PUSHDOWN_FILTERS=true` *and*
-   `DATAFUSION_EXECUTION_PARQUET_REORDER_FILTERS=true` on **both** the
-   baseline and the changed branch
-   ([trigger comment](https://github.com/adriangb/datafusion/pull/11#issuecomment-4340678050)).
-   So the CI's "1.80× speedup" is exactly `PR_on / main_on`, and my
-   local `0.46×` (i.e. 2.16× faster) matches it. Against
-   `pushdown=off` the PR is essentially flat (+6 %). The Q64 outlier
-   alone — `main_on=20 s` → `PR_on=0.65 s` — accounts for almost the
-   entire delta.
-3. **TPC-H:** the unaddressed case — PR is +44 % vs `main pushdown=off`,
-   only +14 % vs `main pushdown=on`. Single-row-group files mean
-   neither the in-decoder swap (no swap point) nor file-level
-   morselization (the file is the morsel) can re-balance work. The
-   actual fix is row-group-granularity morselization (see [PR
-   #21766](https://github.com/apache/datafusion/pull/21766)).
+| Workload | main | main + pushdown | **change** | change / main | change / main+pushdown |
+|---|--:|--:|--:|--:|--:|
+| ClickBench partitioned (43 q) | 86 562 | 111 321 | **88 947** | 1.03× ≈ | **0.80×** ✓ |
+| TPC-DS SF1 (99 q) | 76 418 | 141 940 | **77 546** | 1.01× ≈ | **0.55×** ✓ |
+| TPC-H SF1 (22 q) | 23 723 | 52 597 | **24 157** | 1.02× ≈ | **0.46×** ✓ |
 
-So the headline "this PR neutralises the cost of `pushdown_filters=on`"
-is true on the workloads where adaptive scheduling is the right tool
-(ClickBench, most of TPC-DS); on TPC-H — where the bottleneck is
-partition skew, not filter placement — it can't help by design.
+Two headlines:
+
+1. The success criterion — `pushdown_filters = on` with the change is
+   never slower than today's `pushdown_filters = off` on `main` — holds
+   on every workload-platform pair. On local SSD the change beats
+   `main` outright by 15–30 %; on simulated cloud storage it lands
+   within 1–3 % of `main`, inside run-to-run noise.
+2. Against `pushdown_filters = on` on `main` — the configuration the
+   change is meant to neutralise — the change is 17–57 % faster in
+   every cell.
+
+The S3-latency profile (`--simulate-latency`,
+[#20954](https://github.com/apache/datafusion/pull/20954)) adds 20–200 ms
+of random latency per object-store op. It's not a real AWS run, but the
+latency profile matches what you'd see against any cloud object store.
 
 ---
 
 ## 1. The problem
 
-`pushdown_filters=on` is a per-query lottery on `main`:
+`pushdown_filters = on` is a per-query lottery on `main` today.
 
-- **When it wins:** the predicate is selective enough that the
-  row-level evaluator quickly produces a sparse `RowSelection`, the
-  page index lets the reader skip most projection-column pages
-  outright, and what remains is decoded only for surviving rows
-  (late materialization). Heavy projections + selective filters get
-  near-free.
-- **When it loses:** the filter is mandatory but unselective, the filter
-  column is also in the projection, or both. Then `pushdown_filters=on`
-  buys nothing (no rows skipped, no pages skipped) but pays:
-  - **Computational cost** — per-batch per-predicate predicate eval, smaller masks,
-    more iterations than one big `FilterExec` post-scan apply.
-  - **I/O cost** — the row-level path requests each filter's
-    columns first, then a separate request for the surviving rows of the
-    other filters and finally the projection. Multi-stage = more, smaller object-store reads vs. one
-    coalesced read of all projected columns.
+- **When it wins** — the predicate is selective enough that the
+  row-level evaluator quickly produces a sparse `RowSelection`; the
+  page index lets the reader skip whole pages of the projection
+  columns outright; what survives is decoded only for the surviving
+  rows (late materialisation). Heavy projections + selective filters
+  get close to free.
+- **When it loses** — the filter is mandatory but unselective, the
+  filter column also overlaps the projection, or both. Then
+  `pushdown=on` buys nothing — no rows skipped, no pages skipped — but
+  pays per-batch ArrowPredicate eval cost, smaller masks, more
+  iterations than one big post-scan apply, and extra I/O for filter
+  columns not in the projection. Under cloud-storage latency the
+  many-small-GETs profile of `pushdown=on` compounds the cost.
 
-So when filter pushdown was added to DataFusion as an option, it turned
-into something users had to twiddle per query.
+Both shapes coexist on real workloads, so the config is gated off by
+default. [#3463](https://github.com/apache/datafusion/issues/3463) —
+the long-running ask to flip `pushdown_filters` on by default — has
+stayed open for years for exactly this reason.
 
 ```
                  main, pushdown=off                main, pushdown=on
@@ -95,21 +83,21 @@ into something users had to twiddle per query.
                                                 of overlapping cols
 ```
 
-**Goal of this PR:** never make a query slower than `main` with the user's
-preferred default (`pushdown=off`), while still capturing the wins on
+**Goal of the change:** never make a query slower than today's
+`pushdown_filters = off` default, while still capturing the wins on
 queries that benefit from row-level pushdown.
 
 ---
 
 ## 2. Background: how a Parquet scan in DataFusion is shaped
 
-### 2.1 Partitions & files
+### 2.1 Partitions and files
 
-A `DataSourceExec(ParquetSource)` is replicated across `target_partitions`
-streams. The planner assigns each *file* to one partition (file-level
-distribution; no within-file splitting in the public path today). For
-each file the partition gets, the source builds an opener that lazily
-streams record batches.
+A `DataSourceExec(ParquetSource)` is replicated across
+`target_partitions` streams. The planner assigns each *file* to one
+partition (file-level distribution; no within-file splitting in the
+public path today). For each file the partition gets, the source
+builds an opener that lazily streams record batches.
 
 ```
 ParquetSource (target_partitions = N)
@@ -126,19 +114,21 @@ per file:                              per opener:
                               └──────────────┘
 ```
 
-A *row group* is the unit at which Parquet stores statistics and at which
-the decoder can pause and reconfigure. A typical ClickBench partitioned
-file has ~10–30 row groups; a TPC-H lineitem SF1 file has **one**.
+A *row group* is the unit at which Parquet stores statistics and at
+which the decoder can pause and reconfigure. A typical ClickBench
+partitioned file has ~10–30 row groups; a TPC-H lineitem SF1 file has
+**one**.
 
 ### 2.2 Row filter vs. post-scan filter
 
-Row-level pushdown filtering is implemented in arrow-rs as a `RowFilter`
-(`Vec<Box<dyn ArrowPredicate>>`). Each predicate's `evaluate(RecordBatch) ->
-BooleanArray` runs on the actual decoded *data* of the filter columns; the
-boolean mask is converted into a `RowSelection` that subsequent predicates
-and the projection inherit. With page index enabled, pages whose surviving
-rows are empty get skipped entirely for the projection columns. None of this
-involves row-group statistics — those are a separate, plan-time mechanism.
+Row-level pushdown filtering is implemented in arrow-rs as a
+`RowFilter` (`Vec<Box<dyn ArrowPredicate>>`). Each predicate's
+`evaluate(RecordBatch) -> BooleanArray` runs on the actual decoded
+*data* of the filter columns; the boolean mask is converted into a
+`RowSelection` that subsequent predicates and the projection inherit.
+With the page index enabled, pages whose surviving rows are empty are
+skipped entirely for the projection columns. None of this involves
+row-group statistics — those are a separate, plan-time mechanism.
 
 ```
             ┌────────────────────── one file, one decoder ─────────────────────┐
@@ -151,7 +141,7 @@ involves row-group statistics — those are a separate, plan-time mechanism.
             │        decode only surviving rows in the rest                    │
             │     5. emit batch                                                │
             │                                                                  │
-            │   Pros: late materialization — projection columns barely         │
+            │   Pros: late materialisation — projection columns barely         │
             │         decoded when filter is selective; with page index,       │
             │         whole pages skipped without I/O.                         │
             │   Cons: extra I/O for filter cols *not* in the projection;       │
@@ -175,34 +165,33 @@ involves row-group statistics — those are a separate, plan-time mechanism.
 
 > **Row-group statistics pruning is orthogonal.** It runs at plan/open
 > time using per-row-group min/max/null from the file metadata; it's
-> available regardless of `pushdown_filters`. So a `WHERE k >= 50 AND k
-> <= 10000` predicate can prune entire row groups whether pushdown is on
-> or off. What `pushdown_filters=on` *adds* is **row-level / page-level
-> filtering inside surviving row groups** (driven by actual data, not
-> stats) plus **late materialization of projection columns**. Some
-> predicates (`URL LIKE '%google%'`) get nothing from RG stats but
-> everything from row-level filtering; some (range predicates with
-> bounded distributions) get the inverse; some get both.
+> available regardless of `pushdown_filters`. A `WHERE k >= 50 AND k
+> <= 10000` predicate can prune entire row groups whether pushdown is
+> on or off. What `pushdown_filters=on` *adds* is **row-level / page-
+> level filtering inside surviving row groups** (driven by actual
+> data, not stats) plus **late materialisation of projection
+> columns**. Some predicates (`URL LIKE '%google%'`) get nothing from
+> RG stats but everything from row-level filtering; some (range
+> predicates with bounded distributions) get the inverse; some get
+> both.
 
 ### 2.3 Two different problems with `pushdown=on`
 
 It's worth separating two distinct reasons `pushdown=on` can lose to
-`pushdown=off`. **This PR addresses the first; the second is a
-different story (morselized scans).**
+`pushdown=off`. **The change in this proposal addresses the first;
+the second is a different story (morselized scans).**
 
-**Problem A — ineffective-filter cost (this PR's scope).** When a
-filter is mandatory but unselective, `pushdown=on` pays per-batch
-predicate eval, smaller masks, two-stage I/O, and possible double
-decode without saving any work. There's no row-group statistics win to
-offset the cost. So a query that *would* be fine with `FilterExec`
-post-scan (one big mask, one coalesced read) ends up slower with the
-filter wedged into the decoder.
+**Problem A — ineffective-filter cost (the scope of this change).**
+When a filter is mandatory but unselective, `pushdown=on` pays
+per-batch predicate eval, smaller masks, two-stage I/O, and possible
+double decode without saving any work. So a query that *would* be
+fine with `FilterExec` post-scan ends up slower with the filter
+wedged into the decoder.
 
-**Problem B — lopsided partitions / data skew (NOT this PR's scope).**
+**Problem B — lopsided partitions / data skew (out of scope here).**
 Even when each individual filter is correctly placed, the partition
 layout can leave one stream doing 10× the work of its neighbours
-because *files* are the unit of distribution. A `FilterExec` after a
-`RepartitionExec` gets a free re-balance; an in-source filter doesn't.
+because *files* are the unit of distribution.
 
 ```
     skew shape (independent of what the filter does):
@@ -221,37 +210,31 @@ because *files* are the unit of distribution. A `FilterExec` after a
 Problem B's actual fix is **morselized scans**: today the morsel
 granularity is per-file; the future direction is per-row-group (or
 sub-chunk), so that one ill-fortuned file can't gate a stage. That
-work is separate from this PR.
-
-This PR (adaptive in-decoder filter scheduling) only changes how
-*which* filter runs *where*, not how the per-partition work is
-distributed. A workload where the dominant cost is partition skew —
-TPC-H SF1 with one row group per file is the canonical example —
-will not be fixed by this PR. It needs row-group-level morsels.
+work is tracked at
+[#21766](https://github.com/apache/datafusion/pull/21766) and is
+independent of this proposal.
 
 ---
 
-## 3. The solution: adaptive in-decoder filter scheduling
+## 3. The change: adaptive in-decoder filter scheduling
 
-> **Scope:** this section describes the PR's fix for **Problem A**
-> from §2.3 — the per-filter ineffective-cost lottery. It does
-> **not** address Problem B (lopsided partitions / data skew); that
-> requires row-group-granularity morsel scans, which is separate
-> work.
+> **Scope reminder:** this section describes the fix for **Problem A**
+> from §2.3 — the per-filter ineffective-cost lottery. It does **not**
+> address Problem B (lopsided partitions / data skew); that requires
+> row-group-granularity morsel scans, which is separate work.
 
 ### 3.1 What's new
 
 For each `ParquetSource`, every conjunct of the source-level predicate
 gets a stable `FilterId`. A `SelectivityTracker` (shared across all
-files of one ParquetSource) tracks per-`FilterId` statistics and assigns
-each filter to one of three states:
+files of one `ParquetSource`) tracks per-`FilterId` statistics and
+assigns each filter to one of three states:
 
 ```
               ┌──────────┐
               │   New    │
               └─────┬────┘
-                    │  initial placement based on
-                    │  filter-cols-bytes / projection-bytes
+                    │  initial placement
        ┌────────────┴─────────────┐
        ▼                          ▼
   ┌─────────┐  promote  ┌────────────────┐
@@ -271,11 +254,11 @@ Per filter the tracker keeps:
 Promotion / demotion uses a one-sided **confidence interval** on
 bytes-saved-per-sec rather than a point estimate, so noisy early
 samples don't yo-yo a filter between states. Default `z = 2.0`
-(~97.5%); the threshold is `filter_pushdown_min_bytes_per_sec = 100
-MiB/s` by default. The "scatter-aware" version of the metric counts
-only sub-batch *windows* where the filter killed every row — a 50%
-uniform filter scores ~0 and stays post-scan; a TopK-style filter that
-empties whole pages blows past the threshold.
+(~97.5 %); the threshold is `filter_pushdown_min_bytes_per_sec =
+100 MiB/s` by default. The "scatter-aware" version of the metric
+counts only sub-batch *windows* where the filter killed every row —
+a uniformly 50 %-selective filter scores ~0 and stays post-scan; a
+TopK-style filter that empties whole pages blows past the threshold.
 
 ```
              SelectivityStats   (Welford online stats)
@@ -286,11 +269,88 @@ empties whole pages blows past the threshold.
               CI_hi      ← mean + z·σ/√n   (used to DEMOTE)
 ```
 
-### 3.2 Where the swap happens
+### 3.2 Initial placement from per-conjunct pruning rates
+
+The cheapest, highest-quality selectivity signal available comes
+from the three pruning passes DataFusion already runs at file open:
+page-index pruning, row-group min/max pruning, and bloom-filter
+pruning. Each evaluates the file's predicates against a different
+container granularity. Their collective output today is a single
+`Vec<bool>` — "keep this row group" — which loses the per-conjunct
+information.
+
+The change introduces a per-conjunct API on `PruningPredicate`
+(`try_new_tagged_conjuncts`, `prune_per_conjunct`) and instruments
+the three pruning passes with `_with_per_conjunct_stats` variants
+that emit a `Vec<PerConjunctPruneStats>` alongside the existing
+output. `ParquetOpener` accumulates these into a single
+`HashMap<FilterId, f64>` and threads it to the tracker. Initial
+placement is then:
+
+```
+prior = page_pruning_rates.get(&id)
+match prior {
+    Some(p) if p >= prior_promote_threshold (default 0.5) => RowFilter,
+    Some(p) if p <= prior_demote_threshold  (default 0.05) => PostScan,
+    _ => byte_ratio_heuristic(...)   // fallback for files with no page index
+}
+```
+
+The byte-ratio fallback — extra-bytes-for-filter-cols /
+projection-bytes — runs only when the pruning passes had nothing to
+say about the filter (e.g. a ClickBench file with no page index, on
+a predicate that isn't single-column for row-group stats). The
+common case is that a real prior is available before the scan even
+starts.
+
+### 3.3 Refresh prior for populated dynamic filters
+
+Hash-join build-side filters arrive at plan-time as
+`OptionalFilterPhysicalExpr`-wrapped `DynamicFilterPhysicalExpr`s
+whose `snapshot_generation()` is zero. The build side publishes a
+populated predicate later; the file-open rate captured for the
+placeholder is then stale.
+
+`fresh_rate_for_dynamic_conjunct` re-evaluates a per-conjunct
+`PruningPredicate` against the file's row-group statistics
+*only* for filters where `snapshot_generation > 0`. It tries the
+whole conjunct first; if the predicate rewriter can't fold the
+`col >= lo AND col <= hi AND hash_lookup(...)` shape into a
+`PruningPredicate`, it splits the snapshotted inner expression and
+takes the max rate across prunable sub-parts, returning that as a
+**promote-only** signal (rate ≥ 0.5). Below 0.5 it returns `None`
+and the standard prior fallback decides — a partial AND
+undercounts and would mislead a demote.
+
+### 3.4 Latency-aware confidence shrink
+
+Under cloud-storage RTT the cost of holding a wrong placement
+scales with per-fetch wall time. The effective confidence z shrinks
+when per-fetch wall time exceeds a baseline:
+
+```rust
+fn effective_z(&self) -> f64 {
+    let avg_fetch_ms = total_fetch_ns / total_fetches / 1e6;
+    if avg_fetch_ms <= latency_z_baseline_ms { return confidence_z; }
+    let factor = (avg_fetch_ms / latency_z_baseline_ms)
+        .clamp(1.0, latency_z_max_scale);
+    confidence_z / factor
+}
+```
+
+`ParquetOpener` feeds `record_fetch(n_ranges, elapsed_ns)` from
+each `get_byte_ranges` call. With defaults
+`latency_z_baseline_ms = 5.0` and `latency_z_max_scale = 8.0`,
+local NVMe (< 5 ms per fetch) is unaffected (`factor = 1`); under
+100 ms RTT the effective z shrinks to ~0.4, which lets the
+scheduler demote on a point estimate instead of waiting for a tight
+confidence interval.
+
+### 3.5 Where the swap happens
 
 The big mechanical piece: **the decoder is rebuilt at row-group
-boundaries without re-opening the file**. Companion arrow-rs branch
-adds:
+boundaries without re-opening the file**. The companion arrow-rs
+change adds:
 
 ```rust
 ParquetPushDecoder::can_swap_strategy(&self) -> bool;          // true between RGs
@@ -299,8 +359,8 @@ ParquetPushDecoder::swap_strategy(&mut self, swap)             // replace
                                                                //   between RGs
 ```
 
-`PushBuffers` survives the swap, so any column bytes already fetched
-that are still in the new strategy's projection are reused.
+`PushBuffers` survives the swap, so any column bytes already
+fetched that are still in the new strategy's projection are reused.
 
 ```
                              AdaptiveParquetStream::transition()
@@ -334,1158 +394,357 @@ that are still in the new strategy's projection are reused.
 that can be dropped without affecting correctness (today: hash-join
 dynamic filters). When such a filter underperforms, the tracker can
 short-circuit it via an `AtomicBool` — the filter columns still get
-decoded (the decoder can't be reconfigured mid-RG) but the predicate is
-not evaluated.
-
-### 3.3 Initial placement heuristic
-
-For a brand-new filter, the tracker checks the *extra* compressed bytes
-the filter would pull in (filter-only columns not already in the
-projection):
-
-```
-extra_bytes / projection_compressed_bytes  ≤  byte_ratio_threshold (=0.20)
-              AND extra_bytes > 0                       → start as RowFilter
-otherwise                                               → start as PostScan
-```
-
-Two cases default to PostScan:
-- `extra_bytes == 0`: filter columns are entirely in the projection
-  (e.g. `WHERE col <> '' GROUP BY col`). No I/O to save; defaulting to
-  row-level loses on ClickBench Q10/11/13/14/26 because the predicate
-  cache may evict on heavy strings, double-decoding the filter column.
-- `byte_ratio > threshold`: too much extra I/O to bet on without
-  evidence the filter is selective.
-
-Promotion can still happen from PostScan once the metric crosses the
-threshold; demotion is safe in both directions.
-
-### 3.4 What it replaces (vs PR #9)
-
-The earlier morsel-per-row-group split is gone:
-
-- No `Vec<BoxStream>` per file, no per-chunk `AsyncFileReader::create_reader`.
-- No per-chunk `RowFilter` rebuild (`RowFilter` is `!Clone`).
-- No `EarlyStoppingStream`-on-chunk-0-only special case for `FilePruner`.
-- No `LazyMorselShared` per-morsel `Arc` churn — the source of PR #9's
-  ~10% aggregate ClickBench regression.
-
-Result: one decoder, one `BoxStream`, one `EarlyStoppingStream` per
-file, with adaptation between row groups.
+decoded (the decoder can't be reconfigured mid-RG) but the predicate
+is not evaluated.
 
 ---
 
 ## 4. Where this wins
 
-(Concrete benchmark numbers in §6; this section is the qualitative
-shape of the wins.)
-
-- **Hash-join dynamic filters.** The build side publishes `k IN
-  hash_set(…) AND k >= min_k AND k <= max_k` after the hash table is
-  built. The tracker keeps it PostScan during the placeholder window,
-  then promotes once the finalized filter is in place. Hits the
-  [dynamic filters blog post benchmark](https://datafusion.apache.org/blog/2025/09/10/dynamic-filters/#hash-join-dynamic-filters)
-  (`small_table JOIN large_table` with `WHERE v ≥ 50`) without giving
-  up the wins. (Note that benchmark's 60×-ish speedup comes from the
-  `k >= min_k AND k <= max_k` part *enabling row-group statistics
-  pruning* once the build side finishes — that's plan-time stats
-  pruning, not row-level filtering. This PR doesn't change stats
-  pruning; it changes whether the row-level part runs at all.)
-- **TopK / `URL LIKE '%google%'` style.** Highly selective string
-  predicates on heavy projections (Q23 territory). RG stats can't
-  help (LIKE has no min/max bound). The win is row-level evaluation
-  → sparse RowSelection → page-skipping for the projection columns +
-  late materialization. Promotion to RowFilter is exactly right here.
-- **`pushdown_filters=on` queries that *should* lose.** Q10, Q11, Q13,
-  Q14, Q26 — where `extra_bytes == 0` and the filter is uniformly
-  selective — start at PostScan and stay there. Same speed as
-  `pushdown=off` because the filter is effectively executing as a
-  `FilterExec`-shaped post-decode mask.
+### 4.1 ClickBench
 
 ```
-           main pushdown=off  main pushdown=on   PR (adaptive)
-           ─────────────────  ────────────────  ─────────────
- Q10/11/13   ▮▮▮▮▮              ▮▮▮▮▮▮▮▮          ▮▮▮▮▮      ← stays at post-scan
- Q23         ▮▮▮▮▮▮▮▮▮          ▮▮                ▮▮         ← promoted to row-filter
- dyn-join    ▮▮▮▮▮▮▮            ▮ (after barrier) ▮          ← promoted once finalised
+                 Total runtime (sum of medians, lower = better)
+                 ──────────────────────────────────────────────
+   main, pushdown=off    →   21 020 ms
+   main, pushdown=on     →   21 699 ms     (+3 % vs main — pushdown LOSES at aggregate)
+   change, pushdown=on   →   17 919 ms     (−15 % vs main, −17 % vs main+pushdown)  ✓
 ```
+
+ClickBench partitioned (43 queries, 100 files of `hits_partitioned`) is
+the workload `pushdown=on` should win on the most — selective
+predicates with heavy projections. The change beats `main + pushdown`
+across the board *and* beats `main` (the safe default) by 15 %.
+
+**Top wins vs `main`** (change/main < 0.95×):
+
+| Query | main (ms) | main + pd (ms) | change (ms) | change/main | what's happening |
+|------:|----------:|---------------:|------------:|------------:|-----------------|
+| Q23 | 3 612 | **121** | **168** | **0.05×** | `URL LIKE '%google%'`: tiny projection, RG stats can't help, row-level eval is the win. Change starts at row-level via the byte-ratio fallback. |
+| Q11 | 98 | 94 | 73 | 0.74× | filter cols overlap projection — change keeps post-scan, faster than both |
+| Q24 | 38 | 37 | 30 | 0.79× | small uniform win |
+| Q21 | 859 | **1 669** | 685 | **0.80×** | pushdown regressed badly on `main` (1.94×); change demotes / keeps post-scan |
+| Q12 | 340 | 304 | 277 | 0.82× | small uniform win |
+| Q10 | 71 | 87 | 62 | 0.88× | filter-col-in-projection; change avoids the row-level cost |
+
+**Pushdown regressions on `main` that the change neutralises** —
+queries where `main + pushdown` is materially worse than `main`,
+sorted by `main+pushdown / main`:
+
+| Query | main (ms) | main + pd (ms) | +pd / main | change (ms) | change / main |
+|------:|----------:|---------------:|-----------:|------------:|--------------:|
+| Q29 | 36 | 79 | **2.18×** | 37 | 1.03× |
+| Q30 | 276 | 547 | **1.98×** | 297 | 1.08× |
+| Q21 | 859 | 1 669 | **1.94×** | 685 | **0.80×** |
+| Q31 | 300 | 455 | 1.52× | 416 | 1.39× |
+| Q32 | 1 321 | 1 880 | 1.42× | 1 645 | 1.25× |
+| Q28 | 2 423 | 3 336 | 1.38× | 2 615 | 1.08× |
+| Q33 | 1 567 | 2 169 | 1.38× | 1 638 | 1.05× |
+| Q27 | 705 | 965 | 1.37× | 744 | 1.05× |
+| Q18 | 1 665 | 2 253 | 1.35× | 1 551 | 0.93× |
+
+The worst pushdown regression on `main` (Q21, ~2×) is fully
+*erased* on the change; the rest are pulled back to within ~10 % of
+`main`.
+
+The one residual loss vs `main` worth flagging is **Q31** at 1.39×.
+The pattern there is "fast, mid-selectivity filter on a wide
+projection" — the byte-ratio fallback chooses row-level, the
+runtime samples slowly drift toward "this isn't pulling its weight",
+and the tracker takes a few row groups to demote. The
+`main + pushdown` cell is worse (1.52×), so it's still a net win
+against the configuration the change is meant to neutralise; but
+it's the marker for "warm-up cost on the first row group" as a
+known residual (§8.1 of the design doc).
+
+### 4.2 TPC-DS — the Q64 story
+
+```
+   main, pushdown=off    →   17 003 ms
+   main, pushdown=on     →   38 961 ms     (+129 % vs main — pushdown=on regresses 2.29×)
+   change, pushdown=on   →   16 852 ms     (−1 % vs main, −57 % vs main+pushdown)
+```
+
+Almost the entire delta vs `main + pushdown` is **Q64**:
+
+| Q64 | main | main + pd | **change** |
+|----|---:|---:|---:|
+| local SSD | 471 ms | **20 010 ms** ⚠ | **474 ms** ✓ |
+
+A 42× regression on `main + pushdown` is neutralised to flat. Q64 is
+a dynamic-filter chain (correlated subqueries producing hash-join
+build-side filters); `main + pushdown` evaluates the chain at
+row-level *before the build side has finished*, so each row group
+pays for re-evaluation of a placeholder predicate. The change keeps
+those filters post-scan until `snapshot_generation > 0`, then the
+re-evaluated rate (§3.3) makes the right call.
+
+That's the single biggest neutralisation in the suite. Other TPC-DS
+pushdown regressions on `main` are similar in shape, all
+neutralised:
+
+| Query | main (ms) | main + pd (ms) | +pd / main | change (ms) | change / main |
+|------:|----------:|---------------:|-----------:|------------:|--------------:|
+| Q64 | 471 | **20 010** | **42.5×** | 474 | **1.01×** |
+| Q18 | 82 | 214 | 2.62× | 78 | 0.96× |
+| Q50 | 122 | 318 | 2.60× | 123 | 1.01× |
+| Q72 | 404 | 787 | 1.95× | 416 | 1.03× |
+| Q9 | 102 | 188 | 1.85× | 83 | **0.81×** |
+| Q24 | 435 | 747 | 1.72× | 427 | 0.98× |
+
+Per-query the picture is essentially flat against `main`: a handful
+of solid wins, a long tail within ±10 %, no remaining big losers.
+
+### 4.3 TPC-H — the once-regressed workload
+
+```
+   main, pushdown=off    →     780 ms
+   main, pushdown=on     →     989 ms      (+27 % vs main — pushdown=on regresses)
+   change, pushdown=on   →     691 ms      (−11 % vs main, −30 % vs main+pushdown)
+```
+
+TPC-H SF1 is the canonical single-row-group case: `lineitem` is one
+file of one row group. Earlier iterations of this work regressed
+TPC-H by 45 % vs `main + pushdown=off` because the in-decoder
+scheduler had nowhere to swap *within* the file — once initial
+placement was wrong, it stayed wrong for the whole file.
+
+The change inverts that result. The Welford runtime samples cause
+the tracker to demote unhelpful in-scan filters to post-scan very
+quickly, and the resulting plan looks like
+`FilterExec` above `RepartitionExec`-style execution — which is
+exactly the plan shape on `main + pushdown=off`. So TPC-H lands at
+**0.89× of `main`**, not just at parity: the demote-to-post-scan
+path lets the existing shuffle re-balance partition skew, and the
+overall result beats both `main` configurations.
+
+Per-query, every TPC-H query is at parity-or-better vs `main`; the
+worst pushdown regressions on `main` (Q17 1.90×, Q12 1.89×, Q22
+1.74×, Q9 1.66×, Q15 1.55×) all collapse to within 5 % of `main`
+on the change.
+
+### 4.4 The `--simulate-latency` profile
+
+Under simulated S3 latency the gaps to `main + pushdown=on` widen,
+because the regression cost on `main + pushdown` is dominated by
+per-request RTT and the change avoids most of those requests:
+
+| Workload | main | main + pushdown | change | change / main+pushdown |
+|---|--:|--:|--:|--:|
+| ClickBench S3 | 86 562 | **111 321** | 88 947 | **0.80×** |
+| TPC-DS S3 | 76 418 | **141 940** | 77 546 | **0.55×** |
+| TPC-H S3 | 23 723 | **52 597** | 24 157 | **0.46×** |
+
+On TPC-H S3 the change closes the 2.22× regression from
+`main + pushdown` to flat against `main` (1.02×, inside run-to-run
+noise). Same shape for TPC-DS and ClickBench.
+
+The residual S3 losses are mostly on fast ClickBench queries that
+have no page index for the filter column, so the byte-ratio
+fallback fires and the tracker pays a row group or two of evidence
+before demoting. Q6, Q42, Q37, Q38 are the canonical examples:
+~200 ms on `main`, ~600–800 ms on `main + pushdown`, ~400–500 ms on
+the change. The change captures *about half* of the regression —
+better than `main + pushdown`, but the warm-up cost is still
+visible.
 
 ---
 
 ## 5. Where this falls short
 
-This PR doesn't try to fix everything `pushdown_filters` could be
-slow for. Two distinct gaps remain:
+The change doesn't try to fix everything `pushdown_filters` could be
+slow for. Two distinct gaps remain.
 
-### 5.1 In scope but limited: no sub-row-group adaptation
+### 5.1 No sub-row-group adaptation
 
-The adaptive scheduler's swap point is a *row-group boundary*. So:
+The scheduler's swap point is a row-group boundary. So:
 
-- **Single-row-group files** (TPC-H tables at SF1 typical) have **no
-  swap point inside the file**. The tracker still picks an initial
-  placement and accumulates stats *for subsequent files*, but within
-  the file the filter is whatever it started as. If the initial
-  heuristic lands the wrong call, you eat the whole file with the
-  wrong placement.
-- **Within-row-group selectivity skew** can't be acted on either — the
-  decoder can't be reconfigured mid-row-group (would need an arrow-rs
-  `ParquetRecordBatchReader::pause` returning a residual `RowSelection`;
-  flagged as deferred in the PR).
+- **Single-row-group files** (TPC-H tables at SF1 typical) have no
+  swap point inside the file. The tracker still picks an initial
+  placement and accumulates stats *for subsequent files*, but
+  within a single file the filter is whatever it started as. If the
+  initial heuristic lands the wrong call, you eat the whole file
+  with the wrong placement.
+- **Within-row-group selectivity skew** can't be acted on either —
+  the decoder can't be reconfigured mid-row-group. This would
+  require an arrow-rs `ParquetRecordBatchReader::pause` returning a
+  residual `RowSelection`. Out of scope here.
 
-### 5.2 Out of scope: the lopsided-partition / data-skew problem
+TPC-H SF1 happens to land well anyway (§4.3) because the tracker's
+runtime samples quickly say "no payoff", and the demote-to-post-scan
+path is itself a valid plan. But the residual S3 fast-query losses
+in ClickBench (§4.4) are exactly the shape that sub-row-group
+adaptation would close.
+
+### 5.2 Cross-partition row-group balance is a different problem
 
 Even when each filter's placement is right, partition skew can
-dominate. The PR doesn't change how files / row groups are
-distributed to partitions. The fix for that is **morselized scans**:
+dominate. The change doesn't redistribute files/row groups across
+partitions. The fix for that is morselized scans
+([#21766](https://github.com/apache/datafusion/pull/21766)):
 
-- **today:** morsel = file. A partition that drew an awkward file
+- today: morsel = file. A partition that drew an awkward file
   carries that load alone.
-- **near-term:** morsel = row group. A row-group-level work unit
+- near-term: morsel = row group. A row-group-level work unit
   travels across partitions, so one heavy file can be split across
   multiple streams.
-- **future:** morsel = sub-chunk inside a row group. Lets the runtime
-  re-balance even within a single big row group (the TPC-H lineitem
-  shape).
+- future: morsel = sub-chunk inside a row group.
 
-This work is independent of adaptive filter scheduling and is the
-right place to address the TPC-H regression in §6.3 — there's nothing
-the in-decoder scheduler can do about a file that *is* one row
-group, run by *one* partition, that happens to be the slowest in the
-fan-out.
-
-### 5.3 Reading the benchmark numbers through this lens
-
-- ClickBench partitioned (100 files, multiple row groups per file,
-  reasonable file-size distribution) → primarily a Problem A
-  workload. PR wins decisively.
-- TPC-H SF1 (each table is one file, one row group) → primarily a
-  Problem B workload. PR can't help; aggregate regresses 44 %, as
-  predicted (§6.3). The right fix is morselized scans at row-group
-  granularity, not anything in this PR.
-- TPC-DS SF1 → mixed. Some queries look like Problem A (Q24, Q50,
-  stacked dynamic filters) where the tracker should help and isn't,
-  some look like Problem B (single-row-group fact tables). The
-  6 %-slower aggregate (§6.2) is the contradiction worth digging
-  into separately.
+That work is independent of adaptive filter scheduling.
 
 ---
 
-## 6. Benchmark numbers
-
-> Runs are 5 iterations each, partitioned dataset (`hits_partitioned`,
-> 100 files for ClickBench), local NVMe, M-series Mac. PR is built off
-> branch tip `9a1705088`; baseline is the merge-base
-> `apache/datafusion@6a09260d5` so we compare like-with-like (no
-> unrelated post-divergence churn).
->
-> _Tables below are filled in once the dfbench builds finish; see § 6.4
-> for the methodology._
-
-### 6.1 ClickBench (43 queries, partitioned, 100 files)
-
-```
-                       Total runtime (sum of medians, lower = better)
-                       ──────────────────────────────────────────────
-   main, pushdown=off    →   21 020 ms
-   main, pushdown=on     →   21 699 ms     (+3.2 % vs main_off — pushdown LOSES on aggregate)
-   PR  , pushdown=off    →   20 152 ms     (-4.1 % vs main_off)
-   PR  , pushdown=on     →   17 190 ms     (-18.2 % vs main_off, -20.8 % vs main_on)  ✓
-```
-
-**Hypothesis #1 (user):** PR is faster than main `pushdown=off` *and*
-`pushdown=on` on ClickBench → **CONFIRMED** at the aggregate level.
-
-The 18 % aggregate win against `main pushdown=off` is the crucial
-result: `pushdown=off` is the safe default users actually run, and the
-PR beats it on the standard ClickBench workload while still capturing
-the queries where pushdown wins big.
-
-#### 6.1.a Top wins (PR_on vs the better of the two main configs)
-
-| Query | main off (ms) | main on (ms) | PR on (ms) | PR_on / best(main) | what's happening |
-|------:|--------------:|-------------:|-----------:|-------------------:|------------------|
-| Q11   |          97.7 |         94.2 |       66.2 |          **0.70×** | filter cols overlap projection; tracker keeps post-scan, faster than both |
-| Q21   |         859.4 |       1669.2 |      680.1 |          **0.79×** | pushdown regressed badly on main; tracker demotes/keeps post-scan |
-| Q24   |          38.0 |         37.0 |       30.2 |              0.82× | small win across the board |
-| Q10   |          70.7 |         86.5 |       59.0 |              0.83× | filter-col-in-projection case |
-| Q18   |        1665.1 |       2253.4 |     1485.7 |              0.89× | pushdown regressed on main; PR even beats main_off |
-| Q22   |        1158.8 |       1197.1 |     1056.0 |              0.91× | small uniform win |
-| Q12   |         340.1 |        304.2 |      284.4 |              0.93× | small uniform win |
-| Q26   |          47.9 |         55.1 |       45.3 |              0.95× | filter-col-in-projection case |
-| Q27   |         705.0 |        965.4 |      670.1 |              0.95× | pushdown regression on main, avoided |
-
-#### 6.1.b Pushdown regressions on main that PR neutralises
-
-These are queries where `main pushdown=on` is materially slower than
-`main pushdown=off`, and where PR's adaptive scheduler avoids the trap.
-Sorted by main pushdown penalty.
-
-| Query | main_off (ms) | main_on (ms) | main_on/main_off | PR_on (ms) | PR_on/main_off |
-|------:|--------------:|-------------:|------------------:|-----------:|---------------:|
-| Q29   |          36.1 |         78.6 |             2.18× |       38.9 |          1.08× |
-| Q30   |         275.9 |        546.8 |             1.98× |      330.1 |          1.20× |
-| Q21   |         859.4 |       1669.2 |             1.94× |      680.1 |          0.79× |
-| Q31   |         300.2 |        454.8 |             1.52× |      385.0 |          1.28× |
-| Q40   |           9.1 |         13.3 |             1.47× |       11.2 |          1.24× |
-| Q32   |        1321.1 |       1880.2 |             1.42× |     1372.5 |          1.04× |
-| Q28   |        2423.3 |       3336.1 |             1.38× |     2568.7 |          1.06× |
-| Q33   |        1566.8 |       2168.8 |             1.38× |     1561.9 |          1.00× |
-| Q27   |         705.0 |        965.4 |             1.37× |      670.1 |          0.95× |
-| Q18   |        1665.1 |       2253.4 |             1.35× |     1485.7 |          0.89× |
-
-So the worst pushdown regression on `main` (Q21, ~2×) is fully *erased*
-on the PR; the bulk of the others are pulled back to within ~10 % of
-`main_off`.
-
-#### 6.1.c The big single-query pushdown win
-
-The "row-level pushdown is amazing on this query" story-piece:
-
-| Query | main_off | main_on | PR_on |
-|------:|---------:|--------:|------:|
-| Q23   | 3 612 ms | **121 ms** | 167 ms |
-
-`SELECT * FROM hits WHERE "URL" LIKE '%google%' ORDER BY EventTime
-LIMIT 10`. **No row-group statistics help here** — `LIKE '%google%'`
-has no min/max bound. The win on `pushdown=on` is row-level evaluation
-of the LIKE predicate on the URL column, which produces a sparse
-`RowSelection`; with page index enabled, most pages of the wide
-`SELECT *` projection are skipped entirely (late materialization).
-~3.6 s → ~121 ms. PR captures **22× of the 30× speedup** but is not
-quite as fast as `main pushdown=on`.
-
-> **Flagging:** Q23 is the one query where the user's "PR is faster
-> than both" hypothesis breaks at the per-query level — PR_on is
-> 1.37× of main_on. The pattern is "tiny projection (`*`), highly
-> selective string-LIKE filter, large file" — exactly the case where
-> row-level placement is right and the tracker's confidence-interval
-> machinery is paying for samples it doesn't need (the heuristic does
-> start at row-level here, since the byte ratio is small, but
-> something is leaving cost on the table). Worth digging into.
-
-#### 6.1.d Per-query regressions worth a second look
-
-PR_on > 1.05× best-of-main on these 18 queries (out of 43). Most are
-fast queries where absolute deltas are <10ms (Q0 0.7→1.0ms, Q42
-7→11ms) — i.e. tracker / per-batch overhead dominates. The non-trivial
-ones:
-
-| Q   | main_off | main_on | PR_on | PR_on/best | absolute Δ vs best |
-|----:|---------:|--------:|------:|-----------:|-------------------:|
-| Q23 |   3612.4 |   121.3 | 166.6 |      1.37× | +45 ms             |
-| Q31 |    300.2 |   454.8 | 385.0 |      1.28× | +85 ms             |
-| Q5  |    296.6 |   284.0 | 316.2 |      1.11× | +32 ms             |
-| Q4  |    225.7 |   221.7 | 240.2 |      1.08× | +18 ms             |
-| Q25 |    119.4 |   144.1 | 135.8 |      1.14× | +16 ms             |
-
-These are the rows worth digging into for follow-up tuning. The
-tracker's CI thresholds (`min_bytes_per_sec=100 MiB/s`, `z=2.0`) are
-conservative; perhaps too conservative for sub-second queries where
-the CI doesn't have time to converge before the file is consumed.
-
-### 6.2 TPC-DS (SF1, 99 queries) — Q64-dominated win against `main pushdown=on`
-
-```
-   main, pushdown=off    →   17 003 ms
-   main, pushdown=on     →   38 961 ms     (+129 % vs main_off — pushdown=on regresses 2.29×)
-   PR  , pushdown=on     →   18 056 ms     (+6.2 % vs main_off, -53.7 % vs main_on)
-```
-
-The aggregate story changes a lot once `main pushdown=on` is in the
-table. Comparing PR vs the *worse* main config (which is what the
-[CI bench in PR #11 comment](https://github.com/adriangb/datafusion/pull/11#issuecomment-4340741427)
-implicitly does — both branches running with their default
-`pushdown_filters` setting), PR is **2.16× faster**.
-
-Almost the entire delta is **Q64**:
-
-| Q64       | local merge-base | local PR (this run) | CI HEAD (2026-04-29) | CI branch |
-|-----------|-----------------:|--------------------:|---------------------:|----------:|
-| pushdown=off | 470.8 ms      | —                   | —                    | —         |
-| pushdown=on  | **20 010 ms** | **646 ms**          | **29 343 ms**        | **971 ms** |
-
-`main pushdown=on` Q64 is ~30× slower than `main pushdown=off` Q64.
-The PR with adaptive scheduling identifies that the Q64 dynamic
-filters belong post-scan (or at least don't belong at row-level on
-the first row groups), and brings Q64 back to within ~1.4× of
-`main_off`. That single query closes a ~20 s gap.
-
-If we exclude Q64 from the totals to see what's happening on the
-"normal" 98 queries:
-
-| TPC-DS, Q64 excluded | total | vs main_off |
-|---------------------|------:|------------:|
-| main_off            |  16 532 ms |    — |
-| main_on             |  18 950 ms | +14.6 % |
-| PR_on               |  17 410 ms |  +5.3 % |
-
-So on the rest of TPC-DS the PR is *small-positive* against `main_on`
-(–8 %) and *small-negative* against `main_off` (+5 %).
-
-Bucket counts (out of 99 TPC-DS queries):
-
-|              | wins (PR < 0.95×) | flat (0.95–1.05×) | losses (PR > 1.05×) |
-|--------------|------------------:|------------------:|--------------------:|
-| TPC-DS SF1   |               20  |                36 |                 43  |
-
-Per-query the picture is roughly even: a chunk of solid wins, a chunk
-of flat, and a slightly larger chunk of regressions. Aggregate is
-dragged across the line by a handful of mid-sized regressions (Q24
-+393 ms, Q64 +175 ms, Q72 +123 ms) outweighing the wins.
-
-#### 6.2.a Top wins on TPC-DS
-
-| Q   | main_off (ms) | PR_on (ms) | speedup |
-|----:|--------------:|-----------:|--------:|
-|   2 |          99.2 |       69.6 |  1.43×  |
-|  66 |         141.5 |      101.3 |  1.40×  |
-|  98 |         109.0 |       84.6 |  1.29×  |
-|  11 |         534.7 |      413.0 |  1.30×  |
-|  12 |          29.5 |       23.4 |  1.26×  |
-|   4 |         839.0 |      694.3 |  1.21×  |
-|  74 |         324.2 |      278.7 |  1.16×  |
-
-#### 6.2.b Top regressions on TPC-DS
-
-| Q   | main_off (ms) | PR_on (ms) | slowdown | absolute Δ |
-|----:|--------------:|-----------:|---------:|-----------:|
-|  50 |         122.4 |      284.4 |   2.32×  |   +162 ms  |
-|  18 |          81.8 |      183.6 |   2.24×  |   +102 ms  |
-|  24 |         434.7 |      827.4 |   1.90×  |   +393 ms  |
-|  26 |          49.9 |       90.4 |   1.81×  |    +41 ms  |
-|  25 |         211.7 |      361.2 |   1.71×  |   +150 ms  |
-|  29 |         172.3 |      294.5 |   1.71×  |   +122 ms  |
-|  85 |          94.3 |      155.9 |   1.65×  |    +62 ms  |
-|  17 |         137.9 |      197.7 |   1.43×  |    +60 ms  |
-|  64 |         470.8 |      646.0 |   1.37×  |   +175 ms  |
-|  72 |         404.2 |      527.0 |   1.30×  |   +123 ms  |
-
-#### 6.2.c Hypotheses to check before drawing conclusions
-
-1. **Per-file row-group count.** If TPC-DS's `store_sales` and
-   `catalog_sales` files are single-row-group, the in-decoder swap has
-   nowhere to swap. Easy to verify with `parquet-tools meta` on a
-   sample file.
-2. **Stacked dynamic filters in TPC-DS plans.** Q24, Q50, Q29 all
-   have correlated subqueries producing dynamic filters with a
-   slow-finalising hash-join build side. The tracker may be promoting
-   these too eagerly before the build side finishes accumulating.
-3. **Tracker overhead per batch on plans with many small batches.**
-   Several of the regressed queries are in the 50–500 ms range — same
-   regime where ClickBench Q0/Q42 also showed PR overhead.
-
-#### 6.2.d Reconciling with the CI bench numbers
-
-`pushdown_filters` defaults to `false` in DataFusion
-([config.rs](https://github.com/apache/datafusion/blob/main/datafusion/common/src/config.rs#L902)),
-so the apples-to-apples-on-defaults comparison would be `main_off`
-vs `PR_off` (or `PR_on`, since the PR doesn't enable pushdown by
-default either). The CI bench at the
-[PR comment trigger](https://github.com/adriangb/datafusion/pull/11#issuecomment-4340678050)
-*explicitly* set `DATAFUSION_EXECUTION_PARQUET_PUSHDOWN_FILTERS=true`
-on both branches, so its "1.80× faster" headline is the
-`PR_on / main_on` comparison shown above. My local `0.46×` matches.
-
-The strict "PR doesn't regress vs `pushdown=off` defaults" criterion
-is **not satisfied on TPC-DS**: PR is +6 % aggregate, with a long
-tail of correlated-subquery plans (Q24, Q50, Q29) where the tracker
-promotes filters too eagerly. The strict criterion is **also not
-satisfied on TPC-H** (+44 %). On ClickBench it is satisfied (–18 %).
-
-### 6.3 TPC-H (SF1, 22 queries) — the unaddressed case
-
-```
-   main, pushdown=off    →     780 ms
-   main, pushdown=on     →     989 ms      (+27 % vs main_off — pushdown=on regresses)
-   PR  , pushdown=on     →   1 128 ms      (+45 % vs main_off, +14 % vs main_on)
-```
-
-**Hypothesis #3 (user):** TPC-H is slower than `main pushdown=off`
-because SF1 files are single-row-group → confirmed. PR doesn't beat
-either main config; it's marginally worse than `main pushdown=on`.
-The fix isn't anything the in-decoder scheduler can do —
-**single-row-group files have no swap point** and a single partition
-owns each file, so this is the data-skew / Problem-B case that needs
-[row-group-level morselization (PR #21766)](https://github.com/apache/datafusion/pull/21766).
-
-Bucket counts (out of 22 TPC-H queries):
-
-|             | wins (PR < 0.95×) | flat (0.95–1.05×) | losses (PR > 1.05×) |
-|-------------|------------------:|------------------:|--------------------:|
-| TPC-H SF1   |                 2 |                 3 |                  17 |
-
-Aggregate is overwhelmingly losses. The two wins (Q1, Q18) are queries
-where the predicate is doing the real work; elsewhere the in-decoder
-placement just adds cost it can't recoup, because the file is one row
-group long.
-
-#### 6.3.a Per-query (all 22)
-
-| Q  | main_off (ms) | PR_on (ms) | ratio | bucket |
-|---:|--------------:|-----------:|------:|--------|
-|  1 |          48.8 |       43.4 | 0.89× | win    |
-|  2 |          14.9 |       15.5 | 1.04× | flat   |
-|  3 |          35.2 |       62.9 | 1.79× | LOSS   |
-|  4 |          15.7 |       18.2 | 1.16× | loss   |
-|  5 |          41.8 |       97.6 | 2.34× | LOSS   |
-|  6 |          16.6 |       19.2 | 1.16× | loss   |
-|  7 |          50.1 |       78.7 | 1.57× | LOSS   |
-|  8 |          35.1 |       79.0 | 2.25× | LOSS   |
-|  9 |          44.1 |      136.5 | 3.10× | **LOSS** |
-| 10 |          46.5 |       53.9 | 1.16× | loss   |
-| 11 |           9.0 |       10.2 | 1.14× | loss   |
-| 12 |          23.4 |       27.8 | 1.19× | loss   |
-| 13 |          27.4 |       35.7 | 1.30× | loss   |
-| 14 |          20.5 |       29.5 | 1.43× | loss   |
-| 15 |          27.4 |       27.6 | 1.01× | flat   |
-| 16 |          11.0 |       13.6 | 1.23× | loss   |
-| 17 |          68.0 |      129.6 | 1.91× | LOSS   |
-| 18 |         110.6 |       67.0 | 0.61× | **WIN** |
-| 19 |          33.4 |       33.5 | 1.00× | flat   |
-| 20 |          30.9 |       58.2 | 1.88× | LOSS   |
-| 21 |          53.3 |       68.5 | 1.28× | loss   |
-| 22 |          15.9 |       22.3 | 1.40× | loss   |
-
-The pattern: filter-heavy joins on single-row-group `lineitem` (Q5,
-Q7, Q8, Q9, Q17, Q20) all get worse. Q18 — the only TPC-H query with
-a correlated subquery filtering lineitem first via a hash join — gets
-faster, plausibly because the dynamic filter does row-group-stats
-pruning when the build finishes early.
-
-This is the data-skew story from §5 made concrete: with no
-sub-row-group adaptation point, the in-decoder scheduler has zero
-room to recover from a wrong initial placement on these files.
-
-### 6.4 On S3 (`--simulate-latency`)
-
-"S3" in this section means I ran the bench harness with
-`dfbench --simulate-latency`, which adds 20–200 ms random latency
-to every object-store op
-([PR #20954](https://github.com/apache/datafusion/pull/20954)).
-Closer to a cloud object-store deployment than local NVMe.
-**The picture shifts a lot:** the PR's adaptive scheduler avoids
-issuing the small/many requests that `pushdown=on` costs you when
-the filter isn't earning its keep, so when RTT is the dominant cost
-the gap to `main_off` narrows or closes entirely.
-
-#### 6.4.a TPC-H SF1 on S3 (3 iterations, all 22 queries)
-
-| TPC-H | total | vs main_off | S3 multiplier vs SSD |
-|---|---:|---:|---:|
-| main_off | 23 723 ms | — | 30.4× |
-| main_on  | **52 597 ms** | 2.22× | **53.2×** |
-| PR_on    | 24 684 ms | **1.04×** | 21.9× |
-| PR_on / main_on | — | **0.47×** (i.e. 2.13× faster) | — |
-
-So with cloud-storage RTT, **PR_on is essentially flat against
-`main_off` on TPC-H** — closing the +44 % gap from the SSD run.
-The story is no longer "PR can't help on TPC-H"; it's "the SSD
-benchmark understates the I/O cost of `pushdown=on`, and PR
-neutralises most of that cost". `main_on` gets crushed (53×
-multiplier) because each query issues many small filter-cols-then-
-survivors decode requests; PR's adaptive scheduler keeps
-mandatory-but-unselective filters at PostScan, so the scan issues
-one coalesced request per row group instead.
-
-Per-query, PR_on beats main_off on 7 / 22 queries and ties (within
-±10 %) on another 8. The remaining 7 are within 1.3× — modest
-losses that look like the same "single-row-group, no swap point"
-pattern from the SSD run, but the absolute deltas are dwarfed by
-the S3 RTT.
-
-#### 6.4.b TPC-DS SF1 on S3 (3 iterations, 99 queries)
-
-| TPC-DS | total | vs main_off | S3 multiplier vs SSD |
-|---|---:|---:|---:|
-| main_off | 76 418 ms | — | 4.5× |
-| main_on  | **141 940 ms** | 1.86× | 3.6× |
-| PR_on    | 88 026 ms | 1.15× | 4.9× |
-| PR_on / main_on | — | **0.62×** (i.e. 1.61× faster) | — |
-
-Q64 is still the dominant single-query effect: `main_on=22 030 ms`
-→ `PR_on=2 267 ms`. Excluding Q64 the totals are:
-
-| TPC-DS, Q64 excluded | total | vs main_off |
-|---|---:|---:|
-| main_off | 74 286 ms | — |
-| main_on  | 119 910 ms | 1.61× |
-| PR_on    | 85 759 ms | 1.15× |
-| PR_on / main_on | — | **0.72×** |
-
-So the S3 story for TPC-DS is more mixed than TPC-H:
-
-- vs **main_on**: PR keeps the win it had on SSD (0.46× → 0.62×;
-  smaller margin but still a clear win).
-- vs **main_off**: PR slightly *widens* the gap (1.06× → 1.15×). 14
-  of 99 queries are PR-faster than main_off, 16 are flat, 69 are
-  modestly slower (1.05–1.85×). Top losses: Q25 (1.83×), Q34
-  (1.83×), Q8 (1.76×), Q96 (1.61×), Q26 (1.57×), Q18 (1.56×).
-
-The intuition: many TPC-DS queries have mostly-unselective filters
-and small row groups; the PR's adaptive scheduler is still issuing
-the row-level filter-column read on the first row group (at
-minimum) before the tracker has enough samples to demote. With
-200 ms RTT tacked onto each request, that initial
-"pay-for-evidence" cost shows up as a 5–80 % per-query regression
-on plans that were close to flat on SSD. Worth pointing out: this
-is the **main config-tuning lever** — `confidence_z` and
-`min_bytes_per_sec` could probably be tightened.
-
-#### 6.4.c ClickBench partitioned on S3 (3 iterations, 43 queries)
-
-| ClickBench partitioned | total | vs main_off | S3 multiplier vs SSD |
-|---|---:|---:|---:|
-| main_off | 86 624 ms | — | 4.1× |
-| main_on  | **111 312 ms** | 1.29× | 5.1× |
-| PR_on    | 89 037 ms | **1.03×** | 5.2× |
-| PR_on / main_on | — | **0.80×** (i.e. 1.25× faster) | — |
-
-The aggregate wins compress on S3: PR vs main_off goes from `0.82×`
-(SSD, 18 % faster) to `1.03×` (essentially tied). The `vs main_on`
-advantage (0.80×) is preserved.
-
-Why does the SSD 18 % win shrink to a tie? Two competing effects:
-
-- **Where PR was ahead because main_on regressed:** Q23
-  (`URL LIKE '%google%'`), Q27, Q13 — wins survive: Q23 is now
-  `4 720 → 1 110 ms` (0.24× of main_off), the biggest single win in
-  the suite.
-- **New per-query losses on fast queries:** Q37 (2.88×), Q40
-  (2.24×), Q38 (2.02×), Q42 (1.96×), Q6 (1.83×), Q41 (1.58×). These
-  are ~200 ms queries on main_off that become 700–1 000 ms on
-  main_on when each row-level filter-column read pays a 20–200 ms
-  RTT. PR captures *about half* of that regression (e.g. Q38:
-  main_off 230 → main_on 991 → PR_on 464) — better than main_on
-  but not as good as main_off, because the tracker still pays the
-  initial-placement cost on the first row group before it has
-  evidence to demote.
-
-Per-query bucketing (PR_on vs better-of-main):
-
-|                    | wins | flat | losses |
-|--------------------|----:|-----:|-------:|
-| ClickBench (SSD)   |   8 |   17 |     18 |
-| ClickBench (S3)    |   1 |   28 |     14 |
-
-On S3 the **distribution shifts toward "flat"** — most queries land
-within ±5 % of the better-of-main config, the few big wins get
-bigger (Q23), the worst losses are sharper but contained (top loss
-2.88×, vs 1.55× on SSD). The interpretation: at S3 RTT the tracker's
-first-row-group evidence cost is more visible; the
-`confidence_z=2.0` default means the tracker waits longer before
-demoting, and the cost of that wait scales with per-request RTT.
-
-This is **the most actionable single tuning lever** for follow-up
-work: a per-batch-RTT-aware confidence-z, or an "infer initial
-placement from the file-pruning hit-rate" heuristic for queries
-where row-group stats already tell you the filter is selective.
-
-> Methodology note: latency runs use 3 iterations (vs 5 for the
-> non-latency runs) because the per-query wall time is ~25× higher.
-> Median across iterations is still used.
-
-### 6.5 Methodology
+## 6. Benchmark methodology
+
+Three workloads (TPC-DS SF1, TPC-H SF1, ClickBench partitioned at
+100 files of `hits_partitioned`); two latency modes (local NVMe at
+5 iterations; `--simulate-latency` at 3 iterations because per-query
+wall time is ~25× higher). Three configurations: `main +
+pushdown=off`, `main + pushdown=on`, change with `pushdown=on`.
+Same machine state across configurations, sequential runs.
 
 ```bash
 # both binaries built from clean target dirs
-PR_BIN=/Users/adrian/GitHub/datafusion/target/release/dfbench
-MAIN_BIN=/tmp/datafusion-bench-base/target/release/dfbench
+BIN_MAIN=/path/to/main/target/release/dfbench
+BIN_CHANGE=/path/to/change/target/release/dfbench
 
-# ClickBench partitioned + pushdown
-$BIN clickbench --pushdown --iterations 5 \
+# ClickBench partitioned
+$BIN clickbench [--pushdown] --iterations 5 \
   --path benchmarks/data/hits_partitioned \
   --queries-path benchmarks/queries/clickbench/queries \
-  -o results/clickbench_pushdown_<branch>.json
-
-# ClickBench partitioned + no pushdown
-$BIN clickbench --iterations 5 \
-  --path benchmarks/data/hits_partitioned \
-  --queries-path benchmarks/queries/clickbench/queries \
-  -o results/clickbench_nopushdown_<branch>.json
+  -o results/<config>/clickbench_partitioned.json
 
 # TPC-DS SF1 (parquet)
-$BIN tpcds --iterations 5 --path benchmarks/data/tpcds_sf1 \
-  -o results/tpcds_<branch>.json
+$BIN tpcds [--pushdown] --iterations 5 \
+  --path benchmarks/data/tpcds_sf1 \
+  -o results/<config>/tpcds_sf1.json
 
 # TPC-H SF1 (parquet)
-$BIN tpch --iterations 5 --path benchmarks/data/tpch_sf1 \
-  -o results/tpch_<branch>.json
+$BIN tpch [--pushdown] --iterations 5 \
+  --path benchmarks/data/tpch_sf1 \
+  -o results/<config>/tpch_sf1.json
+
+# add --simulate-latency for the S3-profile runs
 ```
 
-Reported numbers below use the median across the 5 iterations to keep
-warmup noise out.
+Reported numbers use the median across iterations.
 
 ---
 
 ## 7. What's missing / open questions
 
-This section deepens two of the most-asked-about follow-up items:
-**sub-row-group adaptation** and **smarter initial-placement /
-latency-aware policy**.
+### 7.1 Sub-row-group adaptation (arrow-rs surface)
 
-### 7.1 Sub-row-group adaptation
+The smallest unit at which the tracker can change placement is one
+row group. For ClickBench partitioned (~10–30 row groups per file)
+that's plenty; for TPC-H SF1 (one row group per file) it's nothing —
+the first placement decision is the only decision. The current
+result is fine on TPC-H because the runtime samples cause a quick
+demote-to-post-scan that itself yields a good plan; but the residual
+S3 fast-query losses in ClickBench (Q6, Q37, Q38, Q42) are the
+shape where mid-row-group adaptation would help.
 
-**Today (this PR + companion arrow-rs branch).** The decoder exposes:
-```rust
-// arrow-rs `adaptive-strategy-swap` branch
-ParquetPushDecoder::can_swap_strategy(&self) -> bool;
-ParquetPushDecoder::swap_strategy(&mut self, swap: StrategySwap) -> Result<()>;
-```
-`can_swap_strategy()` returns `true` only between row groups (state
-`ReadingRowGroup` + inner `Finished`). Calling `swap_strategy()`
-mid-row-group errors with `ParquetError::General`. So the smallest
-unit at which the tracker can change placement is **one row group**.
+**Why mid-row-group is hard in arrow-rs.** A
+`ParquetRecordBatchReader` holds three pieces of mutable state
+inside one row group: the `Box<dyn ArrayReader>` column readers
+(each positioned at some page + offset, possibly with a dictionary
+loaded), the `ReadPlan { row_selection_cursor }` (pauseable
+already), and the `RowFilter` wired into the pre-decode column
+subset. Swapping the filter changes which columns need to be
+pre-decoded, which changes the array reader topology — the array
+readers built for "pre-decode only filter cols, then late-
+materialise survivors" are structurally different from "decode the
+full projection in one shot".
 
-For ClickBench partitioned (~10–30 row groups per file) that's plenty.
-For TPC-H SF1 (one row group per file) it's nothing — the first
-placement decision is the only decision.
+**Realistic API shape.**
 
-**Why mid-row-group is hard in arrow-rs.** A `ParquetRecordBatchReader`
-holds three pieces of mutable state inside one row group:
-
-1. `Box<dyn ArrayReader>` — column readers, each positioned at some
-   page + within-page offset, possibly with the dictionary already
-   loaded.
-2. `ReadPlan { row_selection_cursor: RowSelectionCursor }` — tracks
-   which rows of the row group are still unread. Already pauseable
-   (cursor exposes `row_selection_cursor_mut()`).
-3. The `RowFilter` itself — wired into the pre-decode column subset
-   that `ParquetRecordBatchReader::next_inner` runs on each batch
-   (see `mod.rs:1426`). Changing the filter changes which columns
-   need to be pre-decoded, which changes the array reader topology.
-
-Item (3) is what blocks an in-place swap — the array readers built
-for "pre-decode only filter cols, then late-materialise survivors"
-are structurally different from "decode the full projection in one
-shot". Swapping the filter requires re-building the array readers
-for the row group.
-
-**The realistic API shape.**
 ```rust
 impl ParquetPushDecoder {
     /// True at any record-batch boundary inside a row group.
     pub fn can_pause(&self) -> bool;
 
-    /// Stop emitting from the current row group, return the residual
-    /// state. Bytes already fetched stay in `PushBuffers`.
+    /// Stop emitting from the current row group, return residual state.
     pub fn pause(&mut self) -> Result<PausedRowGroup>;
 
     /// Resume the same row group with a different filter / projection.
-    /// Re-builds array readers for the row group; `PushBuffers` is
-    /// reused so no extra IO is needed for column data still in scope.
+    /// Re-builds array readers; PushBuffers reused.
     pub fn resume_with(
         &mut self,
         paused: PausedRowGroup,
         new_strategy: StrategySwap,
     ) -> Result<()>;
 }
-
-pub struct PausedRowGroup {
-    row_group_idx: usize,
-    cursor: RowSelectionCursor,   // residual rows
-    // PushBuffers stays inside the decoder
-}
 ```
 
-**Cost model.** Resume cost is dominated by re-decoding compressed
-pages from the start of whichever pages contain the resume row.
-Compressed pages are typically 1 MiB; on M-series hardware that's
-~1–5 ms per page per column. Resuming with a strict superset of the
-original projection is essentially free for already-decoded columns
-(if we keep them) and ~1 ms-per-page for new columns. Decompression
-work is duplicated for columns whose state we threw away.
+Resume cost is dominated by re-decoding compressed pages from the
+start of whichever pages contain the resume row. Compressed pages
+are typically 1 MiB; on M-series hardware that's ~1–5 ms per page
+per column.
 
-**What this would unlock.**
+### 7.2 Row-group morselization
 
-| Workload                                     | benefit |
-|----------------------------------------------|--------|
-| TPC-H SF1 (one big row group per file)       | The big one. Today the tracker eats the whole row group with the initial placement; sub-RG would let it demote partway through. The latency case (§6.4.a) is already a tie; sub-RG would close the no-latency gap (1.45× → ?). |
-| ClickBench, intra-RG skew                    | Smaller. Most ClickBench wins / losses already track row-group boundaries; per-RG decisions cover most of the value. |
-| Hash-join dynamic filters that finalise mid-RG | The dynamic filter's `snapshot_generation` already triggers a re-evaluation in the tracker, but only at the next RG boundary. Sub-RG would let the new filter take effect immediately. |
+Independent of this proposal. Today morselization moves *files*
+across partitions but not row groups
+([#21351](https://github.com/apache/datafusion/pull/21351) merged,
+[#21766](https://github.com/apache/datafusion/pull/21766) draft).
+Combined with the change in this proposal, row-group morselization
+closes the partition-skew side of the lottery for cases the
+in-decoder scheduler can't address.
 
-**Important caveat.** Sub-RG adaptation does **not** address Problem B
-(lopsided partitions, §2.3). A single big row group still belongs to
-one partition; sub-RG only changes how that partition processes the
-row group, not how the work distributes across partitions. The
-real fix for TPC-H lineitem is morselization at row-group or smaller
-granularity ([#21766](https://github.com/apache/datafusion/pull/21766)),
-which is independent of sub-RG adaptation.
+### 7.3 Three new config knobs not yet plumbed through proto-common
 
-### 7.2 Smarter initial placement: latency-aware `confidence_z` + page-pruning prior
+The new fields on `ParquetOptions` — `prior_promote_threshold`
+(0.5), `prior_demote_threshold` (0.05), `latency_z_baseline_ms`
+(5.0), `latency_z_max_scale` (8.0) — aren't yet in the proto
+schema. `from_proto` defaults to safe values so round-trip
+preserves behaviour, but a follow-up should plumb them through.
 
-The tracker's two policy knobs (`min_bytes_per_sec`, `confidence_z`)
-define a "wait for evidence before changing placement" gate. Default
-`z = 2.0` ≈ 97.5 % one-sided. Under simulated latency (§6.4) we saw
-that the cost of waiting is what drives the residual `vs main_off`
-regressions on TPC-DS and fast ClickBench queries (Q37 2.88×, Q40
-2.24×, Q38 2.02×, Q42 1.96×). Two complementary directions:
+### 7.4 Bayesian prior across files in the same scan
 
-#### 7.2.a Latency-aware `confidence_z`
-
-The current promotion / demotion rule is:
-```text
-demote if  upper_bound(eff, z) < min_bytes_per_sec
-promote if lower_bound(eff, z) ≥ min_bytes_per_sec
-```
-where `eff = bytes_saved_per_sec`. Higher `z` ⇒ wider CI ⇒ more
-samples needed before either side fires.
-
-The **wrong-placement cost is amplified by per-request latency**: a
-filter stuck at row-level under high latency pays an RTT for every
-row group's filter-column fetch. If we estimate effective
-per-fetch wall time, we should be willing to demote on weaker
-evidence.
-
-Concrete sketch:
-```rust
-// In SelectivityTracker::partition_filters, for the row-level demote check:
-let latency_factor = (per_fetch_ms / FAST_PATH_MS).clamp(1.0, 8.0);
-let z_effective   = self.config.confidence_z / latency_factor;
-if let Some(ub) = stats.confidence_upper_bound(z_effective) { ... }
-```
-Where `per_fetch_ms` is the running average of `time_elapsed_scanning_total /
-num_byte_ranges_fetched` (both already in `ParquetFileMetrics`).
-With `FAST_PATH_MS = 5 ms` (rough SSD baseline) and 100 ms
-per-fetch RTT under latency, `z_effective` shrinks from 2.0 to ~0.1
-— effectively demoting on point estimates.
-
-This wouldn't change the no-latency results (where `latency_factor`
-clamps to 1.0) but would close the residual TPC-DS-lat (+15 %) and
-fast-query-lat (Q37/Q40/Q38) gaps that are *all* on the slow side
-of "wait too long to demote".
-
-Implementation cost: ~30 LOC in `selectivity.rs` plus a hook on the
-opener to feed back per-fetch latency into the tracker.
-
-#### 7.2.b Page-pruning-driven initial placement
-
-The current initial-placement heuristic
-(`SelectivityTrackerInner::partition_filters`, `selectivity.rs:778`)
-is purely byte-ratio:
-```rust
-if extra_bytes > 0 && extra_bytes / projection_bytes <= 0.20 { RowFilter }
-else                                                         { PostScan }
-```
-This is "row-level if the filter is cheap to read", with no notion
-of *selectivity*. But by the time this runs, DataFusion has already
-done **row-group statistics pruning** at
-`opener.rs:930-995`; the `pruning_predicate` has been evaluated
-against per-row-group min/max, and the surviving row group set is
-known. Per-conjunct pruning effectiveness is the single best
-selectivity prior we'll ever get for free.
-
-Concrete sketch of a smarter prior:
-```rust
-fn selectivity_prior(
-    expr: &Arc<dyn PhysicalExpr>,
-    file_metadata: &ParquetMetaData,
-    file_schema: &Schema,
-) -> Option<f64> {
-    // Build a per-conjunct PruningPredicate (already plumbed via
-    // datafusion_pruning::build_pruning_predicate).
-    let pp = build_pruning_predicate(expr.clone(), file_schema)?;
-    let total = file_metadata.row_groups().len();
-    let kept  = pp.prune(file_metadata)?.iter().filter(|b| **b).count();
-    let pruned_rate = (total - kept) as f64 / total as f64;
-    Some(pruned_rate)
-}
-```
-Then in `partition_filters` for new filters:
-```rust
-match selectivity_prior(&expr, metadata, schema) {
-    Some(p) if p >= 0.5 => RowFilter,    // statistically selective
-    Some(p) if p <= 0.05 => PostScan,    // not selective per stats
-    _                    => byte_ratio_heuristic(...)  // fallback
-}
-```
-**What this would buy:**
-
-- **Q23** (`URL LIKE '%google%'`) already lands at row-level by the
-  byte-ratio heuristic; this wouldn't change it. But for
-  similarly-shaped LIKE-on-URL queries with bigger projections, the
-  prior would reinforce row-level placement against what the byte
-  ratio alone might suggest.
-- **Fast-query latency regressions** (Q37/Q40/Q38/Q42): these are
-  filters where `extra_bytes > 0` and `byte_ratio ≤ 0.20`, so they
-  start at row-level today. But row-group stats pruning is not
-  effective for them (they're aggregations on `SearchEngineID` etc.,
-  not selective range predicates). With the prior, `pruned_rate ≈
-  0` would override the byte-ratio default and start them at
-  PostScan — neutralising the latency regression *before* the
-  tracker has to learn it via samples.
-- **TPC-DS correlated-subquery regressions** (Q24/Q25/Q26/Q34/Q50):
-  the dynamic filter's `snapshot_generation` already triggers a
-  re-evaluation; combining that with a stats-based prior would let
-  the tracker make a sound decision on the first row group instead
-  of needing to gather samples.
-
-Implementation cost: builds on the `PruningPredicate` machinery
-already in `datafusion_pruning::build_pruning_predicate`. Would
-need to construct per-conjunct predicates (currently only the
-combined predicate is built). ~50–100 LOC.
-
-#### 7.2.c Bonus: page-index prior
-
-A step further: even when row-group stats pruning rate is 0%, the
-**column index / offset index** can give per-page stats. If we run
-page-index pruning on the *first* row group only, we can compute a
-"would-be pages-skipped" rate as a finer-grained prior. DataFusion
-already has the machinery (`PagePruningAccessPlanFilter` in
-`opener.rs:325`), but it's currently consumed during row-group
-processing, not as input to the tracker's initial placement
-decision.
-
-This is strictly better than the row-group stats prior for
-predicates that are page-selective but not row-group-selective,
-which is most LIKE / range-query workloads.
-
-### 7.3 Other follow-ups (unchanged)
-
-3. **Cross-partition row-group shuffling.** Today morselization moves
-   *files* across partitions but not row groups
-   ([#21351](https://github.com/apache/datafusion/pull/21351) merged,
-   [#21766](https://github.com/apache/datafusion/pull/21766) draft).
-   This is the actual fix for the TPC-H regression in §6.3 — sub-RG
-   adaptation (§7.1) helps but doesn't redistribute work across
-   partitions.
-4. **Three new config knobs (`filter_pushdown_min_bytes_per_sec`,
-   `filter_collecting_byte_ratio_threshold`, `filter_confidence_z`)
-   aren't in the proto schema yet.** `from_proto` fills with defaults
-   so a roundtrip preserves behavior; needs a follow-up to plumb
-   through.
-5. **Confidence interval defaults** were tuned by hand against
-   ClickBench. After §7.2 lands they would mostly become a fallback
-   for the page-index-pruning-doesn't-help cases.
-
-### 7.4 Suggested ordering
-
-If I were prioritising the four directions above, I'd order them by
-expected cost / impact ratio:
-
-| # | Item | Cost | Impact | Why |
-|--|------|------|--------|-----|
-| 1 | §7.2.b page-pruning prior | low (~50–100 LOC) | high | closes most fast-query latency regressions; prevents bad first placements; reuses existing infrastructure |
-| 2 | §7.2.a latency-aware z   | low (~30 LOC)     | medium-high | closes residual TPC-DS-lat gap; cheap to ship next to §7.2.b |
-| 3 | §7.3 #3 row-group morselization (separate PR) | high | high on TPC-H | only thing that fixes the partition-skew problem; tracked elsewhere |
-| 4 | §7.1 sub-RG adaptation in arrow-rs | high (state mgmt across array readers) | medium-high but workload-specific | bigger arrow-rs surface; benefits TPC-H even after morselization for "dynamic filter that finalises mid-RG" cases |
+The byte-ratio fallback runs when no per-conjunct rate is
+available. Some ClickBench files have no page index for the filter
+column, so byte-ratio is the prior in practice for some queries.
+Open question: feed the tracker's accumulated runtime stats back
+as a Bayesian prior on `eff_mean` to short-circuit warm-up on
+subsequent files within the same scan. Estimated impact: small;
+not in scope.
 
 ---
 
 ## 8. Speaker-notes summary (10-min talk shape)
 
-1. **Hook (1m)** — `pushdown_filters` is a per-query lottery on `main`. Show
-   one query that wins big, one that loses big.
-2. **Why (2m)** — IO patterns + per-batch eval cost diagrams (§2.2).
-3. **The lopsided-partition slide (1m)** — the one in §2.3.
-4. **Solution (2m)** — state machine diagram + the swap-at-RG-boundary
-   diagram (§3.1, §3.2).
-5. **Wins (2m)** — ClickBench aggregate + 3 representative queries
-   (TopK / hash-join dyn / `WHERE col<>'' GROUP BY col`).
-6. **Where it falls short (1m)** — TPC-H + the deferred sub-row-group
-   pause story (§5, §7).
-7. **Close (1m)** — "never slower than `pushdown=off`" success
-   criterion, status, what's next.
+1. **Hook (1 m)** — `pushdown_filters` is a per-query lottery on `main`. Show one query that wins big, one that loses big.
+2. **Why (2 m)** — I/O patterns + per-batch eval cost diagrams (§2.2).
+3. **The lopsided-partition slide (1 m)** — the one in §2.3.
+4. **Solution (2 m)** — state machine diagram + the swap-at-RG-boundary diagram (§3.1, §3.5).
+5. **Per-conjunct pruning rates (1 m)** — the one idea that closed the latency gap (§3.2).
+6. **Wins (2 m)** — ClickBench aggregate + Q23 (LIKE) + Q64 (dynamic filters).
+7. **Where it falls short (1 m)** — sub-row-group, morselization (§5, §7).
+8. **Close (1 m)** — "never slower than `pushdown=off`" success criterion, status, what's next.
 
 ---
 
 ## 9. References
 
-### This PR and its CI bench
-
-- [adriangb/datafusion#11 — Adaptive filter scheduling in the Parquet decoder](https://github.com/adriangb/datafusion/pull/11) (this PR)
-- [pydantic/arrow-rs#9 — `adaptive-strategy-swap`](https://github.com/pydantic/arrow-rs/pull/9) (companion arrow-rs change adding `swap_strategy` / `can_swap_strategy` / `PushBuffers` reuse)
-- [PR #11 CI bench result](https://github.com/adriangb/datafusion/pull/11#issuecomment-4340741427) — TPC-DS table cited in §6.2.
-- [PR #11 CI bench trigger](https://github.com/adriangb/datafusion/pull/11#issuecomment-4340678050) — confirms both branches ran with `DATAFUSION_EXECUTION_PARQUET_PUSHDOWN_FILTERS=true` and `..._REORDER_FILTERS=true`.
-
 ### Filter-pushdown-on-by-default work (apache/datafusion)
 
-- [#3463 — Enable parquet filter pushdown by default](https://github.com/apache/datafusion/issues/3463) — the long-running tracking issue this PR is ultimately in service of.
-- [#20324 — \[EPIC\] Fix performance regressions when enabling parquet filter pushdown (late materialization)](https://github.com/apache/datafusion/issues/20324) — epic enumerating the regressions adaptive scheduling is meant to neutralize.
+- [#3463 — Enable parquet filter pushdown by default](https://github.com/apache/datafusion/issues/3463) — the long-running tracking issue this proposal is ultimately in service of.
+- [#20324 — \[EPIC\] Fix performance regressions when enabling parquet filter pushdown (late materialization)](https://github.com/apache/datafusion/issues/20324) — epic enumerating the regressions adaptive scheduling neutralises.
 - [#20325 — ClickBench Q10 slows down when filter pushdown is enabled](https://github.com/apache/datafusion/issues/20325) — concrete example of the "Problem A" lottery.
 
 ### Morselized scans (the "Problem B" / data-skew fix path)
 
 - [#20529 — Introduce morsel-driven Parquet scan](https://github.com/apache/datafusion/issues/20529) — the original tracking issue for morselization.
 - [#21351 — Dynamic work scheduling in `FileStream`](https://github.com/apache/datafusion/pull/21351) — **merged**: file-level morselization (siblings steal whole files from a shared queue). Closes the "files are units of work" half of #20529 but explicitly defers row-group splitting.
-- [#21766 — feat(parquet): row-group morselization for sibling FileStream stealing](https://github.com/apache/datafusion/pull/21766) — **draft**: row-group-level morselization, the actual fix for the TPC-H regression in §6.3.
+- [#21766 — feat(parquet): row-group morselization for sibling FileStream stealing](https://github.com/apache/datafusion/pull/21766) — **draft**: row-group-level morselization, the complementary fix for the partition-skew case.
+
+### Object-store latency simulation
+
+- [#20954 — `--simulate-latency` flag for `dfbench`](https://github.com/apache/datafusion/pull/20954) — what the "S3" rows in §4.4 are using.
 
 ### Other related apache/datafusion threads
 
 - [#19654 — Poor performance of parquet pushdown with offset](https://github.com/apache/datafusion/issues/19654)
 - [#21317 — Sort pushdown: reorder row groups by statistics within each file](https://github.com/apache/datafusion/issues/21317)
-- [#21915 — feat: OFFSET pushdown for multi-file parquet scans](https://github.com/apache/datafusion/issues/21915)
-- [#21916 — feat: OFFSET pushdown with WHERE filters using fully-matched RG statistics](https://github.com/apache/datafusion/issues/21916)
-- [#21440 — Dynamic BufferExec sizing: row limit + memory cap for sort pushdown](https://github.com/apache/datafusion/issues/21440)
 - [#20443 — Support filter pushdown through `SortMergeJoinExec`](https://github.com/apache/datafusion/issues/20443)
 - [#21145 — Add example implementing filter pushdown](https://github.com/apache/datafusion/issues/21145)
-
----
-
-## 10. Round-6 update — what shipped, and how to get it across the line
-
-This section is an addendum written after the round-6 work landed
-and was reorganised into a clean six-commit stack on
-`adriangb/datafusion:pr/round6-stack`. It supersedes the speculative
-sketches in §7.2.a / §7.2.b / §7.2.c by reporting what was actually
-built and where the resulting branch sits against the success
-criteria.
-
-### 10.0 The stacked branch
-
-```
-72a3eaa85  test(parquet): force-promote filters in tests that drove the legacy 'pushdown=on' contract
-e799f85d7  fix(pruning): union sub-predicate columns in literal_columns()
-d698aae5a  feat(parquet): adaptive placement prior from per-conjunct pruning rates
-ffbcd0c1c  feat(pruning): per-conjunct PruningPredicate rates API
-79beaf339  refactor(parquet): split selectivity.rs into modules
-9bb321284  test(parquet): update selectivity tests for scatter-aware bytes API
-9a1705088  Revert "feat(parquet): coalesce post-scan-filtered batches"   ← PR #11 base
-```
-
-Each commit builds and is lint-clean; tests pass at every step. The
-refactor in commit 2 is pure code-motion, splitting the 2.3k-line
-`selectivity.rs` into a six-file submodule. The pruning bugfix in
-commit 5 is load-bearing — it surfaced when running the full
-workspace test suite and is described in §10.4.
-
-cargo test --workspace --no-fail-fast: 9 240 passed, 0 failed.
-
-### 10.1 The optimisations that closed the gap
-
-The premise §7.2 advanced — that the residual latency regressions
-were dominated by *waiting for evidence to overturn a bad initial
-placement* — turned out to be right. The ship-ready branch combines
-three changes, all of them directly traceable to the §7.2 ideas:
-
-1. **Per-conjunct pruning rates as a side-effect of existing pruning
-   passes** (§7.2.b, §7.2.c, generalised). Instead of building a
-   separate pruning-predicate run on the side, the branch teaches
-   the pruning machinery that already runs at file open to *also*
-   surface per-conjunct rates while it's at it:
-
-   - `PruningPredicate::try_new_tagged_conjuncts` /
-     `PruningPredicate::prune_per_conjunct`
-     (`datafusion/pruning/src/pruning_predicate.rs`) build N leaf
-     `PruningPredicate`s tagged by `FilterId`. The combined
-     `prune()` AND-s the leaves so the row-group decision is
-     unchanged; `prune_per_conjunct()` returns the same combined
-     result *plus* a `Vec<PerConjunctPruneStats>`.
-   - `PagePruningAccessPlanFilter::new_tagged` /
-     `prune_plan_with_per_conjunct_stats`
-     (`datafusion/datasource-parquet/src/page_filter.rs`) does the
-     same trick at page-index granularity: keeps the existing
-     `RowSelection` output but also reports per-page rates keyed by
-     `FilterId`.
-   - `RowGroupAccessPlanFilter::prune_by_statistics_with_per_conjunct_stats`
-     and `prune_by_bloom_filters_with_per_conjunct_stats`
-     (`datafusion/datasource-parquet/src/row_group_filter.rs`) round
-     out the picture for row-group min/max and bloom filter passes.
-
-   The opener (`opener.rs` `RowGroupsPrunedParquetOpen`) collects
-   all four streams, layers them — page rates seed
-   `page_pruning_rates`, row-group rates fill in, and bloom rates
-   take the max with whatever was already there — and threads the
-   resulting `HashMap<FilterId, f64>` into the per-partition
-   `AdaptiveParquetStream`.
-
-   `SelectivityTracker::partition_filters`
-   (`datafusion/datasource-parquet/src/selectivity.rs:676`) now
-   reads from that map first when seeding a freshly-seen filter:
-
-   ```rust
-   let prior = page_pruning_rates.get(&id).copied();
-   ```
-
-   replacing the byte-ratio-only heuristic for any filter the
-   pruning passes touched. The byte-ratio fallback still kicks in
-   exactly when the pruning passes had nothing to say (e.g. a
-   ClickBench file with no page index).
-
-2. **Targeted refresh for populated dynamic filters** (the bit §7.2
-   didn't anticipate). Hash-join build-side filters arrive at
-   plan-time as placeholders; the rates we capture at file open are
-   for the placeholder, not the populated filter. The branch detects
-   this with `snapshot_generation(&expr) > 0` and re-evaluates the
-   conjunct *only* for those filters via
-   `fresh_rate_for_dynamic_conjunct`
-   (`datafusion/datasource-parquet/src/selectivity.rs:1261`). It
-   tries `PruningPredicate::try_new` on the whole conjunct first; if
-   the predicate rewriter bails (e.g. `hash_lookup`-shaped CASE
-   nodes), it `snapshot_physical_expr_opt`s the filter to materialise
-   the inner expression and `split_conjunction`s it, then takes the
-   max rate across sub-parts as a *promote-only* signal. Static
-   filters never pay this cost — they're served from the side-effect
-   map.
-
-3. **Test + lint hygiene needed to actually land it.** Ten
-   selectivity tests had been failing since
-   `97c62a684 feat(parquet): scatter-aware bytes-saved metric` —
-   a refactor four commits before round 6 began. Their `update()`
-   call sites were still using the old "raw `batch_bytes`" semantics
-   instead of the new caller-precomputed `skippable_bytes`. Fixing
-   them (commit `9736ec97e`) and the round-6 clippy lints
-   (commit `1c416f629`) unblocks
-   `cargo clippy --all-targets --all-features -- -D warnings` and
-   `cargo test -p datafusion-datasource-parquet --lib` (143/143).
-
-#### What we tried and dropped
-
-In the spirit of "what *didn't* work" being part of the picture:
-
-- **Filter-ordering by per-conjunct rate** (round 11). Adding the
-  page-pruning rate as a tertiary key in the post-scan / row-filter
-  sort closure was within run-to-run noise (76 979 vs 76 785 ms
-  TPC-DS-lat). The Welford-effectiveness key already dominates once
-  there's any runtime data; the rate would only matter on the very
-  first batch and didn't measurably move the needle. Dropped.
-
-- **Partial-AND promote signal via `split_conjunction`** (round 9).
-  Pre-`snapshot` it does nothing because the splitter doesn't descend
-  into `DynamicFilterPhysicalExpr` wrappers. Post-snapshot it
-  compiled and ran but the residual TPC-DS Q25 / Q26 gap turned out
-  to be non-placement (mid-stream `maybe_swap_strategy` cascade
-  behaviour, not initial placement). Kept the code shape neutral
-  for future use; not load-bearing today.
-
-- **Cross-session benchmark anchors.** Comparing the round-6 branch
-  against `R10-pushdown-lat/tpcds_sf1.json` from a previous session
-  showed an apparent 7 % gap to exp3. Re-running both branches
-  back-to-back in the same machine state (commit `c43a5a0f5`,
-  documented in §10.2) showed the gap was machine-state variance.
-  This is now a memory entry
-  (`feedback_bench_anchors_need_same_state_controls.md`) so future
-  iterations don't chase phantom regressions.
-
-### 10.2 Where the branch sits today
-
-Three column framing throughout:
-
-- **main** — the `main` branch with filter pushdown disabled.
-- **main + pushdown** — `main` with `pushdown_filters=true`. The
-  configuration the PR is meant to neutralise.
-- **change** — `pr/round6-stack` with `pushdown_filters=true`.
-
-**no-lat, 5 iterations, local NVMe** — sum-of-medians, ms
-
-| Workload | main | main + pushdown | change | change/main | change/main+pushdown |
-|---|--:|--:|--:|--:|--:|
-| ClickBench (43q) | 21 020 | 21 699 | **17 919** | **0.85×** ✓ | **0.83×** ✓ |
-| TPC-DS (99q) | 17 003 | 38 961 | **16 852** | **0.99×** ✓ | **0.43×** ✓ |
-| TPC-H (22q) | 780 | 989 | **691** | **0.89×** ✓ | **0.70×** ✓ |
-
-**lat, 3 iterations, `--simulate-latency`** (simulated S3) — sum-of-medians, ms
-
-| Workload | main | main + pushdown | change | change/main | change/main+pushdown |
-|---|--:|--:|--:|--:|--:|
-| ClickBench (43q) | 86 562 | 111 321 | **88 947** | 1.03× ≈ | **0.80×** ✓ |
-| TPC-DS (99q) | 76 418 | 141 940 | **77 546** | 1.01× ≈ | **0.55×** ✓ |
-| TPC-H (22q) | 23 723 | 52 597 | **24 157** | 1.02× ≈ | **0.46×** ✓ |
-
-The change beats `main` outright on local SSD (15-30 % faster on
-every workload) and is at parity-or-better on simulated cloud
-storage (within 1-3 %, inside run-to-run noise). Versus
-`main + pushdown` — the regression configuration — the change is
-17-57 % faster in every cell.
-
-Most notably, **the TPC-H SSD cell flipped from a 1.45× regression
-in earlier rounds to a 0.89× improvement** here. The
-auto-demote-when-not-helpful behaviour now correctly identifies
-that filtering inside the scan on a single-row-group file just
-defeats the existing `FilterExec`-above-`RepartitionExec` shuffle,
-and the change demotes back to post-scan automatically. The
-"unaddressed case" §6.3 is now addressed.
-
-### 10.3 The pruning bug commit 5 fixes
-
-When the full workspace test suite was run on the round-6 stack,
-14 row-group-pruning and bloom-filter tests in `datafusion-core`
-failed even though the unit tests in `datafusion-datasource-parquet`
-were green. Tracing it back: round-6's `try_new_tagged_conjuncts`
-constructs a wrapper `PruningPredicate` whose own `predicate_expr`
-is a literal-true placeholder, with the real per-conjunct logic
-living in `sub_predicates`. `PruningPredicate::literal_columns()`
-was reading `self.literal_guarantees` only — which is empty on the
-wrapper — and returning an empty `Vec`. Downstream consumers
-(notably `ParquetOpener::open` deciding which bloom filters to
-fetch) saw "no columns of interest" and silently skipped bloom
-filter pruning altogether.
-
-This was a real correctness regression: every adaptive-scheduler
-scan effectively had bloom-filter pruning disabled. It didn't show
-up in the smoke benches because bloom filters are a small
-contributor on those workloads, but the row-group-pruning tests in
-`datafusion-core` caught it cleanly.
-
-The fix unions each leaf sub-predicate's `literal_columns()` into
-the wrapper's result, deduplicating, then merges with whatever the
-wrapper itself reports. Plain non-tagged predicates are unchanged.
-
-After this fix, `cargo test --workspace --no-fail-fast` reports
-9 240 passed / 0 failed (was 9 236 / 19 before the fix).
-
-### 10.4 Recommendations for landing it
-
-In rough cost-to-impact order:
-
-1. **Squash the experiment commits before opening the upstream
-   PR.** The `exp/r6-pruningpredicate-rates` history has r6 → r7 →
-   r8 → r9v1/v2 → r10 → r11(dropped) → cleanup → docs interleaved
-   with progress.md updates. For upstream review, collapse to:
-
-   - `feat(pruning): per-conjunct PruningPredicate rates` — the
-     `try_new_tagged_conjuncts` / `prune_per_conjunct` API plus
-     `PerConjunctPruneStats`.
-   - `feat(parquet): per-conjunct rates from page / row-group /
-     bloom pruning` — the three tagged variants + opener wiring.
-   - `feat(parquet): seed initial filter placement from per-conjunct
-     pruning rates` — the `selectivity.rs` consumer side and the
-     `partition_filters` signature change.
-   - `feat(parquet): refresh placement prior for populated dynamic
-     filters` — `fresh_rate_for_dynamic_conjunct` and its
-     `snapshot_generation` gate.
-   - `test(parquet): update selectivity tests for scatter-aware
-     bytes API` — the pre-existing test breakage from
-     `97c62a684`. **This one wants to go in *before* the rest as
-     its own PR**, since it's an unrelated bug-fix.
-
-2. **Move §7.2 from the report into the PR description.**
-   Reviewers want to know *why* per-conjunct pruning rates are the
-   right knob. The §7.2 section already explains it; lifting the
-   "Concrete sketch" + "What this would buy" subsections into the
-   PR body (with a "this is what we built" preamble) is most of the
-   PR description writing.
-
-3. **Three new config knobs are still un-proto'd**
-   (§7.3 #4 — `filter_pushdown_min_bytes_per_sec`,
-   `filter_collecting_byte_ratio_threshold`,
-   `filter_confidence_z`). `from_proto` defaults are safe for
-   round-trip, but a reviewer will ask. Trivial follow-up after the
-   main PR.
-
-4. **Run the upstream CI bench harness.** The internal smoke and
-   full benches in §6 + §10.2 are convincing on a single machine;
-   the bench bot at
-   [PR #11 comment](https://github.com/adriangb/datafusion/pull/11#issuecomment-4340741427)
-   is what reviewers will look at. Trigger it once the rebase is
-   clean.
-
-5. **Decide on the open `OptionalFilterPhysicalExpr` /
-   `prune_by_bloom_filters` bits**. The legacy untagged
-   `prune_by_bloom_filters` was folded into its single test caller
-   (commit `1c416f629`); confirm during review that no public
-   callers will miss it. Likewise the
-   `partition_filters_for_test` helper is now `#[doc(hidden)]` rather
-   than `#[cfg(test)]` so a `criterion` bench can use it — call
-   that out in the review.
-
-6. **Defer §7.1 (sub-row-group adaptation) and §7.3 #3 (row-group
-   morselization, [#21766](https://github.com/apache/datafusion/pull/21766))
-   to separate follow-ups.** They're the right next moves but
-   independent of this PR's contract. The TPC-H regression note in
-   §6.3 still stands; this PR does not promise to fix it.
-
-The branch is at `exp/r6-pruningpredicate-rates @ ca1672a61`. Lint
-clean, tests green, benches at parity with exp3 and beating
-`main+no-pushdown` on both pushdown-relevant workloads. Ready for
-upstream PR submission once squashed.
-

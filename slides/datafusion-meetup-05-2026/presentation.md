@@ -40,8 +40,8 @@ style: |
 Slide 1 — title (~15s):
 
 - pushdown_filters today: per-query lottery
-- this PR: removes the lottery at the decoder level
-- takeaway: never slower than main_on, within a few % of main_off
+- proposal: remove the lottery at the decoder level
+- bar: never slower than `pushdown=off` on main, on every workload tested
 -->
 
 ---
@@ -52,14 +52,14 @@ Slide 1 — title (~15s):
 
 | Mode | Decode pattern per row group | Cost when filter is unselective |
 |---|---|---|
-| `pushdown=off` | decode all projected cols → one coalesced read, one big mask post-decode | none — filter is a `FilterExec` after the scan |
-| `pushdown=on` | **decode filter cols first → evaluate predicate → build `RowSelection` → skip pages / decode only surviving rows for the projection** | per-batch ArrowPredicate eval cost; extra I/O for any filter col **not in the projection**; possible double-decode of filter cols **also in the projection** |
+| `pushdown=off` | decode all projected cols → one coalesced read, filter mask above the scan | none beyond the mask — filter is a `FilterExec` after the scan |
+| `pushdown=on` | **decode filter cols first → evaluate predicate → build `RowSelection` → skip pages / decode only surviving rows of the projection** | per-batch ArrowPredicate eval cost; extra I/O for filter cols **not in the projection**; possible double-decode of filter cols **also in the projection** |
 
 <br>
 
-The community has wanted `pushdown_filters` on by default for years
-([#3463](https://github.com/apache/datafusion/issues/3463)) — but you can't until
-the lottery is fixed ([#20324](https://github.com/apache/datafusion/issues/20324)).
+`pushdown_filters` on by default has been an open ask for years
+([#3463](https://github.com/apache/datafusion/issues/3463)) — blocked by exactly
+this lottery ([#20324](https://github.com/apache/datafusion/issues/20324)).
 
 <!--
 Slide 2 — the lottery (~60s):
@@ -72,7 +72,7 @@ Slide 2 — the lottery (~60s):
 
 ---
 
-# The solution: per-filter, adaptive, in-decoder
+# The proposal: per-filter, adaptive, in-decoder
 
 <br>
 
@@ -81,7 +81,8 @@ Slide 2 — the lottery (~60s):
                 │   New    │                   - rows seen / matched
                 └─────┬────┘                   - eval time (ns)
                       │  initial placement     - bytes seen
-                      │  from byte ratio       - Welford running stats
+                      │  from per-conjunct     - Welford running stats
+                      │  pruning rate
         ┌─────────────┴─────────────┐
         ▼                           ▼        decision metric:
   ┌──────────┐  promote   ┌──────────────┐     scatter-aware
@@ -92,15 +93,16 @@ Slide 2 — the lottery (~60s):
                                               OptionalFilterPhysicalExpr)
 ```
 
-<span class="highlight">Decoder swaps strategy at every row-group boundary</span> — same `ParquetPushDecoder`, same `BoxStream`, fresh `RowFilter`. `PushBuffers` carries through (already-fetched bytes that survive the swap are reused).
+<span class="highlight">Decoder swaps strategy at every row-group boundary</span> — same `ParquetPushDecoder`, same `BoxStream`, fresh `RowFilter`. `PushBuffers` carries through, so already-fetched bytes that survive the swap are reused.
 
 <!--
-Slide 3 — solution (~60s):
+Slide 3 — proposal (~60s):
 
 - each conjunct gets a FilterId; SelectivityTracker per ParquetSource keeps Welford stats
+- initial placement comes from per-conjunct pruning rates emitted as a side-effect of the existing page-index / row-group / bloom passes
 - decision metric: scatter-aware bytes-saved-per-second (counts only sub-batch windows the filter empties)
 - one-sided CI (z=2.0) gates promote/demote — no yo-yoing on noisy samples
-- arrow-rs companion: can_swap_strategy / swap_strategy at RG boundaries; PushBuffers reused
+- companion arrow-rs change: can_swap_strategy / swap_strategy at RG boundaries; PushBuffers reused
 - OptionalFilterPhysicalExpr (hash-join dyn filters) can be dropped when CPU-dominated
 -->
 
