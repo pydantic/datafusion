@@ -151,24 +151,25 @@ Slide 5 — TPC-DS SSD (~45s):
 
 ---
 
-# TPC-H SF1 · SSD — the lopsided-partition case
+# TPC-H SF1 · SSD — the single-row-group case
 
 ![w:52% center](img/tpch_nolat.png)
 
 <div class="takeaway">
 
 `main + pushdown` regresses **27 %** on a workload that is mostly *not* about filters. **`change` 691 ms — 11 % *faster* than `main`, 30 % faster than `main + pushdown`.**
-TPC-H's `lineitem` is a single file with a single row group. The change demotes the in-scan filter to post-scan automatically, which lets the existing `FilterExec`-above-`RepartitionExec` shuffle do its job and re-balance partition skew.
+TPC-H's `lineitem` is a single file with a single row group, so the picks have to be right on file open. The pruning-rate prior promotes the filters that benefit — Q18's `l_quantity IN (subquery)` dynamic filter lands at **0.59× of `main`** (46 of the 89 ms total delta), and Q1/Q3/Q19 contribute smaller page-skipping wins on selective predicates.
 
 </div>
 
 <!--
 Slide 6 — TPC-H SSD (~60s):
 
-- main_off runs the filter as FilterExec *after* RepartitionExec → shuffle re-balances skew
-- main+pushdown does in-scan filter, skips shuffle → partition skew, one slow partition gating
-- change auto-detects 'this filter isn't pulling its weight' and demotes to post-scan; result lands faster than main even
-- TPC-H regression noted in earlier rounds was a side effect of *not* yet auto-demoting; now it does
+- single-row-group files have no swap point inside the file → initial placement is the only placement, and the per-conjunct pruning-rate prior is doing the real work here
+- Q18's `l_quantity IN (subquery)` is the canonical hash-join dynamic filter; dynamic-filter refresh re-evaluates the prior once the build publishes → row-level → 0.59×, ~46 ms saved
+- Q1/Q3/Q19 smaller wins from page-skipping on selective predicates
+- post-scan-placed filters run inside the parquet opener instead of a separate FilterExec above the scan; equivalent cost — not a win by itself
+- not partition-skew re-balance — that's row-group morselization (#21766), separate work
 -->
 
 ---

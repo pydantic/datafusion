@@ -275,11 +275,11 @@ img[alt~=&quot;center&quot;] { display: block; margin: 0 auto; }
 .takeaway { font-size: 19px; margin-top: 8px; line-height: 1.35; }
 .takeaway p { margin: 4px 0; }
 ;" data-marpit-pagination-total="8" data-size="16:9">
-<h1 id="tpc-h-sf1--ssd--the-lopsided-partition-case">TPC-H SF1 · SSD — the lopsided-partition case</h1>
+<h1 id="tpc-h-sf1--ssd--the-single-row-group-case">TPC-H SF1 · SSD — the single-row-group case</h1>
 <p><img src="img/tpch_nolat.png" alt="center" /></p>
 <div class="takeaway">
 <p><code>main + pushdown</code> regresses <strong>27 %</strong> on a workload that is mostly <em>not</em> about filters. <strong><code>change</code> 691 ms — 11 % <em>faster</em> than <code>main</code>, 30 % faster than <code>main + pushdown</code>.</strong><br />
-TPC-H's <code>lineitem</code> is a single file with a single row group. The change demotes the in-scan filter to post-scan automatically, which lets the existing <code>FilterExec</code>-above-<code>RepartitionExec</code> shuffle do its job and re-balance partition skew.</p>
+TPC-H's <code>lineitem</code> is a single file with a single row group, so the picks have to be right on file open. The pruning-rate prior promotes the filters that benefit — Q18's <code>l_quantity IN (subquery)</code> dynamic filter lands at <strong>0.59× of <code>main</code></strong> (46 of the 89 ms total delta), and Q1/Q3/Q19 contribute smaller page-skipping wins on selective predicates.</p>
 </div>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="7" data-paginate="true" data-theme="default" data-style="section {
@@ -413,10 +413,11 @@ img[alt~=&quot;center&quot;] { display: block; margin: 0 auto; }
 - change keeps it PostScan until the build publishes a useful predicate
 - single-query speedup on Q64 dominates the totals (CI bench's &quot;1.80× total speedup&quot; is essentially this query)</p></div><div class="bespoke-marp-note" data-index="5" tabindex="0"><p>Slide 6 — TPC-H SSD (~60s):
 
-- main_off runs the filter as FilterExec *after* RepartitionExec → shuffle re-balances skew
-- main+pushdown does in-scan filter, skips shuffle → partition skew, one slow partition gating
-- change auto-detects 'this filter isn't pulling its weight' and demotes to post-scan; result lands faster than main even
-- TPC-H regression noted in earlier rounds was a side effect of *not* yet auto-demoting; now it does</p></div><div class="bespoke-marp-note" data-index="6" tabindex="0"><p>Slide 7 — TPC-H S3 (~60s):
+- single-row-group files have no swap point inside the file → initial placement is the only placement, and the per-conjunct pruning-rate prior is doing the real work here
+- Q18's `l_quantity IN (subquery)` is the canonical hash-join dynamic filter; dynamic-filter refresh re-evaluates the prior once the build publishes → row-level → 0.59×, ~46 ms saved
+- Q1/Q3/Q19 smaller wins from page-skipping on selective predicates
+- post-scan-placed filters run inside the parquet opener instead of a separate FilterExec above the scan; equivalent cost — not a win by itself
+- not partition-skew re-balance — that's row-group morselization (#21766), separate work</p></div><div class="bespoke-marp-note" data-index="6" tabindex="0"><p>Slide 7 — TPC-H S3 (~60s):
 
 - &quot;S3&quot; = `--simulate-latency` (20-200ms per OS op); didn't hit real AWS, profile matches any cloud store
 - main+pushdown regression amplifies to 2.22× under latency (vs 27% on SSD)

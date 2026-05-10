@@ -201,18 +201,17 @@ because *files* are the unit of distribution.
     p2 ▮▮▮▮                  ← partial prune
     …
        └────────── stragglers gate the whole stage ──────────┘
-
-    pushdown=off, FilterExec after RepartitionExec(hash) re-balances:
-    ─────────────────────────────────────────────────────────────────
-    p0 ▮▮▮  p1 ▮▮▮  p2 ▮▮▮  …
 ```
 
-Problem B's actual fix is **morselized scans**: today the morsel
+Problem B's fix is **morselized scans**: today the morsel
 granularity is per-file; the future direction is per-row-group (or
 sub-chunk), so that one ill-fortuned file can't gate a stage. That
 work is tracked at
 [#21766](https://github.com/apache/datafusion/pull/21766) and is
-independent of this proposal.
+independent of this proposal. Filter placement (the scope of the
+change in this proposal) only governs *which* filter runs *where*
+inside a single scan's per-partition stream; it does not
+redistribute work across partitions.
 
 ---
 
@@ -509,19 +508,39 @@ TPC-H by 45 % vs `main + pushdown=off` because the in-decoder
 scheduler had nowhere to swap *within* the file — once initial
 placement was wrong, it stayed wrong for the whole file.
 
-The change inverts that result. The Welford runtime samples cause
-the tracker to demote unhelpful in-scan filters to post-scan very
-quickly, and the resulting plan looks like
-`FilterExec` above `RepartitionExec`-style execution — which is
-exactly the plan shape on `main + pushdown=off`. So TPC-H lands at
-**0.89× of `main`**, not just at parity: the demote-to-post-scan
-path lets the existing shuffle re-balance partition skew, and the
-overall result beats both `main` configurations.
+The change inverts that result and lands at **0.89× of `main`** —
+better than either `main` configuration. The story is entirely
+about correct row-level placement on the filters that benefit:
+
+- **Q18 is the headline.** Its `l_quantity IN (subquery)` is the
+  canonical hash-join dynamic filter. Once the build side
+  publishes a populated predicate, the dynamic-filter refresh
+  (§3.3) re-evaluates the prior and promotes it to row-level. Q18
+  lands at **0.59× of `main`** — 46 ms saved on a 110 ms baseline,
+  more than half the aggregate 89 ms delta.
+- **Q1, Q3, Q19 contribute smaller wins** (0.81–0.86×) from
+  row-level placement on selective date and range predicates that
+  generate sparse `RowSelection`s and let the projection skip
+  pages.
+- **The post-scan-placed filters wash.** When the scheduler picks
+  post-scan placement, the filter runs inside the parquet opener
+  (`apply_post_scan_filters_with_stats`) rather than via a
+  `FilterExec` operator above the scan as `main + pushdown=off`
+  would. The two paths are equivalent in cost — the in-scan
+  application doesn't buy anything by itself. The win is the
+  correct row-level placement on the queries above, not the
+  in-scan-vs-above-scan choice for the rest.
 
 Per-query, every TPC-H query is at parity-or-better vs `main`; the
 worst pushdown regressions on `main` (Q17 1.90×, Q12 1.89×, Q22
 1.74×, Q9 1.66×, Q15 1.55×) all collapse to within 5 % of `main`
 on the change.
+
+The post-scan path is per-partition — there is no shuffle
+re-balance involved. Cross-partition skew on single-row-group
+files (one file's worth of work concentrated on one partition) is
+out of scope for this change; the fix is row-group morselization
+([#21766](https://github.com/apache/datafusion/pull/21766)).
 
 ### 4.4 The `--simulate-latency` profile
 
