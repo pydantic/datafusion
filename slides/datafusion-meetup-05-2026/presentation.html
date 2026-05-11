@@ -146,12 +146,9 @@ img[alt~=&quot;center&quot;] { display: block; margin: 0 auto; }
 <h1 id="when-pushdown-wins-big">When pushdown wins big</h1>
 <pre is="marp-pre" data-auto-scaling="downscale-only"><code class="language-sql"><span class="hljs-keyword">SELECT</span> <span class="hljs-operator">*</span>
 <span class="hljs-keyword">FROM</span> hits
-<span class="hljs-keyword">WHERE</span> &quot;URL&quot; <span class="hljs-keyword">LIKE</span> <span class="hljs-string">&#x27;%google%&#x27;</span>
-<span class="hljs-keyword">ORDER</span> <span class="hljs-keyword">BY</span> &quot;EventTime&quot;
-LIMIT <span class="hljs-number">10</span>;
+<span class="hljs-keyword">WHERE</span> &quot;URL&quot; <span class="hljs-keyword">LIKE</span> <span class="hljs-string">&#x27;%google%&#x27;</span>;
 </code></pre>
 <br />
-<p><code>main</code> 3 612 ms → <code>main + pushdown</code> <strong>121 ms</strong> — <span class="highlight"><strong>30× faster</strong> ✓</span></p>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="4" data-paginate="true" data-theme="default" data-style="section {
   font-family: -apple-system, &quot;Helvetica Neue&quot;, Arial, sans-serif;
@@ -187,16 +184,11 @@ img[alt~=&quot;center&quot;] { display: block; margin: 0 auto; }
 .takeaway p { margin: 4px 0; }
 ;" data-marpit-pagination-total="10" data-size="16:9">
 <h1 id="when-pushdown-loses-big">When pushdown loses big</h1>
-<pre is="marp-pre" data-auto-scaling="downscale-only"><code class="language-sql"><span class="hljs-keyword">SELECT</span> &quot;SearchEngineID&quot;, &quot;ClientIP&quot;, <span class="hljs-built_in">COUNT</span>(<span class="hljs-operator">*</span>) <span class="hljs-keyword">AS</span> c,
-       <span class="hljs-built_in">SUM</span>(&quot;IsRefresh&quot;), <span class="hljs-built_in">AVG</span>(&quot;ResolutionWidth&quot;)
+<pre is="marp-pre" data-auto-scaling="downscale-only"><code class="language-sql"><span class="hljs-keyword">SELECT</span> &quot;SearchEngineID&quot;, &quot;SearchPhrase&quot;
 <span class="hljs-keyword">FROM</span> hits
-<span class="hljs-keyword">WHERE</span> &quot;SearchPhrase&quot; <span class="hljs-operator">&lt;&gt;</span> <span class="hljs-string">&#x27;&#x27;</span>
-<span class="hljs-keyword">GROUP</span> <span class="hljs-keyword">BY</span> &quot;SearchEngineID&quot;, &quot;ClientIP&quot;
-<span class="hljs-keyword">ORDER</span> <span class="hljs-keyword">BY</span> c <span class="hljs-keyword">DESC</span>
-LIMIT <span class="hljs-number">10</span>;
+<span class="hljs-keyword">WHERE</span> &quot;SearchPhrase&quot; <span class="hljs-operator">&lt;&gt;</span> <span class="hljs-string">&#x27;&#x27;</span>;
 </code></pre>
 <br />
-<p><code>main</code> 276 ms → <code>main + pushdown</code> <strong>547 ms</strong> — <span class="warn"><strong>1.98× slower</strong> ✗</span></p>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="5" data-paginate="true" data-theme="default" data-style="section {
   font-family: -apple-system, &quot;Helvetica Neue&quot;, Arial, sans-serif;
@@ -286,8 +278,7 @@ img[alt~=&quot;center&quot;] { display: block; margin: 0 auto; }
 <h1 id="clickbench-partitioned--ssd">ClickBench partitioned · SSD</h1>
 <p><img src="img/clickbench_nolat.png" alt="center" /></p>
 <div class="takeaway">
-<p><strong><code>change</code> 17.9 s — 15 % faster than <code>main</code>, 17 % faster than <code>main + pushdown</code>.</strong><br />
-<strong>Q23</strong>: <code>SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10</code>. Row-group stats can't help (<code>LIKE</code> has no min/max); the win comes from <strong>row-level eval → sparse <code>RowSelection</code> → page-skipping (late materialization)</strong>.</p>
+<p><strong>Q23</strong>: <code>SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10</code>.</p>
 </div>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="7" data-paginate="true" data-theme="default" data-style="section {
@@ -326,8 +317,7 @@ img[alt~=&quot;center&quot;] { display: block; margin: 0 auto; }
 <h1 id="tpc-ds-sf1--ssd--q64-carries-the-day">TPC-DS SF1 · SSD — Q64 carries the day</h1>
 <p><img src="img/tpcds_nolat.png" alt="center" /></p>
 <div class="takeaway">
-<p><code>main + pushdown</code> regresses <strong>2.3×</strong> vs <code>main</code>. <strong><code>change</code> 16.9 s — 1 % <em>faster</em> than <code>main</code>, 2.3× faster than <code>main + pushdown</code>.</strong><br />
-<strong>Q64</strong>: chained hash joins on <code>store_sales</code> publish <code>key BETWEEN min AND max</code> dynamic filters that aren't selective enough on this data to pay for row-level. <code>main + pushdown</code> runs them all row-level regardless; the change re-evaluates each populated dynamic filter's pruning rate against row-group stats and keeps the unselective ones post-scan.</p>
+<p><strong>Q64</strong>: chained hash joins on <code>store_sales</code> publish <code>key BETWEEN min AND max</code> dynamic filters that aren't selective enough on this data to pay for row-level. <code>main + pushdown</code> runs them all row-level regardless; the change re-evaluates each populated dynamic filter's pruning rate against row-group stats and keeps the unselective ones post-scan.</p>
 </div>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="8" data-paginate="true" data-theme="default" data-style="section {
@@ -366,7 +356,8 @@ img[alt~=&quot;center&quot;] { display: block; margin: 0 auto; }
 <h1 id="tpc-h-sf1--ssd--the-single-row-group-case">TPC-H SF1 · SSD — the single-row-group case</h1>
 <p><img src="img/tpch_nolat.png" alt="center" /></p>
 <div class="takeaway">
-<p><strong><code>change</code> 691 ms — 11 % <em>faster</em> than <code>main</code>, 30 % faster than <code>main + pushdown</code>.</strong> TPC-H's <code>lineitem</code> is one file of one row group, so the picks have to be right on file open. The pruning-rate prior promotes the filters that benefit: <strong>Q18</strong>'s <code>l_quantity IN (subquery)</code> dynamic filter lands at <strong>0.59× of <code>main</code></strong> (46 of the 89 ms total delta); Q1/Q3/Q19 contribute smaller page-skipping wins.</p>
+<p>TPC-H's <code>lineitem</code> is one file of one row group, so the picks have to be right on file open.<br />
+The pruning-rate prior promotes the filters that benefit: <strong>Q18</strong>'s <code>l_quantity IN (subquery)</code> dynamic filter lands at <strong>0.59× of <code>main</code></strong> (46 of the 89 ms total delta); Q1/Q3/Q19 contribute smaller page-skipping wins.</p>
 </div>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="9" data-paginate="true" data-theme="default" data-style="section {
@@ -405,7 +396,7 @@ img[alt~=&quot;center&quot;] { display: block; margin: 0 auto; }
 <h1 id="switch-from-ssd-to-s3-the-picture-amplifies">Switch from SSD to S3: the picture amplifies</h1>
 <p><img src="img/tpch_lat.png" alt="center" /></p>
 <div class="takeaway">
-<p>Same TPC-H, <strong>simulated S3.</strong> <code>main + pushdown</code> regresses <strong>2.2×</strong> (52.6 s vs 23.7 s). <strong><code>change</code> 24.2 s — 1.02× of <code>main</code> ≈ flat; 0.46× of <code>main + pushdown</code>.</strong><br />
+<p>Same TPC-H, <strong>simulated S3.</strong> <code>main + pushdown</code> regresses <strong>2.2x×</strong> (52.6 s vs 23.7 s). <strong><code>change</code> 24.2 s — 1.02× of <code>main</code> ≈ flat; 0.46× of <code>main + pushdown</code>.</strong><br />
 Latency multipliers vs SSD: main 30×, main + pushdown 53×, change 35×. <code>pushdown=on</code> on <code>main</code> issues many small I/Os and pays a round-trip per range; the change avoids that by demoting unhelpful filters to post-scan automatically.</p>
 </div>
 </section>
@@ -484,11 +475,11 @@ img[alt~=&quot;center&quot;] { display: block; margin: 0 auto; }
 - on object storage (20–200ms RTT) the loss case is catastrophic
 - #3463 (open since 2022): &quot;pushdown_filters on by default&quot; — blocked by exactly this lottery</p></div><div class="bespoke-marp-note" data-index="2" tabindex="0"><p>Slide 3 — pushdown wins big (~30s):
 
-- ClickBench Q23. Selective LIKE filter, wide `SELECT *` projection.
+- Approx ClickBench Q23. Selective LIKE filter, wide `SELECT *` projection.
 - Row-level eval produces a sparse RowSelection (very few rows match) → page-skipping for the projection cols (late materialization).
 - RG stats can't help — LIKE has no min/max bound. The win is purely from row-level evaluation enabling page-skipping.</p></div><div class="bespoke-marp-note" data-index="3" tabindex="0"><p>Slide 4 — pushdown loses big (~30s):
 
-- ClickBench Q30. `&quot;SearchPhrase&quot; &lt;&gt; ''` is mandatory but unselective (most rows match).
+- Approx ClickBench Q30. `&quot;SearchPhrase&quot; &lt;&gt; ''` is mandatory but unselective (most rows match).
 - Row-level eval does no row-skipping (RowSelection still ~all rows), but pays per-batch ArrowPredicate eval cost on every batch.
 - `SearchPhrase` isn't in the projection → extra column read for the filter.
 - Same lottery flag, opposite outcome on the same dataset — and the user can't tell which way it'll go just by looking at the query.</p></div><div class="bespoke-marp-note" data-index="4" tabindex="0"><p>Slide 5 — proposal (~60s):

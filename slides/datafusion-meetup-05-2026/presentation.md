@@ -77,19 +77,15 @@ Slide 2 — the lottery (~60s):
 ```sql
 SELECT *
 FROM hits
-WHERE "URL" LIKE '%google%'
-ORDER BY "EventTime"
-LIMIT 10;
+WHERE "URL" LIKE '%google%';
 ```
 
 <br>
 
-`main` 3 612 ms → `main + pushdown` **121 ms** — <span class="highlight">**30× faster** ✓</span>
-
 <!--
 Slide 3 — pushdown wins big (~30s):
 
-- ClickBench Q23. Selective LIKE filter, wide `SELECT *` projection.
+- Approx ClickBench Q23. Selective LIKE filter, wide `SELECT *` projection.
 - Row-level eval produces a sparse RowSelection (very few rows match) → page-skipping for the projection cols (late materialization).
 - RG stats can't help — LIKE has no min/max bound. The win is purely from row-level evaluation enabling page-skipping.
 -->
@@ -99,23 +95,17 @@ Slide 3 — pushdown wins big (~30s):
 # When pushdown loses big
 
 ```sql
-SELECT "SearchEngineID", "ClientIP", COUNT(*) AS c,
-       SUM("IsRefresh"), AVG("ResolutionWidth")
+SELECT "SearchEngineID", "SearchPhrase"
 FROM hits
-WHERE "SearchPhrase" <> ''
-GROUP BY "SearchEngineID", "ClientIP"
-ORDER BY c DESC
-LIMIT 10;
+WHERE "SearchPhrase" <> '';
 ```
 
 <br>
 
-`main` 276 ms → `main + pushdown` **547 ms** — <span class="warn">**1.98× slower** ✗</span>
-
 <!--
 Slide 4 — pushdown loses big (~30s):
 
-- ClickBench Q30. `"SearchPhrase" <> ''` is mandatory but unselective (most rows match).
+- Approx ClickBench Q30. `"SearchPhrase" <> ''` is mandatory but unselective (most rows match).
 - Row-level eval does no row-skipping (RowSelection still ~all rows), but pays per-batch ArrowPredicate eval cost on every batch.
 - `SearchPhrase` isn't in the projection → extra column read for the filter.
 - Same lottery flag, opposite outcome on the same dataset — and the user can't tell which way it'll go just by looking at the query.
@@ -165,8 +155,7 @@ Slide 5 — proposal (~60s):
 
 <div class="takeaway">
 
-**`change` 17.9 s — 15 % faster than `main`, 17 % faster than `main + pushdown`.**
-**Q23**: `SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`. Row-group stats can't help (`LIKE` has no min/max); the win comes from **row-level eval → sparse `RowSelection` → page-skipping (late materialization)**.
+**Q23**: `SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`.
 
 </div>
 
@@ -186,7 +175,6 @@ Slide 6 — ClickBench SSD (~60s):
 
 <div class="takeaway">
 
-`main + pushdown` regresses **2.3×** vs `main`. **`change` 16.9 s — 1 % *faster* than `main`, 2.3× faster than `main + pushdown`.**
 **Q64**: chained hash joins on `store_sales` publish `key BETWEEN min AND max` dynamic filters that aren't selective enough on this data to pay for row-level. `main + pushdown` runs them all row-level regardless; the change re-evaluates each populated dynamic filter's pruning rate against row-group stats and keeps the unselective ones post-scan.
 
 </div>
@@ -210,7 +198,8 @@ Slide 7 — TPC-DS SSD (~45s):
 
 <div class="takeaway">
 
-**`change` 691 ms — 11 % *faster* than `main`, 30 % faster than `main + pushdown`.** TPC-H's `lineitem` is one file of one row group, so the picks have to be right on file open. The pruning-rate prior promotes the filters that benefit: **Q18**'s `l_quantity IN (subquery)` dynamic filter lands at **0.59× of `main`** (46 of the 89 ms total delta); Q1/Q3/Q19 contribute smaller page-skipping wins.
+TPC-H's `lineitem` is one file of one row group, so the picks have to be right on file open.
+The pruning-rate prior promotes the filters that benefit: **Q18**'s `l_quantity IN (subquery)` dynamic filter lands at **0.59× of `main`** (46 of the 89 ms total delta); Q1/Q3/Q19 contribute smaller page-skipping wins.
 
 </div>
 
@@ -232,7 +221,7 @@ Slide 8 — TPC-H SSD (~60s):
 
 <div class="takeaway">
 
-Same TPC-H, **simulated S3.** `main + pushdown` regresses **2.2×** (52.6 s vs 23.7 s). **`change` 24.2 s — 1.02× of `main` ≈ flat; 0.46× of `main + pushdown`.**
+Same TPC-H, **simulated S3.** `main + pushdown` regresses **2.2x×** (52.6 s vs 23.7 s). **`change` 24.2 s — 1.02× of `main` ≈ flat; 0.46× of `main + pushdown`.**
 Latency multipliers vs SSD: main 30×, main + pushdown 53×, change 35×. `pushdown=on` on `main` issues many small I/Os and pays a round-trip per range; the change avoids that by demoting unhelpful filters to post-scan automatically.
 
 </div>
