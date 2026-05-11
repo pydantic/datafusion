@@ -304,26 +304,31 @@ starts.
 
 ### 3.3 Refresh prior for populated dynamic filters
 
-Hash-join build-side filters are `OptionalFilterPhysicalExpr`-wrapped
-`DynamicFilterPhysicalExpr`s. `HashJoinExec` blocks the probe-side
-stream on `collect_build_side` until the build is fully done — so
-by the time the probe-side `ParquetScan` opens a file, the dynamic
-filter is always populated. What §3.2's static path can't easily
-do is *introspect through the wrapper*: building a per-conjunct
-`PruningPredicate` directly off the wrapper expression doesn't
-yield a useful rate, because the predicate rewriter can't see the
-populated inner expression without an explicit snapshot.
+The §3.2 side-effect path handles the common `col >= lo AND col <=
+hi` bounds shape correctly: `PruningPredicate::try_new` calls
+`snapshot_physical_expr_opt` unconditionally, and both
+`OptionalFilterPhysicalExpr` and `DynamicFilterPhysicalExpr`
+implement `snapshot()` to unwrap to the populated inner expression.
+For ordinary range bounds the static path captures a useful
+per-conjunct rate.
 
-`fresh_rate_for_dynamic_conjunct` snapshots the wrapper and
-evaluates a per-conjunct `PruningPredicate` against the file's
-row-group statistics. It tries the whole conjunct first; if the
-predicate rewriter can't fold the
-`col >= lo AND col <= hi AND hash_lookup(...)` shape into a
-`PruningPredicate`, it splits the snapshotted inner expression and
-takes the max rate across prunable sub-parts, returning that as a
-**promote-only** signal (rate ≥ 0.5). Below 0.5 it returns `None`
-and the standard prior fallback decides — a partial AND
-undercounts and would mislead a demote.
+What the static path *can't* handle is the
+`col >= lo AND col <= hi AND hash_lookup(set, col)` shape that
+hash-join dynamic filters publish in some plans: `hash_lookup` is
+unhandled by `build_predicate_expression`, which flattens the whole
+AND toward always-true, and `try_new_tagged_conjuncts` then skips
+the conjunct. The per-conjunct rate map has no entry for that
+filter.
+
+`fresh_rate_for_dynamic_conjunct` fills that gap for filters with
+`snapshot_generation > 0`. It tries `PruningPredicate::try_new` on
+the whole conjunct first (mostly redundant with the static path,
+kept as a cheap defensive retry); if that fails or returns
+always-true, it snapshots the dynamic filter, `split_conjunction`s
+the inner AND, and evaluates each prunable sub-part separately.
+The max rate across sub-parts is returned as a **promote-only**
+signal (rate ≥ 0.5) — a partial AND undercounts the true rate and
+would mislead a demote.
 
 ### 3.4 Latency-aware confidence shrink
 
