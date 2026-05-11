@@ -72,29 +72,53 @@ Slide 2 — the lottery (~60s):
 
 ---
 
-# The lottery, in numbers
+# When pushdown wins big
+
+```sql
+SELECT *
+FROM hits
+WHERE "URL" LIKE '%google%'
+ORDER BY "EventTime"
+LIMIT 10;
+```
 
 <br>
 
-| Query | `main` | `main + pushdown` | impact |
-|---|--:|--:|--:|
-| ClickBench Q23 — `SELECT * … URL LIKE '%google%'` | 3 612 ms | **121 ms** | <span class="highlight">**30× faster** ✓</span> |
-| ClickBench Q11 — filter col overlaps projection | 98 ms | 94 ms | 1.04× ≈ |
-| ClickBench Q21 — mandatory unselective filter | 859 ms | 1 669 ms | <span class="warn">1.9× slower ✗</span> |
-| TPC-DS Q64 — chained hash-join dynamic filters | 471 ms | **20 010 ms** | <span class="warn">**42× slower** ✗</span> |
-
-<br>
-
-Same data, same query semantics, one flag flipped. Which side of the lottery you land on depends on the *filter*, the *projection*, and the *plan shape* — none of which the user can reason about per query.
+`main` 3 612 ms → `main + pushdown` **121 ms** — <span class="highlight">**30× faster** ✓</span>
 
 <!--
-Slide 2.5 — the lottery in numbers (~45s):
+Slide 3 — pushdown wins big (~30s):
 
-- Q23: tiny projection (`SELECT *` over a wide row but LIMIT 10) + selective LIKE → sparse RowSelection → page-skipping wins big
-- Q11: filter col in projection → predicate cache helps; basically a tie
-- Q21: mandatory unselective filter → row-level pays per-batch eval + extra IO with no payoff
-- Q64: chained dynamic filters publish `key BETWEEN min AND max` from build-side bounds, run row-level across many self-joins of store_sales without recouping the cost → 42× catastrophe
-- the point: same workload (ClickBench has both Q23 and Q21!), opposite outcomes
+- ClickBench Q23. Selective LIKE filter, wide `SELECT *` projection.
+- Row-level eval produces a sparse RowSelection (very few rows match) → page-skipping for the projection cols (late materialization).
+- RG stats can't help — LIKE has no min/max bound. The win is purely from row-level evaluation enabling page-skipping.
+-->
+
+---
+
+# When pushdown loses big
+
+```sql
+SELECT "SearchEngineID", "ClientIP", COUNT(*) AS c,
+       SUM("IsRefresh"), AVG("ResolutionWidth")
+FROM hits
+WHERE "SearchPhrase" <> ''
+GROUP BY "SearchEngineID", "ClientIP"
+ORDER BY c DESC
+LIMIT 10;
+```
+
+<br>
+
+`main` 276 ms → `main + pushdown` **547 ms** — <span class="warn">**1.98× slower** ✗</span>
+
+<!--
+Slide 4 — pushdown loses big (~30s):
+
+- ClickBench Q30. `"SearchPhrase" <> ''` is mandatory but unselective (most rows match).
+- Row-level eval does no row-skipping (RowSelection still ~all rows), but pays per-batch ArrowPredicate eval cost on every batch.
+- `SearchPhrase` isn't in the projection → extra column read for the filter.
+- Same lottery flag, opposite outcome on the same dataset — and the user can't tell which way it'll go just by looking at the query.
 -->
 
 ---
@@ -123,7 +147,7 @@ Slide 2.5 — the lottery in numbers (~45s):
 <span class="highlight">Decoder swaps strategy at every row-group boundary</span> — same `ParquetPushDecoder`, same `BoxStream`, fresh `RowFilter`. `PushBuffers` carries through, so already-fetched bytes that survive the swap are reused.
 
 <!--
-Slide 3 — proposal (~60s):
+Slide 5 — proposal (~60s):
 
 - each conjunct gets a FilterId; SelectivityTracker per ParquetSource keeps Welford stats
 - initial placement comes from per-conjunct pruning rates emitted as a side-effect of the existing page-index / row-group / bloom passes
@@ -147,7 +171,7 @@ Slide 3 — proposal (~60s):
 </div>
 
 <!--
-Slide 4 — ClickBench SSD (~60s):
+Slide 6 — ClickBench SSD (~60s):
 
 - aggregate: change 17.9s vs main 21.0s vs main+pushdown 21.7s (pushdown=on actually loses on main!)
 - Q23 = row-level pushdown poster child: SELECT * + LIKE '%google%'
@@ -168,7 +192,7 @@ Slide 4 — ClickBench SSD (~60s):
 </div>
 
 <!--
-Slide 5 — TPC-DS SSD (~45s):
+Slide 7 — TPC-DS SSD (~45s):
 
 - pushdown=on regresses 2.29× on main (39.0s vs 17.0s); change closes it to slightly under main
 - Q64: chain of HashJoins on store_sales; each publishes a `key BETWEEN min AND max` dynamic filter from the build-side bounds
@@ -191,7 +215,7 @@ Slide 5 — TPC-DS SSD (~45s):
 </div>
 
 <!--
-Slide 6 — TPC-H SSD (~60s):
+Slide 8 — TPC-H SSD (~60s):
 
 - single-row-group files have no swap point inside the file → initial placement is the only placement, and the per-conjunct pruning-rate prior is doing the real work here
 - Q18's `l_quantity IN (subquery)` is the canonical hash-join dynamic filter; dynamic-filter refresh re-evaluates the prior once the build publishes → row-level → 0.59×, ~46 ms saved
@@ -214,7 +238,7 @@ Latency multipliers vs SSD: main 30×, main + pushdown 53×, change 35×. `pushd
 </div>
 
 <!--
-Slide 7 — TPC-H S3 (~60s):
+Slide 9 — TPC-H S3 (~60s):
 
 - "S3" = `--simulate-latency` (20-200ms per OS op); didn't hit real AWS, profile matches any cloud store
 - main+pushdown regression amplifies to 2.22× under latency (vs 27% on SSD)
@@ -237,7 +261,7 @@ Slide 7 — TPC-H S3 (~60s):
 <br>
 
 <!--
-Slide 8 — what's next (~45s):
+Slide 10 — what's next (~45s):
 
 - sub-row-group pause/resume in arrow-rs → unlock single-row-group files even further
 - row-group morselization (#21766) → orthogonal fix for partition skew
