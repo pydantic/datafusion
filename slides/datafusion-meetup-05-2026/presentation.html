@@ -239,7 +239,7 @@ img[alt~=&quot;center&quot;] { display: block; margin: 0 auto; }
 <p><img src="img/tpcds_nolat.png" alt="center" /></p>
 <div class="takeaway">
 <p><code>main + pushdown</code> regresses <strong>2.3×</strong> vs <code>main</code>. <strong><code>change</code> 16.9 s — 1 % <em>faster</em> than <code>main</code>, 2.3× faster than <code>main + pushdown</code>.</strong><br />
-<strong>Q64</strong>: dynamic-filter chain that <code>main + pushdown</code> evaluates at row-level <em>before the build side finishes</em> — the change keeps it post-scan until the build publishes a useful predicate.</p>
+<strong>Q64</strong>: chained hash joins on <code>store_sales</code> publish <code>key BETWEEN min AND max</code> dynamic filters that aren't selective enough on this data to pay for row-level. <code>main + pushdown</code> runs them all row-level regardless; the change re-evaluates each populated dynamic filter's pruning rate against row-group stats and keeps the unselective ones post-scan.</p>
 </div>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="6" data-paginate="true" data-theme="default" data-style="section {
@@ -408,8 +408,10 @@ img[alt~=&quot;center&quot;] { display: block; margin: 0 auto; }
 - mechanism: row-level eval → sparse RowSelection → page-skipping; NOT RG-stats</p></div><div class="bespoke-marp-note" data-index="4" tabindex="0"><p>Slide 5 — TPC-DS SSD (~45s):
 
 - pushdown=on regresses 2.29× on main (39.0s vs 17.0s); change closes it to slightly under main
-- Q64: stacked dynamic filter chain; main+pushdown evaluates at row-level with placeholder before build finishes
-- change keeps it PostScan until the build publishes a useful predicate
+- Q64: chain of HashJoins on store_sales; each publishes a `key BETWEEN min AND max` dynamic filter from the build-side bounds
+- HashJoinExec waits for build to complete before probe starts, so the probe-side scan always sees populated filters — there's no placeholder-eval window
+- the populated filters just aren't selective enough on Q64's data to recoup row-level cost (per-batch eval, extra I/O for filter cols not in projection)
+- the change calls `fresh_rate_for_dynamic_conjunct` on each populated dynamic filter, sees the low pruning rate, keeps it post-scan
 - single-query speedup on Q64 dominates the totals (CI bench's &quot;1.80× total speedup&quot; is essentially this query)</p></div><div class="bespoke-marp-note" data-index="5" tabindex="0"><p>Slide 6 — TPC-H SSD (~60s):
 
 - single-row-group files have no swap point inside the file → initial placement is the only placement, and the per-conjunct pruning-rate prior is doing the real work here

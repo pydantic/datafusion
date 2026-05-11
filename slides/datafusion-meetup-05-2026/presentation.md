@@ -136,7 +136,7 @@ Slide 4 — ClickBench SSD (~60s):
 <div class="takeaway">
 
 `main + pushdown` regresses **2.3×** vs `main`. **`change` 16.9 s — 1 % *faster* than `main`, 2.3× faster than `main + pushdown`.**
-**Q64**: dynamic-filter chain that `main + pushdown` evaluates at row-level *before the build side finishes* — the change keeps it post-scan until the build publishes a useful predicate.
+**Q64**: chained hash joins on `store_sales` publish `key BETWEEN min AND max` dynamic filters that aren't selective enough on this data to pay for row-level. `main + pushdown` runs them all row-level regardless; the change re-evaluates each populated dynamic filter's pruning rate against row-group stats and keeps the unselective ones post-scan.
 
 </div>
 
@@ -144,8 +144,10 @@ Slide 4 — ClickBench SSD (~60s):
 Slide 5 — TPC-DS SSD (~45s):
 
 - pushdown=on regresses 2.29× on main (39.0s vs 17.0s); change closes it to slightly under main
-- Q64: stacked dynamic filter chain; main+pushdown evaluates at row-level with placeholder before build finishes
-- change keeps it PostScan until the build publishes a useful predicate
+- Q64: chain of HashJoins on store_sales; each publishes a `key BETWEEN min AND max` dynamic filter from the build-side bounds
+- HashJoinExec waits for build to complete before probe starts, so the probe-side scan always sees populated filters — there's no placeholder-eval window
+- the populated filters just aren't selective enough on Q64's data to recoup row-level cost (per-batch eval, extra I/O for filter cols not in projection)
+- the change calls `fresh_rate_for_dynamic_conjunct` on each populated dynamic filter, sees the low pruning rate, keeps it post-scan
 - single-query speedup on Q64 dominates the totals (CI bench's "1.80× total speedup" is essentially this query)
 -->
 

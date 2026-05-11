@@ -304,16 +304,20 @@ starts.
 
 ### 3.3 Refresh prior for populated dynamic filters
 
-Hash-join build-side filters arrive at plan-time as
-`OptionalFilterPhysicalExpr`-wrapped `DynamicFilterPhysicalExpr`s
-whose `snapshot_generation()` is zero. The build side publishes a
-populated predicate later; the file-open rate captured for the
-placeholder is then stale.
+Hash-join build-side filters are `OptionalFilterPhysicalExpr`-wrapped
+`DynamicFilterPhysicalExpr`s. `HashJoinExec` blocks the probe-side
+stream on `collect_build_side` until the build is fully done — so
+by the time the probe-side `ParquetScan` opens a file, the dynamic
+filter is always populated. What §3.2's static path can't easily
+do is *introspect through the wrapper*: building a per-conjunct
+`PruningPredicate` directly off the wrapper expression doesn't
+yield a useful rate, because the predicate rewriter can't see the
+populated inner expression without an explicit snapshot.
 
-`fresh_rate_for_dynamic_conjunct` re-evaluates a per-conjunct
-`PruningPredicate` against the file's row-group statistics
-*only* for filters where `snapshot_generation > 0`. It tries the
-whole conjunct first; if the predicate rewriter can't fold the
+`fresh_rate_for_dynamic_conjunct` snapshots the wrapper and
+evaluates a per-conjunct `PruningPredicate` against the file's
+row-group statistics. It tries the whole conjunct first; if the
+predicate rewriter can't fold the
 `col >= lo AND col <= hi AND hash_lookup(...)` shape into a
 `PruningPredicate`, it splits the snapshotted inner expression and
 takes the max rate across prunable sub-parts, returning that as a
@@ -470,13 +474,22 @@ Almost the entire delta vs `main + pushdown` is **Q64**:
 |----|---:|---:|---:|
 | local SSD | 471 ms | **20 010 ms** ⚠ | **474 ms** ✓ |
 
-A 42× regression on `main + pushdown` is neutralised to flat. Q64 is
-a dynamic-filter chain (correlated subqueries producing hash-join
-build-side filters); `main + pushdown` evaluates the chain at
-row-level *before the build side has finished*, so each row group
-pays for re-evaluation of a placeholder predicate. The change keeps
-those filters post-scan until `snapshot_generation > 0`, then the
-re-evaluated rate (§3.3) makes the right call.
+A 42× regression on `main + pushdown` is neutralised to flat. Q64
+is a chain of hash joins on `store_sales`; each one publishes a
+`key BETWEEN min AND max` dynamic filter from the build-side
+bounds. `HashJoinExec` waits for the full build to complete before
+the probe-side scan starts reading, so the probe-side `ParquetScan`
+always sees the *populated* dynamic filter — there is no
+placeholder-eval window. The mechanism is more mundane than that:
+the populated dynamic filters on Q64 simply aren't selective enough
+on this data to recoup the cost of row-level evaluation (per-batch
+ArrowPredicate, extra I/O for filter columns not in the projection,
+repeated re-evaluation across the many self-joins of
+`store_sales`). `main + pushdown` runs them at row-level
+regardless. The change re-evaluates each populated dynamic filter's
+pruning rate via `fresh_rate_for_dynamic_conjunct` (§3.3) against
+the file's row-group statistics, sees the low rate, and keeps the
+filter post-scan.
 
 That's the single biggest neutralisation in the suite. Other TPC-DS
 pushdown regressions on `main` are similar in shape, all

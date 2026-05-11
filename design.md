@@ -24,7 +24,7 @@ This document specifies a per-filter, adaptive, in-decoder scheduler that decide
 1. **Success criterion**: across TPC-DS SF1, TPC-H SF1, and ClickBench-partitioned, on both local NVMe and a `--simulate-latency` profile that mimics object storage, `pushdown_filters = on` with this change ≤ `pushdown_filters = off` on `main` today.
 2. Capture per-query wins of row-level filtering where present (sparse `RowSelection` + page-skipping + late materialisation).
 3. Avoid per-query losses when filters are unselective, projection-overlapping, or paying many small range I/Os under cloud-storage latency.
-4. Re-evaluate placement at every row-group boundary so the scan self-corrects mid-file when the cost/benefit shifts (e.g. when a dynamic filter populates after the build side finishes).
+4. Re-evaluate placement at every row-group boundary so the scan self-corrects mid-file when the runtime cost/benefit shifts.
 
 ### Non-goals
 
@@ -57,7 +57,7 @@ Each evaluates a *combined* predicate against a set of containers and emits a si
 
 Even with a per-conjunct prior from the pruning passes, the scheduler needs a runtime signal to correct itself once batches start flowing:
 
-- Hash-join build-side filters (`DynamicFilterPhysicalExpr` wrapped in `OptionalFilterPhysicalExpr`) start out as placeholder predicates whose `snapshot_generation()` is zero; the build side publishes a real predicate later.
+- Hash-join build-side filters (`DynamicFilterPhysicalExpr` wrapped in `OptionalFilterPhysicalExpr`) are populated by the time the probe-side `ParquetScan` opens a file — `HashJoinExec` blocks the probe side on `collect_build_side` until the build is fully done. But the static `try_new_tagged_conjuncts` machinery can't introspect *through* the wrapper without an explicit snapshot, so the side-effect rate map from §4.2 may not have a useful entry for these conjuncts. The dynamic-filter refresh in §4.4 fills that gap.
 - A predicate can be statically "looks selective" but materially unselective on this file's actual data distribution.
 - Object-storage latency makes a wrong placement much more expensive to hold than on local NVMe.
 
@@ -126,14 +126,14 @@ The byte-ratio fallback — extra-bytes-for-filter-cols / projection-bytes — r
 
 ### 4.4 Refresh prior for populated dynamic filters
 
-Hash-join build-side filters are `OptionalFilterPhysicalExpr`-wrapped `DynamicFilterPhysicalExpr`s; their `snapshot_generation()` starts at 0 (placeholder) and increments when the build side publishes a populated predicate. The rates captured at file open belong to the placeholder, not the populated filter, so they're worthless.
+Hash-join build-side filters are `OptionalFilterPhysicalExpr`-wrapped `DynamicFilterPhysicalExpr`s. `HashJoinExec` blocks the probe-side stream on `collect_build_side` until the build is fully done — by the time the probe-side `ParquetScan` calls into the scheduler, the filter is always populated and `snapshot_generation()` is greater than 0. What the §4.2 side-effect path can't easily do is *introspect through the wrapper*: building a per-conjunct `PruningPredicate` directly off the wrapper expression doesn't yield a useful rate, because the predicate rewriter can't see the populated inner expression without an explicit snapshot.
 
-`fresh_rate_for_dynamic_conjunct(expr, arrow_schema, parquet_schema, metadata)` runs *only* for filters with `snapshot_generation > 0`. It evaluates a per-conjunct `PruningPredicate` against the file's current row-group statistics in two paths:
+`fresh_rate_for_dynamic_conjunct(expr, arrow_schema, parquet_schema, metadata)` runs for filters with `snapshot_generation > 0` and gets us the per-conjunct rate the side-effect map is missing. It tries two paths:
 
-1. **Whole-conjunct.** `PruningPredicate::try_new(expr, schema)` succeeds and is not `always_true` for most populated dynamic filters; the rate is returned directly.
+1. **Whole-conjunct.** `PruningPredicate::try_new(expr, schema)` succeeds and is not `always_true` for most populated dynamic filters (a typical bounds filter is `col >= lo AND col <= hi`); the rate is returned directly.
 2. **Partial-AND fallback.** For the `col >= lo AND col <= hi AND hash_lookup(...)` shape that the predicate rewriter can't fold into a single `PruningPredicate`, snapshot the dynamic filter, `split_conjunction()` the inner expression, evaluate each prunable part, and return the max rate across sub-parts. This is a **promote-only signal**: it's returned only at rate ≥ 0.5 (a confident "this filter is selective"). Below that, return `None` and let the standard prior / byte-ratio fallback decide — a partial AND undercounts and would mislead.
 
-Because this re-evaluation runs only for populated dynamic filters, it doesn't cost anything on the cold path.
+The refresh runs only for dynamic-filter conjuncts, so the static path's cost is unchanged.
 
 ### 4.5 Latency-aware confidence-z shrink
 
