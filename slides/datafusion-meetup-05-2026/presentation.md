@@ -40,7 +40,7 @@ style: |
 Slide 1 — title (~15s):
 
 - pushdown_filters today: per-query lottery
-- proposal: remove the lottery at the decoder level
+- proposal: rig the lottery (per-filter adaptive in-decoder scheduling)
 - bar: never slower than `pushdown=off` on main, on every workload tested
 -->
 
@@ -52,8 +52,8 @@ Slide 1 — title (~15s):
 
 | Mode | Decode pattern per row group | Cost when filter is unselective |
 |---|---|---|
-| `pushdown=off` | decode all projected cols → one coalesced read, filter mask above the scan | none beyond the mask — filter is a `FilterExec` after the scan |
-| `pushdown=on` | **decode filter cols first → evaluate predicate → build `RowSelection` → skip pages / decode only surviving rows of the projection** | per-batch ArrowPredicate eval cost; extra I/O for filter cols **not in the projection**; possible double-decode of filter cols **also in the projection** |
+| `pushdown=off` | download projection + filter, apply filter in memory via `FilterExec` | IO to download and compute to decode and then mask projection columns |
+| `pushdown=on` | download 1 filter's columns at a time -> iteratively accumulate mask -> download projection | smaller IOs, more computation overall |
 
 <br>
 
@@ -64,10 +64,37 @@ this lottery ([#20324](https://github.com/apache/datafusion/issues/20324)).
 <!--
 Slide 2 — the lottery (~60s):
 
-- wins when: row-level eval → sparse RowSelection → page-skipping → late materialization (nothing to do with RG-stats pruning, that's separate)
-- loses when: filter mandatory but unselective; or filter col overlaps projection → 2-stage decode + extra IO
+- wins when: row-level eval → sparse RowSelection → page-skipping → late materialization
+- loses when: filter mandatory but unselective; or filter col overlaps projection
 - on object storage (20–200ms RTT) the loss case is catastrophic
 - #3463 (open since 2022): "pushdown_filters on by default" — blocked by exactly this lottery
+-->
+
+---
+
+# The lottery, in numbers
+
+<br>
+
+| Query | `main` | `main + pushdown` | impact |
+|---|--:|--:|--:|
+| ClickBench Q23 — `SELECT * … URL LIKE '%google%'` | 3 612 ms | **121 ms** | <span class="highlight">**30× faster** ✓</span> |
+| ClickBench Q11 — filter col overlaps projection | 98 ms | 94 ms | 1.04× ≈ |
+| ClickBench Q21 — mandatory unselective filter | 859 ms | 1 669 ms | <span class="warn">1.9× slower ✗</span> |
+| TPC-DS Q64 — chained hash-join dynamic filters | 471 ms | **20 010 ms** | <span class="warn">**42× slower** ✗</span> |
+
+<br>
+
+Same data, same query semantics, one flag flipped. Which side of the lottery you land on depends on the *filter*, the *projection*, and the *plan shape* — none of which the user can reason about per query.
+
+<!--
+Slide 2.5 — the lottery in numbers (~45s):
+
+- Q23: tiny projection (`SELECT *` over a wide row but LIMIT 10) + selective LIKE → sparse RowSelection → page-skipping wins big
+- Q11: filter col in projection → predicate cache helps; basically a tie
+- Q21: mandatory unselective filter → row-level pays per-batch eval + extra IO with no payoff
+- Q64: chained dynamic filters publish `key BETWEEN min AND max` from build-side bounds, run row-level across many self-joins of store_sales without recouping the cost → 42× catastrophe
+- the point: same workload (ClickBench has both Q23 and Q21!), opposite outcomes
 -->
 
 ---
