@@ -46,6 +46,17 @@ Slide 1 — title (~15s):
 
 ---
 
+![w:75% center](img/pydantic_logfire.png)
+
+<!--
+Slide 2 — sponsor plug (~10s):
+
+- I work on Pydantic Logfire — observability for AI engineering
+- Pydantic is all you need
+-->
+
+---
+
 # `pushdown_filters=on` is a per-query lottery
 
 <br>
