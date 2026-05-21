@@ -25,6 +25,7 @@
 //! core configuration and data-source plumbing.
 
 use super::FileScanConfig;
+use crate::PartitionedFile;
 use crate::file::FileSource;
 use crate::file_groups::FileGroup;
 use crate::source::DataSource;
@@ -110,9 +111,11 @@ impl FileScanConfig {
 
         new_config.file_source = new_file_source;
 
+        let sort_order = LexOrdering::new(order.iter().cloned());
+
         // Sort files within groups by statistics when not reversing
         let all_non_overlapping = if !reverse_file_groups {
-            if let Some(sort_order) = LexOrdering::new(order.iter().cloned()) {
+            if let Some(sort_order) = sort_order.as_ref() {
                 let projected_schema = new_config.projected_schema()?;
                 let projection_indices = new_config
                     .file_source
@@ -121,7 +124,7 @@ impl FileScanConfig {
                     .and_then(|p| ordered_column_indices_from_projection(p));
                 let result = sort_files_within_groups_by_statistics(
                     &new_config.file_groups,
-                    &sort_order,
+                    sort_order,
                     &projected_schema,
                     projection_indices.as_deref(),
                 );
@@ -164,6 +167,19 @@ impl FileScanConfig {
             // sits idle the entire time, losing the parallelism benefit.
         } else {
             new_config.output_ordering = vec![];
+            // Inexact: SortExec remains above and a SharedWorkSource may be
+            // active for this scan. Stash the requested sort order so the
+            // shared queue can be seeded in globally best-first order —
+            // dynamic filters (TopK, etc.) then tighten fastest across the
+            // whole scan. Skip on the reverse path: the within-group reversal
+            // must not be overridden by a global ascending sort (a globally
+            // descending hint is a possible follow-up).
+            //
+            // TODO: populate a reversed hint in the `reverse_file_groups`
+            // case for symmetry (see lines ~99-109 above).
+            if !reverse_file_groups {
+                new_config.work_order_hint = sort_order;
+            }
         }
 
         Ok(new_config)
@@ -249,6 +265,11 @@ impl FileScanConfig {
         }
 
         new_config.output_ordering = vec![];
+        // Inexact: see `rebuild_with_source` for rationale. This branch is
+        // always reached via the non-reversing path (`try_sort_file_groups_by_statistics`
+        // only sorts in the natural direction), so no reverse-scan gating
+        // is needed here.
+        new_config.work_order_hint = Some(sort_order);
         Ok(SortOrderPushdownResult::Inexact {
             inner: Arc::new(new_config),
         })
@@ -341,6 +362,60 @@ pub(crate) fn sort_files_within_groups_by_statistics(
         any_reordered,
         all_non_overlapping: confirmed_non_overlapping == file_groups.len(),
     }
+}
+
+/// Flatten all files across groups and sort them globally by min value of the
+/// sort key. Used to seed the [`SharedWorkSource`](crate::file_stream::work_source::SharedWorkSource)
+/// queue in the Inexact sort-pushdown case so workers pull files in globally
+/// best-first order — e.g., lowest-min first for ASC, which after the
+/// reverse-scan flip is highest-max first for DESC TopK. Tightens the TopK
+/// dynamic filter threshold faster across the whole scan.
+///
+/// Returns `None` when stats are unusable (e.g., any file missing statistics,
+/// or there are no files). Callers should fall back to their existing flat
+/// order in that case.
+pub(crate) fn sort_files_globally_by_statistics(
+    file_groups: &[FileGroup],
+    sort_order: &LexOrdering,
+    projected_schema: &SchemaRef,
+    projection_indices: Option<&[usize]>,
+) -> Option<Vec<PartitionedFile>> {
+    let files: Vec<&PartitionedFile> =
+        file_groups.iter().flat_map(FileGroup::iter).collect();
+    if files.len() <= 1 {
+        return None;
+    }
+
+    let statistics = match MinMaxStatistics::new_from_files(
+        sort_order,
+        projected_schema,
+        projection_indices,
+        files.iter().copied(),
+    ) {
+        Ok(stats) => stats,
+        Err(e) => {
+            log::trace!(
+                "Cannot globally sort files by statistics: {e}. Falling back to flat order."
+            );
+            return None;
+        }
+    };
+
+    let sorted_indices = statistics.min_values_sorted();
+    let already_sorted = sorted_indices
+        .iter()
+        .enumerate()
+        .all(|(pos, (idx, _))| pos == *idx);
+    if already_sorted {
+        return None;
+    }
+
+    Some(
+        sorted_indices
+            .iter()
+            .map(|(idx, _)| files[*idx].clone())
+            .collect(),
+    )
 }
 
 /// Check if any file in any group has nulls in the sort columns.
