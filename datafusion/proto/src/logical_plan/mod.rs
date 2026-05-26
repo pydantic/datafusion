@@ -39,7 +39,7 @@ use datafusion_catalog::empty::EmptyTable;
 use datafusion_common::file_options::file_type::FileType;
 use datafusion_common::format::ExplainFormat;
 use datafusion_common::{
-    Result, TableReference, ToDFSchema, assert_or_internal_err, context,
+    Result, TableReference, assert_or_internal_err, context,
     internal_datafusion_err, internal_err, not_impl_err, plan_err,
 };
 use datafusion_datasource::file_format::FileFormat;
@@ -65,7 +65,8 @@ use datafusion_expr::{
     logical_plan::{
         Aggregate, CreateCatalog, CreateCatalogSchema, CreateExternalTable, CreateView,
         DdlStatement, Distinct, EmptyRelation, Extension, Join, JoinConstraint, Prepare,
-        Projection, Repartition, Sort, SubqueryAlias, TableScan, Values, Window,
+        Projection, Repartition, Sort, SubqueryAlias, TableScan, TableScanBuilder, Values,
+        Window,
         builder::project,
     },
 };
@@ -371,15 +372,7 @@ fn from_table_source(
     target: Arc<dyn TableSource>,
     extension_codec: &dyn LogicalExtensionCodec,
 ) -> Result<LogicalPlanNode> {
-    let projected_schema = target.schema().to_dfschema_ref()?;
-    let r = LogicalPlan::TableScan(TableScan {
-        table_name,
-        source: target,
-        projection: None,
-        projected_schema,
-        filters: vec![],
-        fetch: None,
-    });
+    let r = LogicalPlan::TableScan(TableScanBuilder::new(table_name, target).build()?);
 
     LogicalPlanNode::try_from_logical_plan(&r, extension_codec)
 }
