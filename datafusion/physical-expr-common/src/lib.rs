@@ -30,6 +30,7 @@
 //!
 //! [DataFusion]: <https://crates.io/crates/datafusion>
 
+pub mod adaptive;
 pub mod binary_map;
 pub mod binary_view_map;
 pub mod datum;
