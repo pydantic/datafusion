@@ -20,14 +20,20 @@
 //! Adaptive filter policies observe how predicates behave at runtime and
 //! re-decide accordingly — the parquet scan adapts filter *placement*
 //! (row-level vs. post-scan vs. dropped), and an adaptive `FilterExec` could
-//! adapt conjunct evaluation *order*. The first shared ingredient is
-//! per-predicate online **selectivity + cost** measurement with confidence
-//! intervals — [`SelectivityStats`].
+//! adapt conjunct evaluation *order*. So far the shared ingredients are:
+//!
+//! - per-predicate online **selectivity + cost** measurement with confidence
+//!   intervals — [`SelectivityStats`];
+//! - a concurrent **registry** keyed by a caller-local [`FilterId`], with
+//!   per-predicate skip flags so an optional predicate can be made a no-op
+//!   mid-stream — [`AdaptiveStatsRegistry`].
 //!
 //! What stays with each consumer is *policy*: the per-batch effectiveness
-//! metric it feeds in and what it does with the measurements. This module
-//! intentionally contains no placement or ordering logic.
+//! metric it feeds in and the proposal it computes over the snapshots. This
+//! module intentionally contains no placement or ordering logic.
 
+pub mod registry;
 pub mod stats;
 
+pub use registry::AdaptiveStatsRegistry;
 pub use stats::{FilterId, SelectivityStats};
