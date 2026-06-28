@@ -36,7 +36,6 @@ use datafusion_functions_aggregate_common::min_max::{MaxAccumulator, MinAccumula
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_plan::Accumulator;
-use log::debug;
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore};
 use parquet::DecodeResult;
@@ -419,36 +418,62 @@ impl<'a> DFParquetMetadata<'a> {
                     vec![Some(true); logical_file_schema.fields().len()];
                 let mut distinct_counts_array =
                     vec![Precision::Absent; logical_file_schema.fields().len()];
+                // Build a name -> physical (root) field index map once so that
+                // resolving each column's parquet leaf index is O(1). The
+                // previous code called `StatisticsConverter::try_new(name, ..)`
+                // per column, which does a linear name lookup against both the
+                // arrow and parquet schemas — O(N^2) for wide schemas.
+                let physical_name_to_idx: HashMap<&str, usize> = physical_file_schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, f)| (f.name().as_str(), idx))
+                    .collect();
+
                 logical_file_schema.fields().iter().enumerate().for_each(
-                    |(idx, field)| match StatisticsConverter::try_new(
-                        field.name(),
-                        &physical_file_schema,
-                        file_metadata.schema_descr(),
-                    ) {
-                        Ok(stats_converter) => {
-                            let mut accumulators = StatisticsAccumulators {
-                                min_accs: &mut min_accs,
-                                max_accs: &mut max_accs,
-                                null_counts_array: &mut null_counts_array,
-                                is_min_value_exact: &mut is_min_value_exact,
-                                is_max_value_exact: &mut is_max_value_exact,
-                                column_byte_sizes: &mut column_byte_sizes,
-                                distinct_counts_array: &mut distinct_counts_array,
-                            };
-                            summarize_column_statistics(
-                                logical_file_schema,
-                                &mut accumulators,
-                                idx,
-                                &stats_converter,
-                                row_groups_metadata,
-                                num_rows,
-                            )
-                            .ok();
-                        }
-                        Err(e) => {
-                            debug!("Failed to create statistics converter: {e}");
+                    |(idx, field)| {
+                        // Resolve the column against the physical file schema by
+                        // name. Absent => the column isn't in this file.
+                        let Some(&root_idx) =
+                            physical_name_to_idx.get(field.name().as_str())
+                        else {
                             null_counts_array[idx] = Precision::Exact(num_rows);
-                        }
+                            return;
+                        };
+                        let physical_field =
+                            physical_file_schema.fields()[root_idx].as_ref();
+                        // O(1) root-field -> first-leaf parquet column index.
+                        let parquet_leaf_index =
+                            if physical_field.data_type().is_nested() {
+                                None
+                            } else {
+                                file_metadata
+                                    .schema_descr()
+                                    .root_first_leaf_index(root_idx)
+                            };
+                        let stats_converter = StatisticsConverter::from_arrow_field(
+                            physical_field,
+                            file_metadata.schema_descr(),
+                            parquet_leaf_index,
+                        );
+                        let mut accumulators = StatisticsAccumulators {
+                            min_accs: &mut min_accs,
+                            max_accs: &mut max_accs,
+                            null_counts_array: &mut null_counts_array,
+                            is_min_value_exact: &mut is_min_value_exact,
+                            is_max_value_exact: &mut is_max_value_exact,
+                            column_byte_sizes: &mut column_byte_sizes,
+                            distinct_counts_array: &mut distinct_counts_array,
+                        };
+                        summarize_column_statistics(
+                            logical_file_schema,
+                            &mut accumulators,
+                            idx,
+                            &stats_converter,
+                            row_groups_metadata,
+                            num_rows,
+                        )
+                        .ok();
                     },
                 );
 

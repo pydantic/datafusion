@@ -291,3 +291,25 @@ debug = false
 debug-assertions = false
 strip = "debuginfo"
 incremental = false
+
+# EXPERIMENT (do not merge): point all arrow-rs crates at apache/arrow-rs PR #9882
+# (pydantic/arrow-rs branch adrian/wide-schema-perf), which adds O(1) parquet_column
+# lookup + StatisticsConverter::from_arrow_field for wide-schema scans.
+[patch.crates-io]
+arrow = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+arrow-arith = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+arrow-array = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+arrow-avro = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+arrow-buffer = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+arrow-cast = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+arrow-csv = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+arrow-data = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+arrow-flight = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+arrow-ipc = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+arrow-json = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+arrow-ord = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+arrow-row = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+arrow-schema = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+arrow-select = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+arrow-string = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
+parquet = { git = "https://github.com/pydantic/arrow-rs.git", rev = "41d7b4a6c5a06ee233c0a5d9e5c07ca3084c8931" }
