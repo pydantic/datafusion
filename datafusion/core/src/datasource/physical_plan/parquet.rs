@@ -753,16 +753,11 @@ mod tests {
             .unwrap();
 
         insta::assert_snapshot!(batches_to_sort_string(&read),@r"
-        +-----+----+----+
-        | c1  | c3 | c2 |
-        +-----+----+----+
-        |     |    |    |
-        |     | 10 | 1  |
-        |     | 20 |    |
-        |     | 20 | 2  |
-        | Foo | 10 |    |
-        | bar |    |    |
-        +-----+----+----+
+        +----+----+----+
+        | c1 | c3 | c2 |
+        +----+----+----+
+        |    | 20 | 2  |
+        +----+----+----+
         ");
     }
 
@@ -897,7 +892,9 @@ mod tests {
         assert_eq!(get_value(&metrics, "pushdown_rows_matched"), 0);
         assert_eq!(rt.batches.unwrap().len(), 0);
 
-        // Predicate should prune no row groups
+        // Predicate should prune no row groups. The scan now applies the
+        // predicate post-scan (since `pushdown_filters` is off in this test),
+        // so only the matching row survives.
         let filter = col("c1").eq(lit(ScalarValue::Utf8(Some("foo".to_string()))));
         let rt = RoundTrip::new()
             .with_predicate(filter)
@@ -914,7 +911,7 @@ mod tests {
             .iter()
             .map(|b| b.num_rows())
             .sum::<usize>();
-        assert_eq!(read, 2, "Expected 2 rows to match the predicate");
+        assert_eq!(read, 1, "Expected 1 row to match the predicate");
     }
 
     #[tokio::test]
@@ -938,7 +935,9 @@ mod tests {
         assert_eq!(get_value(&metrics, "predicate_evaluation_errors"), 0);
         assert_eq!(rt.batches.unwrap().len(), 0);
 
-        // Predicate should prune no row groups
+        // Predicate should prune no row groups. The scan now applies the
+        // predicate post-scan (since `pushdown_filters` is off in this test),
+        // so only the matching row survives.
         let filter = col("c1").eq(lit(ScalarValue::UInt64(Some(1))));
         let rt = RoundTrip::new()
             .with_predicate(filter)
@@ -954,7 +953,7 @@ mod tests {
             .iter()
             .map(|b| b.num_rows())
             .sum::<usize>();
-        assert_eq!(read, 2, "Expected 2 rows to match the predicate");
+        assert_eq!(read, 1, "Expected 1 row to match the predicate");
     }
 
     #[tokio::test]
@@ -1053,16 +1052,11 @@ mod tests {
         // the filter stage would be preserved as a separate execution plan stage so the actual query results would be as expected.
 
         insta::assert_snapshot!(batches_to_sort_string(&read),@r"
-        +-----+----+
-        | c1  | c2 |
-        +-----+----+
-        |     |    |
-        |     |    |
-        |     | 1  |
-        |     | 2  |
-        | Foo |    |
-        | bar |    |
-        +-----+----+
+        +----+----+
+        | c1 | c2 |
+        +----+----+
+        |    | 1  |
+        +----+----+
         ");
     }
 
@@ -1149,22 +1143,13 @@ mod tests {
             .await;
 
         insta::assert_snapshot!(batches_to_sort_string(&rt.batches.unwrap()), @r"
-        +------+----+
-        | c1   | c2 |
-        +------+----+
-        |      | 1  |
-        |      | 2  |
-        | Bar  |    |
-        | Bar  | 2  |
-        | Bar  | 2  |
-        | Bar2 |    |
-        | Bar3 |    |
-        | Foo  |    |
-        | Foo  | 1  |
-        | Foo  | 1  |
-        | Foo2 |    |
-        | Foo3 |    |
-        +------+----+
+        +-----+----+
+        | c1  | c2 |
+        +-----+----+
+        |     | 1  |
+        | Foo | 1  |
+        | Foo | 1  |
+        +-----+----+
         ");
         let metrics = rt.parquet_exec.metrics().unwrap();
 
@@ -1237,7 +1222,6 @@ mod tests {
         +-----+----+
         | c1  | c2 |
         +-----+----+
-        |     | 2  |
         | Foo | 1  |
         | bar |    |
         +-----+----+
@@ -1761,7 +1745,6 @@ mod tests {
         | int |
         +-----+
         | 4   |
-        | 5   |
         +-----+
         ");
         let (page_index_rows_pruned, page_index_rows_matched) =
