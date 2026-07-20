@@ -586,6 +586,18 @@ mod tests {
         assert_eq!(optimize_test(expr_lt, &schema), expected);
     }
 
+    #[test]
+    /// An identity `CAST(date_col AS DATE)` on a Date32 column must fold away so
+    /// the comparison is against the bare column, e.g. `date_col = DATE '...'`.
+    fn test_unwrap_identity_date_cast() {
+        let schema = expr_test_schema();
+        // cast(date32_col as Date32) = Date32(19723)  ->  date32_col = Date32(19723)
+        let lit_date = lit(ScalarValue::Date32(Some(19_723)));
+        let expr_eq = cast(col("date32_col"), DataType::Date32).eq(lit_date.clone());
+        let expected = col("date32_col").eq(lit_date);
+        assert_eq!(optimize_test(expr_eq, &schema), expected);
+    }
+
     fn optimize_test(expr: Expr, schema: &DFSchemaRef) -> Expr {
         let simplifier = ExprSimplifier::new(
             SimplifyContext::builder()
@@ -608,6 +620,7 @@ mod tests {
                     Field::new("c6", DataType::UInt32, false),
                     Field::new("ts_nano_none", timestamp_nano_none_type(), false),
                     Field::new("ts_nano_utf", timestamp_nano_utc_type(), false),
+                    Field::new("date32_col", DataType::Date32, false),
                     Field::new("str1", DataType::Utf8, false),
                     Field::new("largestr", DataType::LargeUtf8, false),
                     Field::new("tag", dictionary_tag_type(), false),
