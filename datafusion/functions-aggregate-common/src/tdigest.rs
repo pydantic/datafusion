@@ -632,35 +632,24 @@ impl TDigest {
     /// Construct a [`TDigest`] directly from its constituent parts, validating
     /// the inputs.
     ///
-    /// This is the non-Arrow counterpart to [`Self::from_scalar_state()`].
-    /// [`Self::to_scalar_state()`]/[`Self::from_scalar_state()`] exist so that
-    /// external systems can persist and restore digest state, but they require
-    /// the caller to pack and unpack that state through a [`ScalarValue::List`]
-    /// of [`ScalarValue::Float64`] (which `from_scalar_state` immediately
-    /// downcasts back to an `&[f64]`). `try_from_parts`, together with the
-    /// [`Self::centroids()`] and [`Self::sum()`] accessors (and the existing
-    /// [`Self::max_size()`], [`Self::count()`], [`Self::max()`], and
-    /// [`Self::min()`] accessors), exposes that state without requiring the
-    /// caller to round-trip through `ScalarValue`, so a digest can be serialized
-    /// into and restored from a caller's own format.
+    /// This is the non-Arrow counterpart to [`Self::from_scalar_state()`]: it
+    /// lets external systems restore digest state from their own serialization
+    /// format instead of round-tripping through a [`ScalarValue`] list. It pairs
+    /// with the [`Self::centroids()`], [`Self::sum()`], [`Self::max_size()`],
+    /// [`Self::count()`], [`Self::max()`], and [`Self::min()`] accessors, which
+    /// expose the same state.
     ///
-    /// Unlike [`Self::from_scalar_state()`], which trusts its input because it
-    /// is only ever fed the output of [`Self::to_scalar_state()`] on the
-    /// intra-query hot path, this is the door for *external* persisters: it may
-    /// be handed bytes decoded from a caller's own format, so it validates the
-    /// invariants that later [`Self::estimate_quantile()`] / merge math relies
-    /// on and returns an error instead of producing a silently wrong digest.
-    /// Callers who trust their data can `unwrap()`.
+    /// Unlike [`Self::from_scalar_state()`], this method validates its inputs and
+    /// returns an error rather than producing a silently wrong digest, so it is
+    /// safe to feed state decoded from an external source. Callers who trust
+    /// their data can `unwrap()`.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - `min` and `max` are both finite but `max < min`;
-    /// - the `centroids` are not sorted in non-decreasing order by mean (the
-    ///   order produced by [`Self::centroids()`]); or
-    /// - any centroid weight is not finite and strictly positive
-    ///   ([`Self::estimate_quantile()`] divides by a centroid's weight, so a
-    ///   zero, negative, or non-finite weight yields silently wrong results).
+    /// - the `centroids` are not sorted in non-decreasing order by mean; or
+    /// - any centroid weight is not finite and strictly positive.
     pub fn try_from_parts(
         max_size: usize,
         sum: f64,
