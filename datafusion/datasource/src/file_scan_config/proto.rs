@@ -25,8 +25,8 @@
 //! instead of the raw `PhysicalExtensionCodec` +
 //! `PhysicalProtoConverterExtension`. Every
 //! `FileSource::try_to_proto` hook (CSV, JSON, Arrow, Parquet, Avro) builds its
-//! `*ScanExecNode` around [`FileScanConfig::to_proto_conf`] and decodes with
-//! [`FileScanConfig::from_proto_conf`], keeping a single copy of the shared
+//! `*ScanExecNode` around [`FileScanConfig::try_to_proto`] and decodes with
+//! [`FileScanConfig::try_from_proto`], keeping a single copy of the shared
 //! wire logic. The wire format is byte-for-byte identical to the old central
 //! serializer.
 //!
@@ -60,7 +60,14 @@ impl FileScanConfig {
     /// Each concrete [`FileSource::try_to_proto`]
     /// wraps the returned value in its own `*ScanExecNode`. Byte-compatible with
     /// the former `serialize_file_scan_config` in `datafusion-proto`.
-    pub fn to_proto_conf(
+    ///
+    /// Note this inherent method shadows
+    /// [`DataSource::try_to_proto`](crate::source::DataSource::try_to_proto) for
+    /// callers holding a concrete `FileScanConfig`: that one serializes the whole
+    /// `DataSourceExec` node (by delegating to the file source), this one only the
+    /// shared `FileScanExecConf` spine. Spell the trait method
+    /// `DataSource::try_to_proto(&config, ctx)` when you want the plan node.
+    pub fn try_to_proto(
         &self,
         ctx: &ExecutionPlanEncodeCtx<'_>,
     ) -> Result<protobuf::FileScanExecConf> {
@@ -97,7 +104,7 @@ impl FileScanConfig {
             .transpose()?;
 
         // Fields must be added to the schema so that they can persist in the
-        // protobuf, and then removed from the schema in `from_proto_conf`.
+        // protobuf, and then removed from the schema in `try_from_proto`.
         let mut fields = self
             .file_schema()
             .fields()
@@ -152,7 +159,7 @@ impl FileScanConfig {
     /// table schema via [`FileScanConfig::parse_table_schema_from_proto`]).
     ///
     /// Byte-compatible with the former `parse_protobuf_file_scan_config`.
-    pub fn from_proto_conf(
+    pub fn try_from_proto(
         conf: &protobuf::FileScanExecConf,
         ctx: &ExecutionPlanDecodeCtx<'_>,
         file_source: Arc<dyn FileSource>,
@@ -240,7 +247,7 @@ impl FileScanConfig {
 
     /// Parse a [`TableSchema`] (file schema + partition columns) from a
     /// [`protobuf::FileScanExecConf`]. File sources use this to rebuild their
-    /// concrete source before calling [`FileScanConfig::from_proto_conf`].
+    /// concrete source before calling [`FileScanConfig::try_from_proto`].
     ///
     /// Byte-compatible with the former `parse_table_schema_from_proto`.
     pub fn parse_table_schema_from_proto(
