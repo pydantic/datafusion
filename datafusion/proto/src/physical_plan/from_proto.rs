@@ -507,6 +507,10 @@ pub fn parse_protobuf_file_scan_schema(
 }
 
 /// Parses a TableSchema from protobuf, extracting the file schema and partition columns
+#[deprecated(
+    since = "55.0.0",
+    note = "use `FileScanConfig::parse_table_schema_from_proto` instead"
+)]
 pub fn parse_table_schema_from_proto(
     proto: &protobuf::FileScanExecConf,
 ) -> Result<TableSchema> {

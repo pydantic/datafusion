@@ -100,7 +100,7 @@ use crate::convert::TryFromProto;
 use crate::convert_required;
 use crate::physical_plan::from_proto::{
     parse_physical_expr_with_converter, parse_physical_sort_exprs,
-    parse_protobuf_file_scan_config, parse_record_batches, parse_table_schema_from_proto,
+    parse_protobuf_file_scan_config, parse_record_batches,
 };
 use crate::physical_plan::to_proto::{
     serialize_file_scan_config, serialize_physical_expr_with_converter,
@@ -1381,8 +1381,9 @@ pub trait PhysicalPlanNodeExt: Sized {
         };
 
         // Parse table schema with partition columns
-        let table_schema =
-            parse_table_schema_from_proto(scan.base_conf.as_ref().unwrap())?;
+        let table_schema = FileScanConfig::parse_table_schema_from_proto(
+            scan.base_conf.as_ref().unwrap(),
+        )?;
 
         let csv_options = CsvOptions {
             has_header: Some(scan.has_header),
@@ -1416,7 +1417,7 @@ pub trait PhysicalPlanNodeExt: Sized {
         proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let base_conf = scan.base_conf.as_ref().unwrap();
-        let table_schema = parse_table_schema_from_proto(base_conf)?;
+        let table_schema = FileScanConfig::parse_table_schema_from_proto(base_conf)?;
         let scan_conf = parse_protobuf_file_scan_config(
             base_conf,
             ctx,
@@ -1435,7 +1436,7 @@ pub trait PhysicalPlanNodeExt: Sized {
         let base_conf = scan.base_conf.as_ref().ok_or_else(|| {
             internal_datafusion_err!("base_conf in ArrowScanExecNode is missing.")
         })?;
-        let table_schema = parse_table_schema_from_proto(base_conf)?;
+        let table_schema = FileScanConfig::parse_table_schema_from_proto(base_conf)?;
         let scan_conf = parse_protobuf_file_scan_config(
             base_conf,
             ctx,
@@ -1490,7 +1491,7 @@ pub trait PhysicalPlanNodeExt: Sized {
             }
 
             // Parse table schema with partition columns
-            let table_schema = parse_table_schema_from_proto(base_conf)?;
+            let table_schema = FileScanConfig::parse_table_schema_from_proto(base_conf)?;
             let object_store_url = match base_conf.object_store_url.is_empty() {
                 false => ObjectStoreUrl::parse(&base_conf.object_store_url)?,
                 true => ObjectStoreUrl::local_filesystem(),
@@ -1537,8 +1538,9 @@ pub trait PhysicalPlanNodeExt: Sized {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         #[cfg(feature = "avro")]
         {
-            let table_schema =
-                parse_table_schema_from_proto(scan.base_conf.as_ref().unwrap())?;
+            let table_schema = FileScanConfig::parse_table_schema_from_proto(
+                scan.base_conf.as_ref().unwrap(),
+            )?;
             let conf = parse_protobuf_file_scan_config(
                 scan.base_conf.as_ref().unwrap(),
                 ctx,
