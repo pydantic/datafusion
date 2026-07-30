@@ -39,7 +39,6 @@ use std::sync::Arc;
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::Schema;
-use chrono::{TimeZone, Utc};
 use datafusion_common::{DataFusionError, Result, internal_datafusion_err};
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
@@ -48,10 +47,7 @@ use datafusion_physical_expr::{
 };
 use datafusion_physical_plan::proto::{ExecutionPlanDecodeCtx, ExecutionPlanEncodeCtx};
 use datafusion_proto_models::protobuf;
-use object_store::ObjectMeta;
-use object_store::path::Path;
 
-use crate::PartitionedFile;
 use crate::file::FileSource;
 use crate::file_groups::FileGroup;
 use crate::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
@@ -71,7 +67,7 @@ impl FileScanConfig {
         let file_groups = self
             .file_groups
             .iter()
-            .map(file_group_to_proto)
+            .map(FileGroup::try_to_proto)
             .collect::<Result<Vec<_>>>()?;
 
         // Sort orderings: only the child expressions need the ctx; the
@@ -185,7 +181,7 @@ impl FileScanConfig {
         let file_groups = conf
             .file_groups
             .iter()
-            .map(file_group_from_proto)
+            .map(FileGroup::try_from_proto)
             .collect::<Result<Vec<_>>>()?;
 
         let object_store_url = match conf.object_store_url.is_empty() {
@@ -435,85 +431,4 @@ fn partitioning_from_proto(
         }
     };
     Ok(Some(partitioning))
-}
-
-fn file_group_to_proto(group: &FileGroup) -> Result<protobuf::FileGroup> {
-    Ok(protobuf::FileGroup {
-        files: group
-            .files()
-            .iter()
-            .map(partitioned_file_to_proto)
-            .collect::<Result<Vec<_>>>()?,
-    })
-}
-
-fn file_group_from_proto(group: &protobuf::FileGroup) -> Result<FileGroup> {
-    let files = group
-        .files
-        .iter()
-        .map(partitioned_file_from_proto)
-        .collect::<Result<Vec<_>>>()?;
-    Ok(FileGroup::new(files))
-}
-
-pub(crate) fn partitioned_file_to_proto(
-    pf: &PartitionedFile,
-) -> Result<protobuf::PartitionedFile> {
-    let last_modified = pf.object_meta.last_modified;
-    let last_modified_ns = last_modified.timestamp_nanos_opt().ok_or_else(|| {
-        DataFusionError::Plan(format!(
-            "Invalid timestamp on PartitionedFile::ObjectMeta: {last_modified}"
-        ))
-    })? as u64;
-    Ok(protobuf::PartitionedFile {
-        arrow_schema: pf
-            .arrow_schema
-            .as_ref()
-            .map(|s| s.as_ref().try_into())
-            .transpose()?,
-        path: pf.object_meta.location.as_ref().to_owned(),
-        size: pf.object_meta.size,
-        last_modified_ns,
-        partition_values: pf
-            .partition_values
-            .iter()
-            .map(|v| v.try_into())
-            .collect::<Result<Vec<_>, _>>()?,
-        range: pf.range.as_ref().map(|range| protobuf::FileRange {
-            start: range.start,
-            end: range.end,
-        }),
-        statistics: pf.statistics.as_ref().map(|s| s.as_ref().into()),
-    })
-}
-
-pub(crate) fn partitioned_file_from_proto(
-    val: &protobuf::PartitionedFile,
-) -> Result<PartitionedFile> {
-    let mut pf = PartitionedFile::new_from_meta(ObjectMeta {
-        location: Path::parse(val.path.as_str())
-            .map_err(|e| internal_datafusion_err!("Invalid object_store path: {e}"))?,
-        last_modified: Utc.timestamp_nanos(val.last_modified_ns as i64),
-        size: val.size,
-        e_tag: None,
-        version: None,
-    })
-    .with_partition_values(
-        val.partition_values
-            .iter()
-            .map(|v| v.try_into())
-            .collect::<Result<Vec<_>, _>>()?,
-    );
-    if let Some(proto_schema) = val.arrow_schema.as_ref() {
-        pf = pf.with_arrow_schema(Arc::new(
-            proto_schema.try_into().map_err(DataFusionError::from)?,
-        ));
-    }
-    if let Some(range) = val.range.as_ref() {
-        pf = pf.with_range(range.start, range.end);
-    }
-    if let Some(proto_stats) = val.statistics.as_ref() {
-        pf = pf.with_statistics(Arc::new(proto_stats.try_into()?));
-    }
-    Ok(pf)
 }
