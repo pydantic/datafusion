@@ -30,21 +30,21 @@
 //! wire logic. The wire format is byte-for-byte identical to the old central
 //! serializer.
 //!
-//! Child physical expressions (sort orderings, hash/range partitioning, and
-//! projection expressions) are (de)serialized through `ctx.encode_expr` /
-//! `ctx.decode_expr`; `Schema`, `Statistics`, `Constraints`, and `ScalarValue`
-//! go through `datafusion-proto-common`. Nothing here needs the raw codec.
+//! Sort orderings and output partitioning ride the shared
+//! `ctx.encode_sort_exprs` / `ctx.encode_partitioning` helpers (and their decode
+//! siblings); projection expressions go through `ctx.encode_expr` /
+//! `ctx.decode_expr`; file groups through
+//! [`FileGroup::try_to_proto`](crate::file_groups::FileGroup::try_to_proto);
+//! and `Schema`, `Statistics`, `Constraints` and `ScalarValue` through
+//! `datafusion-proto-common`. Nothing here needs the raw codec.
 
 use std::sync::Arc;
 
-use arrow::compute::SortOptions;
 use arrow::datatypes::Schema;
 use datafusion_common::{DataFusionError, Result, internal_datafusion_err};
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
-use datafusion_physical_expr::{
-    LexOrdering, Partitioning, PhysicalSortExpr, RangePartitioning, SplitPoint,
-};
+use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalSortExpr};
 use datafusion_physical_plan::proto::{ExecutionPlanDecodeCtx, ExecutionPlanEncodeCtx};
 use datafusion_proto_models::protobuf;
 
@@ -77,30 +77,21 @@ impl FileScanConfig {
             .map(FileGroup::try_to_proto)
             .collect::<Result<Vec<_>>>()?;
 
-        // Sort orderings: only the child expressions need the ctx; the
-        // asc/nulls_first wrapping is plain data inlined into a
-        // `PhysicalSortExprNode` (same shape as `sorts/sort.rs`).
+        let expr_ctx = ctx.expr_ctx();
         let mut output_ordering = vec![];
         for order in &self.output_ordering {
-            let nodes = order
-                .iter()
-                .map(|sort_expr| {
-                    Ok(protobuf::PhysicalSortExprNode {
-                        expr: Some(Box::new(ctx.encode_expr(&sort_expr.expr)?)),
-                        asc: !sort_expr.options.descending,
-                        nulls_first: sort_expr.options.nulls_first,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
             output_ordering.push(protobuf::PhysicalSortExprNodeCollection {
-                physical_sort_expr_nodes: nodes,
+                physical_sort_expr_nodes: order
+                    .iter()
+                    .map(|sort_expr| sort_expr.try_to_proto(&expr_ctx))
+                    .collect::<Result<Vec<_>>>()?,
             });
         }
 
         let output_partitioning = self
             .output_partitioning
             .as_ref()
-            .map(|p| partitioning_to_proto(p, ctx))
+            .map(|partitioning| partitioning.try_to_proto(&expr_ctx))
             .transpose()?;
 
         // Fields must be added to the schema so that they can persist in the
@@ -196,18 +187,23 @@ impl FileScanConfig {
             true => ObjectStoreUrl::local_filesystem(),
         };
 
+        let expr_ctx = ctx.expr_ctx(&schema);
         let mut output_ordering = vec![];
         for node_collection in &conf.output_ordering {
-            let sort_exprs = parse_sort_exprs(
-                &node_collection.physical_sort_expr_nodes,
-                ctx,
-                &schema,
-            )?;
+            let sort_exprs = node_collection
+                .physical_sort_expr_nodes
+                .iter()
+                .map(|sort_expr| PhysicalSortExpr::try_from_proto(sort_expr, &expr_ctx))
+                .collect::<Result<Vec<_>>>()?;
             output_ordering.extend(LexOrdering::new(sort_exprs));
         }
 
-        let output_partitioning =
-            partitioning_from_proto(conf.output_partitioning.as_ref(), ctx, &schema)?;
+        let output_partitioning = conf
+            .output_partitioning
+            .as_ref()
+            .map(|partitioning| Partitioning::try_from_proto(partitioning, &expr_ctx))
+            .transpose()?
+            .flatten();
 
         // Parse projection expressions if present and apply to the file source.
         let file_source = if let Some(proto_projection_exprs) = &conf.projection_exprs {
@@ -297,145 +293,4 @@ fn parse_file_scan_schema(conf: &protobuf::FileScanExecConf) -> Result<Arc<Schem
         })?
         .try_into()?;
     Ok(Arc::new(schema))
-}
-
-fn parse_sort_exprs(
-    nodes: &[protobuf::PhysicalSortExprNode],
-    ctx: &ExecutionPlanDecodeCtx<'_>,
-    schema: &Schema,
-) -> Result<Vec<PhysicalSortExpr>> {
-    nodes
-        .iter()
-        .map(|sort_expr| {
-            let expr = sort_expr.expr.as_ref().ok_or_else(|| {
-                internal_datafusion_err!("Unexpected empty physical expression")
-            })?;
-            Ok(PhysicalSortExpr {
-                expr: ctx.decode_expr(expr, schema)?,
-                options: SortOptions {
-                    descending: !sort_expr.asc,
-                    nulls_first: sort_expr.nulls_first,
-                },
-            })
-        })
-        .collect()
-}
-
-/// Inlined equivalent of `datafusion-proto`'s `serialize_partitioning`. Only
-/// child physical expressions and `ScalarValue`s need the ctx; the
-/// `protobuf::Partitioning` wrapping is built directly here.
-fn partitioning_to_proto(
-    partitioning: &Partitioning,
-    ctx: &ExecutionPlanEncodeCtx<'_>,
-) -> Result<protobuf::Partitioning> {
-    let partition_method = match partitioning {
-        Partitioning::RoundRobinBatch(n) => {
-            protobuf::partitioning::PartitionMethod::RoundRobin(*n as u64)
-        }
-        Partitioning::Hash(exprs, n) => {
-            let hash_expr = ctx.encode_expressions(exprs)?;
-            protobuf::partitioning::PartitionMethod::Hash(
-                protobuf::PhysicalHashRepartition {
-                    hash_expr,
-                    partition_count: *n as u64,
-                },
-            )
-        }
-        Partitioning::Range(range) => {
-            let sort_expr = range
-                .ordering()
-                .iter()
-                .map(|sort_expr| {
-                    Ok(protobuf::PhysicalSortExprNode {
-                        expr: Some(Box::new(ctx.encode_expr(&sort_expr.expr)?)),
-                        asc: !sort_expr.options.descending,
-                        nulls_first: sort_expr.options.nulls_first,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let split_point = range
-                .split_points()
-                .iter()
-                .map(|split_point| {
-                    let value = split_point
-                        .values()
-                        .iter()
-                        .map(|value| value.try_into().map_err(Into::into))
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(protobuf::PhysicalRangeSplitPoint { value })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            protobuf::partitioning::PartitionMethod::Range(
-                protobuf::PhysicalRangePartitioning {
-                    sort_expr,
-                    split_point,
-                },
-            )
-        }
-        Partitioning::UnknownPartitioning(n) => {
-            protobuf::partitioning::PartitionMethod::Unknown(*n as u64)
-        }
-    };
-    Ok(protobuf::Partitioning {
-        partition_method: Some(partition_method),
-    })
-}
-
-/// Inlined equivalent of `datafusion-proto`'s `parse_protobuf_partitioning`.
-fn partitioning_from_proto(
-    partitioning: Option<&protobuf::Partitioning>,
-    ctx: &ExecutionPlanDecodeCtx<'_>,
-    schema: &Schema,
-) -> Result<Option<Partitioning>> {
-    let Some(partitioning) = partitioning else {
-        return Ok(None);
-    };
-    let Some(partition_method) = partitioning.partition_method.as_ref() else {
-        return Ok(None);
-    };
-    let partitioning = match partition_method {
-        protobuf::partitioning::PartitionMethod::RoundRobin(n) => {
-            Partitioning::RoundRobinBatch(*n as usize)
-        }
-        protobuf::partitioning::PartitionMethod::Hash(hash) => {
-            let exprs = hash
-                .hash_expr
-                .iter()
-                .map(|expr| ctx.decode_expr(expr, schema))
-                .collect::<Result<Vec<_>>>()?;
-            Partitioning::Hash(exprs, hash.partition_count as usize)
-        }
-        protobuf::partitioning::PartitionMethod::Unknown(n) => {
-            Partitioning::UnknownPartitioning(*n as usize)
-        }
-        protobuf::partitioning::PartitionMethod::Range(range) => {
-            let sort_exprs = parse_sort_exprs(&range.sort_expr, ctx, schema)?;
-            let sort_expr_count = sort_exprs.len();
-            let ordering = LexOrdering::new(sort_exprs).ok_or_else(|| {
-                internal_datafusion_err!("Range partitioning requires non-empty ordering")
-            })?;
-            if ordering.len() != sort_expr_count {
-                return Err(internal_datafusion_err!(
-                    "Range partitioning ordering must not contain duplicate expressions"
-                ));
-            }
-            let split_points = range
-                .split_point
-                .iter()
-                .map(|split_point| {
-                    let values = split_point
-                        .value
-                        .iter()
-                        .map(|value| {
-                            datafusion_common::ScalarValue::try_from(value)
-                                .map_err(Into::into)
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(SplitPoint::new(values))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Partitioning::Range(RangePartitioning::try_new(ordering, split_points)?)
-        }
-    };
-    Ok(Some(partitioning))
 }
