@@ -28,8 +28,8 @@ use crate::decoder_projection::DecoderProjection;
 use crate::metrics::{ByteProgress, RowFilterSkippedFullyMatchedMetric};
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::push_decoder::{
-    DecoderBuilderConfig, InitialDecoderState, PushDecoderStreamState, RgPlanEntry,
-    RowFilterContext, RowGroupPruner,
+    DecoderBuilderConfig, FetchPolicy, InitialDecoderState, PushDecoderStreamState,
+    ReaderSlot, RgPlanEntry, RowFilterContext, RowGroupPruner,
 };
 use crate::row_group_filter::{RowGroupAccessPlanFilter, row_group_in_range};
 use crate::{
@@ -1889,7 +1889,10 @@ impl RowGroupsPrunedParquetOpen {
             decoder: Some(decoder),
             active_reader: None,
             rg_plan,
-            reader: prepared.async_file_reader,
+            reader: ReaderSlot::Idle(prepared.async_file_reader),
+            fetch_policy: FetchPolicy::from_env(),
+            parquet_metadata: Arc::clone(reader_metadata.metadata()),
+            prefetched_row_groups: std::collections::HashSet::new(),
             decoder_projection,
             arrow_reader_metrics,
             predicate_cache_inner_records,
