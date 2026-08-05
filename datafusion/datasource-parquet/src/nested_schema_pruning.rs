@@ -325,6 +325,60 @@ mod tests {
         let dict =
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
         assert_eq!(count_leaves(&dict), 1);
+        // Wrapper kinds must be descended through, not counted as one leaf.
+        // A dictionary or run-end-encoded *value* that is itself a struct has
+        // as many leaves as the struct: counting it as 1 would misalign every
+        // later leaf index in the mask.
+        assert_eq!(
+            count_leaves(&DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(struct_of(vec![utf8("a"), int64("b")]))
+            )),
+            2
+        );
+        assert_eq!(
+            count_leaves(&DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new(
+                    "values",
+                    struct_of(vec![utf8("a"), int64("b")]),
+                    true
+                ))
+            )),
+            2
+        );
+    }
+
+    /// [`contains_struct`] gates the projection fast path, so it has to agree
+    /// with [`count_leaves`] about which wrappers are descended through.
+    #[test]
+    fn contains_struct_shapes() {
+        assert!(!contains_struct(&DataType::Int32));
+        assert!(!contains_struct(&list_of(DataType::Int32)));
+        assert!(contains_struct(&struct_of(vec![int64("a")])));
+        assert!(contains_struct(&list_of(struct_of(vec![int64("a")]))));
+        assert!(contains_struct(&DataType::LargeList(Arc::new(Field::new(
+            "item",
+            struct_of(vec![int64("a")]),
+            true
+        )))));
+        assert!(contains_struct(&DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(struct_of(vec![int64("a")]))
+        )));
+        assert!(!contains_struct(&DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::Utf8)
+        )));
+        // A map's entries are a struct, so a map always contains one.
+        assert!(contains_struct(&DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                struct_of(vec![utf8("key"), int64("value")]),
+                false
+            )),
+            false
+        )));
     }
 
     /// `{a, b, c} CAST TO {b}` keeps only b's leaf.
@@ -854,13 +908,22 @@ mod fuzz {
 
     /// A root column type that contains a struct somewhere (otherwise there is
     /// nothing this module could ever clip).
+    ///
+    /// Rejection sampling is capped: the filter calls into the very code under
+    /// test, so a bug (or a mutant) that makes [`contains_struct`] always
+    /// return false must fail the test rather than spin here forever.
     fn gen_root_field(rng: &mut Rng) -> Field {
-        loop {
+        const MAX_ATTEMPTS: usize = 10_000;
+        for _ in 0..MAX_ATTEMPTS {
             let dt = gen_type(rng, MAX_DEPTH);
             if contains_struct(&dt) && count_leaves(&dt) <= 32 {
                 return Field::new("col", dt, true);
             }
         }
+        panic!(
+            "no struct-containing type generated in {MAX_ATTEMPTS} attempts; \
+             `contains_struct` or the type generator is broken"
+        );
     }
 
     // ---------------------------------------------------- target generator
