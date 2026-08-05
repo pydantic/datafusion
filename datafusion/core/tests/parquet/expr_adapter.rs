@@ -23,7 +23,7 @@ use arrow::array::{
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::concat_batches;
-use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use bytes::{BufMut, BytesMut};
 use datafusion::assert_batches_eq;
 use datafusion::common::Result;
@@ -1378,7 +1378,7 @@ mod nested_projection_pruning {
         }
     }
 
-    async fn setup_with_config(
+    pub(super) async fn setup_with_config(
         batches: Vec<(&str, RecordBatch)>,
         narrow_schema: SchemaRef,
         full_schema: SchemaRef,
@@ -1407,7 +1407,10 @@ mod nested_projection_pruning {
         .await
     }
 
-    async fn run(ctx: &SessionContext, sql: &str) -> (Vec<RecordBatch>, MetricsSet) {
+    pub(super) async fn run(
+        ctx: &SessionContext,
+        sql: &str,
+    ) -> (Vec<RecordBatch>, MetricsSet) {
         let df = ctx.sql(sql).await.unwrap();
         let (state, logical) = df.into_parts();
         let plan = state.create_physical_plan(&logical).await.unwrap();
@@ -1416,7 +1419,7 @@ mod nested_projection_pruning {
         (batches, metrics)
     }
 
-    fn bytes_scanned(metrics: &MetricsSet) -> usize {
+    pub(super) fn bytes_scanned(metrics: &MetricsSet) -> usize {
         metrics
             .sum(|m| m.value().name() == "bytes_scanned")
             .map(|v| v.as_usize())
@@ -2045,6 +2048,471 @@ mod query_level_nested_cast {
                 "+--------+-----------------------+",
             ],
             &batches
+        );
+    }
+}
+
+/// Randomised end-to-end differential test for nested schema pruning.
+///
+/// Each case writes one random nested Parquet file and registers it twice:
+/// as `t_full` (the file's own schema, so no cast is inserted and every leaf
+/// is read) and as `t_narrow` (a randomly narrowed declared schema, so the
+/// expr adapter inserts `CAST(col AS narrow)` and the scan clips the read).
+/// `SELECT col FROM t_narrow` must then equal the runtime cast applied to the
+/// unclipped `SELECT col FROM t_full`, row for row and null for null at every
+/// nesting level, and must not scan more bytes.
+///
+/// Failures print the seed and case index; re-run with
+/// `NESTED_E2E_FUZZ_SEED0`/`_SEEDS`/`_CASES` to reproduce or widen the search.
+mod nested_pruning_fuzz {
+    use super::nested_projection_pruning::{bytes_scanned, run, setup_with_config};
+    use super::*;
+    use arrow::array::{DictionaryArray, Float64Array, MapArray};
+    use arrow::buffer::NullBuffer;
+    use arrow::compute::concat;
+    use arrow::datatypes::Int32Type;
+    use arrow::util::pretty::pretty_format_batches;
+    use datafusion_common::format::DEFAULT_CAST_OPTIONS;
+    use datafusion_common::nested_struct::cast_column;
+
+    const MAX_DEPTH: usize = 3;
+    const MAX_WIDTH: usize = 4;
+    const ROWS: usize = 8;
+
+    const NAMES: [&str; 6] = ["a", "b", "c", "x", "ключ", "名前"];
+
+    /// xorshift64: seeded, reproducible, no dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+        fn range(&mut self, lo: usize, hi: usize) -> usize {
+            lo + self.below(hi - lo + 1)
+        }
+        fn chance(&mut self, percent: u64) -> bool {
+            self.next_u64() % 100 < percent
+        }
+    }
+
+    // ------------------------------------------------------ type generator
+
+    fn gen_leaf(rng: &mut Rng) -> DataType {
+        match rng.below(6) {
+            0 => DataType::Int32,
+            1 => DataType::Int64,
+            2 => DataType::Utf8,
+            3 => DataType::Boolean,
+            4 => DataType::Float64,
+            _ => {
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+            }
+        }
+    }
+
+    /// Every generated field is nullable: a declared schema that narrows a
+    /// nullable physical field to a non-nullable one is rejected at planning
+    /// time (`validate_struct_compatibility`), which is a different code path
+    /// from the one under test here.
+    fn gen_type(rng: &mut Rng, depth: usize) -> DataType {
+        if depth == 0 {
+            return gen_leaf(rng);
+        }
+        match rng.below(12) {
+            0..=4 => DataType::Struct(gen_fields(rng, depth - 1)),
+            5..=6 => DataType::List(Arc::new(item_field(rng, depth - 1))),
+            7 => DataType::LargeList(Arc::new(item_field(rng, depth - 1))),
+            8 => DataType::FixedSizeList(Arc::new(item_field(rng, depth - 1)), 2),
+            9 => gen_map(rng, depth - 1),
+            _ => gen_leaf(rng),
+        }
+    }
+
+    fn gen_fields(rng: &mut Rng, depth: usize) -> Fields {
+        let n = rng.range(1, MAX_WIDTH).max(rng.range(1, 2));
+        Fields::from(
+            (0..n)
+                .map(|_| {
+                    Field::new(NAMES[rng.below(NAMES.len())], gen_type(rng, depth), true)
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn item_field(rng: &mut Rng, depth: usize) -> Field {
+        Field::new("item", gen_type(rng, depth), true)
+    }
+
+    fn gen_map(rng: &mut Rng, depth: usize) -> DataType {
+        let entries = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", gen_type(rng, depth), true),
+        ]);
+        DataType::Map(
+            Arc::new(Field::new("entries", DataType::Struct(entries), false)),
+            false,
+        )
+    }
+
+    fn gen_root_field(rng: &mut Rng) -> Field {
+        loop {
+            let dt = gen_type(rng, MAX_DEPTH);
+            if contains_struct(&dt) {
+                return Field::new("col", dt, true);
+            }
+        }
+    }
+
+    fn contains_struct(dt: &DataType) -> bool {
+        match dt {
+            DataType::Struct(_) => true,
+            DataType::List(f)
+            | DataType::LargeList(f)
+            | DataType::FixedSizeList(f, _) => contains_struct(f.data_type()),
+            DataType::Map(f, _) => contains_struct(f.data_type()),
+            DataType::Dictionary(_, v) => contains_struct(v),
+            _ => false,
+        }
+    }
+
+    // ---------------------------------------------------- target generator
+
+    /// Narrow `physical` into a declared type: drop struct fields, reorder
+    /// them, widen `Int32` leaves, and invent field names the file does not
+    /// have. Wrapper kinds and maps are preserved, since changing those makes
+    /// the adapter emit a plain Arrow cast instead of the nested one this
+    /// feature is about.
+    fn gen_target(rng: &mut Rng, physical: &DataType) -> DataType {
+        match physical {
+            DataType::Struct(fields) => {
+                // Only the *first* physical field of a given name is
+                // addressable: both the planner's compatibility check and
+                // `cast_column` resolve a target field by looking up the
+                // first source field with that name, so a target derived
+                // from a shadowed duplicate would describe a type the file
+                // does not have under that name. (The file itself keeps its
+                // duplicates, so the clip's duplicate handling is still
+                // exercised.)
+                let mut seen = std::collections::HashSet::new();
+                let addressable: Vec<&FieldRef> = fields
+                    .iter()
+                    .filter(|f| seen.insert(f.name().as_str()))
+                    .collect();
+                let mut kept: Vec<Field> = addressable
+                    .iter()
+                    .filter(|_| rng.chance(55))
+                    .map(|f| f.as_ref().as_ref().clone())
+                    .collect();
+                // At least one field must survive at every level: a
+                // zero-overlap struct cast is rejected during planning.
+                if kept.is_empty() {
+                    kept.push(addressable[rng.below(addressable.len())].as_ref().clone());
+                }
+                let mut out: Vec<Field> = kept
+                    .into_iter()
+                    .map(|f| {
+                        let dt = gen_target(rng, f.data_type());
+                        f.with_data_type(dt)
+                    })
+                    .collect();
+                if rng.chance(20) {
+                    out.push(Field::new("__absent__", DataType::Int64, true));
+                }
+                for i in (1..out.len()).rev() {
+                    out.swap(i, rng.below(i + 1));
+                }
+                DataType::Struct(Fields::from(out))
+            }
+            DataType::List(item) => DataType::List(Arc::new(narrowed_item(rng, item))),
+            DataType::LargeList(item) => {
+                DataType::LargeList(Arc::new(narrowed_item(rng, item)))
+            }
+            DataType::FixedSizeList(item, n) => {
+                DataType::FixedSizeList(Arc::new(narrowed_item(rng, item)), *n)
+            }
+            DataType::Int32 if rng.chance(30) => DataType::Int64,
+            other => other.clone(),
+        }
+    }
+
+    fn narrowed_item(rng: &mut Rng, item: &Field) -> Field {
+        let dt = gen_target(rng, item.data_type());
+        item.clone().with_data_type(dt)
+    }
+
+    // ------------------------------------------------------ data generator
+
+    fn validity(rng: &mut Rng, len: usize) -> Vec<bool> {
+        if len == 0 || rng.chance(25) {
+            return vec![true; len];
+        }
+        let all_null = rng.chance(10);
+        (0..len).map(|_| !all_null && !rng.chance(30)).collect()
+    }
+
+    fn null_buffer(valid: &[bool]) -> Option<NullBuffer> {
+        valid
+            .iter()
+            .any(|v| !v)
+            .then(|| NullBuffer::from(valid.to_vec()))
+    }
+
+    fn gen_array(rng: &mut Rng, dt: &DataType, len: usize) -> ArrayRef {
+        match dt {
+            DataType::Struct(fields) => {
+                let children = fields
+                    .iter()
+                    .map(|f| gen_array(rng, f.data_type(), len))
+                    .collect::<Vec<_>>();
+                let valid = validity(rng, len);
+                Arc::new(StructArray::new(
+                    fields.clone(),
+                    children,
+                    null_buffer(&valid),
+                ))
+            }
+            DataType::List(item) => {
+                let valid = validity(rng, len);
+                let lengths = list_lengths(rng, &valid);
+                let values = gen_array(rng, item.data_type(), lengths.iter().sum());
+                Arc::new(ListArray::new(
+                    Arc::clone(item),
+                    OffsetBuffer::<i32>::from_lengths(lengths),
+                    values,
+                    null_buffer(&valid),
+                ))
+            }
+            DataType::LargeList(item) => {
+                let valid = validity(rng, len);
+                let lengths = list_lengths(rng, &valid);
+                let values = gen_array(rng, item.data_type(), lengths.iter().sum());
+                Arc::new(LargeListArray::new(
+                    Arc::clone(item),
+                    OffsetBuffer::<i64>::from_lengths(lengths),
+                    values,
+                    null_buffer(&valid),
+                ))
+            }
+            DataType::FixedSizeList(item, n) => {
+                let valid = validity(rng, len);
+                let values = gen_array(rng, item.data_type(), len * *n as usize);
+                Arc::new(FixedSizeListArray::new(
+                    Arc::clone(item),
+                    *n,
+                    values,
+                    null_buffer(&valid),
+                ))
+            }
+            DataType::Map(entries_field, sorted) => {
+                let DataType::Struct(children) = entries_field.data_type() else {
+                    unreachable!("map entries are a struct")
+                };
+                let valid = validity(rng, len);
+                let lengths = list_lengths(rng, &valid);
+                let total: usize = lengths.iter().sum();
+                let keys: ArrayRef = Arc::new(StringArray::from_iter_values(
+                    (0..total).map(|i| format!("k{i}")),
+                ));
+                let values = gen_array(rng, children[1].data_type(), total);
+                let entries =
+                    StructArray::new(children.clone(), vec![keys, values], None);
+                Arc::new(MapArray::new(
+                    Arc::clone(entries_field),
+                    OffsetBuffer::<i32>::from_lengths(lengths),
+                    entries,
+                    null_buffer(&valid),
+                    *sorted,
+                ))
+            }
+            DataType::Dictionary(_, _) => {
+                let valid = validity(rng, len);
+                let words = ["alpha", "beta", "gamma"];
+                Arc::new(DictionaryArray::<Int32Type>::from_iter(
+                    valid
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| v.then_some(words[i % words.len()])),
+                ))
+            }
+            DataType::Int32 => Arc::new(Int32Array::from(opt(rng, len, |i| i as i32))),
+            DataType::Int64 => {
+                Arc::new(Int64Array::from(opt(rng, len, |i| i as i64 * 7)))
+            }
+            DataType::Boolean => {
+                Arc::new(BooleanArray::from(opt(rng, len, |i| i % 2 == 0)))
+            }
+            DataType::Float64 => {
+                Arc::new(Float64Array::from(opt(rng, len, |i| i as f64 + 0.5)))
+            }
+            DataType::Utf8 => {
+                Arc::new(StringArray::from(opt(rng, len, |i| format!("v{i}"))))
+            }
+            other => unreachable!("generator does not produce {other:?}"),
+        }
+    }
+
+    fn list_lengths(rng: &mut Rng, valid: &[bool]) -> Vec<usize> {
+        valid
+            .iter()
+            .map(|v| if *v { rng.below(3) } else { 0 })
+            .collect()
+    }
+
+    fn opt<T>(rng: &mut Rng, len: usize, f: impl Fn(usize) -> T) -> Vec<Option<T>> {
+        validity(rng, len)
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| v.then(|| f(i)))
+            .collect()
+    }
+
+    // --------------------------------------------------------------- case
+
+    #[derive(Debug, Default)]
+    struct Stats {
+        cases: usize,
+        /// Cases where the narrow scan read strictly fewer bytes, i.e. the
+        /// clip actually took effect end to end.
+        pruned: usize,
+        /// Cases where the narrow schema was identical to the file's.
+        identical: usize,
+    }
+
+    async fn run_case(rng: &mut Rng, seed: u64, case: usize, stats: &mut Stats) {
+        let col = gen_root_field(rng);
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            col.clone(),
+        ]));
+        let narrow_type = gen_target(rng, col.data_type());
+        let narrow_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("col", narrow_type.clone(), true),
+        ]));
+        let data = gen_array(rng, col.data_type(), ROWS);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![Arc::new(Int32Array::from_iter_values(0..ROWS as i32)), data],
+        )
+        .unwrap();
+
+        stats.cases += 1;
+        if narrow_type == *col.data_type() {
+            stats.identical += 1;
+        }
+
+        let ctx = setup_with_config(
+            vec![("f.parquet", batch)],
+            Arc::clone(&narrow_schema),
+            Arc::clone(&file_schema),
+            // One partition so both scans emit rows in file order and the
+            // two results can be compared positionally.
+            SessionConfig::new()
+                .with_collect_statistics(false)
+                .with_target_partitions(1),
+        )
+        .await;
+
+        let describe = || {
+            format!(
+                "seed={seed} case={case}\n  physical = {:#?}\n  narrow   = {narrow_type:#?}",
+                col.data_type()
+            )
+        };
+
+        let (narrow_batches, narrow_metrics) =
+            run(&ctx, "SELECT col FROM t_narrow").await;
+        let (full_batches, full_metrics) = run(&ctx, "SELECT col FROM t_full").await;
+
+        let actual = single_column(&narrow_batches);
+        let full = single_column(&full_batches);
+
+        // Reference: the unclipped read put through the very same runtime
+        // cast the scan applies (`CastExpr` -> `ColumnarValue::cast_to` ->
+        // `cast_column`), with the cast options `CastExpr` defaults to.
+        let expected = cast_column(&full, &narrow_type, &DEFAULT_CAST_OPTIONS)
+            .unwrap_or_else(|e| panic!("reference cast failed: {e}\n{}", describe()));
+
+        if expected.to_data() != actual.to_data() {
+            panic!(
+                "clipped scan differs from cast over the unclipped scan\n\
+                 {}\n  expected:\n{}\n  actual:\n{}",
+                describe(),
+                pretty(&expected, &narrow_type),
+                pretty(&actual, &narrow_type),
+            );
+        }
+
+        let (narrow_bytes, full_bytes) =
+            (bytes_scanned(&narrow_metrics), bytes_scanned(&full_metrics));
+        assert!(
+            narrow_bytes <= full_bytes,
+            "narrowed scan read {narrow_bytes} bytes, unclipped read \
+             {full_bytes}\n{}",
+            describe()
+        );
+        if narrow_bytes < full_bytes {
+            stats.pruned += 1;
+        }
+    }
+
+    fn single_column(batches: &[RecordBatch]) -> ArrayRef {
+        let columns = batches
+            .iter()
+            .map(|b| b.column(0).as_ref())
+            .collect::<Vec<_>>();
+        concat(&columns).unwrap()
+    }
+
+    fn pretty(array: &ArrayRef, dt: &DataType) -> String {
+        let schema = Arc::new(Schema::new(vec![Field::new("col", dt.clone(), true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::clone(array)]).unwrap();
+        pretty_format_batches(&[batch]).unwrap().to_string()
+    }
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nested_pruning_end_to_end_differential() {
+        let seed0 = env_usize("NESTED_E2E_FUZZ_SEED0", 1) as u64;
+        let seeds = env_usize("NESTED_E2E_FUZZ_SEEDS", 12);
+        let cases = env_usize("NESTED_E2E_FUZZ_CASES", 12);
+
+        let mut stats = Stats::default();
+        for i in 0..seeds {
+            let seed = seed0 + i as u64;
+            let mut rng = Rng::new(seed);
+            for case in 0..cases {
+                run_case(&mut rng, seed, case, &mut stats).await;
+            }
+        }
+
+        println!("nested pruning e2e fuzz: {stats:?}");
+        assert!(stats.cases > 0);
+        // A run in which no query ever read fewer bytes would not have
+        // exercised the feature at all.
+        assert!(
+            stats.pruned * 4 > stats.cases,
+            "only {} of {} cases actually pruned the read: {stats:?}",
+            stats.pruned,
+            stats.cases
         );
     }
 }

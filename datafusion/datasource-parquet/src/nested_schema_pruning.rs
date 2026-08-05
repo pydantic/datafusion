@@ -718,3 +718,774 @@ mod tests {
         }
     }
 }
+
+/// Randomised differential harness for [`clip_for_cast`].
+///
+/// Each case builds a random nested Arrow type, writes a small batch of that
+/// type to an in-memory Parquet file, derives a random narrowing cast target
+/// from the type the *reader* reports for that file, and then checks the two
+/// promises this module makes to
+/// [`crate::projection_read_plan::build_read_plan_with_cast_clipping`]:
+///
+/// 1. the Arrow type predicted for the clipped leaf set is exactly the type
+///    the arrow-rs decoder emits under `ProjectionMask::leaves(kept)`, and
+/// 2. the values (and nulls, at every nesting level) of the clipped read are
+///    exactly those of an unclipped read with the dropped subtrees removed.
+///
+/// Failures print the seed and case index; re-running with
+/// `NESTED_PRUNING_FUZZ_SEED0`/`_SEEDS`/`_CASES` reproduces them exactly.
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+    use arrow::array::{
+        Array, ArrayRef, BooleanArray, DictionaryArray, FixedSizeListArray, Float64Array,
+        Int32Array, Int64Array, LargeListArray, ListArray, MapArray, StringArray,
+        StructArray,
+    };
+    use arrow::buffer::{NullBuffer, OffsetBuffer};
+    use arrow::datatypes::{Int32Type, Schema, SchemaRef};
+    use arrow::record_batch::RecordBatch;
+    use bytes::Bytes;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::{ArrowWriter, ProjectionMask};
+
+    /// Maximum nesting depth of a generated physical type.
+    const MAX_DEPTH: usize = 4;
+    /// Maximum number of fields per generated struct level.
+    const MAX_WIDTH: usize = 6;
+    /// Rows per generated file.
+    const ROWS: usize = 8;
+
+    /// Field-name pool. Small enough that duplicate names inside one struct
+    /// happen naturally, and includes non-ASCII names.
+    const NAMES: [&str; 8] = ["a", "b", "c", "x", "id", "ключ", "名前", "f-1"];
+
+    // ----------------------------------------------------------------- rng
+
+    /// xorshift64: seeded, reproducible, no dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+
+        /// Inclusive range.
+        fn range(&mut self, lo: usize, hi: usize) -> usize {
+            lo + self.below(hi - lo + 1)
+        }
+
+        fn chance(&mut self, percent: u64) -> bool {
+            self.next_u64() % 100 < percent
+        }
+    }
+
+    // ------------------------------------------------------ type generator
+
+    fn gen_leaf(rng: &mut Rng) -> DataType {
+        match rng.below(6) {
+            0 => DataType::Int32,
+            1 => DataType::Int64,
+            2 => DataType::Utf8,
+            3 => DataType::Boolean,
+            4 => DataType::Float64,
+            _ => {
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+            }
+        }
+    }
+
+    fn gen_type(rng: &mut Rng, depth: usize) -> DataType {
+        if depth == 0 {
+            return gen_leaf(rng);
+        }
+        match rng.below(12) {
+            0..=4 => DataType::Struct(gen_fields(rng, depth - 1)),
+            5..=6 => DataType::List(Arc::new(gen_item_field(rng, depth - 1))),
+            7 => DataType::LargeList(Arc::new(gen_item_field(rng, depth - 1))),
+            8 => DataType::FixedSizeList(Arc::new(gen_item_field(rng, depth - 1)), 2),
+            9 => gen_map(rng, depth - 1),
+            _ => gen_leaf(rng),
+        }
+    }
+
+    fn gen_fields(rng: &mut Rng, depth: usize) -> Fields {
+        // Bias away from width-1 structs: a level with a single field can
+        // only ever be kept whole or emptied, so it exercises little.
+        let n = rng.range(1, MAX_WIDTH).max(rng.range(1, 2));
+        Fields::from(
+            (0..n)
+                .map(|_| {
+                    let name = NAMES[rng.below(NAMES.len())];
+                    Field::new(name, gen_type(rng, depth), !rng.chance(20))
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn gen_item_field(rng: &mut Rng, depth: usize) -> Field {
+        Field::new("item", gen_type(rng, depth), !rng.chance(20))
+    }
+
+    fn gen_map(rng: &mut Rng, depth: usize) -> DataType {
+        let entries = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", gen_type(rng, depth), true),
+        ]);
+        DataType::Map(
+            Arc::new(Field::new("entries", DataType::Struct(entries), false)),
+            false,
+        )
+    }
+
+    /// A root column type that contains a struct somewhere (otherwise there is
+    /// nothing this module could ever clip).
+    fn gen_root_field(rng: &mut Rng) -> Field {
+        loop {
+            let dt = gen_type(rng, MAX_DEPTH);
+            if contains_struct(&dt) && count_leaves(&dt) <= 32 {
+                return Field::new("col", dt, true);
+            }
+        }
+    }
+
+    // ---------------------------------------------------- target generator
+
+    /// Derive a random cast target from a physical type: drop struct fields,
+    /// reorder them, widen leaves, invent absent names, and occasionally swap
+    /// a wrapper kind.
+    fn gen_target(rng: &mut Rng, physical: &DataType) -> DataType {
+        match physical {
+            DataType::Struct(fields) => {
+                let mut kept: Vec<Field> = fields
+                    .iter()
+                    .filter(|_| rng.chance(55))
+                    .map(|f| f.as_ref().clone())
+                    .collect();
+                // Usually make sure at least one field survives, so the clip
+                // has something to keep; the remaining 10% exercise the
+                // zero-overlap bail-out.
+                if kept.is_empty() && !rng.chance(10) {
+                    kept.push(fields[rng.below(fields.len())].as_ref().clone());
+                }
+                // Recurse, then shuffle so target order differs from physical.
+                let mut out: Vec<Field> = kept
+                    .into_iter()
+                    .map(|f| {
+                        let dt = gen_target(rng, f.data_type());
+                        f.with_data_type(dt)
+                    })
+                    .collect();
+                if rng.chance(20) {
+                    out.push(Field::new("__absent__", DataType::Int64, true));
+                }
+                for i in (1..out.len()).rev() {
+                    out.swap(i, rng.below(i + 1));
+                }
+                DataType::Struct(Fields::from(out))
+            }
+            DataType::List(item) => {
+                let inner = item
+                    .as_ref()
+                    .clone()
+                    .with_data_type(gen_target(rng, item.data_type()));
+                if rng.chance(10) {
+                    DataType::LargeList(Arc::new(inner))
+                } else {
+                    DataType::List(Arc::new(inner))
+                }
+            }
+            DataType::LargeList(item) => {
+                let inner = item
+                    .as_ref()
+                    .clone()
+                    .with_data_type(gen_target(rng, item.data_type()));
+                if rng.chance(10) {
+                    DataType::List(Arc::new(inner))
+                } else {
+                    DataType::LargeList(Arc::new(inner))
+                }
+            }
+            DataType::FixedSizeList(item, n) => {
+                let inner = item
+                    .as_ref()
+                    .clone()
+                    .with_data_type(gen_target(rng, item.data_type()));
+                let n = if rng.chance(10) { n + 1 } else { *n };
+                DataType::FixedSizeList(Arc::new(inner), n)
+            }
+            DataType::Map(entries, sorted) => {
+                let DataType::Struct(children) = entries.data_type() else {
+                    return physical.clone();
+                };
+                let value = children[1].as_ref().clone();
+                let value = value
+                    .clone()
+                    .with_data_type(gen_target(rng, value.data_type()));
+                let new_entries = Fields::from(vec![children[0].as_ref().clone(), value]);
+                DataType::Map(
+                    Arc::new(
+                        entries
+                            .as_ref()
+                            .clone()
+                            .with_data_type(DataType::Struct(new_entries)),
+                    ),
+                    *sorted,
+                )
+            }
+            DataType::Dictionary(key, value) => {
+                DataType::Dictionary(key.clone(), Box::new(gen_target(rng, value)))
+            }
+            DataType::Int32 if rng.chance(30) => DataType::Int64,
+            other => other.clone(),
+        }
+    }
+
+    // ---------------------------------------------------- data generator
+
+    fn validity(rng: &mut Rng, nullable: bool, len: usize) -> Vec<bool> {
+        if !nullable || len == 0 {
+            return vec![true; len];
+        }
+        // 25% of arrays have no nulls at all, 10% are entirely null.
+        if rng.chance(25) {
+            return vec![true; len];
+        }
+        let all_null = rng.chance(10);
+        (0..len)
+            .map(|_| !all_null && !rng.chance(30))
+            .collect::<Vec<_>>()
+    }
+
+    fn null_buffer(valid: &[bool]) -> Option<NullBuffer> {
+        valid
+            .iter()
+            .any(|v| !v)
+            .then(|| NullBuffer::from(valid.to_vec()))
+    }
+
+    fn gen_array(rng: &mut Rng, field: &Field, len: usize) -> ArrayRef {
+        let nullable = field.is_nullable();
+        match field.data_type() {
+            DataType::Struct(fields) => {
+                let children = fields
+                    .iter()
+                    .map(|f| gen_array(rng, f, len))
+                    .collect::<Vec<_>>();
+                let valid = validity(rng, nullable, len);
+                Arc::new(StructArray::new(
+                    fields.clone(),
+                    children,
+                    null_buffer(&valid),
+                ))
+            }
+            DataType::List(item) => {
+                let valid = validity(rng, nullable, len);
+                let lengths = valid
+                    .iter()
+                    .map(|v| if *v { rng.below(3) } else { 0 })
+                    .collect::<Vec<_>>();
+                let total: usize = lengths.iter().sum();
+                let values = gen_array(rng, item, total);
+                Arc::new(ListArray::new(
+                    Arc::clone(item),
+                    OffsetBuffer::<i32>::from_lengths(lengths),
+                    values,
+                    null_buffer(&valid),
+                ))
+            }
+            DataType::LargeList(item) => {
+                let valid = validity(rng, nullable, len);
+                let lengths = valid
+                    .iter()
+                    .map(|v| if *v { rng.below(3) } else { 0 })
+                    .collect::<Vec<_>>();
+                let total: usize = lengths.iter().sum();
+                let values = gen_array(rng, item, total);
+                Arc::new(LargeListArray::new(
+                    Arc::clone(item),
+                    OffsetBuffer::<i64>::from_lengths(lengths),
+                    values,
+                    null_buffer(&valid),
+                ))
+            }
+            DataType::FixedSizeList(item, n) => {
+                let valid = validity(rng, nullable, len);
+                let values = gen_array(rng, item, len * *n as usize);
+                Arc::new(FixedSizeListArray::new(
+                    Arc::clone(item),
+                    *n,
+                    values,
+                    null_buffer(&valid),
+                ))
+            }
+            DataType::Map(entries_field, sorted) => {
+                let DataType::Struct(children) = entries_field.data_type() else {
+                    unreachable!("map entries are always a struct")
+                };
+                let valid = validity(rng, nullable, len);
+                let lengths = valid
+                    .iter()
+                    .map(|v| if *v { rng.below(3) } else { 0 })
+                    .collect::<Vec<_>>();
+                let total: usize = lengths.iter().sum();
+                let keys: ArrayRef = Arc::new(StringArray::from_iter_values(
+                    (0..total).map(|i| format!("k{i}")),
+                ));
+                let values = gen_array(rng, &children[1], total);
+                let entries =
+                    StructArray::new(children.clone(), vec![keys, values], None);
+                Arc::new(MapArray::new(
+                    Arc::clone(entries_field),
+                    OffsetBuffer::<i32>::from_lengths(lengths),
+                    entries,
+                    null_buffer(&valid),
+                    *sorted,
+                ))
+            }
+            DataType::Dictionary(_, _) => {
+                let valid = validity(rng, nullable, len);
+                let words = ["alpha", "beta", "gamma"];
+                let it = valid
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| v.then_some(words[i % words.len()]));
+                Arc::new(DictionaryArray::<Int32Type>::from_iter(it))
+            }
+            DataType::Int32 => {
+                let valid = validity(rng, nullable, len);
+                Arc::new(Int32Array::from(
+                    valid
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| v.then_some(i as i32))
+                        .collect::<Vec<_>>(),
+                ))
+            }
+            DataType::Int64 => {
+                let valid = validity(rng, nullable, len);
+                Arc::new(Int64Array::from(
+                    valid
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| v.then_some(i as i64 * 7))
+                        .collect::<Vec<_>>(),
+                ))
+            }
+            DataType::Boolean => {
+                let valid = validity(rng, nullable, len);
+                Arc::new(BooleanArray::from(
+                    valid
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| v.then_some(i % 2 == 0))
+                        .collect::<Vec<_>>(),
+                ))
+            }
+            DataType::Float64 => {
+                let valid = validity(rng, nullable, len);
+                Arc::new(Float64Array::from(
+                    valid
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| v.then_some(i as f64 + 0.5))
+                        .collect::<Vec<_>>(),
+                ))
+            }
+            DataType::Utf8 => {
+                let valid = validity(rng, nullable, len);
+                Arc::new(StringArray::from(
+                    valid
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| v.then(|| format!("v{i}")))
+                        .collect::<Vec<_>>(),
+                ))
+            }
+            other => unreachable!("generator does not produce {other:?}"),
+        }
+    }
+
+    // --------------------------------------------------------- parquet io
+
+    fn write_file(schema: SchemaRef, batch: &RecordBatch) -> Bytes {
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(buf)
+    }
+
+    /// Read the single column of `data`, optionally through a leaf mask.
+    /// Returns the emitted type and the concatenated column.
+    fn read_column(data: &Bytes, mask: Option<&[usize]>) -> (DataType, ArrayRef) {
+        let mut builder = ParquetRecordBatchReaderBuilder::try_new(data.clone()).unwrap();
+        if let Some(leaves) = mask {
+            let mask =
+                ProjectionMask::leaves(builder.parquet_schema(), leaves.iter().copied());
+            builder = builder.with_projection(mask);
+        }
+        let reader = builder.with_batch_size(1024).build().unwrap();
+        let batches = reader.map(|b| b.unwrap()).collect::<Vec<_>>();
+        assert_eq!(batches.len(), 1, "fixture is one batch");
+        let batch = &batches[0];
+        assert_eq!(batch.num_columns(), 1);
+        (
+            batch.schema().field(0).data_type().clone(),
+            Arc::clone(batch.column(0)),
+        )
+    }
+
+    // ------------------------------------------------------- verification
+
+    /// Do two (possibly absent) null buffers mark the same slots valid?
+    fn same_validity(a: Option<&NullBuffer>, b: Option<&NullBuffer>, len: usize) -> bool {
+        (0..len)
+            .all(|i| a.is_none_or(|n| n.is_valid(i)) == b.is_none_or(|n| n.is_valid(i)))
+    }
+
+    /// Assert that the clipped read carries exactly the values and nulls of
+    /// the unclipped read, with the subtrees `predicted` dropped removed.
+    ///
+    /// Walks the two trees in parallel rather than rebuilding a pruned array,
+    /// so it compares what the decoder produced instead of what a validating
+    /// Arrow constructor would accept. `predicted`'s struct children are
+    /// always a *subsequence* (in physical order) of the physical children,
+    /// which is what makes the greedy name matching below well defined even
+    /// with duplicate field names.
+    fn assert_same(
+        full: &ArrayRef,
+        clipped: &ArrayRef,
+        predicted: &DataType,
+        path: &str,
+        ctx: &dyn Fn() -> String,
+    ) {
+        assert_eq!(
+            full.len(),
+            clipped.len(),
+            "length differs at {path}\n{}",
+            ctx()
+        );
+        assert!(
+            same_validity(full.nulls(), clipped.nulls(), full.len()),
+            "validity differs at {path}: {:?} vs {:?}\n{}",
+            full.nulls(),
+            clipped.nulls(),
+            ctx()
+        );
+        match (full.data_type(), predicted) {
+            (DataType::Struct(p_fields), DataType::Struct(t_fields)) => {
+                assert!(
+                    !t_fields.is_empty(),
+                    "clip produced an empty struct level at {path}\n{}",
+                    ctx()
+                );
+                let full_s = full.as_any().downcast_ref::<StructArray>().unwrap();
+                let clipped_s = clipped.as_any().downcast_ref::<StructArray>().unwrap();
+                assert_eq!(clipped_s.num_columns(), t_fields.len());
+                let mut ti = 0;
+                for (i, pf) in p_fields.iter().enumerate() {
+                    if ti < t_fields.len() && pf.name() == t_fields[ti].name() {
+                        assert_same(
+                            full_s.column(i),
+                            clipped_s.column(ti),
+                            t_fields[ti].data_type(),
+                            &format!("{path}.{}", pf.name()),
+                            ctx,
+                        );
+                        ti += 1;
+                    }
+                }
+                assert_eq!(
+                    ti,
+                    t_fields.len(),
+                    "predicted struct at {path} is not a subsequence of the \
+                     physical struct\n{}",
+                    ctx()
+                );
+            }
+            (DataType::List(_), DataType::List(t_item)) => {
+                let full_l = full.as_any().downcast_ref::<ListArray>().unwrap();
+                let clipped_l = clipped.as_any().downcast_ref::<ListArray>().unwrap();
+                assert_eq!(
+                    full_l.offsets(),
+                    clipped_l.offsets(),
+                    "list offsets differ at {path}\n{}",
+                    ctx()
+                );
+                assert_same(
+                    full_l.values(),
+                    clipped_l.values(),
+                    t_item.data_type(),
+                    &format!("{path}[]"),
+                    ctx,
+                );
+            }
+            (DataType::LargeList(_), DataType::LargeList(t_item)) => {
+                let full_l = full.as_any().downcast_ref::<LargeListArray>().unwrap();
+                let clipped_l =
+                    clipped.as_any().downcast_ref::<LargeListArray>().unwrap();
+                assert_eq!(
+                    full_l.offsets(),
+                    clipped_l.offsets(),
+                    "large list offsets differ at {path}\n{}",
+                    ctx()
+                );
+                assert_same(
+                    full_l.values(),
+                    clipped_l.values(),
+                    t_item.data_type(),
+                    &format!("{path}[]"),
+                    ctx,
+                );
+            }
+            // A subtree the clip does not descend through: it must have been
+            // kept whole, so it has to be identical, type and values.
+            _ => {
+                assert_eq!(
+                    full.data_type(),
+                    predicted,
+                    "clip changed a type it does not descend through at \
+                     {path}\n{}",
+                    ctx()
+                );
+                assert_eq!(
+                    full.to_data(),
+                    clipped.to_data(),
+                    "values differ at {path}\n{}",
+                    ctx()
+                );
+            }
+        }
+    }
+
+    /// Why a case did not clip, for the bail-out breakdown.
+    #[derive(Debug, Default)]
+    struct Stats {
+        cases: usize,
+        clipped: usize,
+        bail_nothing_kept: usize,
+        bail_kept_everything: usize,
+        bail_unclippable: usize,
+        leaf_count_mismatch: usize,
+        /// Clipped cases whose physical type nests a struct under a list
+        /// wrapper (the headline `List<Struct>` shape).
+        clipped_under_list: usize,
+        /// Clipped cases whose physical type has a struct level with
+        /// duplicate field names.
+        clipped_with_dup_names: usize,
+        /// Clipped cases whose physical type is more than two levels deep.
+        clipped_deep: usize,
+        /// Total Parquet leaves the clips dropped.
+        leaves_dropped: usize,
+    }
+
+    impl Stats {
+        fn merge(&mut self, other: &Stats) {
+            self.cases += other.cases;
+            self.clipped += other.clipped;
+            self.bail_nothing_kept += other.bail_nothing_kept;
+            self.bail_kept_everything += other.bail_kept_everything;
+            self.bail_unclippable += other.bail_unclippable;
+            self.leaf_count_mismatch += other.leaf_count_mismatch;
+            self.clipped_under_list += other.clipped_under_list;
+            self.clipped_with_dup_names += other.clipped_with_dup_names;
+            self.clipped_deep += other.clipped_deep;
+            self.leaves_dropped += other.leaves_dropped;
+        }
+    }
+
+    /// Does a struct live under a list wrapper anywhere in `dt`?
+    fn struct_under_list(dt: &DataType) -> bool {
+        match dt {
+            DataType::List(f)
+            | DataType::LargeList(f)
+            | DataType::FixedSizeList(f, _) => contains_struct(f.data_type()),
+            DataType::Struct(fields) => {
+                fields.iter().any(|f| struct_under_list(f.data_type()))
+            }
+            _ => nested_child(dt).is_some_and(struct_under_list),
+        }
+    }
+
+    /// Does any struct level in `dt` repeat a field name?
+    fn has_duplicate_names(dt: &DataType) -> bool {
+        match dt {
+            DataType::Struct(fields) => {
+                let mut names: Vec<&str> =
+                    fields.iter().map(|f| f.name().as_str()).collect();
+                names.sort_unstable();
+                let dup = names.windows(2).any(|w| w[0] == w[1]);
+                dup || fields.iter().any(|f| has_duplicate_names(f.data_type()))
+            }
+            _ => nested_child(dt).is_some_and(has_duplicate_names),
+        }
+    }
+
+    fn type_depth(dt: &DataType) -> usize {
+        match dt {
+            DataType::Struct(fields) => {
+                1 + fields
+                    .iter()
+                    .map(|f| type_depth(f.data_type()))
+                    .max()
+                    .unwrap_or(0)
+            }
+            _ => nested_child(dt).map_or(0, |c| 1 + type_depth(c)),
+        }
+    }
+
+    /// Re-run the walk to classify *why* `clip_for_cast` returned `None`.
+    fn classify_bail(physical: &DataType, target: &DataType, stats: &mut Stats) {
+        let total = count_leaves(physical);
+        let mut kept = Vec::new();
+        let mut next_leaf = 0;
+        let mut unclippable = false;
+        clip_type(
+            physical,
+            target,
+            &mut next_leaf,
+            &mut kept,
+            &mut unclippable,
+        );
+        if unclippable {
+            stats.bail_unclippable += 1;
+        } else if kept.is_empty() {
+            stats.bail_nothing_kept += 1;
+        } else if kept.len() >= total {
+            stats.bail_kept_everything += 1;
+        }
+    }
+
+    fn run_case(rng: &mut Rng, seed: u64, case: usize, stats: &mut Stats) {
+        let write_field = gen_root_field(rng);
+        let write_schema = Arc::new(Schema::new(vec![write_field.clone()]));
+        let array = gen_array(rng, &write_field, ROWS);
+        let batch = RecordBatch::try_new(Arc::clone(&write_schema), vec![array]).unwrap();
+        let data = write_file(Arc::clone(&write_schema), &batch);
+
+        // The type the *reader* reports is what DataFusion uses as the file
+        // schema, so that is the "physical" input to `clip_for_cast`.
+        let builder = ParquetRecordBatchReaderBuilder::try_new(data.clone()).unwrap();
+        let physical = builder.schema().field(0).data_type().clone();
+        let num_parquet_leaves = builder.parquet_schema().num_columns();
+        drop(builder);
+
+        if count_leaves(&physical) != num_parquet_leaves {
+            // `build_read_plan_with_cast_clipping` refuses to clip in this
+            // case; record it and move on.
+            stats.leaf_count_mismatch += 1;
+            return;
+        }
+
+        let target = gen_target(rng, &physical);
+        stats.cases += 1;
+
+        let ctx = || {
+            format!(
+                "seed={seed} case={case}\n  physical = {physical:#?}\n  target   = {target:#?}"
+            )
+        };
+
+        let Some((kept, predicted)) = clip_for_cast(&physical, &target) else {
+            classify_bail(&physical, &target, stats);
+            return;
+        };
+        stats.clipped += 1;
+        stats.leaves_dropped += num_parquet_leaves - kept.len();
+        if struct_under_list(&physical) {
+            stats.clipped_under_list += 1;
+        }
+        if has_duplicate_names(&physical) {
+            stats.clipped_with_dup_names += 1;
+        }
+        if type_depth(&physical) > 2 {
+            stats.clipped_deep += 1;
+        }
+
+        assert!(
+            !kept.is_empty() && kept.len() < num_parquet_leaves,
+            "clip must keep a strict, non-empty subset: {kept:?}\n{}",
+            ctx()
+        );
+        assert!(
+            kept.windows(2).all(|w| w[0] < w[1]),
+            "kept leaves must be sorted and unique: {kept:?}\n{}",
+            ctx()
+        );
+
+        let (full_type, full_array) = read_column(&data, None);
+        assert_eq!(full_type, physical, "unclipped read type\n{}", ctx());
+
+        let (clipped_type, clipped_array) = read_column(&data, Some(&kept));
+
+        // (1) the schema the decoder actually emits must be the predicted one
+        assert_eq!(
+            clipped_type,
+            predicted,
+            "predicted type does not match the type the reader emits for \
+             leaves {kept:?}\n{}",
+            ctx()
+        );
+
+        // (2) every surviving leaf must carry the same values, and every
+        // nesting level the same nulls, as the unclipped read
+        assert_same(&full_array, &clipped_array, &predicted, "col", &ctx);
+    }
+
+    fn run_seed(seed: u64, cases: usize) -> Stats {
+        let mut rng = Rng::new(seed);
+        let mut stats = Stats::default();
+        for case in 0..cases {
+            run_case(&mut rng, seed, case, &mut stats);
+        }
+        stats
+    }
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// The harness itself. Runs many independent seeds; every seed is a
+    /// reproducible stream, and any failure prints the seed plus the exact
+    /// physical/target pair that broke.
+    #[test]
+    fn clip_for_cast_differential() {
+        let seed0 = env_usize("NESTED_PRUNING_FUZZ_SEED0", 1) as u64;
+        let seeds = env_usize("NESTED_PRUNING_FUZZ_SEEDS", 24);
+        let cases = env_usize("NESTED_PRUNING_FUZZ_CASES", 60);
+
+        let mut total = Stats::default();
+        for i in 0..seeds {
+            total.merge(&run_seed(seed0 + i as u64, cases));
+        }
+
+        println!("nested pruning fuzz: {total:?}");
+        assert!(total.cases > 0);
+        // A harness that always bails proves nothing: require that a healthy
+        // share of the generated cases actually took the clip path.
+        let clipped_ratio = total.clipped as f64 / total.cases as f64;
+        assert!(
+            clipped_ratio > 0.25,
+            "only {:.1}% of {} cases exercised the clip path: {total:?}",
+            clipped_ratio * 100.0,
+            total.cases
+        );
+    }
+}
