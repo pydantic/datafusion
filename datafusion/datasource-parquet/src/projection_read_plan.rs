@@ -636,11 +636,14 @@ fn build_read_plan_with_cast_clipping(
         let get_field_schema = build_filter_schema(file_schema, &[], &get_field_accesses);
         let get_field_roots: BTreeSet<usize> =
             get_field_accesses.iter().map(|a| a.root_index).collect();
-        for root in get_field_roots {
-            let field = get_field_schema
-                .field_with_name(file_schema.field(root).name())
-                .expect("root name preserved by build_filter_schema");
-            fields.insert(root, Arc::new(field.clone()));
+        // `build_filter_schema` emits one field per accessed root in
+        // ascending root order, which is the order `get_field_roots` iterates
+        // in, so the two line up positionally. Pairing them beats looking each
+        // one up by name: no repeated linear scans, and no ambiguity if two
+        // roots happen to share a name.
+        debug_assert_eq!(get_field_roots.len(), get_field_schema.fields().len());
+        for (root, field) in get_field_roots.iter().zip(get_field_schema.fields()) {
+            fields.insert(*root, Arc::clone(field));
         }
     }
 
