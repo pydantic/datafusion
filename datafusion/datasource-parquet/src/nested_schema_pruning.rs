@@ -747,6 +747,7 @@ mod fuzz {
     use arrow::record_batch::RecordBatch;
     use bytes::Bytes;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::arrow_writer::ArrowWriterOptions;
     use parquet::arrow::{ArrowWriter, ProjectionMask};
 
     /// Maximum nesting depth of a generated physical type.
@@ -868,6 +869,12 @@ mod fuzz {
     /// reorder them, widen leaves, invent absent names, and occasionally swap
     /// a wrapper kind.
     fn gen_target(rng: &mut Rng, physical: &DataType) -> DataType {
+        // Occasionally replace a subtree's target with an unrelated type, so
+        // the walker's catch-all (keep every leaf below here) is exercised
+        // with shapes no schema evolution would ever produce.
+        if rng.chance(4) {
+            return gen_type(rng, 1);
+        }
         match physical {
             DataType::Struct(fields) => {
                 let mut kept: Vec<Field> = fields
@@ -1121,9 +1128,20 @@ mod fuzz {
 
     // --------------------------------------------------------- parquet io
 
-    fn write_file(schema: SchemaRef, batch: &RecordBatch) -> Bytes {
+    /// Write `batch`, optionally *without* the embedded Arrow schema.
+    ///
+    /// Files written by other engines (Spark, parquet-mr) carry no Arrow
+    /// metadata, so the reader derives the Arrow type from the Parquet
+    /// schema alone: three-level list encodings, `element`/`key_value` field
+    /// names, dictionaries decoded as their value type, `LargeList` and
+    /// `FixedSizeList` coming back as `List`. That is exactly the shape the
+    /// motivating workload (a Spark-written `List<Struct>`) has, and it
+    /// produces physical types this generator could not otherwise reach.
+    fn write_file(schema: SchemaRef, batch: &RecordBatch, embed_schema: bool) -> Bytes {
         let mut buf = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        let options = ArrowWriterOptions::new().with_skip_arrow_metadata(!embed_schema);
+        let mut writer =
+            ArrowWriter::try_new_with_options(&mut buf, schema, options).unwrap();
         writer.write(batch).unwrap();
         writer.close().unwrap();
         Bytes::from(buf)
@@ -1291,6 +1309,9 @@ mod fuzz {
         clipped_deep: usize,
         /// Total Parquet leaves the clips dropped.
         leaves_dropped: usize,
+        /// Clipped cases over a file with no embedded Arrow schema, i.e. one
+        /// whose Arrow type the reader derived from the Parquet schema.
+        clipped_without_arrow_metadata: usize,
     }
 
     impl Stats {
@@ -1305,6 +1326,7 @@ mod fuzz {
             self.clipped_with_dup_names += other.clipped_with_dup_names;
             self.clipped_deep += other.clipped_deep;
             self.leaves_dropped += other.leaves_dropped;
+            self.clipped_without_arrow_metadata += other.clipped_without_arrow_metadata;
         }
     }
 
@@ -1375,7 +1397,9 @@ mod fuzz {
         let write_schema = Arc::new(Schema::new(vec![write_field.clone()]));
         let array = gen_array(rng, &write_field, ROWS);
         let batch = RecordBatch::try_new(Arc::clone(&write_schema), vec![array]).unwrap();
-        let data = write_file(Arc::clone(&write_schema), &batch);
+        // Half the files keep the embedded Arrow schema, half do not.
+        let embed_schema = rng.chance(50);
+        let data = write_file(Arc::clone(&write_schema), &batch, embed_schema);
 
         // The type the *reader* reports is what DataFusion uses as the file
         // schema, so that is the "physical" input to `clip_for_cast`.
@@ -1406,6 +1430,9 @@ mod fuzz {
         };
         stats.clipped += 1;
         stats.leaves_dropped += num_parquet_leaves - kept.len();
+        if !embed_schema {
+            stats.clipped_without_arrow_metadata += 1;
+        }
         if struct_under_list(&physical) {
             stats.clipped_under_list += 1;
         }

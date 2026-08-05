@@ -2390,21 +2390,48 @@ mod nested_pruning_fuzz {
         identical: usize,
     }
 
+    /// A nested column declared identically in both schemas and never
+    /// projected. Its Parquet leaves sit *before* `col`'s, so a clipped mask
+    /// can only be right if the leaf offsets `clip_for_cast` returns (which
+    /// are relative to the root's own first leaf) are rebased onto absolute
+    /// leaf indices.
+    fn pre_field() -> Field {
+        Field::new(
+            "pre",
+            DataType::Struct(Fields::from(vec![
+                Field::new("p0", DataType::Int32, true),
+                Field::new(
+                    "p1",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("q0", DataType::Utf8, true),
+                        Field::new("q1", DataType::Int64, true),
+                    ])),
+                    true,
+                ),
+            ])),
+            true,
+        )
+    }
+
     async fn run_case(rng: &mut Rng, seed: u64, case: usize, stats: &mut Stats) {
         let col = gen_root_field(rng);
-        let file_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            col.clone(),
-        ]));
+        let id = Field::new("id", DataType::Int32, false);
+        let file_schema =
+            Arc::new(Schema::new(vec![id.clone(), pre_field(), col.clone()]));
         let narrow_type = gen_target(rng, col.data_type());
         let narrow_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
+            id,
+            pre_field(),
             Field::new("col", narrow_type.clone(), true),
         ]));
         let data = gen_array(rng, col.data_type(), ROWS);
         let batch = RecordBatch::try_new(
             Arc::clone(&file_schema),
-            vec![Arc::new(Int32Array::from_iter_values(0..ROWS as i32)), data],
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..ROWS as i32)),
+                gen_array(rng, pre_field().data_type(), ROWS),
+                data,
+            ],
         )
         .unwrap();
 
@@ -2435,6 +2462,14 @@ mod nested_pruning_fuzz {
         let (narrow_batches, narrow_metrics) =
             run(&ctx, "SELECT col FROM t_narrow").await;
         let (full_batches, full_metrics) = run(&ctx, "SELECT col FROM t_full").await;
+
+        assert_eq!(
+            narrow_batches[0].schema().field(0).data_type(),
+            &narrow_type,
+            "the narrowed scan emitted a different type than the table \
+             declares\n{}",
+            describe()
+        );
 
         let actual = single_column(&narrow_batches);
         let full = single_column(&full_batches);

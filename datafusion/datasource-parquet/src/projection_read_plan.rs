@@ -425,10 +425,7 @@ pub(crate) fn build_projection_read_plan(
     // projection through the slower, name-resolving path. Any column whose
     // `index` does not line up with the file schema (a stale `Column` from an
     // earlier rewrite) falls through to that path, which resolves by name.
-    let projected_columns = exprs
-        .iter()
-        .flat_map(|e| collect_columns(e))
-        .collect::<Vec<_>>();
+    let projected_columns = exprs.iter().flat_map(collect_columns).collect::<Vec<_>>();
     let all_resolvable_and_struct_free = projected_columns.iter().all(|col| {
         file_schema
             .fields()
