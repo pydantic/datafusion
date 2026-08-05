@@ -1872,3 +1872,179 @@ mod nested_projection_pruning {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Nested projection pruning driven by a *query-level* cast rather than by the
+// expression adapter. `ProjectionExec` is merged into the scan
+// (`ParquetSource::try_pushdown_projection`), so a `CAST(col AS nested_type)`
+// written in the query reaches the same read-plan analysis and is clipped the
+// same way. These cases have no equivalent in the adapter path, where every
+// reference to one column goes through one identical cast.
+// ---------------------------------------------------------------------------
+mod query_level_nested_cast {
+    use super::*;
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::cast;
+    use datafusion_expr::col as logical_col;
+
+    fn nullable_i64(name: &str) -> Field {
+        Field::new(name, DataType::Int64, true)
+    }
+
+    fn struct_of(fields: Vec<Field>) -> DataType {
+        DataType::Struct(Fields::from(fields))
+    }
+
+    /// A single-file table whose declared schema is exactly the file's, so no
+    /// adapter cast is inserted and any `CastExpr` in the scan's projection
+    /// came from the query itself.
+    ///
+    /// Schema: `s: Struct{a: Int64, b: Int64, c: Int64}`, two rows.
+    async fn struct_table() -> SessionContext {
+        let fields = Fields::from(vec![
+            nullable_i64("a"),
+            nullable_i64("b"),
+            nullable_i64("c"),
+        ]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(fields.clone()),
+            true,
+        )]));
+        let s = StructArray::new(
+            fields,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![100, 200])) as ArrayRef,
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(s)]).unwrap();
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        write_parquet(batch, Arc::clone(&store), "data/f.parquet").await;
+        let ctx = SessionContext::new();
+        ctx.register_object_store(
+            ObjectStoreUrl::parse("memory://").unwrap().as_ref(),
+            store,
+        );
+        let config =
+            ListingTableConfig::new(ListingTableUrl::parse("memory:///data/").unwrap())
+                .infer_options(&ctx.state())
+                .await
+                .unwrap()
+                .with_schema(schema);
+        ctx.register_table("t", Arc::new(ListingTable::try_new(config).unwrap()))
+            .unwrap();
+        ctx
+    }
+
+    async fn select_casts(targets: Vec<DataType>) -> Vec<RecordBatch> {
+        let ctx = struct_table().await;
+        let exprs = targets
+            .into_iter()
+            .enumerate()
+            .map(|(i, target)| cast(logical_col("s"), target).alias(format!("q{i}")))
+            .collect::<Vec<_>>();
+        let df = ctx.table("t").await.unwrap().select(exprs).unwrap();
+        let (state, logical) = df.into_parts();
+        let plan = state.create_physical_plan(&logical).await.unwrap();
+        collect(plan, state.task_ctx()).await.unwrap()
+    }
+
+    /// One narrowing cast is clipped, and the surviving field keeps its
+    /// values.
+    #[tokio::test]
+    async fn single_cast_is_clipped() {
+        let batches = select_casts(vec![struct_of(vec![nullable_i64("b")])]).await;
+        assert_batches_eq!(
+            [
+                "+---------+",
+                "| q0      |",
+                "+---------+",
+                "| {b: 10} |",
+                "| {b: 20} |",
+                "+---------+",
+            ],
+            &batches
+        );
+    }
+
+    /// Regression test: two casts of the same column to *overlapping* targets.
+    /// Clipping the read to the first target alone leaves the second cast
+    /// nothing to read for `b`, and the runtime cast null-fills it silently.
+    #[tokio::test]
+    async fn overlapping_cast_targets_on_one_column() {
+        let batches = select_casts(vec![
+            struct_of(vec![nullable_i64("a")]),
+            struct_of(vec![nullable_i64("a"), nullable_i64("b")]),
+        ])
+        .await;
+        assert_batches_eq!(
+            [
+                "+--------+---------------+",
+                "| q0     | q1            |",
+                "+--------+---------------+",
+                "| {a: 1} | {a: 1, b: 10} |",
+                "| {a: 2} | {a: 2, b: 20} |",
+                "+--------+---------------+",
+            ],
+            &batches
+        );
+    }
+
+    /// Regression test: two casts of the same column to *disjoint* targets.
+    /// Clipping to the first target makes the second cast's source share no
+    /// field name with its target, which `cast_column` rejects outright — the
+    /// query fails rather than returning nulls.
+    #[tokio::test]
+    async fn disjoint_cast_targets_on_one_column() {
+        let batches = select_casts(vec![
+            struct_of(vec![nullable_i64("a")]),
+            struct_of(vec![nullable_i64("b")]),
+        ])
+        .await;
+        assert_batches_eq!(
+            [
+                "+--------+---------+",
+                "| q0     | q1      |",
+                "+--------+---------+",
+                "| {a: 1} | {b: 10} |",
+                "| {a: 2} | {b: 20} |",
+                "+--------+---------+",
+            ],
+            &batches
+        );
+    }
+
+    /// A cast alongside a whole-column reference: the whole-column read wins
+    /// and both see every field.
+    #[tokio::test]
+    async fn cast_alongside_whole_column_reference() {
+        let ctx = struct_table().await;
+        let df = ctx
+            .table("t")
+            .await
+            .unwrap()
+            .select(vec![
+                cast(logical_col("s"), struct_of(vec![nullable_i64("a")])).alias("q0"),
+                logical_col("s"),
+            ])
+            .unwrap();
+        let (state, logical) = df.into_parts();
+        let plan = state.create_physical_plan(&logical).await.unwrap();
+        let batches = collect(plan, state.task_ctx()).await.unwrap();
+        assert_batches_eq!(
+            [
+                "+--------+-----------------------+",
+                "| q0     | s                     |",
+                "+--------+-----------------------+",
+                "| {a: 1} | {a: 1, b: 10, c: 100} |",
+                "| {a: 2} | {a: 2, b: 20, c: 200} |",
+                "+--------+-----------------------+",
+            ],
+            &batches
+        );
+    }
+}

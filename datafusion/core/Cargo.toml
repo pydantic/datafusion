@@ -259,6 +259,11 @@ required-features = ["parquet"]
 
 [[bench]]
 harness = false
+name = "parquet_wide_schema_read_plan"
+required-features = ["parquet"]
+
+[[bench]]
+harness = false
 name = "cse_projection_pushdown"
 required-features = ["parquet"]
 
