@@ -30,21 +30,24 @@
 //!
 //! Shapes measured:
 //!
-//! 1. `flat_wide` — [`WIDE_COLS`] primitive columns, no structs at all. The
-//!    projection is not a bare column list, so it defeats the
-//!    "all plain columns" fast path and pays the `has_struct_columns` gate
-//!    over every field.
-//! 2. `flat_wide_plus_struct` — the same, plus one narrow struct column *last*
-//!    (worst case for the gate, which stops at the first struct it finds).
-//!    The gate now says "yes", so the full `PushdownChecker` traversal runs.
-//! 3. `wide_struct_full` — one struct column with [`WIDE_STRUCT_FIELDS`]
-//!    subfields, declared exactly as the file has it: no cast, no clipping.
-//!    The baseline for (4).
-//! 4. `wide_struct_narrowed` — the same file declared with half the subfields,
-//!    so the adapter inserts `CAST(s AS narrower_struct)` and the scan clips
-//!    the read to the declared leaves. This is the path whose per-struct-level
-//!    field matching is the thing to watch: it must not be quadratic in the
-//!    number of subfields.
+//! 1. `flat_wide` — [`WIDE_COLS`] primitive columns, no structs at all,
+//!    projected once as a bare column (the "all plain columns" fast path) and
+//!    once through an expression (which defeats it). The gap is what the
+//!    slower path costs on a wide schema with nothing to prune.
+//! 2. `flat_wide_plus_struct` — the same, plus one struct column *last*. The
+//!    projection never touches it, so this measures whether an unprojected
+//!    nested column drags the projection onto the slow path.
+//! 3. `wide_struct/full_schema` — one struct column with
+//!    [`WIDE_STRUCT_FIELDS`] subfields, declared exactly as the file has it:
+//!    no cast, no clipping. The baseline for (4).
+//! 4. `wide_struct/narrowed_schema` — the same file declared with half the
+//!    subfields, so the adapter inserts `CAST(s AS narrower_struct)` and the
+//!    scan clips the read to the declared leaves. This is the path whose
+//!    per-struct-level field matching is the thing to watch: it must not be
+//!    quadratic in the number of subfields.
+//! 5. `wide_struct/unrelated_column` — the very wide struct sits in the
+//!    schema but only `id` is projected. Should cost the same as a schema
+//!    with no struct in it at all.
 
 use arrow::array::{ArrayRef, Int32Array, RecordBatch, StructArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
