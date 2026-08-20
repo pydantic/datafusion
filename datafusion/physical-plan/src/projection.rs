@@ -203,24 +203,13 @@ impl ProjectionExec {
         projector: Projector,
         input: Arc<dyn ExecutionPlan>,
     ) -> Result<Self> {
-        // Construct a map from the input expressions to the output expression of the Projection
-        let projection_mapping =
-            projector.projection().projection_mapping(&input.schema())?;
-        let cache = Self::compute_properties(
-            &input,
-            &projection_mapping,
-            Arc::clone(projector.output_schema()),
-        )?;
-        Ok(Self {
-            projector,
-            input,
-            metrics: ExecutionPlanMetricsSet::new(),
-            cache: Arc::new(cache),
-        })
+        Self::try_from_projector_with_eq_group(projector, input, None)
     }
 
-    /// Like [`Self::try_from_projector`], but reuses `eq_group` as the output
-    /// equivalence group instead of projecting the input's group again.
+    /// Builds a `ProjectionExec` from `projector` and `input`.
+    ///
+    /// `reused_eq_group`, when present, is used as the output equivalence group
+    /// instead of projecting the input's group again.
     ///
     /// [`EquivalenceGroup::project`] is a pure function of the group and the
     /// mapping, so reuse is sound exactly when both are unchanged.
@@ -235,31 +224,20 @@ impl ProjectionExec {
     /// carrying those names, and the comparison above would reject it; were one
     /// to slip through anyway, `try_new`'s name assertion errors out rather than
     /// letting a stale group into the plan.
-    fn try_from_projector_reusing_eq_group(
+    fn try_from_projector_with_eq_group(
         projector: Projector,
         input: Arc<dyn ExecutionPlan>,
-        eq_group: EquivalenceGroup,
+        reused_eq_group: Option<EquivalenceGroup>,
     ) -> Result<Self> {
+        // Construct a map from the input expressions to the output expression of the Projection
         let projection_mapping =
             projector.projection().projection_mapping(&input.schema())?;
-        let input_eq_properties = input.equivalence_properties();
-        let eq_properties = input_eq_properties.project_with_eq_group(
+        let cache = Self::compute_properties(
+            &input,
             &projection_mapping,
             Arc::clone(projector.output_schema()),
-            eq_group,
-        );
-        // Partitioning is projected against the *input's* equivalence
-        // properties, matching `compute_properties`: the question is which
-        // input columns remain interchangeable, not which output ones do.
-        let output_partitioning = input
-            .output_partitioning()
-            .project(&projection_mapping, input_eq_properties);
-        let cache = PlanProperties::new(
-            eq_properties,
-            output_partitioning,
-            input.pipeline_behavior(),
-            input.boundedness(),
-        );
+            reused_eq_group,
+        )?;
         Ok(Self {
             projector,
             input,
@@ -288,10 +266,21 @@ impl ProjectionExec {
         input: &Arc<dyn ExecutionPlan>,
         projection_mapping: &ProjectionMapping,
         schema: SchemaRef,
+        reused_eq_group: Option<EquivalenceGroup>,
     ) -> Result<PlanProperties> {
         // Calculate equivalence properties:
         let input_eq_properties = input.equivalence_properties();
-        let eq_properties = input_eq_properties.project(projection_mapping, schema);
+        // The only thing reuse changes: the projected equivalence group is
+        // handed back rather than recomputed. Everything below is common, so
+        // the two paths cannot drift.
+        let eq_properties = match reused_eq_group {
+            Some(eq_group) => input_eq_properties.project_with_eq_group(
+                projection_mapping,
+                schema,
+                eq_group,
+            ),
+            None => input_eq_properties.project(projection_mapping, schema),
+        };
         // Calculate output partitioning, which needs to respect aliases:
         let output_partitioning = input
             .output_partitioning()
@@ -434,25 +423,23 @@ impl ExecutionPlan for ProjectionExec {
                 // expressions are equal to one another. Projecting that group
                 // again would reproduce the group already cached here, so reuse
                 // it and derive only the orderings.
-                if self
+                let child = children.swap_remove(0);
+                let reused_eq_group = if self
                     .input
                     .equivalence_properties()
                     .eq_group()
-                    .has_same_classes(children[0].equivalence_properties().eq_group())
+                    .has_same_classes(child.equivalence_properties().eq_group())
                 {
                     #[cfg(test)]
                     eq_group_reuse_probe::record_hit();
-                    let eq_group = self.cache.equivalence_properties().eq_group().clone();
-                    return ProjectionExec::try_from_projector_reusing_eq_group(
-                        self.projector.clone(),
-                        children.swap_remove(0),
-                        eq_group,
-                    )
-                    .map(|p| Arc::new(p) as _);
-                }
-                ProjectionExec::try_from_projector(
+                    Some(self.cache.equivalence_properties().eq_group().clone())
+                } else {
+                    None
+                };
+                ProjectionExec::try_from_projector_with_eq_group(
                     self.projector.clone(),
-                    children.swap_remove(0),
+                    child,
+                    reused_eq_group,
                 )
                 .map(|p| Arc::new(p) as _)
             }
