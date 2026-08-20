@@ -52,7 +52,7 @@ use datafusion_common::tree_node::{
 use datafusion_common::{DataFusionError, JoinSide, Result, internal_err, plan_err};
 use datafusion_execution::TaskContext;
 use datafusion_expr::ExpressionPlacement;
-use datafusion_physical_expr::equivalence::{EquivalenceGroup, ProjectionMapping};
+use datafusion_physical_expr::equivalence::{ProjectionMapping, ReusedProjection};
 use datafusion_physical_expr::projection::Projector;
 use datafusion_physical_expr_common::physical_expr::{PhysicalExprRef, fmt_sql};
 use datafusion_physical_expr_common::sort_expr::{
@@ -66,31 +66,6 @@ pub use datafusion_physical_expr::projection::{
 
 use futures::stream::{Stream, StreamExt};
 use log::trace;
-
-/// Counts how often [`ProjectionExec::replace_children`] reused a cached
-/// equivalence group instead of reprojecting it.
-///
-/// Thread local rather than a global counter: the test binary runs tests in
-/// parallel, and a shared count would let one test observe another's hits.
-#[cfg(test)]
-mod eq_group_reuse_probe {
-    use std::cell::Cell;
-
-    thread_local! {
-        static HITS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    pub(super) fn record_hit() {
-        HITS.with(|h| h.set(h.get() + 1));
-    }
-
-    /// Runs `f` and reports how many reuses happened while it did.
-    pub(super) fn count<T>(f: impl FnOnce() -> T) -> (T, usize) {
-        let before = HITS.with(Cell::get);
-        let value = f();
-        (value, HITS.with(Cell::get) - before)
-    }
-}
 
 /// [`ExecutionPlan`] for a projection
 ///
@@ -203,6 +178,30 @@ impl ProjectionExec {
         projector: Projector,
         input: Arc<dyn ExecutionPlan>,
     ) -> Result<Self> {
+        Self::try_from_projector_reusing(projector, input, None)
+    }
+
+    /// Builds a `ProjectionExec` from `projector` and `input`, offering
+    /// `reuse` in place of projecting the input's equivalence group again.
+    ///
+    /// The offer is checked by [`EquivalenceProperties::project_reusing`], which
+    /// takes it only if the input's group is the one the offered projection came
+    /// from -- so this cannot install a stale group, only miss an optimization.
+    ///
+    /// The mapping being unchanged is the caller's part, and it holds here
+    /// because the mapping comes from `projector.projection()`, carried over
+    /// untouched, and from the child's schema, which `ProjectionMapping::try_new`
+    /// consults only for field names and indices -- never for types or
+    /// nullability. So a child differing only in nullability keeps the same
+    /// mapping. A child that renamed or reordered those fields would change the
+    /// group too, and the check would then refuse the offer; were one to slip
+    /// through anyway, `try_new`'s name assertion errors out rather than letting
+    /// a stale group into the plan.
+    fn try_from_projector_reusing(
+        projector: Projector,
+        input: Arc<dyn ExecutionPlan>,
+        reuse: Option<ReusedProjection<'_>>,
+    ) -> Result<Self> {
         // Construct a map from the input expressions to the output expression of the Projection
         let projection_mapping =
             projector.projection().projection_mapping(&input.schema())?;
@@ -210,56 +209,8 @@ impl ProjectionExec {
             &input,
             &projection_mapping,
             Arc::clone(projector.output_schema()),
+            reuse,
         )?;
-        Ok(Self {
-            projector,
-            input,
-            metrics: ExecutionPlanMetricsSet::new(),
-            cache: Arc::new(cache),
-        })
-    }
-
-    /// Like [`Self::try_from_projector`], but reuses `eq_group` as the output
-    /// equivalence group instead of projecting the input's group again.
-    ///
-    /// [`EquivalenceGroup::project`] is a pure function of the group and the
-    /// mapping, so reuse is sound exactly when both are unchanged.
-    ///
-    /// The caller establishes the first by comparing the old and new child
-    /// groups. The second holds because the mapping comes from
-    /// `projector.projection()`, carried over untouched, and from the child's
-    /// schema, which `ProjectionMapping::try_new` consults only for field names
-    /// and indices -- never for types or nullability. So a child differing only
-    /// in nullability keeps the same mapping. A child that renamed or reordered
-    /// those fields would change the group too, since its members are `Column`s
-    /// carrying those names, and the comparison above would reject it; were one
-    /// to slip through anyway, `try_new`'s name assertion errors out rather than
-    /// letting a stale group into the plan.
-    fn try_from_projector_reusing_eq_group(
-        projector: Projector,
-        input: Arc<dyn ExecutionPlan>,
-        eq_group: EquivalenceGroup,
-    ) -> Result<Self> {
-        let projection_mapping =
-            projector.projection().projection_mapping(&input.schema())?;
-        let input_eq_properties = input.equivalence_properties();
-        let eq_properties = input_eq_properties.project_with_eq_group(
-            &projection_mapping,
-            Arc::clone(projector.output_schema()),
-            eq_group,
-        );
-        // Partitioning is projected against the *input's* equivalence
-        // properties, matching `compute_properties`: the question is which
-        // input columns remain interchangeable, not which output ones do.
-        let output_partitioning = input
-            .output_partitioning()
-            .project(&projection_mapping, input_eq_properties);
-        let cache = PlanProperties::new(
-            eq_properties,
-            output_partitioning,
-            input.pipeline_behavior(),
-            input.boundedness(),
-        );
         Ok(Self {
             projector,
             input,
@@ -288,10 +239,15 @@ impl ProjectionExec {
         input: &Arc<dyn ExecutionPlan>,
         projection_mapping: &ProjectionMapping,
         schema: SchemaRef,
+        reuse: Option<ReusedProjection<'_>>,
     ) -> Result<PlanProperties> {
         // Calculate equivalence properties:
         let input_eq_properties = input.equivalence_properties();
-        let eq_properties = input_eq_properties.project(projection_mapping, schema);
+        // Reuse changes only where the projected equivalence group comes from,
+        // and `project_reusing` decides that. Everything below is common, so the
+        // two paths cannot drift.
+        let eq_properties =
+            input_eq_properties.project_reusing(projection_mapping, schema, reuse);
         // Calculate output partitioning, which needs to respect aliases:
         let output_partitioning = input
             .output_partitioning()
@@ -432,27 +388,16 @@ impl ExecutionPlan for ProjectionExec {
                 // does not qualify, yet the child's *equivalence group* is still
                 // identical: sorting changes which orderings hold, not which
                 // expressions are equal to one another. Projecting that group
-                // again would reproduce the group already cached here, so reuse
-                // it and derive only the orderings.
-                if self
-                    .input
-                    .equivalence_properties()
-                    .eq_group()
-                    .has_same_classes(children[0].equivalence_properties().eq_group())
-                {
-                    #[cfg(test)]
-                    eq_group_reuse_probe::record_hit();
-                    let eq_group = self.cache.equivalence_properties().eq_group().clone();
-                    return ProjectionExec::try_from_projector_reusing_eq_group(
-                        self.projector.clone(),
-                        children.swap_remove(0),
-                        eq_group,
-                    )
-                    .map(|p| Arc::new(p) as _);
-                }
-                ProjectionExec::try_from_projector(
+                // again would reproduce the group already cached here, so offer
+                // it up; `project_reusing` takes the offer only if the child's
+                // group really is unchanged, and projects afresh otherwise.
+                ProjectionExec::try_from_projector_reusing(
                     self.projector.clone(),
                     children.swap_remove(0),
+                    Some(ReusedProjection {
+                        source: self.input.equivalence_properties().eq_group(),
+                        projected: self.cache.equivalence_properties().eq_group(),
+                    }),
                 )
                 .map(|p| Arc::new(p) as _)
             }
@@ -2449,18 +2394,14 @@ mod tests {
         let sorted: Arc<dyn ExecutionPlan> =
             Arc::new(SortExec::new(ordering, Arc::clone(&child)));
 
-        let (replaced, reuses) = eq_group_reuse_probe::count(|| {
-            Arc::clone(&projection).replace_children(
-                vec![Arc::clone(&sorted)],
-                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-            )
-        });
-        let replaced = replaced?;
-        assert_eq!(
-            reuses, 1,
-            "expected the fast path to be taken exactly once; deleting it would \
-             otherwise leave this test passing"
-        );
+        // NOTE: whether the offer was taken is asserted in `physical-expr`, by
+        // `test_project_reusing_takes_a_matching_offer_and_matches_project`.
+        // A `cfg(test)` probe cannot see across the crate boundary, so this
+        // test can only check that the resulting properties are right.
+        let replaced = Arc::clone(&projection).replace_children(
+            vec![Arc::clone(&sorted)],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?;
 
         // Guard against vacuity: the group must be worth reusing, and the sort
         // must genuinely have added an ordering the original did not have.
@@ -2537,14 +2478,10 @@ mod tests {
             "nullability moved the equivalence group, so the fast path is no longer under test"
         );
 
-        let (replaced, reuses) = eq_group_reuse_probe::count(|| {
-            Arc::clone(&projection).replace_children(
-                vec![Arc::clone(&tightened_child)],
-                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-            )
-        });
-        let replaced = replaced?;
-        assert_eq!(reuses, 1, "expected the fast path to be taken");
+        let replaced = Arc::clone(&projection).replace_children(
+            vec![Arc::clone(&tightened_child)],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?;
         let recomputed = ProjectionExec::try_from_projector(
             projection.projector.clone(),
             tightened_child,
@@ -2565,17 +2502,10 @@ mod tests {
         // This child equates a different pair, so the cached group is stale and
         // reusing it would be unsound: the guard has to fall through.
         let other = filtered_source("a", "c")?;
-        let (replaced, reuses) = eq_group_reuse_probe::count(|| {
-            Arc::clone(&projection).replace_children(
-                vec![Arc::clone(&other)],
-                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-            )
-        });
-        let replaced = replaced?;
-        assert_eq!(
-            reuses, 0,
-            "the guard let a stale equivalence group through the fast path"
-        );
+        let replaced = Arc::clone(&projection).replace_children(
+            vec![Arc::clone(&other)],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?;
 
         assert!(
             !replaced

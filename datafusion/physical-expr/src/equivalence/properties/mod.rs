@@ -194,6 +194,45 @@ impl OrderingEquivalenceCache {
     }
 }
 
+/// A projection of an [`EquivalenceGroup`] computed earlier, offered to
+/// [`EquivalenceProperties::project_reusing`] so it need not be computed again.
+///
+/// Both halves are needed. `projected` is the result being offered, and
+/// `source` is what makes the offer checkable: without it the callee would have
+/// to trust that the group it was handed really is the projection of this one,
+/// which is a precondition no caller can be relied upon to keep.
+#[derive(Debug, Clone, Copy)]
+pub struct ReusedProjection<'a> {
+    /// The equivalence group `projected` was computed from.
+    pub source: &'a EquivalenceGroup,
+    /// What `source.project(mapping)` produced.
+    pub projected: &'a EquivalenceGroup,
+}
+
+/// Counts how often [`EquivalenceProperties::project_reusing`] took the offer.
+///
+/// Thread local rather than a global counter: the test binary runs tests in
+/// parallel, and a shared count would let one test observe another's hits.
+#[cfg(test)]
+mod reuse_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static HITS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record_hit() {
+        HITS.with(|h| h.set(h.get() + 1));
+    }
+
+    /// Runs `f` and reports how many reuses happened while it did.
+    pub(super) fn count<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        let before = HITS.with(Cell::get);
+        let value = f();
+        (value, HITS.with(Cell::get) - before)
+    }
+}
+
 impl EquivalenceProperties {
     /// Helper used by the ordering equivalence rule when considering whether
     /// an expression can replace an existing sort key without invalidating
@@ -1168,54 +1207,49 @@ impl EquivalenceProperties {
     /// Projects the equivalences within according to `mapping` and
     /// `output_schema`.
     pub fn project(&self, mapping: &ProjectionMapping, output_schema: SchemaRef) -> Self {
-        let eq_group = self.eq_group.project(mapping);
-        // Built here, so it satisfies the precondition by construction; going
-        // through the checked entry point would reproject it under
-        // `debug_assertions` for nothing.
-        self.project_with_eq_group_unchecked(mapping, output_schema, eq_group)
+        self.project_reusing(mapping, output_schema, None)
     }
 
-    /// Same as [`Self::project`], but takes an already-projected equivalence
-    /// group instead of computing one.
+    /// Same as [`Self::project`], but offered a projection computed earlier to
+    /// reuse in place of computing one.
     ///
     /// [`EquivalenceGroup::project`] is a pure function of the group and the
-    /// mapping, so a caller that knows both are unchanged since the last
-    /// projection can hand back the previous result rather than recomputing an
-    /// identical one. Orderings are still derived here: they are precisely what
-    /// changes when a sort is introduced below this node.
+    /// mapping, so an earlier projection can stand in for this one exactly when
+    /// both are unchanged. Orderings are still derived here: they are precisely
+    /// what changes when a sort is introduced below the node being reprojected.
     ///
-    /// # Preconditions
-    ///
-    /// `eq_group` must equal `self.eq_group.project(mapping)`. Anything else
-    /// yields equivalence properties that disagree with the projection, which
-    /// later rules will then reason from. The precondition cannot be enforced
-    /// cheaply -- checking it means performing the very projection the caller is
-    /// avoiding -- so it is asserted in debug builds only and left to the caller
-    /// in release.
-    pub fn project_with_eq_group(
+    /// The offer is *checked*, not trusted: `reuse.projected` is taken only if
+    /// `reuse.source` holds the same equivalence classes this group does. A
+    /// stale offer costs the caller the optimization and nothing else, so there
+    /// is no precondition here for a caller to get wrong. That `source` and
+    /// `projected` belong together, under the `mapping` passed here, is what
+    /// remains of the caller's side of the bargain, and it is asserted in debug
+    /// builds.
+    pub fn project_reusing(
         &self,
         mapping: &ProjectionMapping,
         output_schema: SchemaRef,
-        eq_group: EquivalenceGroup,
+        reuse: Option<ReusedProjection<'_>>,
     ) -> Self {
-        debug_assert!(
-            eq_group.has_same_classes(&self.eq_group.project(mapping)),
-            "project_with_eq_group was handed a group that is not the projection \
-             of this one: got {:?}, expected {:?}",
-            eq_group,
-            self.eq_group.project(mapping)
-        );
-        self.project_with_eq_group_unchecked(mapping, output_schema, eq_group)
-    }
-
-    /// [`Self::project_with_eq_group`] without the precondition check, for
-    /// callers that produced `eq_group` themselves.
-    fn project_with_eq_group_unchecked(
-        &self,
-        mapping: &ProjectionMapping,
-        output_schema: SchemaRef,
-        eq_group: EquivalenceGroup,
-    ) -> Self {
+        let eq_group = match reuse {
+            // The premise reuse rests on: the same group in, under the same
+            // mapping, means the same group out.
+            Some(reuse) if self.eq_group.has_same_classes(reuse.source) => {
+                debug_assert!(
+                    reuse
+                        .projected
+                        .has_same_classes(&reuse.source.project(mapping)),
+                    "project_reusing was offered a projection that its source and \
+                     mapping do not produce: got {:?}, expected {:?}",
+                    reuse.projected,
+                    reuse.source.project(mapping)
+                );
+                #[cfg(test)]
+                reuse_probe::record_hit();
+                reuse.projected.clone()
+            }
+            _ => self.eq_group.project(mapping),
+        };
         let orderings =
             self.projected_orderings(mapping, self.oeq_cache.normal_cls.clone());
         let normal_orderings = orderings
@@ -1630,19 +1664,30 @@ mod tests {
     }
 
     #[test]
-    fn test_project_with_eq_group_matches_project() -> Result<()> {
+    fn test_project_reusing_takes_a_matching_offer_and_matches_project() -> Result<()> {
         let (schema, eq_properties) = create_test_params()?;
         let output_schema = renamed_schema();
         let mapping = renaming_mapping(&schema, &output_schema)?;
 
         let baseline = eq_properties.project(&mapping, Arc::clone(&output_schema));
-        // Handing back exactly what `project` would have computed must
-        // reproduce it in full: this is the invariant the `ProjectionExec`
-        // fast path relies on.
-        let reused = eq_properties.project_with_eq_group(
-            &mapping,
-            Arc::clone(&output_schema),
-            eq_properties.eq_group().project(&mapping),
+        // Offering exactly what `project` would have computed must reproduce it
+        // in full: this is the invariant the `ProjectionExec` fast path rests
+        // on.
+        let projected = eq_properties.eq_group().project(&mapping);
+        let (reused, hits) = reuse_probe::count(|| {
+            eq_properties.project_reusing(
+                &mapping,
+                Arc::clone(&output_schema),
+                Some(ReusedProjection {
+                    source: eq_properties.eq_group(),
+                    projected: &projected,
+                }),
+            )
+        });
+        assert_eq!(
+            hits, 1,
+            "the offer was refused; the rest of this test would then be \
+             comparing `project` against itself"
         );
 
         // Guard against a vacuous comparison.
@@ -1667,22 +1712,64 @@ mod tests {
     }
 
     #[test]
+    fn test_project_reusing_refuses_an_offer_from_another_group() -> Result<()> {
+        // The point of taking the source group rather than the projection
+        // alone: an offer that does not match is refused rather than believed,
+        // so a caller cannot produce equivalence properties that disagree with
+        // the projection. This is what used to be an unchecked precondition.
+        let (schema, eq_properties) = create_test_params()?;
+        let output_schema = renamed_schema();
+        let mapping = renaming_mapping(&schema, &output_schema)?;
+        let unrelated = EquivalenceGroup::default();
+        assert!(
+            !eq_properties.eq_group().has_same_classes(&unrelated),
+            "the offer was meant to be stale"
+        );
+
+        let (projected, hits) = reuse_probe::count(|| {
+            eq_properties.project_reusing(
+                &mapping,
+                Arc::clone(&output_schema),
+                Some(ReusedProjection {
+                    source: &unrelated,
+                    projected: &unrelated,
+                }),
+            )
+        });
+
+        assert_eq!(hits, 0, "a stale offer was taken");
+        let baseline = eq_properties.project(&mapping, output_schema);
+        assert!(
+            baseline.eq_group().has_same_classes(projected.eq_group()),
+            "refusing the offer must fall back to projecting: {:?} vs {:?}",
+            baseline.eq_group(),
+            projected.eq_group()
+        );
+        assert_eq!(baseline.oeq_class(), projected.oeq_class(), "orderings");
+
+        Ok(())
+    }
+
+    #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "not the projection of this one")]
-    fn test_project_with_eq_group_rejects_a_group_it_did_not_produce() {
-        // The precondition cannot be enforced cheaply in release -- checking it
-        // means performing the projection the caller is skipping -- so it is a
-        // debug assertion. This pins that the assertion is actually wired up,
-        // since a caller passing an unrelated group would otherwise get
-        // equivalence properties that silently disagree with the projection.
+    #[should_panic(expected = "source and mapping do not produce")]
+    fn test_project_reusing_rejects_a_pair_that_does_not_belong_together() {
+        // What is left of the caller's side of the bargain: `source` and
+        // `projected` have to be a pair, under this `mapping`. Checking it
+        // means performing the projection the caller is skipping, so it is a
+        // debug assertion; this pins that it is wired up.
         let (schema, eq_properties) = create_test_params().expect("test params");
         let output_schema = renamed_schema();
         let mapping = renaming_mapping(&schema, &output_schema).expect("mapping");
+        let not_the_projection = EquivalenceGroup::default();
 
-        eq_properties.project_with_eq_group(
+        eq_properties.project_reusing(
             &mapping,
             output_schema,
-            EquivalenceGroup::default(),
+            Some(ReusedProjection {
+                source: eq_properties.eq_group(),
+                projected: &not_the_projection,
+            }),
         );
     }
 }

@@ -33,7 +33,7 @@ pub use ordering::OrderingEquivalenceClass;
 // datafusion_physical_expr::projection instead
 pub use crate::projection::{ProjectionMapping, project_ordering, project_orderings};
 pub use properties::{
-    EquivalenceProperties, calculate_union, join_equivalence_properties,
+    EquivalenceProperties, ReusedProjection, calculate_union, join_equivalence_properties,
 };
 
 // Convert each tuple to a `PhysicalSortExpr` and construct a vector.
