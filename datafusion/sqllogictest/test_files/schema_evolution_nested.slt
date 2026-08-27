@@ -122,3 +122,58 @@ FROM large_list_messages;
 ----
 1 10 NULL
 2 30 eth
+
+##########
+# An all-null Struct must stay null when a child evolves to a decimal whose
+# conversion is rejected while it is being set up, before any value is read.
+# A whole-Struct conversion never reaches the child; extracting the field first
+# would. This holds whether the decimal is the selected field itself or sits
+# inside a container below it.
+##########
+
+statement ok
+COPY (
+  SELECT 1 AS row_id,
+         CASE WHEN false THEN named_struct('a', arrow_cast('x', 'Utf8')) END AS s
+) TO 'test_files/scratch/schema_evolution_nested/null_struct_decimal/data.parquet'
+STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE null_struct_decimal (
+  row_id INT,
+  s STRUCT<a DECIMAL(10, -1)>
+)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/schema_evolution_nested/null_struct_decimal/';
+
+query IR
+SELECT row_id, get_field(s, 'a') FROM null_struct_decimal;
+----
+1 NULL
+
+statement ok
+COPY (
+  SELECT 1 AS row_id,
+         CASE WHEN false
+              THEN named_struct('a', arrow_cast(['x'], 'List(Utf8)'))
+         END AS s
+) TO 'test_files/scratch/schema_evolution_nested/null_struct_list_decimal/data.parquet'
+STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE null_struct_list_decimal (
+  row_id INT,
+  s STRUCT<a ARRAY<DECIMAL(10, -1)>>
+)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/schema_evolution_nested/null_struct_list_decimal/';
+
+query I?
+SELECT row_id, s FROM null_struct_list_decimal;
+----
+1 NULL
+
+query I?
+SELECT row_id, get_field(s, 'a') FROM null_struct_list_decimal;
+----
+1 NULL
