@@ -55,19 +55,8 @@ pub enum OutputType {
 pub struct ArrowBytesSet<O: OffsetSizeTrait>(ArrowBytesMap<O, ()>);
 
 impl<O: OffsetSizeTrait> ArrowBytesSet<O> {
-    /// Creates a set that does not pre-allocate its hash table or value buffer.
-    ///
-    /// See [`ArrowBytesMap::new`] for when to prefer this over
-    /// [`Self::with_capacity`].
     pub fn new(output_type: OutputType) -> Self {
         Self(ArrowBytesMap::new(output_type))
-    }
-
-    /// Creates a set with room for `map_capacity` entries.
-    ///
-    /// See [`ArrowBytesMap::with_capacity`].
-    pub fn with_capacity(output_type: OutputType, map_capacity: usize) -> Self {
-        Self(ArrowBytesMap::with_capacity(output_type, map_capacity))
     }
 
     /// Return the contents of this set and replace it with a new empty
@@ -228,13 +217,6 @@ where
     output_type: OutputType,
     /// Underlying hash set for each distinct value
     map: hashbrown::hash_table::HashTable<Entry<O, V>>,
-    /// Hash table capacity to re-create the map with in [`Self::take`], so a
-    /// map built with [`Self::with_capacity`] keeps its pre-allocation when it
-    /// is emptied and reused
-    initial_map_capacity: usize,
-    /// Value buffer capacity to re-create the buffer with in [`Self::take`],
-    /// for the same reason as `initial_map_capacity`
-    initial_buffer_capacity: usize,
     /// In progress buffer containing all values
     buffer: Vec<u8>,
     /// Offsets into `buffer` for each distinct  value. These offsets as used
@@ -252,71 +234,26 @@ where
     null: Option<(V, usize)>,
 }
 
-/// The size, in number of entries, of the hash table pre-allocated by
-/// [`ArrowBytesMap::with_capacity`]. It is a warm up size for maps that go on
-/// to hold many values, not a bound on what the map can hold.
-pub const INITIAL_MAP_CAPACITY: usize = 128;
-/// The size, in bytes, of the string data buffer pre-allocated by
-/// [`ArrowBytesMap::with_capacity`]
+/// The initial size, in bytes, of the string data
 pub const INITIAL_BUFFER_CAPACITY: usize = 8 * 1024;
-
-/// Appends `value` to a map's value buffer, growing the buffer on a power of
-/// two ladder.
-///
-/// `Vec` doubles from wherever its first allocation landed, so a buffer started
-/// empty by [`ArrowBytesMap::new`] and one started at
-/// [`INITIAL_BUFFER_CAPACITY`] by [`ArrowBytesMap::with_capacity`] sit on
-/// different ladders, and can hold the same values at capacities differing by
-/// up to 2x in either direction depending on the value lengths. Rounding every
-/// growth up to a power of two puts both on one ladder, which is what makes a
-/// lazily allocated map never larger than a pre-allocated one holding the same
-/// values. Growth stays geometric, so appending is still amortized constant
-/// time.
-fn push_value_bytes(buffer: &mut Vec<u8>, value: &[u8]) {
-    let required = buffer.len() + value.len();
-    if required > buffer.capacity() {
-        let target = required.checked_next_power_of_two().unwrap_or(required);
-        buffer.reserve_exact(target - buffer.len());
-    }
-    buffer.extend_from_slice(value);
-}
 
 impl<O: OffsetSizeTrait, V> ArrowBytesMap<O, V>
 where
     V: Debug + PartialEq + Eq + Clone + Copy + Default,
 {
-    /// Creates a map that does not pre-allocate its hash table or value buffer.
+    /// Creates an empty map.
     ///
-    /// Use this when maps are created in large numbers and most of them stay
-    /// small, such as the per group `COUNT(DISTINCT)` accumulators that
-    /// `GroupsAccumulatorAdapter` creates one of per group. There the
-    /// pre-allocation dwarfs the values the map actually holds.
+    /// Nothing is pre-allocated: the hash table and the value buffer grow on
+    /// first use. That keeps a map cheap while it is small, which matters when
+    /// many are alive at once, such as the per group `COUNT(DISTINCT)`
+    /// accumulators that `GroupsAccumulatorAdapter` creates one of per group.
+    /// A map that goes on to hold many values pays only a handful of extra
+    /// small reallocations while it grows.
     pub fn new(output_type: OutputType) -> Self {
-        Self::new_inner(output_type, 0, 0)
-    }
-
-    /// Creates a map whose hash table is pre-allocated for `map_capacity`
-    /// entries and whose value buffer is pre-allocated with
-    /// [`INITIAL_BUFFER_CAPACITY`] bytes.
-    ///
-    /// Use this for the few long lived maps that are each expected to hold many
-    /// values, such as the single map backing a `GROUP BY` on one string
-    /// column. The capacities are preserved across [`Self::take`].
-    pub fn with_capacity(output_type: OutputType, map_capacity: usize) -> Self {
-        Self::new_inner(output_type, map_capacity, INITIAL_BUFFER_CAPACITY)
-    }
-
-    fn new_inner(
-        output_type: OutputType,
-        map_capacity: usize,
-        buffer_capacity: usize,
-    ) -> Self {
         Self {
             output_type,
-            map: hashbrown::hash_table::HashTable::with_capacity(map_capacity),
-            initial_map_capacity: map_capacity,
-            initial_buffer_capacity: buffer_capacity,
-            buffer: Vec::with_capacity(buffer_capacity),
+            map: hashbrown::hash_table::HashTable::new(),
+            buffer: Vec::new(),
             offsets: vec![O::default()], // first offset is always 0
             random_state: RandomState::default(),
             hashes_buffer: vec![],
@@ -327,29 +264,9 @@ where
     /// Return the contents of this map and replace it with a new empty map with
     /// the same output type
     pub fn take(&mut self) -> Self {
-        let mut new_self = Self::new_inner(
-            self.output_type,
-            self.initial_map_capacity,
-            self.initial_buffer_capacity,
-        );
+        let mut new_self = Self::new(self.output_type);
         swap(self, &mut new_self);
         new_self
-    }
-
-    /// Empties this map and releases every allocation it holds, so
-    /// [`Self::size`] drops to approximately zero.
-    ///
-    /// This is the difference from [`Self::take`]: `take` restores the
-    /// capacities the map was configured with so the emptied map stays warm for
-    /// continued use, which is what emitting wants, whereas here the point is
-    /// to hand the memory back, as before spilling or before a downstream sort.
-    /// The configured capacities are remembered, so the next [`Self::take`]
-    /// warms the map up again.
-    pub fn clear_and_release(&mut self) {
-        let mut released = Self::new_inner(self.output_type, 0, 0);
-        released.initial_map_capacity = self.initial_map_capacity;
-        released.initial_buffer_capacity = self.initial_buffer_capacity;
-        *self = released;
     }
 
     /// Inserts each value from `values` into the map, invoking `payload_fn` for
@@ -493,7 +410,7 @@ where
                     // Put the small values into buffer and offsets so it appears
                     // the output array, but store the actual bytes inline for
                     // comparison
-                    push_value_bytes(&mut self.buffer, value);
+                    self.buffer.extend_from_slice(value);
                     self.offsets.push(O::usize_as(self.buffer.len()));
                     let payload = make_payload_fn(Some(value));
                     let new_header = Entry {
@@ -531,7 +448,7 @@ where
                     // appears the output array, and store that offset
                     // so the bytes can be compared if needed
                     let offset = self.buffer.len(); // offset of start for data
-                    push_value_bytes(&mut self.buffer, value);
+                    self.buffer.extend_from_slice(value);
                     self.offsets.push(O::usize_as(self.buffer.len()));
 
                     let payload = make_payload_fn(Some(value));
@@ -567,8 +484,6 @@ where
         let Self {
             output_type,
             map: _,
-            initial_map_capacity: _,
-            initial_buffer_capacity: _,
             offsets,
             buffer,
             random_state: _,
@@ -756,6 +671,12 @@ mod tests {
         entries * (size_of::<T>() + 1)
     }
 
+    fn distinct_values(n: usize) -> ArrayRef {
+        Arc::new(StringArray::from_iter_values(
+            (0..n).map(|i| format!("distinct value number {i}")),
+        ))
+    }
+
     #[test]
     fn map_new_does_not_allocate() {
         let map = ArrowBytesMap::<i32, ()>::new(OutputType::Utf8);
@@ -768,17 +689,10 @@ mod tests {
     }
 
     #[test]
-    fn map_with_capacity_reports_the_real_hash_table_allocation() {
-        let map = ArrowBytesMap::<i32, ()>::with_capacity(
-            OutputType::Utf8,
-            INITIAL_MAP_CAPACITY,
-        );
+    fn size_reports_the_real_hash_table_allocation() {
+        let mut map = ArrowBytesMap::<i32, ()>::new(OutputType::Utf8);
+        map.insert_if_new(&distinct_values(1_000), |_| (), |_| ());
 
-        assert!(map.map.capacity() >= INITIAL_MAP_CAPACITY);
-        assert_eq!(map.buffer.capacity(), INITIAL_BUFFER_CAPACITY);
-
-        // Before this accounting was corrected the map reported its hash table
-        // as costing zero bytes until the table grew past its pre-allocation.
         let table_bytes = map.map.allocation_size();
         let lower_bound = min_table_bytes::<Entry<i32, ()>>(map.map.capacity());
         assert!(
@@ -789,112 +703,37 @@ mod tests {
             table_bytes <= 2 * lower_bound + 64,
             "expected {table_bytes} to be within a small factor of {lower_bound}"
         );
-        assert!(map.size() >= table_bytes + INITIAL_BUFFER_CAPACITY);
+        assert!(map.size() >= table_bytes + map.buffer.capacity());
     }
 
+    /// `take` is how `GroupValues::clear_shrink` hands memory back before a
+    /// spill, so the map it leaves behind must not hold on to anything.
     #[test]
-    fn take_preserves_the_capacity_the_map_was_built_with() {
-        let mut preallocated = ArrowBytesMap::<i32, ()>::with_capacity(
-            OutputType::Utf8,
-            INITIAL_MAP_CAPACITY,
-        );
-        let capacity = preallocated.map.capacity();
-        preallocated.take();
-        assert_eq!(preallocated.map.capacity(), capacity);
-        assert_eq!(preallocated.buffer.capacity(), INITIAL_BUFFER_CAPACITY);
+    fn take_leaves_an_empty_map_with_no_allocations() {
+        let mut map = ArrowBytesMap::<i32, ()>::new(OutputType::Utf8);
+        map.insert_if_new(&distinct_values(1_000), |_| (), |_| ());
+        assert!(map.size() > INITIAL_BUFFER_CAPACITY);
 
-        let mut lazy = ArrowBytesMap::<i32, ()>::new(OutputType::Utf8);
-        lazy.take();
-        assert_eq!(lazy.map.capacity(), 0);
-        assert_eq!(lazy.buffer.capacity(), 0);
-    }
-
-    #[test]
-    fn clear_and_release_frees_the_preallocation_that_take_keeps() {
-        let mut map = ArrowBytesMap::<i32, ()>::with_capacity(
-            OutputType::Utf8,
-            INITIAL_MAP_CAPACITY,
-        );
-        let values: ArrayRef = Arc::new(StringArray::from_iter_values(
-            (0..1_000).map(|i| format!("distinct value number {i}")),
-        ));
-        map.insert_if_new(&values, |_| (), |_| ());
-
-        let populated_size = map.size();
-        assert!(populated_size > INITIAL_BUFFER_CAPACITY);
-
-        // `take` deliberately keeps the map warm, so it does not release the
-        // configured capacities.
         map.take();
-        let taken_size = map.size();
-        assert!(
-            taken_size > INITIAL_BUFFER_CAPACITY,
-            "expected take to retain the warm up allocations, got {taken_size}"
-        );
-
-        map.clear_and_release();
-        let released_size = map.size();
         assert_eq!(map.map.allocation_size(), 0);
         assert_eq!(map.buffer.capacity(), 0);
         assert!(
-            released_size < 128,
-            "expected the released map to report approximately zero bytes, got {released_size}"
+            map.size() < 128,
+            "expected the emptied map to report approximately zero bytes, got {}",
+            map.size()
         );
-
-        // The configured capacities survive, so the map warms back up when it
-        // is emitted from again.
-        map.take();
-        assert!(map.map.capacity() >= INITIAL_MAP_CAPACITY);
-        assert_eq!(map.buffer.capacity(), INITIAL_BUFFER_CAPACITY);
     }
 
     #[test]
-    fn lazy_and_pre_allocated_buffers_grow_on_the_same_ladder() {
-        // Value lengths chosen so the buffer requirement lands between powers
-        // of two, which is where the two ladders used to diverge.
-        for value_len in [9usize, 13, 24, 37] {
-            let mut lazy = ArrowBytesMap::<i32, ()>::new(OutputType::Utf8);
-            let mut pre_allocated = ArrowBytesMap::<i32, ()>::with_capacity(
-                OutputType::Utf8,
-                INITIAL_MAP_CAPACITY,
-            );
-
-            for batch in 0..8 {
-                let values: ArrayRef =
-                    Arc::new(StringArray::from_iter_values((0..1_000).map(|i| {
-                        let value = format!("{}:{i}", batch * 1_000 + i);
-                        format!("{value:value_len$}")
-                    })));
-                lazy.insert_if_new(&values, |_| (), |_| ());
-                pre_allocated.insert_if_new(&values, |_| (), |_| ());
-
-                assert_eq!(lazy.buffer.len(), pre_allocated.buffer.len());
-                assert_eq!(
-                    lazy.buffer.capacity(),
-                    pre_allocated.buffer.capacity(),
-                    "value length {value_len}, batch {batch}: a buffer that \
-                     started empty reached {} bytes of capacity against {} for \
-                     one that started at INITIAL_BUFFER_CAPACITY",
-                    lazy.buffer.capacity(),
-                    pre_allocated.buffer.capacity(),
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_lazy_buffer_stays_below_the_pre_allocated_floor_while_it_is_small() {
-        let mut lazy = ArrowBytesMap::<i32, ()>::new(OutputType::Utf8);
-        let values: ArrayRef = Arc::new(StringArray::from_iter_values(
-            (0..10).map(|i| format!("distinct value number {i}")),
-        ));
-        lazy.insert_if_new(&values, |_| (), |_| ());
+    fn a_small_map_stays_below_the_old_pre_allocation() {
+        let mut map = ArrowBytesMap::<i32, ()>::new(OutputType::Utf8);
+        map.insert_if_new(&distinct_values(10), |_| (), |_| ());
 
         assert!(
-            lazy.buffer.capacity() < INITIAL_BUFFER_CAPACITY,
-            "expected a small lazy buffer to stay under the {INITIAL_BUFFER_CAPACITY} \
-             byte pre-allocation, got {}",
-            lazy.buffer.capacity()
+            map.size() < INITIAL_BUFFER_CAPACITY,
+            "expected a map holding 10 values to stay under the \
+             {INITIAL_BUFFER_CAPACITY} bytes that used to be pre-allocated, got {}",
+            map.size()
         );
     }
 

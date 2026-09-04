@@ -22,9 +22,7 @@ use crate::aggregates::group_values::GroupValues;
 use arrow::array::{Array, ArrayRef, OffsetSizeTrait};
 use datafusion_common::Result;
 use datafusion_expr::{EmitTo, GroupSelection};
-use datafusion_physical_expr_common::binary_map::{
-    ArrowBytesMap, INITIAL_MAP_CAPACITY, OutputType,
-};
+use datafusion_physical_expr_common::binary_map::{ArrowBytesMap, OutputType};
 
 /// A [`GroupValues`] storing single column of Utf8/LargeUtf8/Binary/LargeBinary values
 ///
@@ -40,9 +38,7 @@ pub struct GroupValuesBytes<O: OffsetSizeTrait> {
 impl<O: OffsetSizeTrait> GroupValuesBytes<O> {
     pub fn new(output_type: OutputType) -> Self {
         Self {
-            // One map holds every group value for the whole query, so it is
-            // worth pre-allocating the hash table and the value buffer.
-            map: ArrowBytesMap::with_capacity(output_type, INITIAL_MAP_CAPACITY),
+            map: ArrowBytesMap::new(output_type),
             num_groups: 0,
         }
     }
@@ -137,10 +133,9 @@ impl<O: OffsetSizeTrait> GroupValues for GroupValuesBytes<O> {
     }
 
     fn clear_shrink(&mut self, _num_rows: usize) {
-        // Callers use this to hand memory back before spilling or sorting, so
-        // release the map's allocations rather than restoring the warm up
-        // capacities that `take` keeps for the emit path.
-        self.map.clear_and_release();
+        // Callers use this to hand memory back before spilling or sorting.
+        // `take` leaves behind a map that holds no allocations at all.
+        self.map.take();
     }
 }
 
@@ -151,7 +146,6 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::StringArray;
-    use datafusion_physical_expr_common::binary_map::INITIAL_BUFFER_CAPACITY;
 
     /// `clear_shrink` is how the aggregate stream hands memory back before it
     /// spills and before the spilled batch is sorted, so the memory it releases
@@ -161,15 +155,6 @@ mod tests {
         let mut group_values = GroupValuesBytes::<i32>::new(OutputType::Utf8);
         let empty = size_of::<GroupValuesBytes<i32>>();
 
-        // The map is pre-allocated at construction, so it is already well above
-        // its own struct size before a single row is interned.
-        let warm_size = group_values.size();
-        assert!(
-            warm_size > empty + INITIAL_BUFFER_CAPACITY,
-            "expected the pre-allocated map to report more than {} bytes, got {warm_size}",
-            empty + INITIAL_BUFFER_CAPACITY
-        );
-
         let values: ArrayRef = Arc::new(StringArray::from_iter_values(
             (0..1_000).map(|i| format!("group value number {i}")),
         ));
@@ -178,26 +163,21 @@ mod tests {
             .intern(&[Arc::clone(&values)], &mut groups)
             .unwrap();
         let populated_size = group_values.size();
-        assert!(populated_size > warm_size);
+        assert!(populated_size > empty);
 
         group_values.clear_shrink(0);
 
-        // Everything the map held is gone: what remains is the struct itself
-        // plus the single leading zero offset.
+        // Everything the map held is gone: what remains is the struct itself.
         let released_size = group_values.size();
         assert!(
             released_size < empty + 128,
             "expected clear_shrink to release the map, got {released_size} with a struct size of {empty}"
         );
-        assert!(
-            released_size * 10 < populated_size,
-            "expected {released_size} to be far below {populated_size}"
-        );
 
-        // The map still works, and warms back up on the next emit.
+        // The map still works afterwards.
         group_values.intern(&[values], &mut groups).unwrap();
         assert!(group_values.size() > released_size);
-        group_values.emit(EmitTo::All).unwrap();
-        assert!(group_values.size() > empty + INITIAL_BUFFER_CAPACITY);
+        let emitted = group_values.emit(EmitTo::All).unwrap();
+        assert_eq!(emitted[0].len(), 1_000);
     }
 }

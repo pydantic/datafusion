@@ -39,19 +39,8 @@ use std::sync::Arc;
 pub struct ArrowBytesViewSet(ArrowBytesViewMap<()>);
 
 impl ArrowBytesViewSet {
-    /// Creates a set that does not pre-allocate its hash table.
-    ///
-    /// See [`ArrowBytesViewMap::new`] for when to prefer this over
-    /// [`Self::with_capacity`].
     pub fn new(output_type: OutputType) -> Self {
         Self(ArrowBytesViewMap::new(output_type))
-    }
-
-    /// Creates a set with room for `map_capacity` entries.
-    ///
-    /// See [`ArrowBytesViewMap::with_capacity`].
-    pub fn with_capacity(output_type: OutputType, map_capacity: usize) -> Self {
-        Self(ArrowBytesViewMap::with_capacity(output_type, map_capacity))
     }
 
     /// Inserts each value from `values` into the set
@@ -137,10 +126,6 @@ where
     output_type: OutputType,
     /// Underlying hash set for each distinct value
     map: hashbrown::hash_table::HashTable<Entry<V>>,
-    /// Hash table capacity to re-create the map with in [`Self::take`], so a
-    /// map built with [`Self::with_capacity`] keeps its pre-allocation when it
-    /// is emptied and reused
-    initial_map_capacity: usize,
 
     /// Views for all stored values (in insertion order)
     views: Vec<u128>,
@@ -161,36 +146,22 @@ where
     null: Option<(V, usize)>,
 }
 
-/// The size, in number of entries, of the hash table pre-allocated by
-/// [`ArrowBytesViewMap::with_capacity`]. It is a warm up size for maps that go
-/// on to hold many values, not a bound on what the map can hold.
-pub const INITIAL_MAP_CAPACITY: usize = 512;
-
 impl<V> ArrowBytesViewMap<V>
 where
     V: Debug + PartialEq + Eq + Clone + Copy + Default,
 {
-    /// Creates a map that does not pre-allocate its hash table.
+    /// Creates an empty map.
     ///
-    /// Use this when maps are created in large numbers and most of them stay
-    /// small, such as the per group `COUNT(DISTINCT)` accumulators that
-    /// `GroupsAccumulatorAdapter` creates one of per group. There the
-    /// pre-allocation dwarfs the values the map actually holds.
+    /// Nothing is pre-allocated: the hash table grows on first use. That keeps
+    /// a map cheap while it is small, which matters when many are alive at
+    /// once, such as the per group `COUNT(DISTINCT)` accumulators that
+    /// `GroupsAccumulatorAdapter` creates one of per group. A map that goes on
+    /// to hold many values pays only a handful of extra small reallocations
+    /// while it grows.
     pub fn new(output_type: OutputType) -> Self {
-        Self::with_capacity(output_type, 0)
-    }
-
-    /// Creates a map whose hash table is pre-allocated for `map_capacity`
-    /// entries.
-    ///
-    /// Use this for the few long lived maps that are each expected to hold many
-    /// values, such as the single map backing a `GROUP BY` on one string
-    /// column. The capacity is preserved across [`Self::take`].
-    pub fn with_capacity(output_type: OutputType, map_capacity: usize) -> Self {
         Self {
             output_type,
-            map: hashbrown::hash_table::HashTable::with_capacity(map_capacity),
-            initial_map_capacity: map_capacity,
+            map: hashbrown::hash_table::HashTable::new(),
             views: Vec::new(),
             in_progress: Vec::new(),
             completed: Vec::new(),
@@ -204,25 +175,9 @@ where
     /// Return the contents of this map and replace it with a new empty map with
     /// the same output type
     pub fn take(&mut self) -> Self {
-        let mut new_self =
-            Self::with_capacity(self.output_type, self.initial_map_capacity);
+        let mut new_self = Self::new(self.output_type);
         std::mem::swap(self, &mut new_self);
         new_self
-    }
-
-    /// Empties this map and releases every allocation it holds, so
-    /// [`Self::size`] drops to approximately zero.
-    ///
-    /// This is the difference from [`Self::take`]: `take` restores the capacity
-    /// the map was configured with so the emptied map stays warm for continued
-    /// use, which is what emitting wants, whereas here the point is to hand the
-    /// memory back, as before spilling or before a downstream sort. The
-    /// configured capacity is remembered, so the next [`Self::take`] warms the
-    /// map up again.
-    pub fn clear_and_release(&mut self) {
-        let mut released = Self::with_capacity(self.output_type, 0);
-        released.initial_map_capacity = self.initial_map_capacity;
-        *self = released;
     }
 
     /// Inserts each value from `values` into the map, invoking `payload_fn` for
@@ -839,6 +794,12 @@ mod tests {
         entries * (size_of::<T>() + 1)
     }
 
+    fn distinct_values(n: usize) -> ArrayRef {
+        Arc::new(StringViewArray::from_iter_values(
+            (0..n).map(|i| format!("distinct value number {i}")),
+        ))
+    }
+
     #[test]
     fn map_new_does_not_allocate() {
         let map = ArrowBytesViewMap::<()>::new(OutputType::Utf8View);
@@ -849,87 +810,40 @@ mod tests {
     }
 
     #[test]
-    fn test_size_counts_initial_hash_table_capacity() {
-        let map = ArrowBytesViewMap::<()>::with_capacity(
-            OutputType::Utf8View,
-            INITIAL_MAP_CAPACITY,
-        );
+    fn size_reports_the_real_hash_table_allocation() {
+        let mut map = ArrowBytesViewMap::<()>::new(OutputType::Utf8View);
+        map.insert_if_new(&distinct_values(1_000), |_| (), |_| ());
 
-        assert!(map.map.capacity() >= INITIAL_MAP_CAPACITY);
-        assert_eq!(map.size(), map.map.allocation_size());
-
-        // Before this accounting was corrected the map reported exactly
-        // `capacity() * size_of::<Entry<V>>()`, which leaves out the control
-        // bytes and undercounts the real allocation by roughly half.
+        let table_bytes = map.map.allocation_size();
         let lower_bound = min_table_bytes::<Entry<()>>(map.map.capacity());
         assert!(
-            map.size() >= lower_bound,
-            "expected {} to be at least {lower_bound}",
-            map.size()
+            table_bytes >= lower_bound,
+            "expected {table_bytes} to be at least {lower_bound}"
         );
         assert!(
-            map.size() <= 2 * lower_bound + 64,
-            "expected {} to be within a small factor of {lower_bound}",
-            map.size()
+            table_bytes <= 2 * lower_bound + 64,
+            "expected {table_bytes} to be within a small factor of {lower_bound}"
         );
+        // `capacity() * size_of::<Entry<V>>()`, which the map used to report,
+        // leaves out the control bytes and undercounts the real allocation.
         assert!(
-            map.size() > map.map.capacity() * size_of::<Entry<()>>(),
-            "expected {} to exceed {}",
-            map.size(),
+            table_bytes > map.map.capacity() * size_of::<Entry<()>>(),
+            "expected {table_bytes} to exceed {}",
             map.map.capacity() * size_of::<Entry<()>>()
         );
     }
 
+    /// `take` is how `GroupValues::clear_shrink` hands memory back before a
+    /// spill, so the map it leaves behind must not hold on to anything.
     #[test]
-    fn take_preserves_the_capacity_the_map_was_built_with() {
-        let mut preallocated = ArrowBytesViewMap::<()>::with_capacity(
-            OutputType::Utf8View,
-            INITIAL_MAP_CAPACITY,
-        );
-        let capacity = preallocated.map.capacity();
-        preallocated.take();
-        assert_eq!(preallocated.map.capacity(), capacity);
+    fn take_leaves_an_empty_map_with_no_allocations() {
+        let mut map = ArrowBytesViewMap::<()>::new(OutputType::Utf8View);
+        map.insert_if_new(&distinct_values(1_000), |_| (), |_| ());
+        assert!(map.map.allocation_size() > 0);
 
-        let mut lazy = ArrowBytesViewMap::<()>::new(OutputType::Utf8View);
-        lazy.take();
-        assert_eq!(lazy.map.capacity(), 0);
-    }
-
-    #[test]
-    fn clear_and_release_frees_the_preallocation_that_take_keeps() {
-        let mut map = ArrowBytesViewMap::<()>::with_capacity(
-            OutputType::Utf8View,
-            INITIAL_MAP_CAPACITY,
-        );
-        let values: ArrayRef = Arc::new(StringViewArray::from_iter_values(
-            (0..1_000).map(|i| format!("distinct value number {i}")),
-        ));
-        map.insert_if_new(&values, |_| (), |_| ());
-
-        let warm_size = map.map.allocation_size();
-        assert!(warm_size > 0);
-
-        // `take` deliberately keeps the map warm, so it does not release the
-        // configured capacity.
         map.take();
-        let taken_size = map.size();
-        assert!(
-            taken_size >= min_table_bytes::<Entry<()>>(INITIAL_MAP_CAPACITY),
-            "expected take to retain the warm up allocation, got {taken_size}"
-        );
-
-        map.clear_and_release();
         assert_eq!(map.map.allocation_size(), 0);
-        let released_size = map.size();
-        assert!(
-            released_size < 128,
-            "expected the released map to report approximately zero bytes, got {released_size}"
-        );
-
-        // The configured capacity survives, so the map warms back up when it is
-        // emitted from again.
-        map.take();
-        assert!(map.map.capacity() >= INITIAL_MAP_CAPACITY);
+        assert_eq!(map.size(), 0);
     }
 
     #[test]
