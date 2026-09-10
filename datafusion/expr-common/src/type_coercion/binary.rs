@@ -388,7 +388,11 @@ impl<'a> BinaryTypeCoercer<'a> {
     }
 
     /// Coerces a mixed timezone-aware and timezone-naive timestamp pair to the
-    /// session timezone and widens both operands to the same precision.
+    /// session timezone and widens both operands to the finer of the two units.
+    ///
+    /// A timezone-naive timestamp does not identify an instant on its own, so
+    /// comparing or subtracting it against a timezone-aware one has to read it
+    /// in some zone. Postgres and DuckDB read it in the session timezone.
     fn timestamp_types_with_session_timezone(
         &self,
         lhs: &DataType,
@@ -402,8 +406,10 @@ impl<'a> BinaryTypeCoercer<'a> {
         else {
             return None;
         };
-        let unit = timeunit_coercion(lhs_unit, rhs_unit);
-        let data_type = Timestamp(unit, Some(Arc::from(session_time_zone)));
+        let data_type = Timestamp(
+            timeunit_coercion(lhs_unit, rhs_unit),
+            Some(Arc::from(session_time_zone)),
+        );
 
         Some((data_type.clone(), data_type))
     }
@@ -1019,6 +1025,24 @@ pub fn comparison_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<D
         .or_else(|| struct_coercion(lhs_type, rhs_type, comparison_coercion))
         .or_else(|| map_coercion(lhs_type, rhs_type, comparison_coercion))
         .or_else(|| union_coercion(lhs_type, rhs_type))
+}
+
+/// Returns the common type for the non-binary comparison expressions
+/// (`IN`, `BETWEEN`, `CASE x WHEN`, `IN (<subquery>)`, `= ANY/ALL`), using the
+/// same rules as `=` itself so they cannot disagree with it.
+///
+/// `session_time_zone` is `datafusion.execution.time_zone`; see
+/// [`BinaryTypeCoercer::with_session_time_zone`].
+pub fn comparison_coercion_with_session_timezone(
+    lhs_type: &DataType,
+    rhs_type: &DataType,
+    session_time_zone: Option<&str>,
+) -> Option<DataType> {
+    BinaryTypeCoercer::new(lhs_type, &Operator::Eq, rhs_type)
+        .with_session_time_zone(session_time_zone)
+        .get_input_types()
+        .ok()
+        .map(|(lhs_type, _)| lhs_type)
 }
 
 /// Coerce a numeric/string pair to the numeric type.

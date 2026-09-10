@@ -1093,3 +1093,55 @@ fn test_string_concat_coercion() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_comparison_coercion_with_session_timezone() {
+    let aware = DataType::Timestamp(Millisecond, Some("America/New_York".into()));
+    let naive = DataType::Timestamp(Nanosecond, None);
+    let session = DataType::Timestamp(Nanosecond, Some("+08:00".into()));
+
+    // A mixed pair is read in the session timezone, at the finer unit, in
+    // either operand order.
+    assert_eq!(
+        comparison_coercion_with_session_timezone(&aware, &naive, Some("+08:00")),
+        Some(session.clone())
+    );
+    assert_eq!(
+        comparison_coercion_with_session_timezone(&naive, &aware, Some("+08:00")),
+        Some(session)
+    );
+
+    // Pairs that are both aware or both naive are left to the ordinary rules.
+    for (lhs, rhs) in [(&aware, &aware), (&naive, &naive)] {
+        assert_eq!(
+            comparison_coercion_with_session_timezone(lhs, rhs, Some("+08:00")),
+            comparison_coercion(lhs, rhs)
+        );
+    }
+
+    // Without a session timezone this matches `comparison_coercion` for
+    // everything except the `Null` cases below.
+    for (lhs, rhs) in [
+        (&aware, &naive),
+        (&naive, &aware),
+        (&DataType::Int32, &DataType::Int64),
+        (&DataType::Utf8, &DataType::Int32),
+    ] {
+        assert_eq!(
+            comparison_coercion_with_session_timezone(lhs, rhs, None),
+            comparison_coercion(lhs, rhs)
+        );
+    }
+
+    // Unlike `comparison_coercion`, `Null` against a dictionary keeps the
+    // dictionary encoding, because `=` does.
+    let dict = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+    assert_eq!(
+        comparison_coercion_with_session_timezone(&DataType::Null, &dict, None),
+        Some(dict.clone())
+    );
+    assert_eq!(
+        comparison_coercion(&DataType::Null, &dict),
+        Some(DataType::Utf8)
+    );
+}
