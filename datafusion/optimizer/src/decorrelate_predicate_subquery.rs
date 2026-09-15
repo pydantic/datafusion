@@ -406,19 +406,24 @@ fn mark_join(
     )
 }
 
-/// Check if join keys in the join filter may contain NULL values
+/// Whether the `IN` / `NOT IN` value on either side of `in_predicate` can be
+/// NULL, which is when the join needs null-aware (three-valued) semantics.
 ///
-/// Returns true if any join key column is nullable on either side.
-/// This is used to optimize null-aware anti joins: if all join keys are non-nullable,
-/// we can use a regular anti join instead of the more expensive null-aware variant.
-fn join_keys_may_be_null(
-    join_filter: &Expr,
+/// Only the value equality matters: a NULL in a residual correlation
+/// predicate just removes that row from the subquery result, which a plain
+/// join filter already does. `None` means there is no `IN` predicate
+/// (`EXISTS`), which never needs null-aware semantics.
+fn in_predicate_may_be_null(
+    in_predicate: Option<&Expr>,
     left_schema: &DFSchemaRef,
     right_schema: &DFSchemaRef,
 ) -> Result<bool> {
-    // Extract columns from the join filter
+    let Some(in_predicate) = in_predicate else {
+        return Ok(false);
+    };
+    // Extract the columns of the value expressions
     let mut columns = std::collections::HashSet::new();
-    expr_to_columns(join_filter, &mut columns)?;
+    expr_to_columns(in_predicate, &mut columns)?;
 
     // Check if any column is nullable
     for col in columns {
@@ -470,34 +475,25 @@ fn build_join(
             replace_qualified_name(filter, &all_correlated_cols, &alias).map(Some)
         })?;
 
-    let join_filter = match (join_filter_opt, in_predicate_opt.cloned()) {
-        (
-            Some(join_filter),
-            Some(Expr::BinaryExpr(BinaryExpr {
-                left,
-                op: Operator::Eq,
-                right,
-            })),
-        ) => {
-            let right_col = create_col_from_scalar_expr(&right, alias)?;
-            let in_predicate = Expr::eq(left.deref().clone(), Expr::Column(right_col));
-            in_predicate.and(join_filter)
+    // The `IN` / `NOT IN` value equality, rewritten against the subquery alias.
+    let in_predicate = match in_predicate_opt {
+        Some(Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Eq,
+            right,
+        })) => {
+            let right_col = create_col_from_scalar_expr(right, alias)?;
+            Some(Expr::eq(left.deref().clone(), Expr::Column(right_col)))
         }
-        (Some(join_filter), _) => join_filter,
-        (
-            _,
-            Some(Expr::BinaryExpr(BinaryExpr {
-                left,
-                op: Operator::Eq,
-                right,
-            })),
-        ) => {
-            let right_col = create_col_from_scalar_expr(&right, alias)?;
+        _ => None,
+    };
 
-            Expr::eq(left.deref().clone(), Expr::Column(right_col))
-        }
-        (None, None) => lit(true),
-        _ => return Ok(None),
+    let join_filter = match (join_filter_opt, in_predicate.clone()) {
+        (Some(join_filter), Some(in_predicate)) => in_predicate.and(join_filter),
+        (Some(join_filter), None) => join_filter,
+        (None, Some(in_predicate)) => in_predicate,
+        (None, None) if in_predicate_opt.is_none() => lit(true),
+        (None, None) => return Ok(None),
     };
 
     if matches!(join_type, JoinType::LeftMark | JoinType::RightMark) {
@@ -539,9 +535,8 @@ fn build_join(
         // join filter, which the hash join also applies when it decides
         // whether a NULL makes the mark UNKNOWN.
         let null_aware = join_type == JoinType::LeftMark
-            && in_predicate_opt.is_some()
-            && join_keys_may_be_null(
-                &join_filter,
+            && in_predicate_may_be_null(
+                in_predicate.as_ref(),
                 left.schema(),
                 right_projected.schema(),
             )?;
@@ -574,8 +569,11 @@ fn build_join(
     // Additionally, if the join keys are non-nullable on both sides, we don't need
     // null-aware semantics because NULLs cannot exist in the data.
     let null_aware = join_type == JoinType::LeftAnti
-        && in_predicate_opt.is_some()
-        && join_keys_may_be_null(&join_filter, left.schema(), sub_query_alias.schema())?;
+        && in_predicate_may_be_null(
+            in_predicate.as_ref(),
+            left.schema(),
+            sub_query_alias.schema(),
+        )?;
 
     // join our sub query into the main plan
     let new_plan = if null_aware {
@@ -681,6 +679,29 @@ mod tests {
             Field::new("grp", DataType::Int32, true),
         ]);
         table_scan(Some(name), &schema, None)?.build()
+    }
+
+    /// A scan whose `NOT IN` value column `id` is NOT NULL while the
+    /// correlation column `grp` is nullable.
+    fn non_null_id_scan(name: &str) -> Result<LogicalPlan> {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("grp", DataType::Int32, true),
+        ]);
+        table_scan(Some(name), &schema, None)?.build()
+    }
+
+    /// The `null_aware` flag of the first join of `join_type` in `plan`.
+    fn find_join_null_aware(plan: &LogicalPlan, join_type: JoinType) -> Option<bool> {
+        if let LogicalPlan::Join(join) = plan
+            && join.join_type == join_type
+        {
+            return Some(join.null_aware);
+        }
+
+        plan.inputs()
+            .into_iter()
+            .find_map(|input| find_join_null_aware(input, join_type))
     }
 
     fn has_null_aware_left_mark_join(plan: &LogicalPlan) -> bool {
@@ -1438,6 +1459,85 @@ mod tests {
         let optimized = optimize_with_decorrelate(plan)?;
         assert!(
             has_null_aware_left_mark_join(&optimized),
+            "{}",
+            optimized.display_indent_schema()
+        );
+
+        Ok(())
+    }
+
+    /// Only the `NOT IN` value columns decide null-awareness: a nullable
+    /// column in the non-equality correlation does not make the join
+    /// null-aware when the value columns are NOT NULL.
+    #[test]
+    fn correlated_not_in_with_non_null_values_is_not_null_aware() -> Result<()> {
+        let subquery = || -> Result<Arc<LogicalPlan>> {
+            Ok(Arc::new(
+                LogicalPlanBuilder::from(non_null_id_scan("inner_t")?)
+                    .filter(
+                        out_ref_col(DataType::Int32, "outer_t.grp")
+                            .lt(col("inner_t.grp")),
+                    )?
+                    .project(vec![col("inner_t.id")])?
+                    .build()?,
+            ))
+        };
+
+        // Mark join: `NOT IN` inside a larger expression.
+        let outer_scan = non_null_id_scan("outer_t")?;
+        let plan = LogicalPlanBuilder::from(outer_scan.clone())
+            .filter(not_in_subquery(col("outer_t.id"), subquery()?).is_null())?
+            .build()?;
+        let optimized = optimize_with_decorrelate(plan)?;
+        assert_eq!(
+            find_join_null_aware(&optimized, JoinType::LeftMark),
+            Some(false),
+            "{}",
+            optimized.display_indent_schema()
+        );
+
+        // Anti join: `NOT IN` at the top level of the filter.
+        let plan = LogicalPlanBuilder::from(outer_scan)
+            .filter(not_in_subquery(col("outer_t.id"), subquery()?))?
+            .build()?;
+        let optimized = optimize_with_decorrelate(plan)?;
+        assert_eq!(
+            find_join_null_aware(&optimized, JoinType::LeftAnti),
+            Some(false),
+            "{}",
+            optimized.display_indent_schema()
+        );
+
+        Ok(())
+    }
+
+    /// A nullable `NOT IN` value column keeps the anti join null-aware even
+    /// when the correlation columns are NOT NULL.
+    #[test]
+    fn correlated_not_in_with_nullable_value_is_null_aware() -> Result<()> {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("grp", DataType::Int32, false),
+        ]);
+        let outer_scan = table_scan(Some("outer_t"), &schema, None)?.build()?;
+        let inner_scan = table_scan(Some("inner_t"), &schema, None)?.build()?;
+
+        let subquery = Arc::new(
+            LogicalPlanBuilder::from(inner_scan)
+                .filter(
+                    out_ref_col(DataType::Int32, "outer_t.grp").lt(col("inner_t.grp")),
+                )?
+                .project(vec![col("inner_t.id")])?
+                .build()?,
+        );
+
+        let plan = LogicalPlanBuilder::from(outer_scan)
+            .filter(not_in_subquery(col("outer_t.id"), subquery))?
+            .build()?;
+        let optimized = optimize_with_decorrelate(plan)?;
+        assert_eq!(
+            find_join_null_aware(&optimized, JoinType::LeftAnti),
+            Some(true),
             "{}",
             optimized.display_indent_schema()
         );
