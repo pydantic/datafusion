@@ -44,6 +44,7 @@ use datafusion_functions_aggregate::approx_percentile_cont::approx_percentile_co
 use datafusion_functions_aggregate::array_agg::array_agg_udaf;
 use datafusion_functions_aggregate::average::avg_udaf;
 use datafusion_functions_aggregate::first_last::first_value_udaf;
+use datafusion_functions_aggregate::min_max::min_udaf;
 use datafusion_functions_aggregate::nth_value::nth_value_udaf;
 use datafusion_functions_aggregate::string_agg::string_agg_udaf;
 use datafusion_functions_aggregate::sum::sum_udaf;
@@ -205,23 +206,25 @@ fn roundtrip_aggregate_with_limit() -> Result<()> {
     let groups: Vec<(Arc<dyn PhysicalExpr>, String)> =
         vec![(col("a", &schema)?, "unused".to_string())];
 
+    // a limit is only valid on an aggregate that can execute it: a single
+    // MIN/MAX aggregate, or a `SELECT DISTINCT`-style aggregate
     let aggregates = vec![
-        AggregateExprBuilder::new(avg_udaf(), vec![col("b", &schema)?])
+        AggregateExprBuilder::new(min_udaf(), vec![col("b", &schema)?])
             .schema(Arc::clone(&schema))
-            .alias("AVG(b)")
+            .alias("MIN(b)")
             .build()
             .map(Arc::new)?,
     ];
 
-    let agg = AggregateExec::try_new(
+    let agg = AggregateExec::builder(
         AggregateMode::Final,
-        PhysicalGroupBy::new_single(groups.clone()),
-        aggregates,
-        vec![None],
         Arc::new(EmptyExec::new(schema.clone())),
-        schema,
-    )?;
-    let agg = agg.with_limit_options(Some(LimitOptions::new_with_order(12, false)));
+    )
+    .with_group_by(PhysicalGroupBy::new_single(groups.clone()))
+    .with_aggr_exprs(aggregates)
+    .with_input_schema(schema)
+    .with_limit_options(LimitOptions::new_with_order(12, false))
+    .build()?;
     roundtrip_test(Arc::new(agg))
 }
 

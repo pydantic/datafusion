@@ -208,6 +208,7 @@ use topk::heap::is_supported_heap_type;
 
 mod aggregate_hash_table;
 mod aggregate_stream;
+mod builder;
 pub mod group_values;
 mod grouped_hash_stream;
 mod grouped_topk_stream;
@@ -220,6 +221,8 @@ mod partial_reduce_stream;
 mod single_stream;
 mod skip_partial;
 mod topk;
+
+pub use builder::AggregateExecBuilder;
 
 /// Returns true if TopK aggregation data structures support the provided key and value types.
 ///
@@ -810,6 +813,16 @@ enum DynamicFilterAggregateType {
 }
 
 /// Configuration for limit-based optimizations in aggregation
+///
+/// A limit is a hint pushed into the aggregate by the optimizer: operators
+/// above it still enforce it. Only two shapes can actually be executed, and
+/// [`AggregateExecBuilder::build`] rejects anything else:
+///
+/// * a *soft limit* ([`LimitOptions::new`]) on a `SELECT DISTINCT`-style
+///   aggregate, which stops accumulating new groups once it has enough, and
+/// * a *top-k limit* on an aggregate with a single `MIN`/`MAX` expression
+///   (ordered by the aggregate value) or on a group by with an ordering
+///   direction ([`LimitOptions::new_with_order`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LimitOptions {
     /// The maximum number of rows to return
@@ -888,9 +901,57 @@ pub struct AggregateExec {
 }
 
 impl AggregateExec {
+    /// Create a builder for a new [`AggregateExec`] over `input`.
+    ///
+    /// See [`AggregateExecBuilder`] for details and examples.
+    pub fn builder(
+        mode: AggregateMode,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> AggregateExecBuilder {
+        AggregateExecBuilder::new(mode, input)
+    }
+
+    /// Create a builder pre-populated with the fields of this
+    /// [`AggregateExec`], to derive a new node from it.
+    ///
+    /// This is the supported way to rewrite an existing aggregate: the derived
+    /// output schema and plan properties are carried over (so a rewrite cannot
+    /// rename output fields), and the result is validated.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow::datatypes::{DataType, Field, Schema};
+    /// # use datafusion_physical_plan::aggregates::{
+    /// #     AggregateExec, AggregateMode, LimitOptions, PhysicalGroupBy,
+    /// # };
+    /// # use datafusion_physical_plan::empty::EmptyExec;
+    /// # use datafusion_physical_expr::expressions::col;
+    /// # fn main() -> datafusion_common::Result<()> {
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+    /// # let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+    /// # let group_by =
+    /// #     PhysicalGroupBy::new_single(vec![(col("a", &schema)?, "a".to_string())]);
+    /// # let exec = AggregateExec::builder(AggregateMode::Single, input)
+    /// #     .with_group_by(group_by)
+    /// #     .build()?;
+    /// let with_limit = exec
+    ///     .to_builder()
+    ///     .with_limit_options(LimitOptions::new(10))
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn to_builder(&self) -> AggregateExecBuilder {
+        AggregateExecBuilder::from_exec(self)
+    }
+
     /// Function used in `OptimizeAggregateOrder` optimizer rule,
     /// where we need parts of the new value, others cloned from the old one
     /// Rewrites aggregate exec with new aggregate expressions.
+    #[deprecated(
+        since = "56.0.0",
+        note = "use `AggregateExec::to_builder().with_aggr_exprs(..).build()` instead, which validates that the new expressions match the output schema"
+    )]
     pub fn with_new_aggr_exprs(
         &self,
         aggr_expr: impl Into<Arc<[Arc<AggregateFunctionExpr>]>>,
@@ -914,6 +975,10 @@ impl AggregateExec {
     }
 
     /// Clone this exec, overriding only the limit hint.
+    #[deprecated(
+        since = "56.0.0",
+        note = "use `AggregateExec::to_builder().with_limit_options(..).build()` instead, which rejects limits this aggregate cannot execute"
+    )]
     pub fn with_new_limit_options(&self, limit_options: Option<LimitOptions>) -> Self {
         Self {
             limit_options,
@@ -938,6 +1003,9 @@ impl AggregateExec {
     }
 
     /// Create a new hash aggregate execution plan
+    ///
+    /// Prefer [`AggregateExec::builder`], which names each argument and
+    /// validates the result.
     pub fn try_new(
         mode: AggregateMode,
         group_by: impl Into<Arc<PhysicalGroupBy>>,
@@ -1088,12 +1156,22 @@ impl AggregateExec {
     }
 
     /// Set the limit options for this AggExec
+    ///
+    /// Note this sets the limit without checking that this aggregate can
+    /// actually execute it, which the builder does.
+    #[deprecated(
+        since = "56.0.0",
+        note = "use `AggregateExec::to_builder().with_limit_options(..).build()` instead, which rejects limits this aggregate cannot execute"
+    )]
     pub fn with_limit_options(mut self, limit_options: Option<LimitOptions>) -> Self {
         self.limit_options = limit_options;
         self
     }
 
     /// Get the limit options (if set)
+    ///
+    /// Set them with
+    /// [`to_builder().with_limit_options(..)`](AggregateExec::to_builder).
     pub fn limit_options(&self) -> Option<LimitOptions> {
         self.limit_options
     }
@@ -2680,37 +2758,26 @@ impl AggregateExec {
             .collect::<Result<Vec<_>>>()?;
         let group_by =
             PhysicalGroupBy::new(group_expr, null_expr, groups, *has_grouping_set);
-        let aggregate = if let Some(schema) = schema {
-            let schema = SchemaRef::new(schema.try_into()?);
-            AggregateExec::try_new_with_schema(
-                mode,
-                group_by,
-                aggr_expr,
-                filter_expr,
-                input,
-                Arc::clone(&input_schema),
-                schema,
-            )
-        } else {
-            AggregateExec::try_new(
-                mode,
-                group_by,
-                aggr_expr,
-                filter_expr,
-                input,
-                Arc::clone(&input_schema),
-            )
-        }?;
-        let aggregate = if let Some(limit) = limit {
-            let fetch = usize_from_wire(limit.limit, "AggregateExec", "limit")?;
-            let options = match limit.descending {
-                Some(descending) => LimitOptions::new_with_order(fetch, descending),
-                None => LimitOptions::new(fetch),
-            };
-            aggregate.with_limit_options(Some(options))
-        } else {
-            aggregate
+        let limit_options = match limit {
+            Some(limit) => {
+                let fetch = usize_from_wire(limit.limit, "AggregateExec", "limit")?;
+                Some(match limit.descending {
+                    Some(descending) => LimitOptions::new_with_order(fetch, descending),
+                    None => LimitOptions::new(fetch),
+                })
+            }
+            None => None,
         };
+        let mut builder = AggregateExec::builder(mode, input)
+            .with_group_by(group_by)
+            .with_aggr_exprs(aggr_expr)
+            .with_filter_exprs(filter_expr)
+            .with_input_schema(Arc::clone(&input_schema))
+            .with_limit_options(limit_options);
+        if let Some(schema) = schema {
+            builder = builder.with_output_schema(SchemaRef::new(schema.try_into()?));
+        }
+        let aggregate = builder.build()?;
         let aggregate = if let Some(dynamic_filter) = dynamic_filter {
             let dynamic_filter =
                 ctx.decode_expr(dynamic_filter, input_schema.as_ref())?;
@@ -4367,15 +4434,11 @@ mod tests {
             None,
         )?;
         let partial_aggregate = Arc::new(
-            AggregateExec::try_new(
-                AggregateMode::Partial,
-                group_by.clone(),
-                vec![],
-                vec![],
-                partial_input,
-                Arc::clone(&schema),
-            )?
-            .with_limit_options(Some(LimitOptions::new(2))),
+            AggregateExec::builder(AggregateMode::Partial, partial_input)
+                .with_group_by(group_by.clone())
+                .with_input_schema(Arc::clone(&schema))
+                .with_limit_options(LimitOptions::new(2))
+                .build()?,
         );
 
         let partial_stream = partial_aggregate.execute_typed(0, &task_ctx)?;
@@ -4401,15 +4464,11 @@ mod tests {
         let final_input =
             TestMemoryExec::try_new_exec(&[input_batches], Arc::clone(&schema), None)?;
         let final_aggregate = Arc::new(
-            AggregateExec::try_new(
-                AggregateMode::Final,
-                group_by.as_final(),
-                vec![],
-                vec![],
-                final_input,
-                Arc::clone(&schema),
-            )?
-            .with_limit_options(Some(LimitOptions::new(2))),
+            AggregateExec::builder(AggregateMode::Final, final_input)
+                .with_group_by(group_by.as_final())
+                .with_input_schema(Arc::clone(&schema))
+                .with_limit_options(LimitOptions::new(2))
+                .build()?,
         );
 
         let final_stream = final_aggregate.execute_typed(0, &task_ctx)?;
@@ -6579,20 +6638,21 @@ mod tests {
         let input = Arc::new(StatisticsExec::new(stats, (**schema).clone()))
             as Arc<dyn ExecutionPlan>;
 
-        let mut agg = AggregateExec::try_new(
-            mode,
-            group_by,
-            vec![count_a_aggregate(schema)?],
-            vec![None],
-            input,
-            Arc::clone(schema),
-        )?;
+        // A limit is only ever pushed into an aggregate that can execute it.
+        // Without a MIN/MAX aggregate to order by, that means a `SELECT
+        // DISTINCT`-style aggregate with no aggregate expressions.
+        let aggr_exprs = if limit.is_some() {
+            vec![]
+        } else {
+            vec![count_a_aggregate(schema)?]
+        };
 
-        if let Some(limit) = limit {
-            agg = agg.with_limit_options(Some(limit));
-        }
-
-        Ok(agg)
+        AggregateExec::builder(mode, input)
+            .with_group_by(group_by)
+            .with_aggr_exprs(aggr_exprs)
+            .with_input_schema(Arc::clone(schema))
+            .with_limit_options(limit)
+            .build()
     }
 
     fn simple_group_by(schema: &SchemaRef, cols: &[&str]) -> PhysicalGroupBy {
