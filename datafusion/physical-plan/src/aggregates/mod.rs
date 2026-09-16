@@ -222,6 +222,7 @@ mod single_stream;
 mod skip_partial;
 mod topk;
 
+#[doc(hidden)]
 pub use builder::AggregateExecBuilder;
 
 /// Returns true if TopK aggregation data structures support the provided key and value types.
@@ -816,7 +817,7 @@ enum DynamicFilterAggregateType {
 ///
 /// A limit is a hint pushed into the aggregate by the optimizer: operators
 /// above it still enforce it. Only two shapes can actually be executed, and
-/// [`AggregateExecBuilder::build`] rejects anything else:
+/// building an `AggregateExec` rejects anything else:
 ///
 /// * a *soft limit* ([`LimitOptions::new`]) on a `SELECT DISTINCT`-style
 ///   aggregate, which stops accumulating new groups once it has enough, and
@@ -904,6 +905,11 @@ impl AggregateExec {
     /// Create a builder for a new [`AggregateExec`] over `input`.
     ///
     /// See [`AggregateExecBuilder`] for details and examples.
+    ///
+    /// This is public for internal use only and is not part of the public API:
+    /// it is how DataFusion's own physical optimizer rules build and rewrite
+    /// aggregates, and it may change without notice.
+    #[doc(hidden)]
     pub fn builder(
         mode: AggregateMode,
         input: Arc<dyn ExecutionPlan>,
@@ -917,6 +923,10 @@ impl AggregateExec {
     /// This is the supported way to rewrite an existing aggregate: the derived
     /// output schema and plan properties are carried over (so a rewrite cannot
     /// rename output fields), and the result is validated.
+    ///
+    /// This is public for internal use only and is not part of the public API:
+    /// it is how DataFusion's own physical optimizer rules build and rewrite
+    /// aggregates, and it may change without notice.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -941,6 +951,7 @@ impl AggregateExec {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(hidden)]
     pub fn to_builder(&self) -> AggregateExecBuilder {
         AggregateExecBuilder::from_exec(self)
     }
@@ -948,6 +959,7 @@ impl AggregateExec {
     /// Function used in `OptimizeAggregateOrder` optimizer rule,
     /// where we need parts of the new value, others cloned from the old one
     /// Rewrites aggregate exec with new aggregate expressions.
+    #[doc(hidden)]
     #[deprecated(
         since = "56.0.0",
         note = "use `AggregateExec::to_builder().with_aggr_exprs(..).build()` instead, which validates that the new expressions match the output schema"
@@ -975,6 +987,7 @@ impl AggregateExec {
     }
 
     /// Clone this exec, overriding only the limit hint.
+    #[doc(hidden)]
     #[deprecated(
         since = "56.0.0",
         note = "use `AggregateExec::to_builder().with_limit_options(..).build()` instead, which rejects limits this aggregate cannot execute"
@@ -1004,8 +1017,10 @@ impl AggregateExec {
 
     /// Create a new hash aggregate execution plan
     ///
-    /// Prefer [`AggregateExec::builder`], which names each argument and
-    /// validates the result.
+    /// DataFusion's own optimizer rules build and rewrite aggregates through
+    /// `AggregateExec::builder` instead, which names each argument and
+    /// validates the result. That builder is an internal API, see
+    /// `AggregateExecBuilder`.
     pub fn try_new(
         mode: AggregateMode,
         group_by: impl Into<Arc<PhysicalGroupBy>>,
@@ -1159,6 +1174,7 @@ impl AggregateExec {
     ///
     /// Note this sets the limit without checking that this aggregate can
     /// actually execute it, which the builder does.
+    #[doc(hidden)]
     #[deprecated(
         since = "56.0.0",
         note = "use `AggregateExec::to_builder().with_limit_options(..).build()` instead, which rejects limits this aggregate cannot execute"
@@ -1172,6 +1188,11 @@ impl AggregateExec {
     ///
     /// Set them with
     /// [`to_builder().with_limit_options(..)`](AggregateExec::to_builder).
+    ///
+    /// This is public for internal use only and is not part of the public API.
+    /// Unlike the setters it is not deprecated: it has no replacement, and
+    /// reading the limit of an aggregate is safe.
+    #[doc(hidden)]
     pub fn limit_options(&self) -> Option<LimitOptions> {
         self.limit_options
     }

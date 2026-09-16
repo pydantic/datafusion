@@ -38,6 +38,11 @@ use datafusion_physical_expr_common::sort_expr::OrderingRequirements;
 /// supported way to derive a new [`AggregateExec`] from an existing one (see
 /// [`AggregateExec::to_builder`]).
 ///
+/// Like the methods it replaces, this is public for internal use only and is
+/// not part of the public API: it is how DataFusion's own physical optimizer
+/// rules build and rewrite aggregates, and it may change without notice. It is
+/// `#[doc(hidden)]` for that reason, not because it is unfinished.
+///
 /// Compared to calling [`AggregateExec::try_new`] and then mutating individual
 /// fields, the builder:
 ///
@@ -104,6 +109,7 @@ use datafusion_physical_expr_common::sort_expr::OrderingRequirements;
 /// # Ok(())
 /// # }
 /// ```
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct AggregateExecBuilder {
     mode: AggregateMode,
