@@ -807,7 +807,7 @@ struct PerAccumulatorDynFilter {
 }
 
 /// Aggregate types that are supported for dynamic filter in `AggregateExec`
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum DynamicFilterAggregateType {
     Min,
     Max,
@@ -1920,6 +1920,18 @@ impl AggregateExec {
             return;
         }
 
+        self.dynamic_filter = Self::derive_dynamic_filter(&self.aggr_expr);
+    }
+
+    /// Build the dynamic filter state for the given aggregate expressions.
+    ///
+    /// The caller is responsible for only calling this for an aggregate that
+    /// supports dynamic filtering at all (see [`AggrDynFilter`]); the result
+    /// depends on nothing but `aggr_expr`, which is what lets
+    /// [`AggregateExecBuilder`] re-derive it when they are replaced.
+    fn derive_dynamic_filter(
+        aggr_expr: &[Arc<AggregateFunctionExpr>],
+    ) -> Option<Arc<AggrDynFilter>> {
         // Collect supported accumulators
         // It is assumed the order of aggregate expressions are not changed from `AggregateExec`
         // to `AggregateStream`
@@ -1928,7 +1940,7 @@ impl AggregateExec {
         // filter, and it's used to decide if this dynamic filter is able to get push
         // through certain node during optimization.
         let mut all_cols: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
-        for (i, aggr_expr) in self.aggr_expr.iter().enumerate() {
+        for (i, aggr_expr) in aggr_expr.iter().enumerate() {
             // 1. Only `min` or `max` aggregate function
             let fun_name = aggr_expr.fun().name();
             // HACK: Should check the function type more precisely
@@ -1938,7 +1950,7 @@ impl AggregateExec {
             } else if fun_name.eq_ignore_ascii_case("max") {
                 DynamicFilterAggregateType::Max
             } else {
-                return;
+                return None;
             };
 
             // 2. arg should be only 1 column reference
@@ -1954,12 +1966,13 @@ impl AggregateExec {
             }
         }
 
-        if !aggr_dyn_filters.is_empty() {
-            self.dynamic_filter = Some(Arc::new(AggrDynFilter {
-                filter: Arc::new(DynamicFilterPhysicalExpr::new(all_cols, lit(true))),
-                supported_accumulators_info: aggr_dyn_filters,
-            }))
+        if aggr_dyn_filters.is_empty() {
+            return None;
         }
+        Some(Arc::new(AggrDynFilter {
+            filter: Arc::new(DynamicFilterPhysicalExpr::new(all_cols, lit(true))),
+            supported_accumulators_info: aggr_dyn_filters,
+        }))
     }
 
     // Collect column references for the dynamic filter expression from the supported accumulators.

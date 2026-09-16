@@ -327,6 +327,7 @@ impl AggregateExecBuilder {
                     aggr_expr,
                     filter_expr
                 );
+                let mut dynamic_filter = derived.dynamic_filter;
                 if aggr_expr_replaced {
                     check_schema_compatible(
                         &derived.schema,
@@ -335,6 +336,7 @@ impl AggregateExecBuilder {
                         &aggr_expr,
                         mode,
                     )?;
+                    dynamic_filter = rederive_dynamic_filter(dynamic_filter, &aggr_expr);
                 }
                 AggregateExec {
                     mode,
@@ -349,7 +351,7 @@ impl AggregateExecBuilder {
                     input_order_mode: derived.input_order_mode,
                     cache: derived.cache,
                     limit_options: None,
-                    dynamic_filter: derived.dynamic_filter,
+                    dynamic_filter,
                 }
             }
             (None, None) => AggregateExec::try_new(
@@ -399,6 +401,55 @@ fn check_schema_compatible(
     Ok(())
 }
 
+/// Keep a dynamic filter carried over from the node a builder was derived from
+/// only while it still describes the (replaced) aggregate expressions.
+///
+/// The filter records which aggregate expressions are `MIN`/`MAX`, at which
+/// index, and over which column, and the pushed-down predicate is built from
+/// that: a `MIN` produces `col < bound`, a `MAX` produces `col > bound`.
+/// Carrying the old state over a rewrite that turns a `MIN` into a `MAX` (or
+/// that changes the column) would push down the wrong predicate and prune rows
+/// the aggregate needs, so in that case the filter is rebuilt from the new
+/// expressions.
+///
+/// Rebuilding loses the link to whichever child accepted the old filter during
+/// pushdown, which costs the optimization but cannot give wrong results: an
+/// abandoned filter is never narrowed, so the child keeps reading every row.
+/// The common case — a rewrite that only reorders or reverses the aggregate
+/// expressions — leaves the state unchanged and keeps the original filter.
+fn rederive_dynamic_filter(
+    existing: Option<Arc<AggrDynFilter>>,
+    aggr_expr: &[Arc<AggregateFunctionExpr>],
+) -> Option<Arc<AggrDynFilter>> {
+    let existing = existing?;
+    let rederived = AggregateExec::derive_dynamic_filter(aggr_expr);
+    match rederived {
+        Some(rederived) if !describes_same_aggregates(&existing, &rederived) => {
+            Some(rederived)
+        }
+        // The new expressions support no dynamic filter at all: drop it rather
+        // than leave one that describes expressions this node no longer has.
+        None => None,
+        _ => Some(existing),
+    }
+}
+
+/// Whether two dynamic filter states describe the same aggregate expressions:
+/// the same `MIN`/`MAX` kinds at the same indices, over the same columns.
+fn describes_same_aggregates(a: &AggrDynFilter, b: &AggrDynFilter) -> bool {
+    a.supported_accumulators_info.len() == b.supported_accumulators_info.len()
+        && a.supported_accumulators_info
+            .iter()
+            .zip(b.supported_accumulators_info.iter())
+            .all(|(a, b)| a.aggr_type == b.aggr_type && a.aggr_index == b.aggr_index)
+        && a.filter.children().len() == b.filter.children().len()
+        && a.filter
+            .children()
+            .iter()
+            .zip(b.filter.children())
+            .all(|(a, b)| a.eq(&b))
+}
+
 /// Reject [`LimitOptions`] that `exec` cannot execute.
 ///
 /// A limit is only pushed into an aggregate by the optimizer, but nothing stops
@@ -425,6 +476,12 @@ fn validate_limit_options(exec: &AggregateExec) -> Result<()> {
 
     // Everything else is executed by `GroupedTopKAggregateStream`, which keeps
     // a bounded priority queue of `(group key, min/max value)` pairs.
+
+    // A queue of capacity zero reports itself as full while its root is empty,
+    // so the first row read panics in `PrimitiveHeap::is_worse`.
+    if limit_options.limit() == 0 {
+        return plan_err!("Aggregate with a limit of 0 cannot use a top-k aggregation");
+    }
     let group_exprs = exec.group_by.expr();
     if group_exprs.len() != 1 || exec.group_by.has_grouping_set() {
         return plan_err!(
@@ -480,12 +537,14 @@ fn validate_limit_options(exec: &AggregateExec) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aggregates::DynamicFilterAggregateType;
     use crate::empty::EmptyExec;
     use crate::test::TestMemoryExec;
 
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_functions_aggregate::count::count_udaf;
-    use datafusion_functions_aggregate::min_max::min_udaf;
+    use datafusion_functions_aggregate::min_max::{max_udaf, min_udaf};
+    use datafusion_functions_aggregate::sum::sum_udaf;
     use datafusion_physical_expr::aggregate::AggregateExprBuilder;
     use datafusion_physical_expr::expressions::col;
 
@@ -687,6 +746,18 @@ mod tests {
             "unexpected error: {err}"
         );
 
+        // a zero limit would panic in the priority queue
+        let err = AggregateExec::builder(AggregateMode::Single, test_input(&schema))
+            .with_group_by(group_by_a(&schema)?)
+            .with_aggr_exprs(vec![min_b(&schema)?])
+            .with_limit_options(LimitOptions::new(0))
+            .build()
+            .unwrap_err();
+        assert!(
+            err.message().contains("limit of 0"),
+            "unexpected error: {err}"
+        );
+
         // more than one group by expression is not supported by the TopK stream
         let err = AggregateExec::builder(AggregateMode::Single, test_input(&schema))
             .with_group_by(PhysicalGroupBy::new_single(vec![
@@ -703,6 +774,76 @@ mod tests {
             "unexpected error: {err}"
         );
 
+        Ok(())
+    }
+
+    /// A dynamic filter describes the MIN/MAX aggregate expressions it was built
+    /// from. Replacing them with different ones must not leave the old state in
+    /// place: a `MIN` pushes down `col < bound`, a `MAX` pushes down
+    /// `col > bound`, so a stale `MIN` tag on a `MAX` aggregate would prune rows
+    /// the aggregate needs.
+    #[test]
+    fn replacing_aggr_exprs_rederives_the_dynamic_filter() -> Result<()> {
+        let schema = test_schema();
+        let max_b = |schema: &SchemaRef| -> Result<Arc<AggregateFunctionExpr>> {
+            Ok(Arc::new(
+                AggregateExprBuilder::new(max_udaf(), vec![col("b", schema)?])
+                    .schema(Arc::clone(schema))
+                    .alias("min_b")
+                    .build()?,
+            ))
+        };
+
+        // a `Partial` aggregate without a group by is the shape that carries a
+        // dynamic filter
+        let exec = AggregateExec::builder(AggregateMode::Partial, test_input(&schema))
+            .with_aggr_exprs(vec![min_b(&schema)?])
+            .build()?;
+        let dyn_filter = exec.dynamic_filter.as_ref().expect("no dynamic filter");
+        assert_eq!(
+            dyn_filter.supported_accumulators_info[0].aggr_type,
+            DynamicFilterAggregateType::Min
+        );
+
+        // reordering or reversing the expressions leaves the state alone, and
+        // with it the link to whichever child accepted the filter
+        let same = exec
+            .to_builder()
+            .with_aggr_exprs(vec![min_b(&schema)?])
+            .build()?;
+        assert!(Arc::ptr_eq(
+            same.dynamic_filter.as_ref().unwrap(),
+            dyn_filter
+        ));
+
+        // turning the MIN into a MAX rebuilds it
+        let flipped = exec
+            .to_builder()
+            .with_aggr_exprs(vec![max_b(&schema)?])
+            .build()?;
+        let flipped_filter = flipped.dynamic_filter.as_ref().expect("no dynamic filter");
+        assert_eq!(
+            flipped_filter.supported_accumulators_info[0].aggr_type,
+            DynamicFilterAggregateType::Max
+        );
+
+        // replacing them with an aggregate that supports no dynamic filter at
+        // all drops it rather than leaving a filter for expressions that are
+        // gone. `sum` has the same output field as `min` here, so this gets
+        // past the schema check and reaches the dynamic filter.
+        let summed = exec
+            .to_builder()
+            .with_aggr_exprs(vec![Arc::new(
+                AggregateExprBuilder::new(sum_udaf(), vec![col("b", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("min_b")
+                    .build()?,
+            )])
+            .build()?;
+        assert!(
+            summed.dynamic_filter.is_none(),
+            "a sum aggregate must not keep a MIN/MAX dynamic filter"
+        );
         Ok(())
     }
 
