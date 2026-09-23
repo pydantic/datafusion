@@ -163,6 +163,16 @@ pub trait Dialect: Send + Sync {
         BinaryOperator::Divide
     }
 
+    /// Whether the dialect's parser accepts DuckDB-style dictionary syntax
+    /// (`{'a': 1, 'b': 2}`) for struct literals.
+    ///
+    /// When false, `named_struct` is unparsed as a `named_struct(...)`
+    /// function call instead of a dictionary literal, so the emitted SQL can
+    /// be parsed back under the same dialect.
+    fn supports_dictionary_syntax(&self) -> bool {
+        true
+    }
+
     /// Allows the dialect to override scalar function unparsing if the dialect has specific rules.
     /// Returns None if the default unparsing should be used, or Some(ast::Expr) if there is
     /// a custom implementation for the function.
@@ -371,6 +381,10 @@ impl Dialect for PostgreSqlDialect {
         true
     }
 
+    fn supports_dictionary_syntax(&self) -> bool {
+        false
+    }
+
     fn supports_qualify(&self) -> bool {
         false
     }
@@ -562,6 +576,10 @@ impl Dialect for MySqlDialect {
         false
     }
 
+    fn supports_dictionary_syntax(&self) -> bool {
+        false
+    }
+
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         Some('`')
     }
@@ -631,6 +649,10 @@ impl Dialect for SqliteDialect {
         false
     }
 
+    fn supports_dictionary_syntax(&self) -> bool {
+        false
+    }
+
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         Some('`')
     }
@@ -689,6 +711,10 @@ pub struct BigQueryDialect {}
 impl Dialect for BigQueryDialect {
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         Some('`')
+    }
+
+    fn supports_dictionary_syntax(&self) -> bool {
+        false
     }
 
     fn col_alias_overrides(&self, alias: &str) -> Result<Option<String>> {

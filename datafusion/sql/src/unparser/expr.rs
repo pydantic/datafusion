@@ -732,6 +732,12 @@ impl Unparser<'_> {
     }
 
     fn named_struct_to_sql(&self, args: &[Expr]) -> Result<ast::Expr> {
+        // Dialects whose parsers reject dictionary syntax get a plain
+        // `named_struct(...)` call, which survives an unparse/parse round trip.
+        if !self.dialect.supports_dictionary_syntax() {
+            return self.function_to_sql_internal("named_struct", args);
+        }
+
         assert_or_internal_err!(
             args.len().is_multiple_of(2),
             "named_struct must have an even number of arguments"

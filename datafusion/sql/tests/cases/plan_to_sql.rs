@@ -67,7 +67,7 @@ use datafusion_sql::unparser::extension_unparser::{
     UnparseToStatementResult, UnparseWithinStatementResult,
     UserDefinedLogicalNodeUnparser,
 };
-use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect};
+use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect};
 use sqlparser::parser::Parser;
 
 #[test]
@@ -367,6 +367,38 @@ fn roundtrip_statement_with_dialect_3() -> Result<(), DataFusionError> {
         unparser_dialect: UnparserMySqlDialect {},
         expected: @"SELECT min(`ta`.`j1_id`) AS `j1_min`, max(`tb`.`j1_max`) FROM `j1` AS `ta` CROSS JOIN (SELECT DISTINCT max(`ta`.`j1_id`) AS `j1_max` FROM `j1` AS `ta`) AS `tb` ORDER BY `j1_min` ASC LIMIT 10",
     );
+    Ok(())
+}
+
+#[test]
+fn roundtrip_statement_postgres_named_struct() -> Result<(), DataFusionError> {
+    // The postgres parser dialect rejects DuckDB-style dictionary syntax
+    // (`{key: value}`), so unparsing `named_struct` for postgres must emit a
+    // `named_struct(...)` call the same dialect can parse back.
+    let parser_dialect = PostgreSqlDialect {};
+    let sql = "select named_struct('a', j1_id, 'b', j1_string) from j1";
+    let statement = Parser::new(&parser_dialect)
+        .try_with_sql(sql)?
+        .parse_statement()?;
+
+    let state = MockSessionState::default()
+        .with_scalar_function(datafusion_functions::core::named_struct())
+        .with_expr_planner(Arc::new(CoreFunctionPlanner::default()));
+    let context = MockContextProvider { state };
+    let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+
+    let unparsed = Unparser::new(&UnparserPostgreSqlDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert_snapshot!(
+        &unparsed,
+        @r#"SELECT named_struct('a', "j1"."j1_id", 'b', "j1"."j1_string") FROM "j1""#,
+    );
+
+    // The emitted SQL must survive a re-parse under the same dialect.
+    Parser::new(&parser_dialect)
+        .try_with_sql(&unparsed)?
+        .parse_statement()?;
     Ok(())
 }
 
