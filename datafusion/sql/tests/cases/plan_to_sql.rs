@@ -67,7 +67,10 @@ use datafusion_sql::unparser::extension_unparser::{
     UnparseToStatementResult, UnparseWithinStatementResult,
     UserDefinedLogicalNodeUnparser,
 };
-use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect};
+use sqlparser::dialect::{
+    BigQueryDialect as ParserBigQueryDialect, Dialect, GenericDialect, MySqlDialect,
+    PostgreSqlDialect, SQLiteDialect as ParserSqliteDialect,
+};
 use sqlparser::parser::Parser;
 
 #[test]
@@ -371,34 +374,71 @@ fn roundtrip_statement_with_dialect_3() -> Result<(), DataFusionError> {
 }
 
 #[test]
-fn roundtrip_statement_postgres_named_struct() -> Result<(), DataFusionError> {
-    // The postgres parser dialect rejects DuckDB-style dictionary syntax
-    // (`{key: value}`), so unparsing `named_struct` for postgres must emit a
-    // `named_struct(...)` call the same dialect can parse back.
-    let parser_dialect = PostgreSqlDialect {};
-    let sql = "select named_struct('a', j1_id, 'b', j1_string) from j1";
-    let statement = Parser::new(&parser_dialect)
-        .try_with_sql(sql)?
-        .parse_statement()?;
-
-    let state = MockSessionState::default()
-        .with_scalar_function(datafusion_functions::core::named_struct())
-        .with_expr_planner(Arc::new(CoreFunctionPlanner::default()));
-    let context = MockContextProvider { state };
-    let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
-
-    let unparsed = Unparser::new(&UnparserPostgreSqlDialect {})
-        .plan_to_sql(&plan)?
-        .to_string();
-    assert_snapshot!(
-        &unparsed,
-        @r#"SELECT named_struct('a', "j1"."j1_id", 'b', "j1"."j1_string") FROM "j1""#,
+fn roundtrip_statement_named_struct_for_dialects() -> Result<(), DataFusionError> {
+    type DialectCase = (
+        &'static str,
+        Box<dyn Dialect>,
+        Box<dyn UnparserDialect>,
+        char,
     );
 
-    // The emitted SQL must survive a re-parse under the same dialect.
-    Parser::new(&parser_dialect)
-        .try_with_sql(&unparsed)?
-        .parse_statement()?;
+    let dialects: [DialectCase; 4] = [
+        (
+            "postgres",
+            Box::new(PostgreSqlDialect {}),
+            Box::new(UnparserPostgreSqlDialect {}),
+            '"',
+        ),
+        (
+            "mysql",
+            Box::new(MySqlDialect {}),
+            Box::new(UnparserMySqlDialect {}),
+            '`',
+        ),
+        (
+            "sqlite",
+            Box::new(ParserSqliteDialect {}),
+            Box::new(SqliteDialect {}),
+            '`',
+        ),
+        (
+            "bigquery",
+            Box::new(ParserBigQueryDialect),
+            Box::new(BigQueryDialect {}),
+            '`',
+        ),
+    ];
+    let sql = "select named_struct('a', j1_id, 'b', j1_string) from j1";
+
+    for (dialect_name, parser_dialect, unparser_dialect, quote) in dialects {
+        let state = MockSessionState::default()
+            .with_scalar_function(datafusion_functions::core::named_struct())
+            .with_expr_planner(Arc::new(CoreFunctionPlanner::default()));
+        let context = MockContextProvider { state };
+        let sql_to_rel = SqlToRel::new(&context);
+
+        let statement = Parser::new(parser_dialect.as_ref())
+            .try_with_sql(sql)?
+            .parse_statement()?;
+        let plan = sql_to_rel.sql_statement_to_plan(statement)?;
+
+        let unparsed = Unparser::new(unparser_dialect.as_ref())
+            .plan_to_sql(&plan)?
+            .to_string();
+        let qualified_id = format!(
+            "{quote}j1{quote}.{quote}j1_id{quote}, 'b', {quote}j1{quote}.{quote}j1_string{quote}"
+        );
+        let expected =
+            format!("SELECT named_struct('a', {qualified_id}) FROM {quote}j1{quote}");
+        assert_eq!(unparsed, expected, "unexpected {dialect_name} SQL");
+
+        let roundtrip_statement = Parser::new(parser_dialect.as_ref())
+            .try_with_sql(&unparsed)?
+            .parse_statement()?;
+        let roundtrip_plan = sql_to_rel.sql_statement_to_plan(roundtrip_statement)?;
+        assert_eq!(plan, roundtrip_plan, "{dialect_name} logical plan changed");
+    }
+
     Ok(())
 }
 
