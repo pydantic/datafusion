@@ -809,12 +809,15 @@ pub(crate) fn gc_view_arrays(batch: &RecordBatch) -> Result<RecordBatch> {
 /// - `dedup_fixed_block`: as `dedup`, with one block sized to the data.
 /// - `share`: like `gc`, but copy the bytes behind each distinct memory
 ///   address once, so views that already share bytes stay shared.
+/// - `share_sampled`: `share` only when a sample of the views repeats a
+///   memory address, `gc` otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewCompaction {
     Gc,
     Dedup,
     DedupFixedBlock,
     Share,
+    ShareSampled,
 }
 
 static VIEW_COMPACTION: LazyLock<ViewCompaction> =
@@ -823,6 +826,7 @@ static VIEW_COMPACTION: LazyLock<ViewCompaction> =
             Ok("dedup") => ViewCompaction::Dedup,
             Ok("dedup_fixed_block") => ViewCompaction::DedupFixedBlock,
             Ok("share") => ViewCompaction::Share,
+            Ok("share_sampled") => ViewCompaction::ShareSampled,
             Ok("gc") | Err(_) => ViewCompaction::Gc,
             Ok(other) => panic!("unknown DATAFUSION_SPILL_VIEW_COMPACTION: {other}"),
         }
@@ -846,7 +850,54 @@ fn compact_view<T: ByteViewType>(
             dedup_view(array, Some(non_inline.clamp(1, u32::MAX as usize) as u32))
         }
         ViewCompaction::Share => share_view(array),
+        ViewCompaction::ShareSampled => {
+            if views_look_shared(array) {
+                share_view(array)
+            } else {
+                array.gc()
+            }
+        }
     }
+}
+
+/// Memory address of the bytes behind a non-inline view.
+fn view_address<T: ByteViewType>(
+    array: &GenericByteViewArray<T>,
+    i: usize,
+) -> Option<(usize, u32)> {
+    let raw = array.views()[i];
+    if (raw as u32) <= 12 || array.is_null(i) {
+        return None;
+    }
+    let v = ByteView::from(raw);
+    let buffer = &array.data_buffers()[v.buffer_index as usize];
+    Some((buffer.as_ptr() as usize + v.offset as usize, v.length))
+}
+
+/// Cheap check for shared bytes: look at up to 256 evenly spaced views, and
+/// the view after each one. A repeated address among the samples means the
+/// views share bytes (spread out); a sample equal to its neighbour catches
+/// shared bytes that sit next to each other, e.g. when sorted by the value.
+fn views_look_shared<T: ByteViewType>(array: &GenericByteViewArray<T>) -> bool {
+    const SAMPLES: usize = 256;
+    let len = array.len();
+    if len < 2 {
+        return false;
+    }
+    let step = (len / SAMPLES).max(1);
+    let mut sampled = Vec::with_capacity(SAMPLES);
+    let mut i = 0;
+    while i < len && sampled.len() < SAMPLES {
+        if let Some(addr) = view_address(array, i) {
+            if i + 1 < len && view_address(array, i + 1) == Some(addr) {
+                return true;
+            }
+            sampled.push(addr);
+        }
+        i += step;
+    }
+    sampled.sort_unstable();
+    sampled.windows(2).any(|w| w[0] == w[1])
 }
 
 fn dedup_view<T: ByteViewType>(
