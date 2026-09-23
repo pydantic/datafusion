@@ -408,24 +408,25 @@ strip = "debuginfo"
 incremental = false
 
 # EXPERIMENT: pinned to the arrow-rs branch adding
-# `parquet::arrow::push_decoder::plan_scan_ranges` (pydantic/arrow-rs,
-# claude/push-decoder-peek-59 = apache/arrow-rs 59.1.0 + that one module).
-# Every arrow crate must be patched together or two arrow versions collide.
+# `ParquetPushDecoder::scan_plan` (apache/arrow-rs#10555). The branch
+# pydantic/arrow-rs claude/push-decoder-scan-plan-60.0.0 is the 60.0.0 release
+# plus only that change, so benchmarks against main (on 60.0.0) measure only
+# it. Every arrow crate must be patched together or two arrow versions collide.
 [patch.crates-io]
-arrow-arith = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-arrow-array = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-arrow-avro = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-arrow-buffer = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-arrow-cast = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-arrow-csv = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-arrow-data = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-arrow-flight = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-arrow-ipc = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-arrow-json = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-arrow-ord = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-arrow-row = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-arrow-schema = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-arrow-select = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-arrow-string = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-arrow = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
-parquet = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-peek-59" }
+arrow-arith = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+arrow-array = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+arrow-avro = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+arrow-buffer = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+arrow-cast = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+arrow-csv = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+arrow-data = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+arrow-flight = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+arrow-ipc = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+arrow-json = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+arrow-ord = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+arrow-row = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+arrow-schema = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+arrow-select = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+arrow-string = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+arrow = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
+parquet = { git = "https://github.com/pydantic/arrow-rs.git", branch = "claude/push-decoder-scan-plan-60.0.0" }
