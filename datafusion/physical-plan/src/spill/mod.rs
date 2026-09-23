@@ -34,8 +34,8 @@ use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 
 use arrow::array::{
-    Array, ArrayRef, BinaryViewArray, BufferSpec, GenericByteViewArray, StringViewArray,
-    layout, make_array,
+    Array, ArrayRef, BinaryViewArray, BufferSpec, ByteView, GenericByteViewArray,
+    StringViewArray, builder::GenericByteViewBuilder, layout, make_array,
 };
 use arrow::buffer::Buffer;
 use arrow::datatypes::DataType;
@@ -800,6 +800,124 @@ pub(crate) fn gc_view_arrays(batch: &RecordBatch) -> Result<RecordBatch> {
     }
 }
 
+/// PROTOTYPE ONLY (not for merge): selects how spilled view arrays are
+/// compacted, so one binary can compare the strategies. Set
+/// `DATAFUSION_SPILL_VIEW_COMPACTION` to one of:
+/// - `gc` (default): `GenericByteViewArray::gc`, what `main` does.
+/// - `dedup`: rebuild with `GenericByteViewBuilder::with_deduplicate_strings`,
+///   what apache/datafusion#23565 does.
+/// - `dedup_fixed_block`: as `dedup`, with one block sized to the data.
+/// - `share`: like `gc`, but copy the bytes behind each distinct memory
+///   address once, so views that already share bytes stay shared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewCompaction {
+    Gc,
+    Dedup,
+    DedupFixedBlock,
+    Share,
+}
+
+static VIEW_COMPACTION: LazyLock<ViewCompaction> =
+    LazyLock::new(|| {
+        match std::env::var("DATAFUSION_SPILL_VIEW_COMPACTION").as_deref() {
+            Ok("dedup") => ViewCompaction::Dedup,
+            Ok("dedup_fixed_block") => ViewCompaction::DedupFixedBlock,
+            Ok("share") => ViewCompaction::Share,
+            Ok("gc") | Err(_) => ViewCompaction::Gc,
+            Ok(other) => panic!("unknown DATAFUSION_SPILL_VIEW_COMPACTION: {other}"),
+        }
+    });
+
+fn compact_view<T: ByteViewType>(
+    array: &GenericByteViewArray<T>,
+) -> GenericByteViewArray<T> {
+    match *VIEW_COMPACTION {
+        ViewCompaction::Gc => array.gc(),
+        ViewCompaction::Dedup => dedup_view(array, None),
+        ViewCompaction::DedupFixedBlock => {
+            let non_inline: usize = array
+                .views()
+                .iter()
+                .map(|v| {
+                    let len = *v as u32 as usize;
+                    if len > 12 { len } else { 0 }
+                })
+                .sum();
+            dedup_view(array, Some(non_inline.clamp(1, u32::MAX as usize) as u32))
+        }
+        ViewCompaction::Share => share_view(array),
+    }
+}
+
+fn dedup_view<T: ByteViewType>(
+    array: &GenericByteViewArray<T>,
+    fixed_block: Option<u32>,
+) -> GenericByteViewArray<T> {
+    let mut builder = GenericByteViewBuilder::<T>::with_capacity(array.len());
+    if let Some(size) = fixed_block {
+        builder = builder.with_fixed_block_size(size);
+    }
+    let mut builder = builder.with_deduplicate_strings();
+    for v in array.iter() {
+        builder.append_option(v);
+    }
+    builder.finish()
+}
+
+fn share_view<T: ByteViewType>(
+    array: &GenericByteViewArray<T>,
+) -> GenericByteViewArray<T> {
+    let views = array.views();
+    let buffers = array.data_buffers();
+    if array.total_buffer_bytes_used() > i32::MAX as usize {
+        return array.gc();
+    }
+    // Key by memory address, not buffer index: `interleave` gives the same
+    // buffer a new index per source batch, so equal bytes can sit behind
+    // different indices in one array.
+    let mut seen: hashbrown::HashMap<(usize, u32), u32> =
+        hashbrown::HashMap::with_capacity(views.len());
+    let mut data: Vec<u8> = Vec::new();
+    let mut out: Vec<u128> = Vec::with_capacity(views.len());
+    for (i, &raw) in views.iter().enumerate() {
+        if (raw as u32) <= 12 {
+            out.push(raw);
+            continue;
+        }
+        if array.is_null(i) {
+            out.push(0);
+            continue;
+        }
+        let v = ByteView::from(raw);
+        let buffer = &buffers[v.buffer_index as usize];
+        let key = (buffer.as_ptr() as usize + v.offset as usize, v.length);
+        let new_offset = *seen.entry(key).or_insert_with(|| {
+            let start = data.len() as u32;
+            let o = v.offset as usize;
+            data.extend_from_slice(&buffer.as_slice()[o..o + v.length as usize]);
+            start
+        });
+        out.push(
+            ByteView {
+                buffer_index: 0,
+                offset: new_offset,
+                ..v
+            }
+            .as_u128(),
+        );
+    }
+    data.shrink_to_fit();
+    // SAFETY: each non-inline view points into `data` at bytes copied from a
+    // valid view of the input, with its length and prefix unchanged.
+    unsafe {
+        GenericByteViewArray::new_unchecked(
+            out.into(),
+            vec![Buffer::from_vec(data)].into(),
+            array.nulls().cloned(),
+        )
+    }
+}
+
 fn gc_array(array: &ArrayRef) -> Result<(ArrayRef, bool)> {
     match array.data_type() {
         DataType::Utf8View => {
@@ -808,7 +926,7 @@ fn gc_array(array: &ArrayRef) -> Result<(ArrayRef, bool)> {
                 .downcast_ref::<StringViewArray>()
                 .expect("Utf8View array should downcast to StringViewArray");
             if should_gc_view_array(string_view) {
-                Ok((Arc::new(string_view.gc()) as ArrayRef, true))
+                Ok((Arc::new(compact_view(string_view)) as ArrayRef, true))
             } else {
                 Ok((Arc::clone(array), false))
             }
@@ -819,7 +937,7 @@ fn gc_array(array: &ArrayRef) -> Result<(ArrayRef, bool)> {
                 .downcast_ref::<BinaryViewArray>()
                 .expect("BinaryView array should downcast to BinaryViewArray");
             if should_gc_view_array(binary_view) {
-                Ok((Arc::new(binary_view.gc()) as ArrayRef, true))
+                Ok((Arc::new(compact_view(binary_view)) as ArrayRef, true))
             } else {
                 Ok((Arc::clone(array), false))
             }
