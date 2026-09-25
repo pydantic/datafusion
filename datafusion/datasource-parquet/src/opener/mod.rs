@@ -29,8 +29,7 @@ use crate::metrics::{ByteProgress, RowFilterSkippedFullyMatchedMetric};
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::push_decoder::{
     DecoderBuilderConfig, FetchPolicy, InitialDecoderState, PushDecoderStreamState,
-    RgPlanEntry, RowFilterContext, RowGroupPruner, StreamingScanConfig,
-    build_streaming_stream,
+    ReadAhead, RgPlanEntry, RowFilterContext, RowGroupPruner,
 };
 use crate::row_group_filter::{RowGroupAccessPlanFilter, row_group_in_range};
 use crate::{
@@ -83,6 +82,7 @@ use parquet::arrow::arrow_reader::{
 };
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::parquet_column;
+use parquet::arrow::push_decoder::FetchGranularity;
 use parquet::basic::Type;
 use parquet::bloom_filter::Sbbf;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader, RowGroupMetaData};
@@ -652,17 +652,30 @@ impl ParquetOpenState {
             }
             ParquetOpenState::PruneWithStatistics(prepared) => {
                 let mut prepared_row_groups = (*prepared).prune_row_groups()?;
-                // EXPERIMENT: with an offset index the streaming policy's
-                // plan is page-granular; without one it can only fetch whole
+                // EXPERIMENT: with an offset index the streaming policy
+                // fetches and releases pages; without one it fetches whole
                 // column chunks. Page-index loading is otherwise driven purely
-                // by whether *pruning* can use it, so load it here too.
-                let streaming =
-                    matches!(FetchPolicy::from_env(), FetchPolicy::Streaming { .. })
-                        && prepared_row_groups
+                // by whether *pruning* can use it, so load it here too when a
+                // row group to read is larger than the read-ahead window: a
+                // row group that fits gains little from page granularity.
+                let streaming = match FetchPolicy::from_env() {
+                    FetchPolicy::Streaming { window } => {
+                        let metadata = prepared_row_groups
+                            .prepared
+                            .loaded
+                            .reader_metadata
+                            .metadata();
+                        prepared_row_groups
                             .prepared
                             .loaded
                             .prepared
-                            .enable_page_index;
+                            .enable_page_index
+                            && prepared_row_groups.row_groups.row_group_indexes().any(
+                                |idx| row_group_bytes(metadata.row_group(idx)) > window,
+                            )
+                    }
+                    FetchPolicy::Off => false,
+                };
                 if streaming || prepared_row_groups.should_load_page_index()? {
                     Ok(ParquetOpenState::LoadPageIndex(
                         prepared_row_groups.load_page_index().boxed(),
@@ -1727,66 +1740,10 @@ impl RowGroupsPrunedParquetOpen {
             .map(row_group_bytes)
             .sum();
 
-        // EXPERIMENT: streaming (batch-granular) scan path, selected via
-        // DF_FETCH_POLICY=streaming. The fetch plan comes from
-        // `ParquetPushDecoder::scan_plan` (apache/arrow-rs#10555) for a
-        // decoder configured like the push-decoder path below; decoding goes through
-        // a sync reader so a batch can decode as soon as its pages land. See
-        // `build_streaming_stream`. Scans with a pushdown row filter fall back
-        // to the push-decoder path: the sync reader evaluates predicates over
-        // whole row groups.
-        if let FetchPolicy::Streaming { window } = FetchPolicy::from_env() {
-            if precomputed_context.is_none() {
-                let projection_mask = decoder_projection.projection_mask().clone();
-                let access_plan = prepare_access_plan(access_plan)?;
-                // As on the push-decoder path: credit the in-range row groups
-                // the scan will not read now, and each planned row group once
-                // the stream is done with it.
-                let row_groups: VecDeque<(usize, u64)> = access_plan
-                    .row_group_indexes
-                    .iter()
-                    .map(|&idx| (idx, row_group_bytes(&rg_metadata[idx])))
-                    .collect();
-                let planned_bytes: u64 = row_groups.iter().map(|(_, bytes)| bytes).sum();
-                let mut byte_progress = prepared.byte_progress;
-                byte_progress.credit(in_range_bytes.saturating_sub(planned_bytes));
-                let stream = build_streaming_stream(StreamingScanConfig {
-                    decoder_config: &DecoderBuilderConfig {
-                        projection_mask: &projection_mask,
-                        batch_size: prepared.batch_size,
-                        arrow_reader_metrics: &arrow_reader_metrics,
-                        force_filter_selections: prepared.force_filter_selections,
-                        decoder_limit: prepared.limit,
-                    },
-                    access_plan,
-                    row_groups,
-                    reader_metadata: reader_metadata.clone(),
-                    decoder_projection,
-                    reader: prepared.async_file_reader,
-                    baseline_metrics: prepared.baseline_metrics,
-                    byte_progress,
-                    window,
-                })?;
-                let files_ranges_pruned_statistics =
-                    prepared.file_metrics.files_ranges_pruned_statistics.clone();
-                return match prepared.file_pruner {
-                    Some(file_pruner) if file_pruner.is_watching() => {
-                        Ok(EarlyStoppingStream::new(
-                            stream,
-                            file_pruner,
-                            files_ranges_pruned_statistics,
-                        )
-                        .boxed())
-                    }
-                    _ => Ok(stream),
-                };
-            }
-            debug!(
-                "streaming fetch policy requested but pushdown filters are active \
-                 for {}; falling back to row-group-granular push decoding",
-                prepared.file_name
-            );
-        }
+        // EXPERIMENT: `DF_FETCH_POLICY=streaming` decodes with the same push
+        // decoder, a batch at a time, and adds background read-ahead. See
+        // `ReadAhead`.
+        let fetch_policy = FetchPolicy::from_env();
 
         // Lazily-registered suppression counter shared by the open-time first-RG
         // skip below and the stream's per-RG toggle (registered on first use so
@@ -1891,6 +1848,10 @@ impl RowGroupsPrunedParquetOpen {
                 }
             }
 
+            if let FetchPolicy::Streaming { .. } = fetch_policy {
+                builder = builder.with_fetch_granularity(FetchGranularity::Batch);
+            }
+
             InitialDecoderState {
                 decoder: builder.build()?,
                 rg_plan,
@@ -1961,11 +1922,17 @@ impl RowGroupsPrunedParquetOpen {
             .file_metrics
             .row_groups_pruned_dynamic_filter
             .clone();
+        let read_ahead = match fetch_policy {
+            FetchPolicy::Streaming { window } => {
+                Some(ReadAhead::new(window, decoder.scan_plan()))
+            }
+            FetchPolicy::Off => None,
+        };
         let stream = PushDecoderStreamState {
             decoder: Some(decoder),
             active_reader: None,
             rg_plan,
-            reader: prepared.async_file_reader,
+            reader: Some(prepared.async_file_reader),
             decoder_projection,
             arrow_reader_metrics,
             predicate_cache_inner_records,
@@ -1977,6 +1944,7 @@ impl RowGroupsPrunedParquetOpen {
             filter_installed,
             row_filter_skipped_fully_matched,
             byte_progress,
+            read_ahead,
         }
         .into_stream();
 
