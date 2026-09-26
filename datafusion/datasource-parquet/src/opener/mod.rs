@@ -2072,6 +2072,8 @@ impl RowGroupsPrunedParquetOpen {
             // can tighten it before the scan prunes the next row groups.
             flush_at_row_group_boundary: watches_dynamic_filter,
             projection_builder,
+            downstream_pending: None,
+            downstream_timer: None,
         }
         .into_stream();
 

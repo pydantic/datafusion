@@ -80,7 +80,7 @@ use arrow::array::BooleanArray;
 
 use datafusion_common::config::OptionalFilterMode;
 use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_expr::filter_stats::duration_nanos;
+use datafusion_physical_expr::filter_stats::{DownstreamWork, duration_nanos};
 use datafusion_physical_expr::optional_filter_gate::{
     MeasuredRowSaving, OptionalFilterGateConfig, SharedGateVerdict,
 };
@@ -326,7 +326,8 @@ impl OptionalFilterSavings {
 
 /// The shared pauses of the gates of the optional filters of one scan, one
 /// [`SharedGateVerdict`] for each optional filter, shared by all partitions
-/// and files of the scan.
+/// and files of the scan, and the [`DownstreamWork`] of each optional
+/// filter.
 ///
 /// The scan rewrites its predicate for each file, thus a filter is
 /// identified by its [`PhysicalExpr::expression_id`] (a
@@ -335,6 +336,7 @@ impl OptionalFilterSavings {
 #[derive(Debug, Default)]
 pub(crate) struct OptionalFilterSites {
     verdicts: Mutex<HashMap<u64, Arc<SharedGateVerdict>>>,
+    downstream: Mutex<HashMap<u64, Arc<DownstreamWork>>>,
 }
 
 impl OptionalFilterSites {
@@ -347,6 +349,23 @@ impl OptionalFilterSites {
     ) -> Option<Arc<SharedGateVerdict>> {
         let id = filter.expression_id()?;
         Some(Arc::clone(self.verdicts.lock().entry(id).or_default()))
+    }
+
+    /// The work after the scan for the rows of the optional filter
+    /// `filter`, or `None` if it has no expression id. See
+    /// [`Self::verdict_for`]. Each state of the work needs `samples`
+    /// batches (see [`DownstreamWork::new`]).
+    pub(crate) fn downstream_for(
+        &self,
+        filter: &Arc<dyn PhysicalExpr>,
+        samples: usize,
+    ) -> Option<Arc<DownstreamWork>> {
+        let id = filter.expression_id()?;
+        let mut downstream = self.downstream.lock();
+        let work = downstream
+            .entry(id)
+            .or_insert_with(|| Arc::new(DownstreamWork::new(samples)));
+        Some(Arc::clone(work))
     }
 }
 
@@ -407,7 +426,17 @@ mod tests {
         let first = sites.verdict_for(&dynamic).unwrap();
         assert!(Arc::ptr_eq(&first, &sites.verdict_for(&dynamic).unwrap()));
         assert!(!Arc::ptr_eq(&first, &sites.verdict_for(&other).unwrap()));
+        let work = sites.downstream_for(&dynamic, 4).unwrap();
+        assert!(Arc::ptr_eq(
+            &work,
+            &sites.downstream_for(&dynamic, 4).unwrap()
+        ));
+        assert!(!Arc::ptr_eq(
+            &work,
+            &sites.downstream_for(&other, 4).unwrap()
+        ));
         // A filter without an expression id has no shared verdict.
         assert!(sites.verdict_for(&lit(true)).is_none());
+        assert!(sites.downstream_for(&lit(true), 4).is_none());
     }
 }

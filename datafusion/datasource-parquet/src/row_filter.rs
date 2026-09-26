@@ -83,7 +83,9 @@ use datafusion_common::config::OptionalFilterMode;
 use datafusion_common::instant::Instant;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_physical_expr::expressions::OptionalFilterPhysicalExpr;
-use datafusion_physical_expr::filter_stats::{FilterCost, duration_nanos};
+use datafusion_physical_expr::filter_stats::{
+    DownstreamWork, FilterCost, duration_nanos,
+};
 use datafusion_physical_expr::optional_filter_gate::{GateDecision, OptionalFilterGate};
 use datafusion_physical_expr::utils::{is_optional_filter, reassign_expr_columns};
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
@@ -204,6 +206,11 @@ impl OptionalFilterGateState {
     /// True if the gate skips the next batch.
     pub(crate) fn is_paused(&self) -> bool {
         self.gate.is_paused()
+    }
+
+    /// See [`OptionalFilterGate::downstream_work`].
+    pub(crate) fn downstream_work(&self) -> Option<&Arc<DownstreamWork>> {
+        self.gate.downstream_work()
     }
 
     /// Counts down the batches of `rows` rows that the scan did not evaluate
@@ -839,6 +846,15 @@ pub(crate) fn prebuild_row_filter_candidates(
                 optional.options.sites.verdict_for(&candidate.source_expr)
             {
                 gate = gate.with_shared_verdict(verdict);
+            }
+            // The post-scan filter measures the work after the scan for the
+            // rows of the filter, in all files and partitions of the scan,
+            // on as many batches as a probe pause of the gate.
+            if let Some(downstream) = optional.options.sites.downstream_for(
+                &candidate.source_expr,
+                optional.options.gate_config.initial_pause_batches,
+            ) {
+                gate = gate.with_downstream_work(downstream);
             }
             // A removed row saves the decode of the output columns that the
             // filter does not read.

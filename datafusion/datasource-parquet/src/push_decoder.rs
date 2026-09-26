@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
-use arrow::compute::BatchCoalescer;
+use arrow::compute::{BatchCoalescer, filter_record_batch};
 use arrow::datatypes::SchemaRef;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -60,6 +60,7 @@ use parquet::file::metadata::ParquetMetaData;
 use datafusion_common::instant::Instant;
 use datafusion_common::{DataFusionError, Result, internal_err};
 use datafusion_physical_expr::expressions::DynamicFilterTracking;
+use datafusion_physical_expr::filter_stats::{DownstreamWork, duration_nanos};
 use datafusion_physical_expr::utils::split_optional;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Gauge};
@@ -364,6 +365,38 @@ pub(crate) struct PushDecoderStreamState {
     /// changes the post-scan conjuncts at a row group boundary. `Some`
     /// exactly when [`RowFilterContext::placement`] is `Some`.
     pub(crate) projection_builder: Option<DecoderProjectionBuilder>,
+    /// The rows of one input batch that the stream hands downstream alone,
+    /// after the rows in the coalescer, to measure the work after the scan
+    /// for them (see [`DownstreamSample`]).
+    pub(crate) downstream_pending: Option<(RecordBatch, DownstreamSample)>,
+    /// Started when the stream returned the batch of a [`DownstreamSample`]:
+    /// the time until the next poll is the work after the scan.
+    pub(crate) downstream_timer: Option<(Instant, DownstreamSample)>,
+}
+
+/// One input batch of the post-scan filter for the [`DownstreamWork`] of
+/// its gated optional conjuncts. While a [`DownstreamWork`] needs samples,
+/// the stream hands the rows of each input batch downstream alone (not in
+/// the coalescer), thus the time until the next poll is the work after the
+/// scan for the rows of that batch.
+pub(crate) struct DownstreamSample {
+    /// Each work, and the rows that its conjunct removed on the batch
+    /// (`None` if its gate skipped the conjunct).
+    states: Vec<(Arc<DownstreamWork>, Option<usize>)>,
+    input_rows: usize,
+}
+
+impl DownstreamSample {
+    fn record(&self, nanos: u64) {
+        for (work, removed) in &self.states {
+            work.record(
+                removed.is_some(),
+                self.input_rows,
+                removed.unwrap_or(0),
+                nanos,
+            );
+        }
+    }
 }
 
 /// A reusable, `Arc`-shared list of prebuilt row-filter candidates.
@@ -623,6 +656,11 @@ impl PushDecoderStreamState {
     /// miri where `&mut self` creates a single opaque borrow that conflicts
     /// with `unfold`'s ownership across yield points.
     async fn transition(mut self) -> Option<(Result<RecordBatch>, Self)> {
+        // The time since the stream returned the batch of a sample is the
+        // work after the scan for it.
+        if let Some((start, sample)) = self.downstream_timer.take() {
+            sample.record(duration_nanos(start.elapsed()));
+        }
         // Everything below is CPU work (decoding, row group pruning, building
         // readers, projection) except fetching byte ranges, so the timer runs
         // for the whole transition and is paused only across that await.
@@ -650,6 +688,10 @@ impl PushDecoderStreamState {
                 .is_some_and(BatchCoalescer::has_completed_batch)
             {
                 return self.emit_completed();
+            }
+            // Then the rows of a sample, alone.
+            if let Some((batch, sample)) = self.downstream_pending.take() {
+                return self.emit_sample(batch, sample);
             }
 
             // The stream-level limit (set only when a post-scan filter made
@@ -690,9 +732,17 @@ impl PushDecoderStreamState {
                         // slivers; the limit and the projection are applied to
                         // the full-size batches the coalescer hands back.
                         if let Some(filter) = self.decoder_projection.post_scan_filter() {
-                            let pushed = filter.evaluate(batch).and_then(|selection| {
+                            let input_rows = batch.num_rows();
+                            let mut states = Vec::new();
+                            let selection =
+                                filter.evaluate_with_states(batch, &mut states);
+                            let pushed = selection.and_then(|selection| {
                                 let (batch, mask) = match selection {
-                                    PostScanSelection::Empty => return Ok(()),
+                                    PostScanSelection::Empty => {
+                                        // No rows: no work after the scan.
+                                        DownstreamSample { states, input_rows }.record(0);
+                                        return Ok(());
+                                    }
                                     PostScanSelection::Rows { batch, mask } => {
                                         (batch, mask)
                                     }
@@ -702,6 +752,25 @@ impl PushDecoderStreamState {
                                     .batch_coalescer
                                     .as_mut()
                                     .expect("coalescer present with a post-scan filter");
+                                if !states.is_empty() {
+                                    // A sample: the rows of this batch go
+                                    // downstream alone, after the rows in
+                                    // the coalescer.
+                                    if coalescer.get_buffered_rows() > 0 {
+                                        coalescer.finish_buffered_batch()?;
+                                    }
+                                    let rows = match mask {
+                                        Some(mask) => {
+                                            filter_record_batch(&narrowed, &mask)?
+                                        }
+                                        None => narrowed,
+                                    };
+                                    self.downstream_pending = Some((
+                                        rows,
+                                        DownstreamSample { states, input_rows },
+                                    ));
+                                    return Ok(());
+                                }
                                 match mask {
                                     Some(mask) => {
                                         coalescer
@@ -1120,6 +1189,29 @@ impl PushDecoderStreamState {
             batch
         };
         let result = self.project_batch(&batch);
+        Some((result, self))
+    }
+
+    /// Hand out the rows of a [`DownstreamSample`], with the stream-level
+    /// limit and the projection, and start its timer.
+    fn emit_sample(
+        mut self,
+        batch: RecordBatch,
+        sample: DownstreamSample,
+    ) -> Option<(Result<RecordBatch>, Self)> {
+        let batch = match self.remaining_limit {
+            Some(remaining) if batch.num_rows() > remaining => {
+                self.remaining_limit = Some(0);
+                batch.slice(0, remaining)
+            }
+            Some(remaining) => {
+                self.remaining_limit = Some(remaining - batch.num_rows());
+                batch
+            }
+            None => batch,
+        };
+        let result = self.project_batch(&batch);
+        self.downstream_timer = Some((Instant::now(), sample));
         Some((result, self))
     }
 

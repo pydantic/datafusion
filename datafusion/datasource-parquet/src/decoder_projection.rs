@@ -42,7 +42,9 @@ use arrow::datatypes::SchemaRef;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::instant::Instant;
 use datafusion_common::{Result, internal_err};
-use datafusion_physical_expr::filter_stats::{FilterCost, duration_nanos};
+use datafusion_physical_expr::filter_stats::{
+    DownstreamWork, FilterCost, duration_nanos,
+};
 use datafusion_physical_expr::optional_filter_gate::GateDecision;
 use datafusion_physical_expr::projection::{ProjectionExprs, Projector};
 use datafusion_physical_expr::split_conjunction;
@@ -149,6 +151,12 @@ pub(crate) struct PostScanFilter {
 }
 
 impl PostScanFilter {
+    /// [`Self::evaluate_with_states`] without the states.
+    #[cfg(test)]
+    pub(crate) fn evaluate(&self, batch: RecordBatch) -> Result<PostScanSelection> {
+        self.evaluate_with_states(batch, &mut Vec::new())
+    }
+
     /// Evaluate the conjuncts against `batch` and describe the surviving rows.
     ///
     /// Takes the batch by value because a compaction replaces it; the caller
@@ -158,7 +166,17 @@ impl PostScanFilter {
     /// decoder mask widened for the predicate's columns): every conjunct may
     /// need those columns, so narrowing to the projector's inputs must not
     /// happen until the loop is done.
-    pub(crate) fn evaluate(&self, batch: RecordBatch) -> Result<PostScanSelection> {
+    ///
+    /// Adds to `states` the [`DownstreamWork`] of each gated optional
+    /// conjunct whose work needs samples, with the rows that the conjunct
+    /// removed on this batch (`None` if its gate skipped it). The caller
+    /// measures the work after the scan for the rows of this batch and
+    /// records it in them.
+    pub(crate) fn evaluate_with_states(
+        &self,
+        batch: RecordBatch,
+        states: &mut Vec<(Arc<DownstreamWork>, Option<usize>)>,
+    ) -> Result<PostScanSelection> {
         // Scoped timer: stops on drop, so the early-return paths still record.
         let _timer = self.eval_time.timer();
 
@@ -190,9 +208,17 @@ impl PostScanFilter {
             let rows_in = working.num_rows();
             // An optional conjunct that its gate skips lets all rows pass.
             let mut gate = gate.as_ref().map(|gate| gate.lock());
+            let downstream = gate
+                .as_ref()
+                .and_then(|gate| gate.downstream_work())
+                .filter(|downstream| downstream.needs_samples())
+                .map(Arc::clone);
             if let Some(gate) = gate.as_mut()
                 && gate.begin_batch(rows_in) == GateDecision::Skip
             {
+                if let Some(downstream) = downstream {
+                    states.push((downstream, None));
+                }
                 continue;
             }
             let start = gate.as_ref().map(|gate| gate.now_nanos());
@@ -217,6 +243,9 @@ impl PostScanFilter {
             if let (Some(gate), Some(start)) = (gate.as_mut(), start) {
                 let elapsed = gate.now_nanos().saturating_sub(start);
                 gate.record(rows_in, mask.true_count(), Duration::from_nanos(elapsed));
+            }
+            if let Some(downstream) = downstream {
+                states.push((downstream, Some(rows_in - mask.true_count())));
             }
             drop(gate);
             // An all-true conjunct leaves the accumulated selection untouched.
