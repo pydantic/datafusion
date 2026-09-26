@@ -73,8 +73,21 @@
 //!    ```text
 //!    cost_ns   = evaluation time + rows_in * measured overhead
 //!    saving_ns = (rows_in - rows_out) * saving_ns_per_row
-//!    saving_ns_per_row = producer work + measured saving
+//!    saving_ns_per_row = work after the filter + measured saving
+//!    work after the filter = max(downstream work, producer work)
+//!                            if the downstream work is measured,
+//!                            else producer work
 //!    ```
+//!
+//!    The *downstream work* is the work that a removed row saves in all
+//!    operators after the consumer, measured by the consumer while the
+//!    filter is on and while it is off ([`DownstreamWork`]). To measure the
+//!    "off" state of a filter that the gate keeps, the first gate of a plan
+//!    site that keeps the filter pauses it for `initial_pause_batches`
+//!    batches and shares the pause with the other gates of the site: one
+//!    probe for each site. The consumer can miss work: its time stops at an
+//!    exchange. Thus the work after the filter is never smaller than the
+//!    producer work.
 //!
 //!    The *producer work* is the work that a removed row saves after the
 //!    filter, in the operator that produced the filter, for example the
@@ -83,8 +96,9 @@
 //!    [`DynamicFilterPhysicalExpr::removed_row_work`]): a hash join with a
 //!    small build side does 2 to 8 ns of work for each probe row (TPC-DS
 //!    SF1 star joins), a join with a large build side much more. Until the
-//!    producer has measured [`MIN_OBSERVED_ROWS`] rows, the gate uses
-//!    `min_saving_ns_per_row` from the configuration (a prior). With more
+//!    producer has measured [`MIN_OBSERVED_ROWS`] rows and no downstream
+//!    work is measured, the gate uses `min_saving_ns_per_row` from the
+//!    configuration (a prior). With more
 //!    than one dynamic filter in the filter, the smallest measured work is
 //!    used. The *measured saving* and the *measured overhead* are
 //!    optional: a consumer that can measure more work that a removed row
@@ -158,7 +172,8 @@ use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 
 use crate::expressions::{DynamicFilterPhysicalExpr, DynamicFilterTracking};
 use crate::filter_stats::{
-    Clock, FilterCost, MIN_OBSERVED_ROWS, RemovedRowWork, SystemClock, duration_nanos,
+    Clock, DownstreamWork, FilterCost, MIN_OBSERVED_ROWS, RemovedRowWork, SystemClock,
+    duration_nanos,
 };
 
 /// A running filter is paused by the cost rule only if its cost is larger
@@ -437,6 +452,9 @@ pub struct OptionalFilterGate {
     /// The work that the producers of the dynamic filters in `filter` do
     /// for each removed row, see [`RemovedRowWork`].
     producer_work: Vec<Arc<RemovedRowWork>>,
+    /// The work after the consumer, measured by the consumer, see
+    /// [`DownstreamWork`].
+    downstream: Option<Arc<DownstreamWork>>,
     state: GateState,
     /// True while the current window is a probe after a pause. The cost
     /// rule then uses [`RESUME_COST_MARGIN`].
@@ -486,6 +504,7 @@ impl OptionalFilterGate {
             clock: SystemClock::shared(),
             measured_saving: None,
             producer_work,
+            downstream: None,
             state: GateState::new_window(),
             probing: false,
             backoff: config.initial_pause_batches,
@@ -524,6 +543,20 @@ impl OptionalFilterGate {
         self
     }
 
+    /// Uses the work after the consumer that `downstream` measures as the
+    /// saving of a removed row, when it is measured. See [`DownstreamWork`]
+    /// and the [module documentation](self).
+    pub fn with_downstream_work(mut self, downstream: Arc<DownstreamWork>) -> Self {
+        self.downstream = Some(downstream);
+        self
+    }
+
+    /// The measurement of the work after the consumer, see
+    /// [`Self::with_downstream_work`].
+    pub fn downstream_work(&self) -> Option<&Arc<DownstreamWork>> {
+        self.downstream.as_ref()
+    }
+
     /// The filter of this gate.
     pub fn filter(&self) -> &Arc<dyn PhysicalExpr> {
         &self.filter
@@ -536,26 +569,36 @@ impl OptionalFilterGate {
     }
 
     /// The work, in nanoseconds, that the gate assumes each removed row
-    /// saves now: the work of the producer (measured, or the configured
-    /// `min_saving_ns_per_row` before the measurement) plus the measured
-    /// saving of the consumer.
+    /// saves now: the work after the filter plus the measured saving of the
+    /// consumer. The work after the filter is the measured downstream work,
+    /// but at least the measured work of the producer. Without a downstream
+    /// measurement, it is the work of the producer (measured, or the
+    /// configured `min_saving_ns_per_row` before the measurement).
     pub fn saving_ns_per_row(&self) -> f64 {
         let measured = self
             .measured_saving
             .as_ref()
             .map_or(0.0, |saving| saving.ns_per_row());
-        self.producer_work_ns_per_row() + measured
+        let producer = self.producer_work_ns_per_row();
+        let after = match self
+            .downstream
+            .as_ref()
+            .and_then(|downstream| downstream.ns_per_removed_row())
+        {
+            Some(downstream) => downstream.max(producer.unwrap_or(0.0)),
+            None => producer.unwrap_or(self.config.min_saving_ns_per_row),
+        };
+        after + measured
     }
 
     /// The work of the producer for each removed row: the smallest measured
-    /// [`RemovedRowWork`] of the dynamic filters in the filter, or
-    /// `min_saving_ns_per_row` if none is measured yet.
-    fn producer_work_ns_per_row(&self) -> f64 {
+    /// [`RemovedRowWork`] of the dynamic filters in the filter, or `None`
+    /// if none is measured yet.
+    fn producer_work_ns_per_row(&self) -> Option<f64> {
         self.producer_work
             .iter()
             .filter_map(|work| work.ns_per_row())
             .reduce(f64::min)
-            .unwrap_or(self.config.min_saving_ns_per_row)
     }
 
     /// The work, in nanoseconds for each evaluated row, that the gate adds
@@ -676,7 +719,32 @@ impl OptionalFilterGate {
                 // The first decision, or the end of a pause.
                 self.publish(Verdict::Keep);
             }
+            self.probe_downstream_work();
         }
+    }
+
+    /// A filter that the gate keeps has no measurement of the "off" state
+    /// of its [`DownstreamWork`]. The first gate of the plan site that
+    /// keeps the filter pauses it for `initial_pause_batches` batches and
+    /// shares the pause, so that the consumers measure the work after them
+    /// without the filter. One probe for each site, and only if a consumer
+    /// measures the work (it recorded samples).
+    fn probe_downstream_work(&mut self) {
+        let Some(downstream) = &self.downstream else {
+            return;
+        };
+        if !downstream.needs_off_samples()
+            || !downstream.has_samples()
+            || !downstream.claim_probe()
+        {
+            return;
+        }
+        let batches = self.config.initial_pause_batches;
+        self.start_pause(batches);
+        // A probe is not a verdict on the filter.
+        self.backoff = batches;
+        self.uses_shared_pauses = true;
+        self.publish(Verdict::Pause(batches));
     }
 
     /// Before a batch that the gate would evaluate: if this gate uses the
@@ -1467,5 +1535,63 @@ mod tests {
         assert!(evaluate(&mut gate, &input).is_some());
         assert!(gate.is_paused());
         assert!(evaluate(&mut gate, &input).is_none());
+    }
+
+    /// The first gate of a site that keeps its filter pauses it one time,
+    /// for all gates of the site, to measure the work after the consumer
+    /// without the filter. The other gates do not probe again.
+    #[test]
+    fn keep_probes_downstream_work_once_for_the_site() {
+        let shared = Arc::new(SharedGateVerdict::new());
+        let work = Arc::new(DownstreamWork::new(1));
+        let mut first =
+            shared_gate(static_filter(), &shared).with_downstream_work(Arc::clone(&work));
+        // Without samples, the consumer does not measure: no probe.
+        assert_eq!(feed_n(&mut first, 2, 0.5), 2);
+        assert!(!first.is_paused());
+        // The consumer recorded a sample of the "on" state.
+        work.record(true, ROWS, ROWS / 2, 0);
+        // The filter removes half of the rows at no cost: keep, then probe.
+        assert_eq!(feed_n(&mut first, 2, 0.5), 2);
+        assert!(first.is_paused());
+        assert!(shared.is_paused());
+        assert_eq!(skip_until_probe(&mut first, 0.5), 4);
+
+        // After the probe, the filter is kept. Another gate of the site
+        // does not probe again after its own decision.
+        assert_eq!(feed_n(&mut first, 2, 0.5), 2);
+        assert!(!first.is_paused());
+        assert!(!shared.is_paused());
+        let mut second =
+            shared_gate(static_filter(), &shared).with_downstream_work(Arc::clone(&work));
+        assert_eq!(feed_n(&mut second, 2, 0.5), 2);
+        assert!(!second.is_paused());
+    }
+
+    /// The measured work after the consumer replaces the configured saving,
+    /// but is never smaller than the measured work of the producer.
+    #[test]
+    fn downstream_work_replaces_configured_saving() {
+        let (dynamic, filter) = dynamic_filter();
+        let work = Arc::new(DownstreamWork::new(1));
+        let gate = gate_with(filter).with_downstream_work(Arc::clone(&work));
+        assert_eq!(gate.saving_ns_per_row(), 20.0);
+
+        // Only the "on" state: not measured yet. The filter removes 90% of
+        // the rows, 1 ns after the consumer for each input row.
+        let rows = MIN_OBSERVED_ROWS as usize;
+        work.record(true, rows, rows * 9 / 10, rows as u64);
+        assert_eq!(gate.saving_ns_per_row(), 20.0);
+        // Off: 2.8 ns for each input row: (2.8 - 1) / 0.9 = 2 ns for each
+        // removed row.
+        work.record(false, rows, 0, MIN_OBSERVED_ROWS * 28 / 10);
+        let saving = gate.saving_ns_per_row();
+        assert!((saving - 2.0).abs() < 1e-3, "{saving}");
+
+        // The producer measures more: its work is the saving.
+        dynamic
+            .removed_row_work()
+            .record(MIN_OBSERVED_ROWS, 3 * MIN_OBSERVED_ROWS);
+        assert_eq!(gate.saving_ns_per_row(), 3.0);
     }
 }

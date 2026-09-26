@@ -28,16 +28,20 @@
 //! * [`FilterCost`]: the counts and the time of one filter, and the values
 //!   derived from them (cost for each row, rows removed for each
 //!   nanosecond).
+//! * [`RemovedRowWork`] and [`DownstreamWork`]: the work that a row that a
+//!   filter removes saves after the filter, as the producer of the filter
+//!   and the scan that evaluates it measure it.
 //!
 //! For example, an operator can use them to pause a filter that costs more
 //! than it saves, or to change the order of the conjuncts of a predicate.
 
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use datafusion_common::instant::Instant;
+use parking_lot::Mutex;
 
 /// A monotonic clock in nanoseconds.
 ///
@@ -210,6 +214,157 @@ impl RemovedRowWork {
     }
 }
 
+/// The work that the operators after a scan do for the rows of the scan,
+/// measured by the scan while one optional filter is on and while it is
+/// off. The difference is the work that the rows that the filter removes
+/// save after the scan.
+///
+/// A row that the filter removes is not seen after the scan, thus its
+/// saving can be measured only while the filter is off. The producer of
+/// the filter measures only its own work ([`RemovedRowWork`]), but a
+/// removed row also saves the work of all operators between the scan and
+/// the producer. And a selective filter can remove almost all rows before
+/// its producer sees them: then the producer cannot measure its work.
+///
+/// For each input batch of the scan, the scan records whether the filter
+/// was evaluated (on) or skipped (off), the input rows, the rows that the
+/// filter removed, and the time from the return of the output batch to the
+/// next poll of the scan (the synchronous work of the operators above the
+/// scan on that batch, 0 without output rows). Then:
+///
+/// ```text
+/// work(state) = median over the batches of downstream ns / input rows
+/// removed     = rows that the filter removed / input rows, while on
+/// ns for each removed row = (work(off) - work(on)) / removed
+/// ```
+///
+/// This is the saving for each row that the filter itself removes, as its
+/// gate counts them. When other conjuncts remove most of these rows too,
+/// the difference is small, and so is the saving.
+///
+/// The median, not the mean: under load, the thread can stop between the
+/// return of a batch and the next poll, and the first batches after the
+/// scan are slow (TPC-DS SF1 Q10: 54 µs for a batch of 2 rows, then 3 µs).
+/// Each state needs [`MIN_OBSERVED_ROWS`] input rows, and as many batches
+/// as a probe pause of the gate (`samples`).
+///
+/// The time stops at an exchange (for example a `RepartitionExec` that
+/// sends the batch to another task): the work after the exchange is not in
+/// it. Thus it is at least the [`RemovedRowWork`] of the producer for the
+/// consumers (see
+/// [`OptionalFilterGate`](crate::optional_filter_gate::OptionalFilterGate)).
+///
+/// Shared by the gates of one filter in all files and partitions of a scan.
+#[derive(Debug)]
+pub struct DownstreamWork {
+    on: Mutex<DownstreamSamples>,
+    off: Mutex<DownstreamSamples>,
+    /// The batches that each state needs.
+    samples: usize,
+    probe_claimed: AtomicBool,
+}
+
+/// The input batches of one state of a [`DownstreamWork`].
+#[derive(Debug, Default)]
+struct DownstreamSamples {
+    input_rows: u64,
+    removed_rows: u64,
+    /// Downstream nanoseconds for each input row, one value for each batch.
+    ns_per_input_row: Vec<f64>,
+}
+
+impl DownstreamSamples {
+    fn is_complete(&self, samples: usize) -> bool {
+        self.input_rows >= MIN_OBSERVED_ROWS && self.ns_per_input_row.len() >= samples
+    }
+
+    fn median(&mut self) -> f64 {
+        let values = &mut self.ns_per_input_row;
+        if values.is_empty() {
+            return 0.0;
+        }
+        let middle = values.len() / 2;
+        *values.select_nth_unstable_by(middle, f64::total_cmp).1
+    }
+}
+
+impl DownstreamWork {
+    /// Creates an empty measurement. Each state needs `samples` batches
+    /// (at least 1).
+    pub fn new(samples: usize) -> Self {
+        Self {
+            on: Mutex::default(),
+            off: Mutex::default(),
+            samples: samples.max(1),
+            probe_claimed: AtomicBool::new(false),
+        }
+    }
+
+    /// Records one input batch of `input_rows` rows: the filter was
+    /// `evaluated` (and removed `removed_rows` rows) or skipped, and the
+    /// operators above the scan took `nanos` with its output (0 without
+    /// output rows).
+    pub fn record(
+        &self,
+        evaluated: bool,
+        input_rows: usize,
+        removed_rows: usize,
+        nanos: u64,
+    ) {
+        if input_rows == 0 {
+            return;
+        }
+        let samples = if evaluated { &self.on } else { &self.off };
+        let mut samples = samples.lock();
+        samples.input_rows += input_rows as u64;
+        samples.removed_rows += removed_rows as u64;
+        samples
+            .ns_per_input_row
+            .push(nanos as f64 / input_rows as f64);
+    }
+
+    /// True until each state has its samples.
+    pub fn needs_samples(&self) -> bool {
+        !(self.on.lock().is_complete(self.samples)
+            && self.off.lock().is_complete(self.samples))
+    }
+
+    /// True until the "off" state has its samples.
+    pub fn needs_off_samples(&self) -> bool {
+        !self.off.lock().is_complete(self.samples)
+    }
+
+    /// True once a consumer recorded a batch: only then a probe can give
+    /// samples. A consumer that evaluates the filter where it cannot
+    /// measure the work after it records nothing.
+    pub fn has_samples(&self) -> bool {
+        !self.on.lock().ns_per_input_row.is_empty()
+            || !self.off.lock().ns_per_input_row.is_empty()
+    }
+
+    /// Returns true for the first caller only: the gate that pauses the
+    /// filter one time to measure the "off" state for all gates.
+    pub fn claim_probe(&self) -> bool {
+        !self.probe_claimed.swap(true, Ordering::Relaxed)
+    }
+
+    /// The work, in nanoseconds, that each row that the filter removes
+    /// saves after the scan, or `None` before each state has its samples.
+    /// 0 if the filter removed no rows.
+    pub fn ns_per_removed_row(&self) -> Option<f64> {
+        let mut on = self.on.lock();
+        let mut off = self.off.lock();
+        if !(on.is_complete(self.samples) && off.is_complete(self.samples)) {
+            return None;
+        }
+        if on.removed_rows == 0 {
+            return Some(0.0);
+        }
+        let removed = on.removed_rows as f64 / on.input_rows as f64;
+        Some(((off.median() - on.median()) / removed).max(0.0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +377,44 @@ mod tests {
         assert_eq!(work.ns_per_row(), None);
         work.record(1, 3);
         assert_eq!(work.ns_per_row(), Some(3.0));
+    }
+
+    #[test]
+    fn downstream_work_is_the_difference_of_the_states() {
+        let work = DownstreamWork::new(3);
+        assert!(work.needs_samples());
+        assert!(!work.has_samples());
+        let rows = MIN_OBSERVED_ROWS as usize;
+        // Filter on: it removes 90% of the rows, 1 ns for each input row
+        // after the scan.
+        for _ in 0..3 {
+            work.record(true, rows, rows * 9 / 10, rows as u64);
+        }
+        assert!(work.has_samples());
+        assert!(work.needs_samples());
+        assert!(work.needs_off_samples());
+        assert_eq!(work.ns_per_removed_row(), None);
+        // Filter off: 10 ns for each input row, and one batch where the
+        // thread stopped: the median ignores it.
+        work.record(false, rows, 0, 10 * rows as u64);
+        work.record(false, rows, 0, 1000 * rows as u64);
+        assert!(work.needs_off_samples());
+        work.record(false, rows, 0, 10 * rows as u64);
+        assert!(!work.needs_samples());
+        // (10 - 1) / 0.9 = 10 ns for each removed row.
+        let ns = work.ns_per_removed_row().unwrap();
+        assert!((ns - 10.0).abs() < 1e-2, "{ns}");
+        assert!(work.claim_probe());
+        assert!(!work.claim_probe());
+    }
+
+    #[test]
+    fn downstream_work_without_removed_rows_is_zero() {
+        let work = DownstreamWork::new(1);
+        let rows = MIN_OBSERVED_ROWS as usize;
+        work.record(true, rows, 0, 5 * rows as u64);
+        work.record(false, rows, 0, 7 * rows as u64);
+        assert_eq!(work.ns_per_removed_row(), Some(0.0));
     }
 
     #[test]
