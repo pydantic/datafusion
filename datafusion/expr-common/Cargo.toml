@@ -42,10 +42,12 @@ name = "datafusion_expr_common"
 
 [dependencies]
 arrow = { workspace = true }
+chrono = { workspace = true }
 datafusion-common = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 
 [dev-dependencies]
+chrono-tz = { version = "0.10.4", default-features = false }
 insta = { workspace = true }
 rstest = { workspace = true }

@@ -23,6 +23,7 @@
 
 use std::cmp::Ordering;
 
+use arrow::array::timezone::Tz;
 use arrow::datatypes::{
     DataType, MAX_DECIMAL32_FOR_EACH_PRECISION, MAX_DECIMAL64_FOR_EACH_PRECISION,
     MAX_DECIMAL128_FOR_EACH_PRECISION, MIN_DECIMAL32_FOR_EACH_PRECISION,
@@ -31,6 +32,7 @@ use arrow::datatypes::{
 use arrow::temporal_conversions::{
     MICROSECONDS, MILLISECONDS, MILLISECONDS_IN_DAY, NANOSECONDS,
 };
+use chrono::{DateTime, NaiveDateTime, Offset, TimeZone};
 use datafusion_common::ScalarValue;
 
 /// Convert a literal [`ScalarValue`] to `target_type`, preserving the exact value.
@@ -140,25 +142,52 @@ fn is_lossy_temporal_cast(from_type: &DataType, to_type: &DataType) -> bool {
         || (is_date_type(to_type) && from_type.is_temporal())
 }
 
+/// IANA names whose offset from UTC is always zero: the tzdb's UTC and GMT links.
+///
+/// Only names whose offset is zero for their whole history belong here. A zone that
+/// is UTC only some of the time (`Europe/London` in winter, `Antarctica/Troll` before
+/// 2005 and in winter) shifts values and would make the unwrap return wrong results;
+/// a missing name only costs the optimization. `test_utc_aliases_match_tz_database`
+/// checks the list against every zone in the tz database, in both directions. The
+/// IANA lookup is case-sensitive, so `utc` is not a valid timezone and is not listed.
+const UTC_ALIASES: &[&str] = &[
+    "UTC",
+    "Etc/UTC",
+    "UCT",
+    "Etc/UCT",
+    "Universal",
+    "Etc/Universal",
+    "Zulu",
+    "Etc/Zulu",
+    "GMT",
+    "Etc/GMT",
+    "GMT0",
+    "Etc/GMT0",
+    "GMT+0",
+    "Etc/GMT+0",
+    "GMT-0",
+    "Etc/GMT-0",
+    "Greenwich",
+    "Etc/Greenwich",
+];
+
 /// Returns true if `tz` is a timezone whose offset from UTC is always zero, so that
 /// casting a naive timestamp to `Timestamp(_, Some(tz))` does not move the value.
 ///
-/// Arrow's timezone parser accepts three fixed-offset shapes (`+HH:MM`, `+HHMM`,
-/// `+HH`, with either sign) and otherwise an IANA name. A fixed offset is zero when
-/// all of its digits are zero. IANA names are accepted only from the list of UTC
-/// aliases below: a geographic zone such as `Europe/London` has a zero offset for
-/// part of the year only, so it is never accepted. The IANA lookup is case-sensitive,
-/// so `utc` is not a valid timezone and does not need to be listed.
+/// A fixed offset (`+HH:MM`, `+HHMM` or `+HH`, either sign) is parsed with Arrow's
+/// own [`Tz`], the same parser the cast kernel uses, so a string Arrow rejects is
+/// never treated as zero-offset. An IANA name must be one of [`UTC_ALIASES`].
 fn is_zero_offset_timezone(tz: &str) -> bool {
-    match tz {
-        "UTC" | "Etc/UTC" | "UCT" | "Etc/UCT" | "Universal" | "Etc/Universal"
-        | "Zulu" | "Etc/Zulu" | "GMT" | "Etc/GMT" | "GMT0" | "Etc/GMT0" | "GMT+0"
-        | "Etc/GMT+0" | "GMT-0" | "Etc/GMT-0" | "Greenwich" | "Etc/Greenwich" => true,
-        _ => matches!(
-            tz.strip_prefix(['+', '-']).map(str::as_bytes),
-            Some(b"0" | b"00" | b"0000" | b"0:00" | b"00:00")
-        ),
+    if tz.starts_with(['+', '-']) {
+        return tz.parse::<Tz>().is_ok_and(|parsed| {
+            utc_offset_seconds(&parsed, &DateTime::UNIX_EPOCH.naive_utc()) == 0
+        });
     }
+    UTC_ALIASES.contains(&tz)
+}
+
+fn utc_offset_seconds(tz: &Tz, utc: &NaiveDateTime) -> i32 {
+    tz.offset_from_utc_datetime(utc).fix().local_minus_utc()
 }
 
 /// Returns true when casting a timestamp from `from_type` to `to_type` loses
@@ -1069,6 +1098,109 @@ mod tests {
         // Tz-aware <-> Tz-aware is not lossy (both are UTC under the hood)
         assert!(!is_lossy_temporal_cast(&ts_utc, &ts_sgt));
         assert!(!is_lossy_temporal_cast(&ts_sgt, &ts_utc));
+    }
+
+    #[test]
+    fn test_is_zero_offset_timezone_fixed_offsets() {
+        for tz in ["+00", "-00", "+0000", "-0000", "+00:00", "-00:00"] {
+            assert!(is_zero_offset_timezone(tz), "{tz} should be zero-offset");
+        }
+        // Non-zero fixed offsets
+        for tz in ["+01", "-0030", "+00:01", "-12:00"] {
+            assert!(
+                !is_zero_offset_timezone(tz),
+                "{tz} should not be zero-offset"
+            );
+        }
+        // Strings Arrow's timezone parser rejects are never zero-offset
+        for tz in ["+0", "-0", "+0:00", "utc", "", "Not/AZone"] {
+            assert!(
+                tz.parse::<Tz>().is_err(),
+                "{tz} should be rejected by Arrow"
+            );
+            assert!(
+                !is_zero_offset_timezone(tz),
+                "{tz} should not be zero-offset"
+            );
+        }
+    }
+
+    /// Returns true if the tz data reports a zero offset for `tz` at the earliest
+    /// and latest representable instants and weekly from 1800 to 2200. Probing a
+    /// few instants is not enough: `Antarctica/Troll` is zero at both ends and
+    /// before 2005, but +02:00 in summer.
+    fn tz_data_has_zero_offset(tz: &Tz) -> bool {
+        const PROBE_START_SECS: i64 = -5_364_662_400; // 1800-01-01T00:00:00Z
+        const PROBE_END_SECS: i64 = 7_258_118_400; // 2200-01-01T00:00:00Z
+        const WEEK_SECS: usize = 7 * 24 * 60 * 60;
+        let weekly = (PROBE_START_SECS..PROBE_END_SECS)
+            .step_by(WEEK_SECS)
+            .filter_map(|secs| DateTime::from_timestamp(secs, 0))
+            .map(|t| t.naive_utc());
+        [NaiveDateTime::MIN, NaiveDateTime::MAX]
+            .into_iter()
+            .chain(weekly)
+            .all(|instant| utc_offset_seconds(tz, &instant) == 0)
+    }
+
+    /// [`UTC_ALIASES`] must be exactly the IANA zones whose offset is always zero:
+    /// a missing alias loses the optimization, and an extra zone (one that is UTC
+    /// only some of the time) would make the unwrap return wrong results.
+    #[test]
+    fn test_utc_aliases_match_tz_database() {
+        for variant in chrono_tz::TZ_VARIANTS {
+            let name = variant.name();
+            let tz: Tz = name.parse().unwrap();
+            assert_eq!(
+                tz_data_has_zero_offset(&tz),
+                UTC_ALIASES.contains(&name),
+                "{name}: UTC_ALIASES disagrees with the tz database"
+            );
+        }
+        for alias in UTC_ALIASES {
+            assert!(
+                chrono_tz::TZ_VARIANTS.iter().any(|tz| tz.name() == *alias),
+                "{alias} is not an IANA zone"
+            );
+            assert!(is_zero_offset_timezone(alias), "{alias}");
+        }
+        // UTC some of the time is not enough
+        for name in ["Europe/London", "Africa/Abidjan", "Antarctica/Troll"] {
+            assert!(!tz_data_has_zero_offset(&name.parse().unwrap()), "{name}");
+            assert!(!is_zero_offset_timezone(name), "{name}");
+        }
+    }
+
+    /// Pins the Arrow cast behaviour that [`is_lossy_temporal_cast`] relies on for
+    /// timezones: naive -> tz-aware shifts by the zone offset (a no-op for a UTC
+    /// alias), and tz-aware -> naive re-labels the value without shifting it.
+    #[test]
+    fn test_arrow_timezone_cast_semantics() {
+        // 2024-07-01T12:00:00, when Europe/London is on BST (+01:00)
+        let value = 1_719_835_200_000_i64;
+        let naive = DataType::Timestamp(TimeUnit::Millisecond, None);
+        let cast_value = |from: &DataType, to: &DataType| {
+            let DataType::Timestamp(_, from_tz) = from else {
+                unreachable!()
+            };
+            let array = arrow::array::TimestampMillisecondArray::from(vec![value])
+                .with_timezone_opt(from_tz.clone());
+            let array = cast_with_options(&array, to, &CastOptions::default()).unwrap();
+            ScalarValue::try_from_array(&array, 0).unwrap()
+        };
+        let millis = |v: ScalarValue| match v {
+            ScalarValue::TimestampMillisecond(Some(v), _) => v,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        for alias in UTC_ALIASES {
+            let tz = DataType::Timestamp(TimeUnit::Millisecond, Some((*alias).into()));
+            assert_eq!(millis(cast_value(&naive, &tz)), value, "{alias}");
+        }
+        let london =
+            DataType::Timestamp(TimeUnit::Millisecond, Some("Europe/London".into()));
+        assert_eq!(millis(cast_value(&naive, &london)), value - 3_600_000);
+        assert_eq!(millis(cast_value(&london, &naive)), value);
     }
 
     #[test]

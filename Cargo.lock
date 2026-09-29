@@ -2226,6 +2226,8 @@ name = "datafusion-expr-common"
 version = "55.1.0"
 dependencies = [
  "arrow",
+ "chrono",
+ "chrono-tz",
  "datafusion-common",
  "indexmap 2.14.2",
  "insta",
