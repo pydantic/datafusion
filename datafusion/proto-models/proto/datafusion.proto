@@ -103,6 +103,10 @@ message ListingTableScanNode {
     datafusion_common.ArrowFormat arrow = 16;
   }
   repeated SortExprNodeCollection file_sort_order = 13;
+  // Optional number of rows to read.
+  optional uint64 fetch = 17;
+  // Optional number of rows to skip.
+  optional uint64 skip = 18;
 }
 
 message ViewTableScanNode {
@@ -112,6 +116,10 @@ message ViewTableScanNode {
   datafusion_common.Schema schema = 3;
   ProjectionColumns projection = 4;
   string definition = 5;
+  // Optional number of rows to read.
+  optional uint64 fetch = 7;
+  // Optional number of rows to skip.
+  optional uint64 skip = 8;
 }
 
 // Logical Plan to Scan a CustomTableProvider registered at runtime
@@ -122,6 +130,10 @@ message CustomTableScanNode {
   datafusion_common.Schema schema = 3;
   repeated LogicalExprNode filters = 4;
   bytes custom_table_data = 5;
+  // Optional number of rows to read.
+  optional uint64 fetch = 7;
+  // Optional number of rows to skip.
+  optional uint64 skip = 8;
 }
 
 message ProjectionNode {
@@ -1093,6 +1105,8 @@ message PhysicalExprNode {
     PhysicalLambdaVariableExprNode lambda_variable = 26;
     PhysicalRangeExprNode range_expr = 27;
     PhysicalSqlSimilarToPatternNode sql_similar_to_pattern = 28;
+
+    PhysicalOptionalFilterNode optional_filter = 29;
   }
 }
 
@@ -1102,6 +1116,11 @@ message PhysicalDynamicFilterNode {
   uint64 generation = 3;
   PhysicalExprNode inner_expr = 4;
   bool is_complete = 5;
+}
+
+// Marks the wrapped filter as optional: it is not needed for correctness.
+message PhysicalOptionalFilterNode {
+  PhysicalExprNode inner = 1;
 }
 
 message PhysicalSqlSimilarToPatternNode {
@@ -1331,6 +1350,10 @@ message ParquetScanExecNode {
 
   // Source-specific footer prefetch size. Absent means no hint.
   optional uint64 metadata_size_hint = 7;
+
+  // If true, the scan uses `predicate` only to prune: a filter above the
+  // scan applies it.
+  bool pruning_only_predicate = 8;
 }
 
 message CsvScanExecNode {
@@ -1403,7 +1426,9 @@ message HashJoinExecNode {
   JoinFilter filter = 8;
   repeated uint32 projection = 9;
   bool null_aware = 10;
-  // Optional dynamic filter expression for pushing down to the probe side.
+  // Optional dynamic filter expression for pushing down to the probe side:
+  // the membership check. When `dynamic_filter_bounds` is absent, it also
+  // holds the build-side bounds.
   PhysicalExprNode dynamic_filter = 11;
   // Optional row limit pushed into the join by the `limit_pushdown` rule.
   //
@@ -1413,6 +1438,10 @@ message HashJoinExecNode {
   // turning old plans into empty results. With `optional`, absent decodes to
   // `None`, which is the correct reading of an older message.
   optional uint64 fetch = 12;
+  // Optional dynamic filter expression for pushing down to the probe side:
+  // the build-side bounds, separate from the membership check in
+  // `dynamic_filter`.
+  PhysicalExprNode dynamic_filter_bounds = 13;
 }
 
 enum StreamPartitionMode {
@@ -1621,7 +1650,12 @@ message PhysicalHashRepartition {
 
 message PhysicalRangePartitioning {
   repeated PhysicalSortExprNode sort_expr = 1;
+  // Effective split points. Kept for compatibility with older readers.
   repeated PhysicalRangeSplitPoint split_point = 2;
+  // Maximum-resolution sample points used to derive effective split points.
+  repeated PhysicalRangeSplitPoint sample_point = 3;
+  // Zero in legacy payloads means split_point.len() + 1.
+  uint64 partition_count = 4;
 }
 
 message PhysicalRangeSplitPoint {

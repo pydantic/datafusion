@@ -46,7 +46,7 @@ use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
 use crate::spill::get_record_batch_memory_size;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::{GetSlicedSize, SpillManager};
-use crate::statistics::{ChildStats, StatisticsArgs};
+use crate::statistics::{ChildStats, StatisticsArgs, with_per_partition_fetch};
 use crate::stream::ReservationStream;
 use crate::stream::{ObservedStream, RecordBatchStreamAdapter};
 use crate::topk::TopK;
@@ -73,7 +73,9 @@ use datafusion_execution::memory_pool::{
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
+use datafusion_physical_expr::expressions::{
+    DynamicFilterPhysicalExpr, OptionalFilterPhysicalExpr, lit,
+};
 
 use futures::{StreamExt, TryStreamExt};
 use log::{debug, trace};
@@ -1559,10 +1561,16 @@ impl ExecutionPlan for SortExec {
     fn statistics_from_inputs(
         &self,
         input_stats: &[Arc<Statistics>],
-        _args: &StatisticsArgs,
+        args: &StatisticsArgs,
     ) -> Result<Arc<Statistics>> {
         let stats = input_stats[0].as_ref().clone();
-        Ok(Arc::new(stats.with_fetch(self.fetch, 0, 1)?))
+        // With `preserve_partitioning`, the fetch applies to each partition.
+        Ok(Arc::new(with_per_partition_fetch(
+            stats,
+            self.fetch,
+            self.properties().output_partitioning().partition_count(),
+            args,
+        )?))
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -1632,7 +1640,11 @@ impl ExecutionPlan for SortExec {
         if let Some(filter) = &self.filter
             && config.optimizer.enable_topk_dynamic_filter_pushdown
         {
-            child = child.with_self_filter(filter.read().expr());
+            // The TopK itself keeps only the top `fetch` rows, so the filter
+            // is not needed for correctness: mark the pushed copy as optional.
+            child = child.with_self_filter(Arc::new(OptionalFilterPhysicalExpr::new(
+                filter.read().expr(),
+            )));
         }
 
         Ok(FilterDescription::new().with_child(child))
@@ -2168,6 +2180,7 @@ mod tests {
     use crate::execution_plan::Boundedness;
     use crate::expressions::col;
     use crate::filter_pushdown::{FilterPushdownPhase, PushedDown};
+    use crate::statistics::StatisticsContext;
     use crate::test;
     use crate::test::TestMemoryExec;
     use crate::test::exec::{BlockingExec, assert_strong_count_converges_to_zero};
@@ -2181,6 +2194,7 @@ mod tests {
     use datafusion_common::ScalarValue;
     use datafusion_common::cast::as_primitive_array;
     use datafusion_common::config::ConfigOptions;
+    use datafusion_common::stats::Precision;
     use datafusion_common::test_util::batches_to_string;
     use datafusion_execution::RecordBatchStream;
     use datafusion_execution::config::SessionConfig;
@@ -4231,6 +4245,53 @@ mod tests {
         ));
         // But the TopK self-filter should be pushed down.
         assert_eq!(desc.self_filters()[0].len(), 1);
+        Ok(())
+    }
+
+    /// A TopK that preserves partitioning keeps `fetch` rows from every
+    /// partition, so its overall statistics must count all of them.
+    #[tokio::test]
+    async fn test_partitioned_topk_statistics_count_every_partition() -> Result<()> {
+        // Four partitions of 100 rows each.
+        let input = test::scan_partitioned(4);
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr {
+            expr: col("i", &input.schema())?,
+            options: SortOptions::default(),
+        }])
+        .unwrap();
+        let topk = |preserve_partitioning| -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                SortExec::new(ordering.clone(), Arc::clone(&input))
+                    .with_fetch(Some(10))
+                    .with_preserve_partitioning(preserve_partitioning),
+            )
+        };
+        let num_rows = |plan: &Arc<dyn ExecutionPlan>, partition| {
+            StatisticsContext::new()
+                .compute(
+                    plan.as_ref(),
+                    &StatisticsArgs::new().with_partition(partition),
+                )
+                .map(|stats| stats.num_rows)
+        };
+
+        let per_partition = topk(true);
+        let emitted: usize =
+            collect(Arc::clone(&per_partition), Arc::new(TaskContext::default()))
+                .await?
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum();
+        // The partitions share the TopK's dynamic filter, which can prune a few
+        // rows, but together they emit far more than one partition's 10.
+        assert!((11..=40).contains(&emitted), "emitted {emitted} rows");
+        assert_eq!(num_rows(&per_partition, None)?, Precision::Inexact(40));
+        // The scan has no statistics for a single partition, so there the fetch
+        // alone bounds the estimate.
+        assert_eq!(num_rows(&per_partition, Some(0))?, Precision::Inexact(10));
+
+        // Sorting the whole input keeps 10 rows in total.
+        assert_eq!(num_rows(&topk(false), None)?, Precision::Exact(10));
         Ok(())
     }
 }

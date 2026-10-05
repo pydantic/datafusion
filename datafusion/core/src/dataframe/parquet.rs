@@ -162,9 +162,14 @@ mod tests {
             .select_columns(&["bool_col", "int_col"])?;
 
         let plan = df.explain(false, false)?.collect().await?;
-        // Filters all the way to Parquet
+        // Filters all the way to Parquet. The parquet scan now accepts the
+        // pushable filter unconditionally so the `FilterExec` is removed —
+        // the predicate appears as `predicate=` on the `DataSourceExec`.
         let formatted = pretty::pretty_format_batches(&plan)?.to_string();
-        assert!(formatted.contains("FilterExec: id@0 = 1"), "{formatted}");
+        assert!(
+            formatted.contains("predicate=id@0 = 1"),
+            "expected predicate=id@0 = 1 in {formatted}"
+        );
 
         Ok(())
     }
@@ -189,7 +194,7 @@ mod tests {
             let ctx = &test_df.session_state;
             ctx.runtime_env().register_object_store(&local_url, local);
             let mut options = TableParquetOptions::default();
-            options.global.compression = Some(compression.to_string());
+            options.global.compression = Some(compression.parse()?);
             df.write_parquet(
                 output_path,
                 DataFrameWriteOptions::new().with_single_file_output(true),
@@ -490,6 +495,21 @@ mod tests {
         let metrics = plan
             .metrics()
             .expect("DataSinkExec should return metrics from ParquetSink");
+        let selected = plan.metrics().unwrap().for_partition(0);
+        let expected: Vec<_> = metrics
+            .iter()
+            .filter(|metric| metric.partition() == Some(0))
+            .collect();
+        assert_eq!(selected.iter().count(), expected.len());
+        for (actual, expected) in selected.iter().zip(expected) {
+            assert!(Arc::ptr_eq(actual, expected));
+        }
+        // Sink-wide row counts are intentionally absent from a partition snapshot.
+        assert!(
+            selected
+                .iter()
+                .all(|metric| metric.value().name() != "rows_written")
+        );
         let aggregated = metrics.aggregate_by_name();
 
         // rows_written should be 100

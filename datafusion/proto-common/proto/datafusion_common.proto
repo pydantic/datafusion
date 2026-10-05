@@ -626,6 +626,9 @@ message ParquetOptions {
 
   uint64 max_in_list_size = 38;
 
+  // "start_offset" or "midpoint". Empty means "start_offset".
+  string row_group_range_assignment = 39;
+
   string created_by = 16;
 
   oneof coerce_int96_opt {
@@ -635,6 +638,13 @@ message ParquetOptions {
   oneof max_predicate_cache_size_opt {
     uint64 max_predicate_cache_size = 33;
   }
+
+  oneof read_ahead_bytes_opt {
+    uint64 read_ahead_bytes = 39;
+  }
+
+  reserved 40;
+  reserved "read_ahead_conditional";
 
   oneof max_row_group_bytes_opt {
     uint64 max_row_group_bytes = 37;

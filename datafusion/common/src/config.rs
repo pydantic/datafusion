@@ -23,7 +23,10 @@ use arrow_ipc::CompressionType;
 use crate::encryption::{FileDecryptionProperties, FileEncryptionProperties};
 use crate::error::{_config_datafusion_err, _config_err};
 use crate::format::{ExplainAnalyzeCategories, ExplainFormat, MetricType};
-use crate::parquet_config::{DFParquetStatistics, DFParquetWriterVersion};
+use crate::parquet_config::{
+    DFParquetCompression, DFParquetStatistics, DFParquetWriterVersion,
+    RowGroupRangeAssignment,
+};
 use crate::parsers::{CompressionTypeVariant, CsvQuoteStyle};
 use crate::utils::get_available_parallelism;
 use crate::{DataFusionError, Result};
@@ -881,6 +884,62 @@ impl Display for MapKeyDedupPolicy {
     }
 }
 
+/// How DataFusion evaluates optional filters.
+///
+/// Optional filters are filters that are not needed for correctness, such as
+/// dynamic filters pushed down by hash joins and TopK. See
+/// [`ExecutionOptions::optional_filter_mode`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OptionalFilterMode {
+    /// Evaluate optional filters like any other pushed-down filter.
+    Always,
+    /// Pause optional filters that cost more than they save. Try them again
+    /// at intervals to find out if they became worth their cost. This is the
+    /// default.
+    #[default]
+    Adaptive,
+    /// Use optional filters only for statistics pruning (for example of
+    /// files, row groups and pages). Never evaluate them row by row.
+    PruningOnly,
+}
+
+impl FromStr for OptionalFilterMode {
+    type Err = DataFusionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "always" => Ok(Self::Always),
+            "adaptive" => Ok(Self::Adaptive),
+            "pruning_only" => Ok(Self::PruningOnly),
+            other => Err(DataFusionError::Configuration(format!(
+                "Invalid optional filter mode: {other}. Expected one of: always, adaptive, pruning_only"
+            ))),
+        }
+    }
+}
+
+impl ConfigField for OptionalFilterMode {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        v.some(key, self, description)
+    }
+
+    fn set(&mut self, _: &str, value: &str) -> Result<()> {
+        *self = OptionalFilterMode::from_str(value)?;
+        Ok(())
+    }
+}
+
+impl Display for OptionalFilterMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let str = match self {
+            Self::Always => "always",
+            Self::Adaptive => "adaptive",
+            Self::PruningOnly => "pruning_only",
+        };
+        write!(f, "{str}")
+    }
+}
+
 impl From<SpillCompression> for Option<CompressionType> {
     fn from(c: SpillCompression) -> Self {
         match c {
@@ -940,8 +999,10 @@ config_namespace! {
 
         /// The default time zone
         ///
-        /// Some functions, e.g. `now` return timestamps in this time zone
-        pub time_zone: Option<String>, default = None
+        /// Some functions, e.g. `now`, return timestamps in this time zone.
+        /// This is also used to interpret timezone-naive timestamps in
+        /// comparisons and subtraction with timezone-aware timestamps.
+        pub time_zone: Option<ConfigTimeZone>, default = None
 
         /// Parquet options
         pub parquet: ParquetOptions, default = Default::default()
@@ -1036,12 +1097,13 @@ config_namespace! {
         /// SEMI, LEFT ANTI, LEFT MARK, FULL) when the right side has multiple
         /// partitions.
         ///
-        /// This fallback coordinates per-chunk left state (visited bitmap and
-        /// probe-thread counter) across all right-side partitions, which
-        /// assumes every partition runs in the same process. Distributed
-        /// engines that execute each output partition as an independent task
-        /// (e.g. Ballista, datafusion-distributed) build a separate coordinator
-        /// per task and poll only one partition, so the cross-partition
+        /// This fallback shares left-side state (the current left chunk, the
+        /// visited bitmap and the probe-thread counter) across all right-side
+        /// partitions, which assumes every partition runs in the same process.
+        /// Distributed engines that execute each output partition as an
+        /// independent task (e.g. Ballista, datafusion-distributed) give each
+        /// task its own copy
+        /// of this state and poll only one partition, so the cross-partition
         /// counter never reaches zero and the fallback would stall. Such
         /// engines should set this to `false`: the coordinated fallback is then
         /// disabled for left-emitting multi-partition joins, which instead fail
@@ -1056,7 +1118,7 @@ config_namespace! {
         /// Guarantees a minimum level of output files running in parallel.
         /// RecordBatches will be distributed in round robin fashion to each
         /// parallel writer. Each writer is closed and a new file opened once
-        /// soft_max_rows_per_output_file is reached.
+        /// soft_max_rows_per_output_file or soft_max_bytes_per_output_file is reached.
         pub minimum_parallel_output_files: ConfigNonZeroUsize, default = non_zero_usize_default(4)
 
         /// Target number of rows in output files when writing multiple.
@@ -1064,6 +1126,13 @@ config_namespace! {
         /// will be one file smaller than the limit if the total
         /// number of rows written is not roughly divisible by the soft max
         pub soft_max_rows_per_output_file: ConfigNonZeroUsize, default = non_zero_usize_default(50000000)
+
+        /// Target encoded size in bytes of output files when writing multiple.
+        /// Writers asynchronously report the cumulative encoded size as they
+        /// process RecordBatches. The final file size may exceed this limit due
+        /// to batches buffered before the limit is observed, the size of a batch,
+        /// and file metadata written when the file is finalized.
+        pub soft_max_bytes_per_output_file: ConfigNonZeroUsize, default = non_zero_usize_default(4294967295)
 
         /// This is the maximum number of RecordBatches buffered
         /// for each output file being worked. Higher values can potentially
@@ -1182,6 +1251,55 @@ config_namespace! {
         ///
         /// Disabled by default, set to a number greater than 0 for enabling it.
         pub hash_join_buffering_capacity: usize, default = 0
+
+        /// (experimental) When true, `FilterExec` measures the selectivity
+        /// and the evaluation time of each conjunct of an `AND` predicate on
+        /// the first batches of each partition. Then it evaluates first the
+        /// conjuncts that remove the most rows per unit of time. The query
+        /// result does not change, but a fallible conjunct can see different
+        /// rows: for example, a new order of `b <> 0 AND 1 / b > 2` can cause
+        /// or prevent a division by zero error. Predicates with volatile
+        /// expressions are never reordered.
+        pub adaptive_filter_reordering: bool, default = false
+
+        /// Controls how DataFusion evaluates filters that are not needed for
+        /// correctness, such as the dynamic filters that hash joins and TopK
+        /// push down into scans. `always` evaluates these filters like any
+        /// other pushed-down filter. `adaptive` pauses these filters when they
+        /// cost more than they save (see
+        /// `datafusion.execution.optional_filter_min_saving_ns_per_row`) or when
+        /// they remove no rows, and tries them again at intervals (the default).
+        /// `pruning_only` uses these filters only to prune files, row groups
+        /// and pages with statistics, and never evaluates them row by row.
+        ///
+        /// This option is most important when
+        /// `datafusion.execution.parquet.pushdown_filters` is true, because then
+        /// the Parquet reader evaluates pushed-down filters row by row.
+        pub optional_filter_mode: OptionalFilterMode, default = OptionalFilterMode::Adaptive
+
+        /// The assumed work, in nanoseconds, that each row removed by an
+        /// optional filter saves downstream. Optional filters are filters that
+        /// are not needed for correctness, such as the dynamic filters that
+        /// hash joins and TopK push down into scans. When an operator evaluates
+        /// optional filters adaptively, it pauses an optional filter whose
+        /// evaluation costs more than the work that it saves. Consumers that can
+        /// measure the saving (the Parquet scan) add their measured decode cost.
+        /// The default is about the cost of a hash table probe for one row. The
+        /// best value depends on the hardware.
+        pub optional_filter_min_saving_ns_per_row: f64, default = 20.0
+
+        /// When true (the default) and
+        /// `datafusion.execution.parquet.pushdown_filters` is true, the
+        /// Parquet scan decides for each filter conjunct if it is a
+        /// row filter (late materialization) or a filter on the decoded
+        /// batches. Each conjunct starts as a filter on the decoded batches.
+        /// The scan measures the rows that each conjunct removes, the decode
+        /// time and the fetch latency, and it makes a conjunct a row filter at
+        /// a row group boundary only when the decode time that the row filter
+        /// saves is more than its cost. When `datafusion.execution.optional_filter_mode`
+        /// is `adaptive`, an optional filter that is paused is also removed
+        /// from the row filter, thus its columns are not decoded.
+        pub adaptive_filter_placement: bool, default = true
     }
 }
 
@@ -1396,6 +1514,14 @@ config_namespace! {
         /// parquet reader setting. 0 means no caching.
         pub max_predicate_cache_size: Option<usize>, default = None
 
+        /// (reading) If set, decode Parquet a batch at a time and read ahead up to
+        /// this many bytes per partition stream, in the order the decoder reads
+        /// them. If unset, the reader fetches one row group at a time.
+        /// Read-ahead also fetches ranges that a pushed-down filter can make
+        /// unnecessary (speculative reads). The memory pool bounds these
+        /// reads, in addition to this window.
+        pub read_ahead_bytes: Option<usize>, default = None
+
         /// Maximum number of input values in an `IN (...)` list eligible for
         /// min/max pruning. Lists above this cap, or a cap of 0, skip this
         /// rewrite; other predicates and Bloom-filter pruning remain available.
@@ -1412,6 +1538,12 @@ config_namespace! {
         ///
         /// Defaults to 20.
         pub max_in_list_size: usize, default = 20
+
+        /// (reading) Which byte range of a split file reads each row group.
+        /// `start_offset` picks the range containing the row group's start.
+        /// `midpoint` picks the range containing its midpoint, as Spark does,
+        /// which spreads large row groups more evenly across ranges.
+        pub row_group_range_assignment: RowGroupRangeAssignment, default = RowGroupRangeAssignment::StartOffset
 
         // The following options affect writing to parquet files
         // and map to parquet::file::properties::WriterProperties
@@ -1440,7 +1572,7 @@ config_namespace! {
         ///
         /// Note that this default setting is not the same as
         /// the default parquet writer setting.
-        pub compression: Option<String>, transform = str::to_lowercase, default = Some("zstd(3)".into())
+        pub compression: Option<DFParquetCompression>, default = Some(DFParquetCompression::Zstd(3))
 
         /// (writing) Sets if dictionary encoding is enabled. If NULL, uses
         /// default parquet writer setting
@@ -1507,7 +1639,7 @@ config_namespace! {
         /// (writing) Controls whether DataFusion will attempt to speed up writing
         /// parquet files by serializing them in parallel. Each column
         /// in each row group in each output file are serialized in parallel
-        /// leveraging a maximum possible core count of n_files*n_row_groups*n_columns.
+        /// leveraging a maximum possible core count of n_files\*n_row_groups\*n_columns.
         pub allow_single_file_parallelism: bool, default = true
 
         /// (writing) By default parallel parquet writer is tuned for minimum
@@ -1999,6 +2131,76 @@ impl From<ConfigDurationFormat> for arrow::util::display::DurationFormat {
             ConfigDurationFormat::Iso8601 => {
                 arrow::util::display::DurationFormat::ISO8601
             }
+        }
+    }
+}
+
+/// A time zone that is known to parse as an Arrow
+/// [`Tz`](arrow::array::timezone::Tz), used for
+/// [`ExecutionOptions::time_zone`].
+///
+/// The value is kept as it was written, so `+08` stays `+08` rather than
+/// being normalized to `+08:00`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigTimeZone(String);
+
+impl ConfigTimeZone {
+    /// Returns the time zone as it was written.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for ConfigTimeZone {
+    type Err = DataFusionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.parse::<arrow::array::timezone::Tz>() {
+            Ok(_) => Ok(Self(s.to_string())),
+            Err(_) => _config_err!(
+                "Invalid time zone: {s}. Valid values are UTC offsets such as +08:00 or IANA time zone names such as Asia/Taipei"
+            ),
+        }
+    }
+}
+
+impl Display for ConfigTimeZone {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// `ConfigField` for `Option<ConfigTimeZone>` parses before assigning so an
+/// invalid value leaves the current setting unchanged.
+impl ConfigField for Option<ConfigTimeZone> {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        match self {
+            Some(time_zone) => v.some(key, time_zone, description),
+            None => v.none(key, description),
+        }
+    }
+
+    fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        if !key.is_empty() {
+            return _config_err!(
+                "Config field is a scalar Option<ConfigTimeZone> and does not have nested field \"{}\"",
+                key
+            );
+        }
+
+        *self = Some(ConfigTimeZone::from_str(value)?);
+        Ok(())
+    }
+
+    fn reset(&mut self, key: &str) -> Result<()> {
+        if key.is_empty() {
+            *self = None;
+            Ok(())
+        } else {
+            _config_err!(
+                "Config field is a scalar Option<ConfigTimeZone> and does not have nested field \"{}\"",
+                key
+            )
         }
     }
 }
@@ -4051,7 +4253,6 @@ impl Display for OutputFormat {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "parquet")]
     use crate::assert_contains;
     use crate::config::TableParquetOptions;
     use crate::config::{
@@ -4682,6 +4883,128 @@ mod tests {
         let mut scalar = DFParquetStatistics::Page;
         assert!(ConfigField::set(&mut scalar, "typo", "none").is_err());
         assert_eq!(scalar, DFParquetStatistics::Page);
+    }
+
+    #[test]
+    fn test_execution_time_zone_validation() {
+        use crate::config::ConfigOptions;
+
+        const KEY: &str = "datafusion.execution.time_zone";
+        let mut config = ConfigOptions::default();
+        assert_eq!(config.execution.time_zone, None);
+
+        // Valid values are kept exactly as written.
+        for value in ["+08:00", "-08:00", "+0800", "+08", "UTC", "Asia/Taipei"] {
+            config.set(KEY, value).unwrap();
+            assert_eq!(
+                config.execution.time_zone.as_ref().map(|tz| tz.as_str()),
+                Some(value)
+            );
+        }
+
+        // A rejected value leaves the previous one in place.
+        for value in ["+08:00:00", "08:00", "08", "Asia/Taipei2", "AEST", ""] {
+            let err = config.set(KEY, value).unwrap_err();
+            assert_contains!(err.to_string(), format!("Invalid time zone: {value}."));
+            assert_eq!(
+                config.execution.time_zone.as_ref().map(|tz| tz.as_str()),
+                Some("Asia/Taipei")
+            );
+        }
+
+        // An invalid update of an unset value leaves it unset.
+        config.reset(KEY).unwrap();
+        assert_eq!(config.execution.time_zone, None);
+        assert!(config.set(KEY, "Asia/Taipei2").is_err());
+        assert_eq!(config.execution.time_zone, None);
+
+        // The option has no nested fields.
+        config.set(KEY, "UTC").unwrap();
+        assert!(config.set(&format!("{KEY}.typo"), "UTC").is_err());
+        assert!(config.reset(&format!("{KEY}.typo")).is_err());
+        assert_eq!(
+            config.execution.time_zone.as_ref().map(|tz| tz.as_str()),
+            Some("UTC")
+        );
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn test_parquet_compression_validation() {
+        use crate::{config::ConfigOptions, parquet_config::DFParquetCompression};
+
+        let mut config = ConfigOptions::default();
+        assert_eq!(
+            config.execution.parquet.compression,
+            Some(DFParquetCompression::Zstd(3))
+        );
+
+        for (value, expected) in [
+            ("snappy", DFParquetCompression::Snappy),
+            ("GZIP(6)", DFParquetCompression::Gzip(6)),
+            ("'zstd(22)'", DFParquetCompression::Zstd(22)),
+        ] {
+            config
+                .set("datafusion.execution.parquet.compression", value)
+                .unwrap();
+            assert_eq!(config.execution.parquet.compression, Some(expected));
+        }
+
+        for (value, message) in [
+            (
+                "zstdd(3)",
+                "Unknown or unsupported parquet compression: zstdd(3)",
+            ),
+            (
+                "zstd",
+                "zstd compression requires specifying a level such as zstd(4)",
+            ),
+            (
+                "snappy(2)",
+                "Compression snappy does not support specifying a level",
+            ),
+            ("zstd(23)", "Invalid compression level 23 for zstd"),
+        ] {
+            let err = config
+                .set("datafusion.execution.parquet.compression", value)
+                .unwrap_err();
+            assert_contains!(err.to_string(), message);
+            // A rejected value leaves the previous one in place.
+            assert_eq!(
+                config.execution.parquet.compression,
+                Some(DFParquetCompression::Zstd(22))
+            );
+        }
+
+        // An unset value can arise from deserialization. An invalid update must
+        // leave that state unchanged rather than inserting the default.
+        config.execution.parquet.compression = None;
+        assert!(
+            config
+                .set("datafusion.execution.parquet.compression", "zstd")
+                .is_err()
+        );
+        assert_eq!(config.execution.parquet.compression, None);
+
+        config.execution.parquet.compression = Some(DFParquetCompression::Lz4);
+        assert!(
+            config
+                .set("datafusion.execution.parquet.compression.typo", "snappy")
+                .is_err()
+        );
+        assert!(
+            config
+                .reset("datafusion.execution.parquet.compression.typo")
+                .is_err()
+        );
+        assert_eq!(
+            config.execution.parquet.compression,
+            Some(DFParquetCompression::Lz4)
+        );
+
+        let mut scalar = DFParquetCompression::Lz4;
+        assert!(ConfigField::set(&mut scalar, "typo", "snappy").is_err());
+        assert_eq!(scalar, DFParquetCompression::Lz4);
     }
 
     #[cfg(feature = "parquet")]
