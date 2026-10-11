@@ -69,11 +69,17 @@ use crate::{
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
-use arrow::array::{Array, ArrayRef, BooleanBufferBuilder, UInt64Array};
-use arrow::compute::concat_batches;
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanBufferBuilder, GenericByteViewArray,
+    RecordBatchOptions, UInt64Array,
+};
+use arrow::buffer::NullBuffer;
+use arrow::compute::{concat, concat_batches};
 use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{BinaryViewType, ByteViewType, StringViewType};
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
+use arrow_data::ByteView;
 use arrow_schema::{DataType, Schema};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::stats::Precision;
@@ -2965,9 +2971,9 @@ fn concat_build_batches(
     metrics.build_mem_used.add(copy_size);
 
     let batch = if reverse {
-        concat_batches(schema, batches.iter().rev())?
+        concat_build_side(schema, batches.iter().rev())?
     } else {
-        concat_batches(schema, batches.iter())?
+        concat_build_side(schema, batches.iter())?
     };
     drop(batches);
 
@@ -2984,6 +2990,97 @@ fn concat_build_batches(
     }
 
     Ok(batch)
+}
+
+/// Like [`concat_batches`], but concatenates `Utf8View` / `BinaryView` columns
+/// without copying string data: the views are rewritten to point into the
+/// (shared) data buffers of the inputs. Falls back to [`concat`] (which
+/// compacts) when most of the input data buffers are unreferenced, so that a
+/// small, heavily filtered build side does not pin large buffers.
+fn concat_build_side<'a>(
+    schema: &SchemaRef,
+    batches: impl IntoIterator<Item = &'a RecordBatch>,
+) -> Result<RecordBatch> {
+    let batches: Vec<&RecordBatch> = batches.into_iter().collect();
+    match batches.as_slice() {
+        [] => return Ok(RecordBatch::new_empty(Arc::clone(schema))),
+        [batch] => return Ok((*batch).clone()),
+        _ => {}
+    }
+    let num_rows = batches.iter().map(|b| b.num_rows()).sum();
+    let columns = (0..schema.fields().len())
+        .map(|i| {
+            let arrays: Vec<&dyn Array> =
+                batches.iter().map(|b| b.column(i).as_ref()).collect();
+            match schema.field(i).data_type() {
+                DataType::Utf8View => concat_views::<StringViewType>(&arrays),
+                DataType::BinaryView => concat_views::<BinaryViewType>(&arrays),
+                _ => Ok(concat(&arrays)?),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+    )?)
+}
+
+fn concat_views<T: ByteViewType>(arrays: &[&dyn Array]) -> Result<ArrayRef> {
+    let mut referenced = 0usize;
+    let mut buffered = 0usize;
+    for array in arrays {
+        let array = array.as_byte_view::<T>();
+        buffered += array.data_buffers().iter().map(|b| b.len()).sum::<usize>();
+        referenced += array
+            .views()
+            .iter()
+            .map(|v| *v as u32 as usize)
+            .filter(|len| *len > 12)
+            .sum::<usize>();
+    }
+    if buffered > 2 * referenced + 1024 * 1024 {
+        return Ok(concat(arrays)?);
+    }
+
+    let len = arrays.iter().map(|a| a.len()).sum();
+    let mut views: Vec<u128> = Vec::with_capacity(len);
+    let mut buffers = Vec::new();
+    let mut nulls = arrays
+        .iter()
+        .any(|a| a.null_count() > 0)
+        .then(|| BooleanBufferBuilder::new(len));
+    for array in arrays {
+        let array = array.as_byte_view::<T>();
+        let offset = buffers.len() as u32;
+        if offset == 0 {
+            views.extend_from_slice(array.views());
+        } else {
+            views.extend(array.views().iter().map(|&v| {
+                if v as u32 <= 12 {
+                    v
+                } else {
+                    let mut view = ByteView::from(v);
+                    view.buffer_index = view.buffer_index.wrapping_add(offset);
+                    view.as_u128()
+                }
+            }));
+        }
+        buffers.extend(array.data_buffers().iter().cloned());
+        if let Some(nulls) = nulls.as_mut() {
+            match array.nulls() {
+                Some(n) => nulls.append_buffer(n.inner()),
+                None => nulls.append_n(array.len(), true),
+            }
+        }
+    }
+    let nulls = nulls.map(|mut n| NullBuffer::new(n.finish()));
+    // SAFETY: every view refers to the same bytes as in its input array, with
+    // the buffer index shifted to the position of that array's buffers
+    let array = unsafe {
+        GenericByteViewArray::<T>::new_unchecked(views.into(), buffers.into(), nulls)
+    };
+    Ok(Arc::new(array))
 }
 
 /// Collects all batches from the left (build) side stream and creates a hash map for joining.
