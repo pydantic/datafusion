@@ -1124,3 +1124,72 @@ fn extension_codec_expr_participates_in_deduplication() -> Result<()> {
 
     Ok(())
 }
+
+/// A custom expression with an `expression_id` that serializes through
+/// `PhysicalExpr::try_to_proto` by delegating to a built-in (`Column`). The
+/// built-in hook writes `expr_id: None`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct IdentifiedColumn {
+    inner: Column,
+    id: u64,
+}
+
+impl Display for IdentifiedColumn {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IdentifiedColumn({})", self.inner)
+    }
+}
+
+impl PhysicalExpr for IdentifiedColumn {
+    fn data_type(&self, input_schema: &Schema) -> Result<DataType> {
+        self.inner.data_type(input_schema)
+    }
+    fn nullable(&self, input_schema: &Schema) -> Result<bool> {
+        self.inner.nullable(input_schema)
+    }
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+        self.inner.evaluate(batch)
+    }
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![]
+    }
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        Ok(self)
+    }
+    fn fmt_sql(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(self, f)
+    }
+    fn expression_id(&self) -> Option<u64> {
+        Some(self.id)
+    }
+    fn try_to_proto(
+        &self,
+        ctx: &PhysicalExprEncodeCtx<'_>,
+    ) -> Result<Option<PhysicalExprNode>> {
+        self.inner.try_to_proto(ctx)
+    }
+}
+
+/// The serializer must stamp `expr_id` on a node returned by
+/// `PhysicalExpr::try_to_proto`, so that two references to an expression with
+/// an `expression_id` decode to one shared `Arc`.
+#[test]
+fn try_to_proto_node_participates_in_deduplication() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let shared: Arc<dyn PhysicalExpr> = Arc::new(IdentifiedColumn {
+        inner: Column::new("a", 0),
+        id: 42,
+    });
+
+    let (left, right) = roundtrip_dynamic_filter_expr_pair(
+        Arc::clone(&shared),
+        Arc::clone(&shared),
+        schema,
+    )?;
+
+    assert!(Arc::ptr_eq(&left, &right));
+    Ok(())
+}
