@@ -7345,3 +7345,53 @@ SELECT a FROM window_in_filter_t LIMIT count(*);
 
 statement ok
 DROP TABLE window_in_filter_t;
+
+# Regression test for https://github.com/apache/datafusion/issues/26762:
+# a window ordered by `(total DESC, k)` where `k` is constant (derived from a
+# filtered column) must not fail SanityCheckPlan.
+statement ok
+set datafusion.execution.target_partitions = 1;
+
+statement ok
+CREATE TABLE t_26762(g VARCHAR, v BIGINT) AS VALUES ('a', 1), ('b', 2);
+
+query TI
+SELECT k, DENSE_RANK() OVER (ORDER BY total DESC, k) AS r FROM (
+  SELECT k, SUM(s) OVER (PARTITION BY k) AS total FROM (
+    SELECT lower(g) AS k, SUM(v) AS s FROM t_26762 WHERE g = 'a' GROUP BY lower(g)
+  )
+);
+----
+a 1
+
+query TT
+EXPLAIN SELECT k, DENSE_RANK() OVER (ORDER BY total DESC, k) AS r FROM (
+  SELECT k, SUM(s) OVER (PARTITION BY k) AS total FROM (
+    SELECT lower(g) AS k, SUM(v) AS s FROM t_26762 WHERE g = 'a' GROUP BY lower(g)
+  )
+);
+----
+logical_plan
+01)Projection: k, dense_rank() ORDER BY [total DESC NULLS FIRST, k ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS r
+02)--WindowAggr: windowExpr=[[dense_rank() ORDER BY [total DESC NULLS FIRST, k ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+03)----Projection: k, sum(s) PARTITION BY [k] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS total
+04)------WindowAggr: windowExpr=[[sum(s) PARTITION BY [k] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]
+05)--------Projection: lower(t_26762.g) AS k, sum(t_26762.v) AS s
+06)----------Aggregate: groupBy=[[lower(t_26762.g)]], aggr=[[sum(t_26762.v)]]
+07)------------Filter: t_26762.g = Utf8View("a")
+08)--------------TableScan: t_26762 projection=[g, v]
+physical_plan
+01)ProjectionExec: expr=[k@0 as k, dense_rank() ORDER BY [total DESC NULLS FIRST, k ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 as r]
+02)--BoundedWindowAggExec: wdw=[dense_rank() ORDER BY [total DESC NULLS FIRST, k ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "dense_rank() ORDER BY [total DESC NULLS FIRST, k ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": UInt64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+03)----ProjectionExec: expr=[k@0 as k, sum(s) PARTITION BY [k] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING@2 as total]
+04)------WindowAggExec: wdw=[sum(s) PARTITION BY [k] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING: Ok(Field { name: "sum(s) PARTITION BY [k] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING", data_type: Int64, nullable: true }), frame: WindowFrame { units: Rows, start_bound: Preceding(UInt64(NULL)), end_bound: Following(UInt64(NULL)), is_causal: false }]
+05)--------ProjectionExec: expr=[lower(t_26762.g)@0 as k, sum(t_26762.v)@1 as s]
+06)----------AggregateExec: mode=Single, gby=[lower(g@0) as lower(t_26762.g)], aggr=[sum(t_26762.v)]
+07)------------FilterExec: g@0 = a
+08)--------------DataSourceExec: partitions=1, partition_sizes=[1]
+
+statement ok
+DROP TABLE t_26762;
+
+statement ok
+reset datafusion.execution.target_partitions;

@@ -355,7 +355,7 @@ impl EquivalenceProperties {
                 .oeq_class
                 .iter()
                 .cloned()
-                .map(|o| self.eq_group.normalize_sort_exprs(o));
+                .map(|o| normalize_cached_ordering(&self.eq_group, o));
             self.oeq_cache = OrderingEquivalenceCache::new(normal_orderings);
         }
     }
@@ -370,7 +370,9 @@ impl EquivalenceProperties {
         let normal_orderings: Vec<_> = orderings
             .iter()
             .cloned()
-            .filter_map(|o| self.normalize_sort_exprs(o))
+            .filter_map(|o| {
+                LexOrdering::new(normalize_cached_ordering(&self.eq_group, o))
+            })
             .collect();
         if !normal_orderings.is_empty() {
             self.oeq_class.extend(orderings);
@@ -392,7 +394,7 @@ impl EquivalenceProperties {
         let normal_cls = mem::take(&mut self.oeq_cache.normal_cls);
         let normal_orderings = normal_cls
             .into_iter()
-            .map(|o| self.eq_group.normalize_sort_exprs(o));
+            .map(|o| normalize_cached_ordering(&self.eq_group, o));
         self.oeq_cache.normal_cls = OrderingEquivalenceClass::new(normal_orderings);
         self.oeq_cache.update_map();
         // Discover any new orderings based on the new equivalence classes:
@@ -1281,7 +1283,7 @@ impl EquivalenceProperties {
         let normal_orderings = orderings
             .iter()
             .cloned()
-            .map(|o| eq_group.normalize_sort_exprs(o));
+            .map(|o| normalize_cached_ordering(&eq_group, o));
         Self {
             oeq_cache: OrderingEquivalenceCache::new(normal_orderings),
             oeq_class: OrderingEquivalenceClass::new(orderings),
@@ -1503,6 +1505,21 @@ impl Display for EquivalenceProperties {
         }
         Ok(())
     }
+}
+
+/// Normalizes `ordering` for the ordering cache, which backs the
+/// satisfaction checks. Unlike [`EquivalenceGroup::normalize_sort_exprs`], this
+/// removes *all* constants, including heterogeneous ones: such values are
+/// constant within each partition, and satisfaction checks reason about the
+/// order of a single partition. Keeping them would leave a constant as the
+/// leading key of a cached ordering and hide the keys after it (see #26762).
+fn normalize_cached_ordering<'a>(
+    eq_group: &'a EquivalenceGroup,
+    ordering: impl IntoIterator<Item = PhysicalSortExpr> + 'a,
+) -> impl Iterator<Item = PhysicalSortExpr> + 'a {
+    eq_group
+        .normalize_sort_exprs(ordering)
+        .filter(|sort_expr| eq_group.is_expr_constant(&sort_expr.expr).is_none())
 }
 
 /// Calculates the properties of a given [`ExprPropertiesNode`].
