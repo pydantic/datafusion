@@ -33,7 +33,7 @@ mod metrics;
 mod nested_schema_pruning;
 mod opener;
 mod page_filter;
-mod prefetch;
+pub mod prefetch;
 mod projection_read_plan;
 mod pruning;
 mod push_decoder;

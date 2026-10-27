@@ -16,6 +16,54 @@ use std::time::Duration;
 static HIT_BYTES: AtomicU64 = AtomicU64::new(0);
 static MISS_BYTES: AtomicU64 = AtomicU64::new(0);
 static WAIT_US: AtomicU64 = AtomicU64::new(0);
+static EVICT_BYTES: AtomicU64 = AtomicU64::new(0);
+static DENIED: AtomicU64 = AtomicU64::new(0);
+
+/// Every live prefetch buffer, so a memory pool under pressure can reclaim
+/// optional bytes.
+static REGISTRY: Mutex<Vec<Weak<Shared>>> = Mutex::new(Vec::new());
+
+/// Drop up to `bytes` of prefetched data that the decoder has not started to
+/// read, furthest from the decoder first. Returns the bytes freed. The
+/// decoder fetches a dropped range itself when it reaches it.
+pub fn reclaim_prefetch(bytes: usize) -> usize {
+    let shareds: Vec<Arc<Shared>> = {
+        let Ok(mut reg) = REGISTRY.try_lock() else { return 0 };
+        reg.retain(|w| w.strong_count() > 0);
+        reg.iter().filter_map(Weak::upgrade).collect()
+    };
+    // Gather candidates across all buffers, then evict the furthest ahead of
+    // each buffer's read position first, round robin by distance.
+    let mut cands: Vec<(u64, usize, u64)> = Vec::new(); // (distance, shared idx, start)
+    for (i, s) in shareds.iter().enumerate() {
+        let Ok(entries) = s.entries.try_lock() else { continue };
+        let pos = entries.keys().next().copied().unwrap_or(0);
+        for (start, (_, e)) in entries.iter() {
+            if let Entry::Ready { consumed: 0, .. } = e {
+                cands.push((start - pos, i, *start));
+            }
+        }
+    }
+    cands.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut freed = 0;
+    for (_, i, start) in cands {
+        if freed >= bytes {
+            break;
+        }
+        let s = &shareds[i];
+        let Ok(mut entries) = s.entries.try_lock() else { continue };
+        if let Some((end, Entry::Ready { consumed: 0, .. })) = entries.get(&start) {
+            let len = (*end - start) as usize;
+            entries.remove(&start);
+            drop(entries);
+            s.reservation.shrink(len);
+            freed += len;
+        }
+    }
+    EVICT_BYTES.fetch_add(freed as u64, Ordering::Relaxed);
+    freed
+}
+
 
 use bytes::Bytes;
 use datafusion_execution::memory_pool::{
@@ -45,7 +93,7 @@ enum Entry {
 struct Shared {
     /// start -> (end, entry)
     entries: Mutex<BTreeMap<u64, (u64, Entry)>>,
-    reservation: Mutex<MemoryReservation>,
+    reservation: MemoryReservation,
     notify: Notify,
 }
 
@@ -91,11 +139,13 @@ impl PrefetchReader {
             MemoryConsumer::new(format!("ParquetPrefetch[{partition}]")).register(&pool);
         let shared = Arc::new(Shared {
             entries: Mutex::new(BTreeMap::new()),
-            reservation: Mutex::new(reservation),
+            reservation,
             notify: Notify::new(),
         });
         let fraction = env_f64("DF_PREFETCH_FRACTION").unwrap_or(0.6);
+        let fallible = std::env::var("DF_PREFETCH_TRY").is_ok();
         let chunk = env_usize("DF_PREFETCH_CHUNK").unwrap_or(8 << 20) as u64;
+        REGISTRY.lock().unwrap().push(Arc::downgrade(&shared));
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         PRIORITY.lock().unwrap().insert((partition, seq), false);
         let ranges = Arc::new(coalesce(plan, chunk));
@@ -110,6 +160,7 @@ impl PrefetchReader {
                 Arc::clone(&live),
                 Arc::clone(&pool),
                 fraction,
+                fallible,
                 partition,
                 seq,
             ));
@@ -130,10 +181,12 @@ impl Drop for PrefetchReader {
         self.shared.notify.notify_waiters();
         if std::env::var("DF_PREFETCH_STATS").is_ok() {
             eprintln!(
-                "PREFETCH_STATS hit_mib={} miss_mib={} wait_ms={}",
+                "PREFETCH_STATS hit_mib={} miss_mib={} wait_ms={} evict_mib={} denied={}",
                 HIT_BYTES.load(Ordering::Relaxed) >> 20,
                 MISS_BYTES.load(Ordering::Relaxed) >> 20,
-                WAIT_US.load(Ordering::Relaxed) / 1000
+                WAIT_US.load(Ordering::Relaxed) / 1000,
+                EVICT_BYTES.load(Ordering::Relaxed) >> 20,
+                DENIED.load(Ordering::Relaxed)
             );
         }
     }
@@ -179,6 +232,7 @@ async fn prefetch_worker(
     live: Arc<AtomicUsize>,
     pool: Arc<dyn MemoryPool>,
     fraction: f64,
+    fallible: bool,
     partition: usize,
     seq: u64,
 ) {
@@ -200,16 +254,27 @@ async fn prefetch_worker(
                 tokio::time::timeout(Duration::from_millis(2), s.notify.notified()).await;
             continue;
         }
+        if fallible {
+            // Optional bytes: take only what the pool grants now.
+            if s.reservation.try_grow(len).is_err() {
+                DENIED.fetch_add(1, Ordering::Relaxed);
+                let _ = tokio::time::timeout(Duration::from_millis(5), s.notify.notified())
+                    .await;
+                continue;
+            }
+        } else {
+            s.reservation.grow(len);
+        }
         if next
             .compare_exchange(i, i + 1, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
+            s.reservation.shrink(len);
             continue;
         }
         if i + 1 == ranges.len() {
             set_done(partition, seq);
         }
-        s.reservation.lock().unwrap().grow(len);
         s.entries
             .lock()
             .unwrap()
@@ -235,7 +300,7 @@ async fn prefetch_worker(
                 Err(_) => {
                     // Let the decoder fetch this range itself.
                     entries.remove(&r.start);
-                    s.reservation.lock().unwrap().shrink(len);
+                    s.reservation.shrink(len);
                 }
             }
         }
@@ -300,7 +365,7 @@ impl Shared {
             }
         }
         if freed > 0 {
-            self.reservation.lock().unwrap().shrink(freed);
+            self.reservation.shrink(freed);
             self.notify.notify_waiters();
         }
         Lookup::Hit(single.unwrap_or_else(|| out.freeze()))

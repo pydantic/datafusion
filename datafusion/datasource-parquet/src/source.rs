@@ -726,6 +726,7 @@ impl FileSource for ParquetSource {
             .table_parquet_options
             .global
             .read_ahead_bytes
+            .or(std::env::var("DF_PREFETCH").ok().map(|_| 0))
             .map(|_| Arc::clone(context.memory_pool()));
         Ok(Box::new(self.build_morselizer(
             object_store,

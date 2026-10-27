@@ -795,8 +795,24 @@ impl ReadAheadMemory {
 
     /// Reserve bytes the decoder needs. Never fails and can exceed the pool
     /// limit: the decoder cannot continue without these bytes.
-    fn reserve_required(&self, bytes: u64) {
-        self.reservation.grow(to_usize(bytes));
+    fn reserve_required(&self, bytes: u64) -> Result<()> {
+        let bytes = to_usize(bytes);
+        // PROTOTYPE: DF_REQUIRED_STRICT orders required reservations:
+        // try the pool, reclaim optional prefetch bytes, retry, then fail.
+        if std::env::var("DF_REQUIRED_STRICT").is_err() {
+            self.reservation.grow(bytes);
+            return Ok(());
+        }
+        if self.reservation.try_grow(bytes).is_ok() {
+            return Ok(());
+        }
+        crate::prefetch::reclaim_prefetch(bytes);
+        self.reservation.try_grow(bytes).map_err(|e| {
+            e.context(format!(
+                "required bytes for the next batch of {}",
+                self.reservation.consumer().name()
+            ))
+        })
     }
 
     /// Bytes the pool can grant now. Unlimited if the pool has no limit or
@@ -1164,7 +1180,7 @@ impl PushDecoderStreamState {
             .buffered_bytes();
         let read_ahead = self.read_ahead.as_mut().expect("streaming policy");
         let needed_bytes: u64 = needed.iter().map(|r| r.end - r.start).sum();
-        read_ahead.memory.reserve_required(needed_bytes);
+        read_ahead.memory.reserve_required(needed_bytes)?;
         for range in &needed {
             read_ahead.fetched.insert((range.start, range.end));
         }
@@ -1487,7 +1503,7 @@ mod tests {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(100));
         let memory = ReadAheadMemory::new(Some(Arc::clone(&pool)), 0);
         // Required bytes can exceed the limit; speculative bytes cannot.
-        memory.reserve_required(150);
+        memory.reserve_required(150).unwrap();
         assert_eq!(pool.reserved(), 150);
         assert_eq!(memory.available(), 0);
         assert!(!memory.try_reserve_speculative(1));
