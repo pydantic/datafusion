@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -95,6 +95,10 @@ struct Shared {
     entries: Mutex<BTreeMap<u64, (u64, Entry)>>,
     reservation: MemoryReservation,
     notify: Notify,
+    /// The coalesced fetch ranges in decode order. A range is fetched once,
+    /// by whichever side claims it first.
+    ranges: Vec<Range<u64>>,
+    claimed: Vec<AtomicBool>,
 }
 
 pub(crate) struct PrefetchReader {
@@ -137,25 +141,27 @@ impl PrefetchReader {
     ) -> Self {
         let reservation =
             MemoryConsumer::new(format!("ParquetPrefetch[{partition}]")).register(&pool);
+        let chunk = env_usize("DF_PREFETCH_CHUNK").unwrap_or(8 << 20) as u64;
+        let ranges = coalesce(plan, chunk);
+        let claimed = ranges.iter().map(|_| AtomicBool::new(false)).collect();
         let shared = Arc::new(Shared {
             entries: Mutex::new(BTreeMap::new()),
             reservation,
             notify: Notify::new(),
+            ranges,
+            claimed,
         });
         let fraction = env_f64("DF_PREFETCH_FRACTION").unwrap_or(0.6);
         let fallible = std::env::var("DF_PREFETCH_TRY").is_ok();
-        let chunk = env_usize("DF_PREFETCH_CHUNK").unwrap_or(8 << 20) as u64;
         REGISTRY.lock().unwrap().push(Arc::downgrade(&shared));
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         PRIORITY.lock().unwrap().insert((partition, seq), false);
-        let ranges = Arc::new(coalesce(plan, chunk));
         let next = Arc::new(AtomicUsize::new(0));
         let live = Arc::new(AtomicUsize::new(prefetch_readers.len()));
         for reader in prefetch_readers {
             tokio::spawn(prefetch_worker(
                 Arc::downgrade(&shared),
                 reader,
-                Arc::clone(&ranges),
                 Arc::clone(&next),
                 Arc::clone(&live),
                 Arc::clone(&pool),
@@ -181,12 +187,13 @@ impl Drop for PrefetchReader {
         self.shared.notify.notify_waiters();
         if std::env::var("DF_PREFETCH_STATS").is_ok() {
             eprintln!(
-                "PREFETCH_STATS hit_mib={} miss_mib={} wait_ms={} evict_mib={} denied={}",
+                "PREFETCH_STATS hit_mib={} miss_mib={} wait_ms={} evict_mib={} denied={} promoted_mib={}",
                 HIT_BYTES.load(Ordering::Relaxed) >> 20,
                 MISS_BYTES.load(Ordering::Relaxed) >> 20,
                 WAIT_US.load(Ordering::Relaxed) / 1000,
                 EVICT_BYTES.load(Ordering::Relaxed) >> 20,
-                DENIED.load(Ordering::Relaxed)
+                DENIED.load(Ordering::Relaxed),
+                PROMOTED.load(Ordering::Relaxed) >> 20
             );
         }
     }
@@ -228,7 +235,6 @@ fn pool_has_room(pool: &dyn MemoryPool, fraction: f64, add: usize) -> bool {
 async fn prefetch_worker(
     shared: Weak<Shared>,
     mut reader: Box<dyn AsyncFileReader>,
-    ranges: Arc<Vec<Range<u64>>>,
     next: Arc<AtomicUsize>,
     live: Arc<AtomicUsize>,
     pool: Arc<dyn MemoryPool>,
@@ -240,13 +246,18 @@ async fn prefetch_worker(
     loop {
         let Some(s) = shared.upgrade() else { return };
         let i = next.load(Ordering::Relaxed);
-        if i >= ranges.len() {
+        if i >= s.ranges.len() {
             if live.fetch_sub(1, Ordering::Relaxed) == 1 {
                 set_done(partition, seq);
             }
             return;
         }
-        let r = ranges[i].clone();
+        if s.claimed[i].load(Ordering::Relaxed) {
+            // The decoder promoted this range to a required fetch.
+            let _ = next.compare_exchange(i, i + 1, Ordering::Relaxed, Ordering::Relaxed);
+            continue;
+        }
+        let r = s.ranges[i].clone();
         let len = (r.end - r.start) as usize;
         if !may_fetch(partition, seq) || !pool_has_room(pool.as_ref(), fraction, len) {
             // Wait for consumption, or poll again soon, because other
@@ -269,11 +280,12 @@ async fn prefetch_worker(
         if next
             .compare_exchange(i, i + 1, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
+            || s.claimed[i].swap(true, Ordering::Relaxed)
         {
             s.reservation.shrink(len);
             continue;
         }
-        if i + 1 == ranges.len() {
+        if i + 1 == s.ranges.len() {
             set_done(partition, seq);
         }
         s.entries
@@ -375,14 +387,19 @@ impl Shared {
 
 impl PrefetchReader {
     async fn read(&mut self, range: Range<u64>) -> ParquetResult<Bytes> {
+        let shared = Arc::clone(&self.shared);
         loop {
-            let notified = self.shared.notify.notified();
-            match self.shared.lookup(&range) {
+            let notified = shared.notify.notified();
+            match shared.lookup(&range) {
                 Lookup::Hit(b) => {
                     HIT_BYTES.fetch_add(range.end - range.start, Ordering::Relaxed);
                     return Ok(b);
                 }
                 Lookup::Miss => {
+                    if std::env::var("DF_PREFETCH_PROMOTE").is_ok() && self.promote(&range).await
+                    {
+                        continue;
+                    }
                     MISS_BYTES.fetch_add(range.end - range.start, Ordering::Relaxed);
                     return self.inner.get_bytes(range).await;
                 }
@@ -395,6 +412,51 @@ impl PrefetchReader {
         }
     }
 }
+
+impl PrefetchReader {
+    /// The decoder needs `range` now. If an unclaimed fetch range covers it,
+    /// fetch that whole range as required bytes, so the prefetch worker does
+    /// not fetch it again later. Return false if no such range exists.
+    async fn promote(&mut self, range: &Range<u64>) -> bool {
+        let s = Arc::clone(&self.shared);
+        let Some(i) = s
+            .ranges
+            .iter()
+            .position(|r| r.start <= range.start && range.end <= r.end)
+        else {
+            return false;
+        };
+        if s.claimed[i].swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        let r = s.ranges[i].clone();
+        let len = (r.end - r.start) as usize;
+        PROMOTED.fetch_add(len as u64, Ordering::Relaxed);
+        s.reservation.grow(len);
+        s.entries
+            .lock()
+            .unwrap()
+            .insert(r.start, (r.end, Entry::InFlight));
+        let result = self.inner.get_bytes(r.clone()).await;
+        let mut entries = s.entries.lock().unwrap();
+        let ok = match result {
+            Ok(b) => {
+                entries.insert(r.start, (r.end, Entry::Ready { bytes: b, consumed: 0 }));
+                true
+            }
+            Err(_) => {
+                entries.remove(&r.start);
+                s.reservation.shrink(len);
+                false
+            }
+        };
+        drop(entries);
+        s.notify.notify_waiters();
+        ok
+    }
+}
+
+static PROMOTED: AtomicU64 = AtomicU64::new(0);
 
 impl AsyncFileReader for PrefetchReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
