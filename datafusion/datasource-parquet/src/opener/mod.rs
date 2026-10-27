@@ -1946,12 +1946,17 @@ impl RowGroupsPrunedParquetOpen {
         ) {
             (true, Some(pool)) => Box::new(crate::prefetch::PrefetchReader::spawn(
                 prepared.async_file_reader,
-                prepared.parquet_file_reader_factory.create_reader(
-                    prepared.partition_index,
-                    prepared.partitioned_file.clone(),
-                    prepared.metadata_size_hint,
-                    &prepared.metrics,
-                )?,
+                (0..crate::prefetch::env_usize("DF_PREFETCH_CONCURRENCY").unwrap_or(4))
+                    .map(|_| {
+                        prepared.parquet_file_reader_factory.create_reader(
+                            prepared.partition_index,
+                            prepared.partitioned_file.clone(),
+                            prepared.metadata_size_hint,
+                            &prepared.metrics,
+                        )
+                    })
+                    .map(|r| r.map(|r| r as Box<dyn AsyncFileReader>))
+                    .collect::<Result<Vec<_>>>()?,
                 decoder.scan_plan(),
                 pool,
                 prepared.partition_index,
