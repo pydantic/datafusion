@@ -81,6 +81,10 @@ pub(super) struct ScanState {
     /// Once the I/O completes, yields the next planner and is pushed back
     /// onto `ready_planners`.
     pending_planner: Option<PendingMorselPlanner>,
+    /// PROTOTYPE: extra planners blocked on I/O, for files opened ahead.
+    pending_ahead: Vec<PendingMorselPlanner>,
+    /// PROTOTYPE: files to open ahead of the active reader (`DF_FILE_LOOKAHEAD`).
+    lookahead: usize,
     /// Metrics for the active scan queues.
     metrics: FileStreamMetrics,
 }
@@ -102,6 +106,11 @@ impl ScanState {
             ready_morsels: Default::default(),
             reader: None,
             pending_planner: None,
+            pending_ahead: Vec::new(),
+            lookahead: std::env::var("DF_FILE_LOOKAHEAD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             metrics,
         }
     }
@@ -123,8 +132,8 @@ impl ScanState {
     /// The return [`ScanAndReturn`] tells `poll_inner` how to update the
     /// outer `FileStreamState`.
     pub(super) fn poll_scan(&mut self, cx: &mut Context<'_>) -> ScanAndReturn {
-        let _processing_timer: ScopedTimerGuard<'_> =
-            self.metrics.time_processing.timer();
+        let time_processing = self.metrics.time_processing.clone();
+        let _processing_timer: ScopedTimerGuard<'_> = time_processing.timer();
 
         // Try and resolve outstanding IO first. If it is still pending, check
         // the current reader or ready morsels before yielding. New planning
@@ -151,6 +160,14 @@ impl ScanState {
                         OnError::Fail => ScanAndReturn::Error(err),
                     };
                 }
+            }
+        }
+
+        // PROTOTYPE: open files ahead while a reader is active, so their
+        // metadata I/O and prefetch overlap the current file's decode.
+        if self.lookahead > 0 && self.reader.is_some() {
+            if let Err(err) = self.plan_ahead(cx) {
+                return ScanAndReturn::Error(err);
             }
         }
 
@@ -227,6 +244,15 @@ impl ScanState {
         if self.pending_planner.is_some() {
             return ScanAndReturn::Return(Poll::Pending);
         }
+        if !self.pending_ahead.is_empty() && self.ready_planners.is_empty() {
+            if let Err(err) = self.plan_ahead(cx) {
+                return ScanAndReturn::Error(err);
+            }
+            if self.ready_planners.is_empty() && self.ready_morsels.is_empty() {
+                return ScanAndReturn::Return(Poll::Pending);
+            }
+            return ScanAndReturn::Continue;
+        }
 
         // No reader or morsel, so try to produce more work via CPU planning.
         if let Some(planner) = self.ready_planners.pop_front() {
@@ -287,6 +313,55 @@ impl ScanState {
                 OnError::Fail => ScanAndReturn::Error(err),
             },
         }
+    }
+}
+
+impl ScanState {
+    /// PROTOTYPE: poll the look-ahead I/O, plan ready files, and open new
+    /// files until `lookahead` files are queued behind the active reader.
+    /// Errors are returned regardless of `on_error`.
+    fn plan_ahead(&mut self, cx: &mut Context<'_>) -> Result<()> {
+        let mut i = 0;
+        while i < self.pending_ahead.len() {
+            match self.pending_ahead[i].poll_unpin(cx) {
+                Poll::Pending => i += 1,
+                Poll::Ready(r) => {
+                    self.pending_ahead.swap_remove(i);
+                    self.ready_planners.push_back(r?);
+                }
+            }
+        }
+        while let Some(planner) = self.ready_planners.pop_front() {
+            if let Some(mut plan) = planner.plan()? {
+                self.ready_morsels.extend(plan.take_morsels());
+                self.ready_planners.extend(plan.take_ready_planners());
+                if let Some(mut p) = plan.take_pending_planner() {
+                    // Poll once so its waker is registered.
+                    match p.poll_unpin(cx) {
+                        Poll::Pending => self.pending_ahead.push(p),
+                        Poll::Ready(r) => self.ready_planners.push_back(r?),
+                    }
+                }
+            } else {
+                self.metrics.files_processed.add(1);
+            }
+        }
+        while self.ready_morsels.len() + self.pending_ahead.len() < self.lookahead {
+            let Some(file) = self.work_source.pop_front() else { break };
+            self.metrics.files_opened.add(1);
+            let planner = self.morselizer.plan_file(file)?;
+            if let Some(mut plan) = planner.plan()? {
+                self.ready_morsels.extend(plan.take_morsels());
+                self.ready_planners.extend(plan.take_ready_planners());
+                if let Some(mut p) = plan.take_pending_planner() {
+                    match p.poll_unpin(cx) {
+                        Poll::Pending => self.pending_ahead.push(p),
+                        Poll::Ready(r) => self.ready_planners.push_back(r?),
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 

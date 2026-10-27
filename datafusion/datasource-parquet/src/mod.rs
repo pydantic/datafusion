@@ -35,6 +35,7 @@ mod opener;
 mod page_filter;
 mod projection_read_plan;
 mod pruning;
+mod prefetch;
 mod push_decoder;
 mod reader;
 mod row_filter;

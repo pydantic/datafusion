@@ -1928,6 +1928,7 @@ impl RowGroupsPrunedParquetOpen {
             .file_metrics
             .row_groups_pruned_dynamic_filter
             .clone();
+        let prepared_memory_pool = prepared.memory_pool.clone();
         let read_ahead = read_ahead_bytes.map(|window| {
             let memory =
                 ReadAheadMemory::new(prepared.memory_pool, prepared.partition_index);
@@ -1938,11 +1939,30 @@ impl RowGroupsPrunedParquetOpen {
             );
             ReadAhead::new(window, decoder.scan_plan(), memory, metrics)
         });
+        // PROTOTYPE: prefetch this file's scan plan in the background.
+        let reader: Box<dyn AsyncFileReader> = match (
+            std::env::var("DF_PREFETCH").is_ok(),
+            prepared_memory_pool.clone(),
+        ) {
+            (true, Some(pool)) => Box::new(crate::prefetch::PrefetchReader::spawn(
+                prepared.async_file_reader,
+                prepared.parquet_file_reader_factory.create_reader(
+                    prepared.partition_index,
+                    prepared.partitioned_file.clone(),
+                    prepared.metadata_size_hint,
+                    &prepared.metrics,
+                )?,
+                decoder.scan_plan(),
+                pool,
+                prepared.partition_index,
+            )),
+            _ => prepared.async_file_reader,
+        };
         let stream = PushDecoderStreamState {
             decoder: Some(decoder),
             active_reader: None,
             rg_plan,
-            reader: Some(prepared.async_file_reader),
+            reader: Some(reader),
             decoder_projection,
             arrow_reader_metrics,
             predicate_cache_inner_records,
