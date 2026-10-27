@@ -214,7 +214,8 @@ fn coalesce(plan: ScanPlan, chunk: u64) -> Vec<Range<u64>> {
 fn pool_has_room(pool: &dyn MemoryPool, fraction: f64, add: usize) -> bool {
     match pool.memory_limit() {
         MemoryLimit::Finite(limit) => {
-            (pool.reserved() + add) as f64 <= limit as f64 * fraction
+            let headroom = env_usize("DF_PREFETCH_HEADROOM").unwrap_or(0);
+            (pool.reserved() + add + headroom) as f64 <= limit as f64 * fraction
         }
         _ => true,
     }
