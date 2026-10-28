@@ -156,18 +156,22 @@ impl Drop for PrefetchReader {
 }
 
 /// Merge adjacent plan ranges into chunks of at most `chunk` bytes, and split
-/// larger ranges. The window needs chunks in increasing byte order, so return
-/// `None` if the plan moves backward.
+/// larger ranges. The chunks stay in decode order, which can move backward in
+/// the file, for example when row groups are read in reverse. The window needs
+/// chunks that do not overlap, so return `None` if a range overlaps the start
+/// of the previous chunk.
 fn coalesce(plan: ScanPlan, chunk: u64) -> Option<Vec<Range<u64>>> {
     let mut out: Vec<Range<u64>> = Vec::new();
     for planned in plan {
         let mut r = planned.range;
         if let Some(last) = out.last() {
-            if r.start < last.start {
+            if r.start < last.start && r.end > last.start {
                 return None;
             }
-            // Keep only the part after the previous chunk.
-            r.start = r.start.max(last.end);
+            if r.start >= last.start {
+                // Keep only the part after the previous chunk.
+                r.start = r.start.max(last.end);
+            }
         }
         while r.start < r.end {
             match out.last_mut() {
