@@ -100,7 +100,8 @@ pub(crate) struct PrefetchReader {
 
 impl PrefetchReader {
     /// Wrap `inner` in a window over `plan`, with one worker for each reader
-    /// in `prefetch_readers`.
+    /// in `prefetch_readers`. Return `inner` unchanged if the plan does not
+    /// fit a window.
     pub(crate) fn spawn(
         inner: Box<dyn AsyncFileReader>,
         prefetch_readers: Vec<Box<dyn AsyncFileReader>>,
@@ -108,8 +109,12 @@ impl PrefetchReader {
         pool: Arc<dyn MemoryPool>,
         partition: usize,
         config: PrefetchConfig,
-    ) -> Self {
-        let chunks = coalesce(plan, config.chunk)
+    ) -> Result<Self, Box<dyn AsyncFileReader>> {
+        let Some(ranges) = coalesce(plan, config.chunk) else {
+            // The plan moves backward. Read without prefetch.
+            return Err(inner);
+        };
+        let chunks = ranges
             .into_iter()
             .map(|range| Chunk {
                 range,
@@ -127,11 +132,11 @@ impl PrefetchReader {
         for reader in prefetch_readers {
             workers.spawn(worker(Arc::clone(&shared), reader));
         }
-        Self {
+        Ok(Self {
             inner,
             shared,
             _workers: workers,
-        }
+        })
     }
 }
 
@@ -150,28 +155,60 @@ impl Drop for PrefetchReader {
     }
 }
 
-/// Merge adjacent plan ranges into chunks of at most `chunk` bytes. The
-/// chunks do not overlap.
-fn coalesce(plan: ScanPlan, chunk: u64) -> Vec<Range<u64>> {
+/// Merge adjacent plan ranges into chunks of at most `chunk` bytes, and split
+/// larger ranges. The window needs chunks in increasing byte order, so return
+/// `None` if the plan moves backward.
+fn coalesce(plan: ScanPlan, chunk: u64) -> Option<Vec<Range<u64>>> {
     let mut out: Vec<Range<u64>> = Vec::new();
     for planned in plan {
         let mut r = planned.range;
-        if let Some(last) = out.last_mut() {
-            if r.start >= last.start && r.start < last.end {
-                // Keep only the part after the previous chunk.
-                r.start = last.end;
+        if let Some(last) = out.last() {
+            if r.start < last.start {
+                return None;
             }
-            if r.start >= r.end {
-                continue;
-            }
-            if r.start == last.end && r.end - last.start <= chunk {
-                last.end = r.end;
-                continue;
+            // Keep only the part after the previous chunk.
+            r.start = r.start.max(last.end);
+        }
+        while r.start < r.end {
+            match out.last_mut() {
+                Some(last) if last.end == r.start && last.end - last.start < chunk => {
+                    let end = r.end.min(last.start + chunk);
+                    last.end = end;
+                    r.start = end;
+                }
+                _ => {
+                    let end = r.end.min(r.start + chunk);
+                    out.push(r.start..end);
+                    r.start = end;
+                }
             }
         }
-        out.push(r);
     }
-    out
+    Some(out)
+}
+
+/// A claim on an `InFlight` chunk. Dropping an unfinished claim returns the
+/// chunk to `Pending` and releases its memory, so no reader waits forever.
+struct Claim<'a> {
+    shared: &'a Shared,
+    i: usize,
+    done: bool,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let mut w = self.shared.window.lock().unwrap();
+        let chunk = &mut w.chunks[self.i];
+        if matches!(chunk.state, State::InFlight) {
+            chunk.state = State::Pending;
+        }
+        self.shared.reservation.shrink(len(&chunk.range));
+        drop(w);
+        self.shared.notify.notify_waiters();
+    }
 }
 
 fn len(r: &Range<u64>) -> usize {
@@ -185,6 +222,24 @@ impl Shared {
         if let State::Ready(_) = std::mem::replace(&mut chunk.state, State::Freed) {
             self.reservation.shrink(len(&chunk.range));
         }
+    }
+
+    /// Fetch the claimed chunk `i` and store the result. If the future is
+    /// dropped first, the guard returns the chunk to `Pending`.
+    async fn fetch(
+        self: &Arc<Self>,
+        reader: &mut Box<dyn AsyncFileReader>,
+        i: usize,
+        range: Range<u64>,
+    ) {
+        let mut guard = Claim {
+            shared: self,
+            i,
+            done: false,
+        };
+        let result = reader.get_bytes(range).await;
+        guard.done = true;
+        self.complete(i, result);
     }
 
     /// Store the result of the fetch of chunk `i`.
@@ -206,7 +261,7 @@ impl Shared {
     }
 
     /// Claim the first pending chunk ahead of the cursor for a worker. The
-    /// bytes from the cursor to the end of that chunk must fit in the budget,
+    /// bytes after the cursor chunk up to the end of that chunk must fit in the budget,
     /// and the pool must grant them. Return `Err` when no pending chunk is
     /// left.
     fn claim_optional(&self) -> Result<Option<(usize, Range<u64>)>, ()> {
@@ -214,11 +269,13 @@ impl Shared {
         let cursor = w.cursor;
         let mut ahead = 0;
         for i in cursor..w.chunks.len() {
-            ahead += len(&w.chunks[i].range) as u64;
+            if i > cursor {
+                ahead += len(&w.chunks[i].range) as u64;
+            }
             if !matches!(w.chunks[i].state, State::Pending) {
                 continue;
             }
-            if ahead > self.budget && i > cursor {
+            if ahead > self.budget {
                 return Ok(None);
             }
             let r = w.chunks[i].range.clone();
@@ -242,10 +299,14 @@ impl Shared {
         else {
             return Step::Direct;
         };
-        for i in w.cursor..first {
-            self.free(&mut w.chunks[i]);
+        if first > w.cursor {
+            for i in w.cursor..first {
+                self.free(&mut w.chunks[i]);
+            }
+            w.cursor = first;
+            // The budget now reaches further, so wake the workers.
+            self.notify.notify_waiters();
         }
-        w.cursor = first;
         let mut last = first;
         while w.chunks[last].range.end < range.end {
             last += 1;
@@ -305,10 +366,7 @@ async fn worker(shared: Arc<Shared>, mut reader: Box<dyn AsyncFileReader>) {
         notified.as_mut().enable();
         match shared.claim_optional() {
             Err(()) => return,
-            Ok(Some((i, range))) => {
-                let result = reader.get_bytes(range).await;
-                shared.complete(i, result);
-            }
+            Ok(Some((i, range))) => shared.fetch(&mut reader, i, range).await,
             // The cursor moves with a notification, but the pool frees memory
             // without one. So poll the pool as well.
             Ok(None) => {
@@ -347,9 +405,11 @@ impl PrefetchReader {
                     WAIT_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
                 }
                 Step::Fetch(claims) => {
+                    // The decoder has one reader, so it fetches the claims in
+                    // turn. A read spans more than one chunk only at a chunk
+                    // boundary, so a claim list is short.
                     for (i, r) in claims {
-                        let result = self.inner.get_bytes(r).await;
-                        shared.complete(i, result);
+                        shared.fetch(&mut self.inner, i, r).await;
                     }
                 }
             }

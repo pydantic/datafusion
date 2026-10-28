@@ -1946,7 +1946,7 @@ impl RowGroupsPrunedParquetOpen {
         ) {
             (true, Some(pool)) => {
                 let config = crate::prefetch::PrefetchConfig::from_env();
-                Box::new(crate::prefetch::PrefetchReader::spawn(
+                match crate::prefetch::PrefetchReader::spawn(
                     prepared.async_file_reader,
                     (0..config.concurrency)
                         .map(|_| {
@@ -1963,7 +1963,10 @@ impl RowGroupsPrunedParquetOpen {
                     pool,
                     prepared.partition_index,
                     config,
-                ))
+                ) {
+                    Ok(r) => Box::new(r),
+                    Err(inner) => inner,
+                }
             }
             _ => prepared.async_file_reader,
         };
