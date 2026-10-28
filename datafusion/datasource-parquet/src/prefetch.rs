@@ -1,74 +1,30 @@
-// PROTOTYPE: background prefetch of a file's scan plan into the memory pool.
+// PROTOTYPE: a fetch window over one file's scan plan.
 //
-// A spawned task fetches the decoder's `scan_plan()` ranges in decode order,
-// independent of whether the stream is being polled. The decoder's reader
-// serves requests from the prefetched bytes when they cover the request.
-// The task reserves every byte it holds from the memory pool, and stops
-// fetching while the pool is above `DF_PREFETCH_FRACTION` of its limit, so
-// other operators keep headroom.
+// The decoder's `scan_plan()` lists the byte ranges of the file in decode
+// order. This module coalesces them into chunks and keeps a window of chunks
+// in memory, starting at the read cursor. The cursor is the chunk that holds
+// the decoder's current read.
+//
+// Each chunk has one owner at a time, so no chunk is fetched twice:
+//
+// - The decoder fetches a chunk itself when it reads from a chunk that no
+//   worker has claimed. These are required bytes, so the reservation grows
+//   without a check.
+// - Workers fetch chunks ahead of the cursor, up to `budget` bytes from the
+//   cursor. These are optional bytes, so the reservation uses `try_grow` and
+//   a worker waits when the pool refuses.
+//
+// When the cursor moves past a chunk, the window frees the chunk. A chunk
+// that is in flight at that time is freed when its fetch completes. Dropping
+// the reader aborts the workers and frees the reservation.
 
-use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-static HIT_BYTES: AtomicU64 = AtomicU64::new(0);
-static MISS_BYTES: AtomicU64 = AtomicU64::new(0);
-static WAIT_US: AtomicU64 = AtomicU64::new(0);
-static EVICT_BYTES: AtomicU64 = AtomicU64::new(0);
-static DENIED: AtomicU64 = AtomicU64::new(0);
-
-/// Every live prefetch buffer, so a memory pool under pressure can reclaim
-/// optional bytes.
-static REGISTRY: Mutex<Vec<Weak<Shared>>> = Mutex::new(Vec::new());
-
-/// Drop up to `bytes` of prefetched data that the decoder has not started to
-/// read, furthest from the decoder first. Returns the bytes freed. The
-/// decoder fetches a dropped range itself when it reaches it.
-pub fn reclaim_prefetch(bytes: usize) -> usize {
-    let shareds: Vec<Arc<Shared>> = {
-        let Ok(mut reg) = REGISTRY.try_lock() else { return 0 };
-        reg.retain(|w| w.strong_count() > 0);
-        reg.iter().filter_map(Weak::upgrade).collect()
-    };
-    // Gather candidates across all buffers, then evict the furthest ahead of
-    // each buffer's read position first, round robin by distance.
-    let mut cands: Vec<(u64, usize, u64)> = Vec::new(); // (distance, shared idx, start)
-    for (i, s) in shareds.iter().enumerate() {
-        let Ok(entries) = s.entries.try_lock() else { continue };
-        let pos = entries.keys().next().copied().unwrap_or(0);
-        for (start, (_, e)) in entries.iter() {
-            if let Entry::Ready { consumed: 0, .. } = e {
-                cands.push((start - pos, i, *start));
-            }
-        }
-    }
-    cands.sort_by(|a, b| b.0.cmp(&a.0));
-    let mut freed = 0;
-    for (_, i, start) in cands {
-        if freed >= bytes {
-            break;
-        }
-        let s = &shareds[i];
-        let Ok(mut entries) = s.entries.try_lock() else { continue };
-        if let Some((end, Entry::Ready { consumed: 0, .. })) = entries.get(&start) {
-            let len = (*end - start) as usize;
-            entries.remove(&start);
-            drop(entries);
-            s.reservation.shrink(len);
-            freed += len;
-        }
-    }
-    EVICT_BYTES.fetch_add(freed as u64, Ordering::Relaxed);
-    freed
-}
-
-
 use bytes::Bytes;
-use datafusion_execution::memory_pool::{
-    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
-};
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use parquet::arrow::async_reader::AsyncFileReader;
@@ -76,140 +32,140 @@ use parquet::arrow::push_decoder::ScanPlan;
 use parquet::errors::Result as ParquetResult;
 use parquet::file::metadata::ParquetMetaData;
 use tokio::sync::Notify;
+use tokio::task::JoinSet;
 
-pub(crate) fn env_f64(name: &str) -> Option<f64> {
-    std::env::var(name).ok().and_then(|v| v.parse().ok())
-}
+static HIT_BYTES: AtomicU64 = AtomicU64::new(0);
+static MISS_BYTES: AtomicU64 = AtomicU64::new(0);
+static REQUIRED_BYTES: AtomicU64 = AtomicU64::new(0);
+static WAIT_US: AtomicU64 = AtomicU64::new(0);
+static DENIED: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
-enum Entry {
+/// The settings of a prefetch window. The opener reads them once per file.
+#[derive(Clone, Copy)]
+pub(crate) struct PrefetchConfig {
+    /// The largest chunk, in bytes.
+    pub chunk: u64,
+    /// The most bytes that workers hold or fetch, counted from the cursor.
+    pub budget: u64,
+    /// The number of workers. Each worker has one request in flight.
+    pub concurrency: usize,
+}
+
+impl PrefetchConfig {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            chunk: env_usize("DF_PREFETCH_CHUNK").unwrap_or(8 << 20) as u64,
+            budget: env_usize("DF_PREFETCH_BUDGET").unwrap_or(32 << 20) as u64,
+            concurrency: env_usize("DF_PREFETCH_CONCURRENCY").unwrap_or(4),
+        }
+    }
+}
+
+enum State {
+    Pending,
     InFlight,
-    Ready { bytes: Bytes, consumed: u64 },
+    Ready(Bytes),
+    Freed,
+}
+
+struct Chunk {
+    range: Range<u64>,
+    state: State,
+}
+
+struct Window {
+    chunks: Vec<Chunk>,
+    /// The index of the chunk that holds the decoder's current read. Each
+    /// chunk before it is `Freed`, or `InFlight` and freed on completion.
+    cursor: usize,
 }
 
 struct Shared {
-    /// start -> (end, entry)
-    entries: Mutex<BTreeMap<u64, (u64, Entry)>>,
+    window: Mutex<Window>,
     reservation: MemoryReservation,
     notify: Notify,
-    /// The coalesced fetch ranges in decode order. A range is fetched once,
-    /// by whichever side claims it first.
-    ranges: Vec<Range<u64>>,
-    claimed: Vec<AtomicBool>,
+    budget: u64,
 }
 
 pub(crate) struct PrefetchReader {
     inner: Box<dyn AsyncFileReader>,
     shared: Arc<Shared>,
-    partition: usize,
-    seq: u64,
-}
-
-/// Per partition: file sequence number -> whether that file has issued all
-/// its fetches. A file fetches only after every earlier open file of the
-/// same partition has issued all its fetches, so the file being decoded
-/// gets I/O and memory before look-ahead files.
-static PRIORITY: Mutex<BTreeMap<(usize, u64), bool>> = Mutex::new(BTreeMap::new());
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn may_fetch(partition: usize, seq: u64) -> bool {
-    PRIORITY
-        .lock()
-        .unwrap()
-        .range((partition, 0)..(partition, seq))
-        .all(|(_, done)| *done)
-}
-
-fn set_done(partition: usize, seq: u64) {
-    if let Some(d) = PRIORITY.lock().unwrap().get_mut(&(partition, seq)) {
-        *d = true;
-    }
+    /// Dropping the set aborts the workers.
+    _workers: JoinSet<()>,
 }
 
 impl PrefetchReader {
-    /// Spawn one prefetch worker per reader in `prefetch_readers` for
-    /// `plan`, and wrap `inner` so it reads from the prefetched bytes.
+    /// Wrap `inner` in a window over `plan`, with one worker for each reader
+    /// in `prefetch_readers`.
     pub(crate) fn spawn(
         inner: Box<dyn AsyncFileReader>,
         prefetch_readers: Vec<Box<dyn AsyncFileReader>>,
         plan: ScanPlan,
         pool: Arc<dyn MemoryPool>,
         partition: usize,
+        config: PrefetchConfig,
     ) -> Self {
-        let reservation =
-            MemoryConsumer::new(format!("ParquetPrefetch[{partition}]")).register(&pool);
-        let chunk = env_usize("DF_PREFETCH_CHUNK").unwrap_or(8 << 20) as u64;
-        let ranges = coalesce(plan, chunk);
-        let claimed = ranges.iter().map(|_| AtomicBool::new(false)).collect();
+        let chunks = coalesce(plan, config.chunk)
+            .into_iter()
+            .map(|range| Chunk {
+                range,
+                state: State::Pending,
+            })
+            .collect();
         let shared = Arc::new(Shared {
-            entries: Mutex::new(BTreeMap::new()),
-            reservation,
+            window: Mutex::new(Window { chunks, cursor: 0 }),
+            reservation: MemoryConsumer::new(format!("ParquetPrefetch[{partition}]"))
+                .register(&pool),
             notify: Notify::new(),
-            ranges,
-            claimed,
+            budget: config.budget,
         });
-        let fraction = env_f64("DF_PREFETCH_FRACTION").unwrap_or(0.6);
-        let fallible = std::env::var("DF_PREFETCH_TRY").is_ok();
-        REGISTRY.lock().unwrap().push(Arc::downgrade(&shared));
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        PRIORITY.lock().unwrap().insert((partition, seq), false);
-        let next = Arc::new(AtomicUsize::new(0));
-        let live = Arc::new(AtomicUsize::new(prefetch_readers.len()));
+        let mut workers = JoinSet::new();
         for reader in prefetch_readers {
-            tokio::spawn(prefetch_worker(
-                Arc::downgrade(&shared),
-                reader,
-                Arc::clone(&next),
-                Arc::clone(&live),
-                Arc::clone(&pool),
-                fraction,
-                fallible,
-                partition,
-                seq,
-            ));
+            workers.spawn(worker(Arc::clone(&shared), reader));
         }
         Self {
             inner,
             shared,
-            partition,
-            seq,
+            _workers: workers,
         }
     }
 }
 
 impl Drop for PrefetchReader {
     fn drop(&mut self) {
-        PRIORITY.lock().unwrap().remove(&(self.partition, self.seq));
-        // The workers hold only a `Weak`. Waking them lets them observe the drop.
-        self.shared.notify.notify_waiters();
         if std::env::var("DF_PREFETCH_STATS").is_ok() {
             eprintln!(
-                "PREFETCH_STATS hit_mib={} miss_mib={} wait_ms={} evict_mib={} denied={} promoted_mib={}",
+                "PREFETCH_STATS hit_mib={} miss_mib={} required_mib={} wait_ms={} denied={}",
                 HIT_BYTES.load(Ordering::Relaxed) >> 20,
                 MISS_BYTES.load(Ordering::Relaxed) >> 20,
+                REQUIRED_BYTES.load(Ordering::Relaxed) >> 20,
                 WAIT_US.load(Ordering::Relaxed) / 1000,
-                EVICT_BYTES.load(Ordering::Relaxed) >> 20,
-                DENIED.load(Ordering::Relaxed),
-                PROMOTED.load(Ordering::Relaxed) >> 20
+                DENIED.load(Ordering::Relaxed)
             );
         }
     }
 }
 
-/// Merge adjacent plan ranges into fetches of at most `chunk` bytes.
+/// Merge adjacent plan ranges into chunks of at most `chunk` bytes. The
+/// chunks do not overlap.
 fn coalesce(plan: ScanPlan, chunk: u64) -> Vec<Range<u64>> {
     let mut out: Vec<Range<u64>> = Vec::new();
     for planned in plan {
-        let r = planned.range;
+        let mut r = planned.range;
         if let Some(last) = out.last_mut() {
-            if r.start == last.end && last.end - last.start + (r.end - r.start) <= chunk {
-                last.end = r.end;
+            if r.start >= last.start && r.start < last.end {
+                // Keep only the part after the previous chunk.
+                r.start = last.end;
+            }
+            if r.start >= r.end {
                 continue;
             }
-            if r.start >= last.start && r.end <= last.end {
+            if r.start == last.end && r.end - last.start <= chunk {
+                last.end = r.end;
                 continue;
             }
         }
@@ -218,171 +174,155 @@ fn coalesce(plan: ScanPlan, chunk: u64) -> Vec<Range<u64>> {
     out
 }
 
-fn pool_has_room(pool: &dyn MemoryPool, fraction: f64, add: usize) -> bool {
-    match pool.memory_limit() {
-        MemoryLimit::Finite(limit) => {
-            let headroom = env_usize("DF_PREFETCH_HEADROOM").unwrap_or(0);
-            (pool.reserved() + add + headroom) as f64 <= limit as f64 * fraction
-        }
-        _ => true,
-    }
-}
-
-/// One worker keeps one request in flight. Each worker takes the next range
-/// in decode order as soon as its previous request completes, so a slow
-/// range does not hold back the others.
-#[allow(clippy::too_many_arguments)]
-async fn prefetch_worker(
-    shared: Weak<Shared>,
-    mut reader: Box<dyn AsyncFileReader>,
-    next: Arc<AtomicUsize>,
-    live: Arc<AtomicUsize>,
-    pool: Arc<dyn MemoryPool>,
-    fraction: f64,
-    fallible: bool,
-    partition: usize,
-    seq: u64,
-) {
-    loop {
-        let Some(s) = shared.upgrade() else { return };
-        let i = next.load(Ordering::Relaxed);
-        if i >= s.ranges.len() {
-            if live.fetch_sub(1, Ordering::Relaxed) == 1 {
-                set_done(partition, seq);
-            }
-            return;
-        }
-        if s.claimed[i].load(Ordering::Relaxed) {
-            // The decoder promoted this range to a required fetch.
-            let _ = next.compare_exchange(i, i + 1, Ordering::Relaxed, Ordering::Relaxed);
-            continue;
-        }
-        let r = s.ranges[i].clone();
-        let len = (r.end - r.start) as usize;
-        if !may_fetch(partition, seq) || !pool_has_room(pool.as_ref(), fraction, len) {
-            // Wait for consumption, or poll again soon, because other
-            // partitions and earlier files also free memory and I/O.
-            let _ =
-                tokio::time::timeout(Duration::from_millis(2), s.notify.notified()).await;
-            continue;
-        }
-        if fallible {
-            // Optional bytes: take only what the pool grants now.
-            if s.reservation.try_grow(len).is_err() {
-                DENIED.fetch_add(1, Ordering::Relaxed);
-                let _ = tokio::time::timeout(Duration::from_millis(5), s.notify.notified())
-                    .await;
-                continue;
-            }
-        } else {
-            s.reservation.grow(len);
-        }
-        if next
-            .compare_exchange(i, i + 1, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-            || s.claimed[i].swap(true, Ordering::Relaxed)
-        {
-            s.reservation.shrink(len);
-            continue;
-        }
-        if i + 1 == s.ranges.len() {
-            set_done(partition, seq);
-        }
-        s.entries
-            .lock()
-            .unwrap()
-            .insert(r.start, (r.end, Entry::InFlight));
-        drop(s);
-        let result = reader.get_bytes(r.clone()).await;
-        let Some(s) = shared.upgrade() else { return };
-        {
-            let mut entries = s.entries.lock().unwrap();
-            match result {
-                Ok(b) => {
-                    entries.insert(
-                        r.start,
-                        (
-                            r.end,
-                            Entry::Ready {
-                                bytes: b,
-                                consumed: 0,
-                            },
-                        ),
-                    );
-                }
-                Err(_) => {
-                    // Let the decoder fetch this range itself.
-                    entries.remove(&r.start);
-                    s.reservation.shrink(len);
-                }
-            }
-        }
-        s.notify.notify_waiters();
-    }
-}
-
-enum Lookup {
-    Miss,
-    Wait,
-    Hit(Bytes),
+fn len(r: &Range<u64>) -> usize {
+    (r.end - r.start) as usize
 }
 
 impl Shared {
-    /// Serve `range` from one or more contiguous entries.
-    fn lookup(&self, range: &Range<u64>) -> Lookup {
-        let mut entries = self.entries.lock().unwrap();
-        let Some((&first, _)) = entries.range(..=range.start).next_back() else {
-            return Lookup::Miss;
-        };
-        let mut parts = Vec::new();
-        let mut pos = range.start;
-        for (&start, (end, entry)) in entries.range(first..) {
-            if start > pos {
-                return Lookup::Miss;
+    /// Release the memory of `chunk`. If the chunk is in flight, `complete`
+    /// releases the memory when the fetch ends.
+    fn free(&self, chunk: &mut Chunk) {
+        if let State::Ready(_) = std::mem::replace(&mut chunk.state, State::Freed) {
+            self.reservation.shrink(len(&chunk.range));
+        }
+    }
+
+    /// Store the result of the fetch of chunk `i`.
+    fn complete(&self, i: usize, result: ParquetResult<Bytes>) {
+        let mut w = self.window.lock().unwrap();
+        let chunk = &mut w.chunks[i];
+        match (&chunk.state, result) {
+            (State::InFlight, Ok(bytes)) => chunk.state = State::Ready(bytes),
+            (State::InFlight, Err(_)) => {
+                // The decoder reads this range directly.
+                chunk.state = State::Freed;
+                self.reservation.shrink(len(&chunk.range));
             }
-            if *end <= pos {
+            // The cursor moved past the chunk while it was in flight.
+            _ => self.reservation.shrink(len(&chunk.range)),
+        }
+        drop(w);
+        self.notify.notify_waiters();
+    }
+
+    /// Claim the first pending chunk ahead of the cursor for a worker. The
+    /// bytes from the cursor to the end of that chunk must fit in the budget,
+    /// and the pool must grant them. Return `Err` when no pending chunk is
+    /// left.
+    fn claim_optional(&self) -> Result<Option<(usize, Range<u64>)>, ()> {
+        let mut w = self.window.lock().unwrap();
+        let cursor = w.cursor;
+        let mut ahead = 0;
+        for i in cursor..w.chunks.len() {
+            ahead += len(&w.chunks[i].range) as u64;
+            if !matches!(w.chunks[i].state, State::Pending) {
                 continue;
             }
-            match entry {
-                Entry::InFlight => return Lookup::Wait,
-                Entry::Ready { .. } => parts.push(start),
+            if ahead > self.budget && i > cursor {
+                return Ok(None);
             }
-            pos = *end;
-            if pos >= range.end {
-                break;
+            let r = w.chunks[i].range.clone();
+            if self.reservation.try_grow(len(&r)).is_err() {
+                DENIED.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
+            w.chunks[i].state = State::InFlight;
+            return Ok(Some((i, r)));
+        }
+        Err(())
+    }
+
+    /// Move the cursor to the chunk that holds `range.start`, then serve
+    /// `range` or say what the decoder must do first.
+    fn step(&self, range: &Range<u64>) -> Step {
+        let mut guard = self.window.lock().unwrap();
+        let w = &mut *guard;
+        let Some(first) = (w.cursor..w.chunks.len())
+            .find(|&i| w.chunks[i].range.contains(&range.start))
+        else {
+            return Step::Direct;
+        };
+        for i in w.cursor..first {
+            self.free(&mut w.chunks[i]);
+        }
+        w.cursor = first;
+        let mut last = first;
+        while w.chunks[last].range.end < range.end {
+            last += 1;
+            if last == w.chunks.len()
+                || w.chunks[last].range.start != w.chunks[last - 1].range.end
+            {
+                // The range leaves the plan. Read it directly.
+                return Step::Direct;
             }
         }
-        if pos < range.end {
-            return Lookup::Miss;
+        let mut claims = Vec::new();
+        let mut wait = false;
+        for i in first..=last {
+            match w.chunks[i].state {
+                State::Pending => {
+                    // Required bytes: the decoder cannot continue without them.
+                    let r = w.chunks[i].range.clone();
+                    self.reservation.grow(len(&r));
+                    REQUIRED_BYTES.fetch_add(r.end - r.start, Ordering::Relaxed);
+                    w.chunks[i].state = State::InFlight;
+                    claims.push((i, r));
+                }
+                State::InFlight => wait = true,
+                State::Ready(_) => {}
+                State::Freed => return Step::Direct,
+            }
         }
-        let mut out = bytes::BytesMut::new();
-        let mut single = None;
-        let mut freed = 0;
-        for start in &parts {
-            let (end, entry) = entries.get_mut(start).unwrap();
-            let Entry::Ready { bytes, consumed } = entry else {
+        if !claims.is_empty() {
+            return Step::Fetch(claims);
+        }
+        if wait {
+            return Step::Wait;
+        }
+        let mut pieces = (first..=last).map(|i| {
+            let c = &w.chunks[i];
+            let State::Ready(bytes) = &c.state else {
                 unreachable!()
             };
-            let lo = range.start.max(*start);
-            let hi = range.end.min(*end);
-            let piece = bytes.slice((lo - start) as usize..(hi - start) as usize);
-            if parts.len() == 1 {
-                single = Some(piece);
-            } else {
-                out.extend_from_slice(&piece);
-            }
-            *consumed += hi - lo;
-            if *consumed >= *end - start {
-                freed += (*end - start) as usize;
-                entries.remove(start);
-            }
+            let lo = range.start.max(c.range.start) - c.range.start;
+            let hi = range.end.min(c.range.end) - c.range.start;
+            bytes.slice(lo as usize..hi as usize)
+        });
+        if first == last {
+            return Step::Hit(pieces.next().unwrap());
         }
-        if freed > 0 {
-            self.reservation.shrink(freed);
-            self.notify.notify_waiters();
-        }
-        Lookup::Hit(single.unwrap_or_else(|| out.freeze()))
+        let mut out = bytes::BytesMut::with_capacity(len(range));
+        pieces.for_each(|p| out.extend_from_slice(&p));
+        Step::Hit(out.freeze())
     }
+}
+
+/// Fetch optional chunks until none is pending.
+async fn worker(shared: Arc<Shared>, mut reader: Box<dyn AsyncFileReader>) {
+    loop {
+        let notified = shared.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        match shared.claim_optional() {
+            Err(()) => return,
+            Ok(Some((i, range))) => {
+                let result = reader.get_bytes(range).await;
+                shared.complete(i, result);
+            }
+            // The cursor moves with a notification, but the pool frees memory
+            // without one. So poll the pool as well.
+            Ok(None) => {
+                let _ = tokio::time::timeout(Duration::from_millis(5), notified).await;
+            }
+        }
+    }
+}
+
+enum Step {
+    Hit(Bytes),
+    Wait,
+    Fetch(Vec<(usize, Range<u64>)>),
+    Direct,
 }
 
 impl PrefetchReader {
@@ -390,73 +330,32 @@ impl PrefetchReader {
         let shared = Arc::clone(&self.shared);
         loop {
             let notified = shared.notify.notified();
-            match shared.lookup(&range) {
-                Lookup::Hit(b) => {
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match shared.step(&range) {
+                Step::Hit(b) => {
                     HIT_BYTES.fetch_add(range.end - range.start, Ordering::Relaxed);
                     return Ok(b);
                 }
-                Lookup::Miss => {
-                    if std::env::var("DF_PREFETCH_PROMOTE").is_ok() && self.promote(&range).await
-                    {
-                        continue;
-                    }
+                Step::Direct => {
                     MISS_BYTES.fetch_add(range.end - range.start, Ordering::Relaxed);
                     return self.inner.get_bytes(range).await;
                 }
-                Lookup::Wait => {
+                Step::Wait => {
                     let t = std::time::Instant::now();
                     notified.await;
                     WAIT_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
                 }
+                Step::Fetch(claims) => {
+                    for (i, r) in claims {
+                        let result = self.inner.get_bytes(r).await;
+                        shared.complete(i, result);
+                    }
+                }
             }
         }
     }
 }
-
-impl PrefetchReader {
-    /// The decoder needs `range` now. If an unclaimed fetch range covers it,
-    /// fetch that whole range as required bytes, so the prefetch worker does
-    /// not fetch it again later. Return false if no such range exists.
-    async fn promote(&mut self, range: &Range<u64>) -> bool {
-        let s = Arc::clone(&self.shared);
-        let Some(i) = s
-            .ranges
-            .iter()
-            .position(|r| r.start <= range.start && range.end <= r.end)
-        else {
-            return false;
-        };
-        if s.claimed[i].swap(true, Ordering::Relaxed) {
-            return false;
-        }
-        let r = s.ranges[i].clone();
-        let len = (r.end - r.start) as usize;
-        PROMOTED.fetch_add(len as u64, Ordering::Relaxed);
-        s.reservation.grow(len);
-        s.entries
-            .lock()
-            .unwrap()
-            .insert(r.start, (r.end, Entry::InFlight));
-        let result = self.inner.get_bytes(r.clone()).await;
-        let mut entries = s.entries.lock().unwrap();
-        let ok = match result {
-            Ok(b) => {
-                entries.insert(r.start, (r.end, Entry::Ready { bytes: b, consumed: 0 }));
-                true
-            }
-            Err(_) => {
-                entries.remove(&r.start);
-                s.reservation.shrink(len);
-                false
-            }
-        };
-        drop(entries);
-        s.notify.notify_waiters();
-        ok
-    }
-}
-
-static PROMOTED: AtomicU64 = AtomicU64::new(0);
 
 impl AsyncFileReader for PrefetchReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {

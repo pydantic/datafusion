@@ -797,22 +797,8 @@ impl ReadAheadMemory {
     /// limit: the decoder cannot continue without these bytes.
     fn reserve_required(&self, bytes: u64) -> Result<()> {
         let bytes = to_usize(bytes);
-        // PROTOTYPE: DF_REQUIRED_STRICT orders required reservations:
-        // try the pool, reclaim optional prefetch bytes, retry, then fail.
-        if std::env::var("DF_REQUIRED_STRICT").is_err() {
-            self.reservation.grow(bytes);
-            return Ok(());
-        }
-        if self.reservation.try_grow(bytes).is_ok() {
-            return Ok(());
-        }
-        crate::prefetch::reclaim_prefetch(bytes);
-        self.reservation.try_grow(bytes).map_err(|e| {
-            e.context(format!(
-                "required bytes for the next batch of {}",
-                self.reservation.consumer().name()
-            ))
-        })
+        self.reservation.grow(bytes);
+        Ok(())
     }
 
     /// Bytes the pool can grant now. Unlimited if the pool has no limit or
