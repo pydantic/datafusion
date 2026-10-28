@@ -58,7 +58,7 @@ pub(crate) struct PrefetchConfig {
 impl PrefetchConfig {
     pub(crate) fn from_env() -> Self {
         Self {
-            chunk: env_usize("DF_PREFETCH_CHUNK").unwrap_or(8 << 20) as u64,
+            chunk: env_usize("DF_PREFETCH_CHUNK").unwrap_or(4 << 20) as u64,
             budget: env_usize("DF_PREFETCH_BUDGET").unwrap_or(32 << 20) as u64,
             concurrency: env_usize("DF_PREFETCH_CONCURRENCY").unwrap_or(4),
         }
