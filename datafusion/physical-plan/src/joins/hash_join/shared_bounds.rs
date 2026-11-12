@@ -1594,10 +1594,14 @@ mod tests {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .expect("dynamic filter should evaluate to BooleanArray");
-        assert_eq!(
-            result,
-            &BooleanArray::from(vec![false, true, true, true, false, true, true, false,])
-        );
+        // Under `force_hash_collisions` the routed lookup matches by hash, so every
+        // row routed to a non-empty partition passes.
+        let expected = if cfg!(feature = "force_hash_collisions") {
+            vec![false, true, true, true, true, true, true, true]
+        } else {
+            vec![false, true, true, true, false, true, true, false]
+        };
+        assert_eq!(result, &BooleanArray::from(expected));
 
         Ok(())
     }
