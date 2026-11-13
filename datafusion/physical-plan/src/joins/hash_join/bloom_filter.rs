@@ -118,7 +118,9 @@ pub(crate) fn partition_filter(
     }
     let mut filter = Sbbf::new_with_num_of_bytes(bytes);
     for_each_hash_batch(keys, |hashes| {
-        filter.insert_hashes(hashes);
+        for &hash in hashes {
+            filter.insert_hash(hash);
+        }
         Ok(())
     })?;
     Ok(Some(filter))
